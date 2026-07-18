@@ -125,9 +125,25 @@ public:
     }
 
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
-                                                       vk::PipelineStageFlagBits2 dst_stage,
+                                                       vk::PipelineStageFlags2 dst_stage,
                                                        u32 offset = 0) {
         if (dst_acess_mask == access_mask && stage == dst_stage) {
+            return {};
+        }
+
+        // A memory dependency is unnecessary between two read-only uses. Mixed vertex/index
+        // allocations are common in PS4 titles; replacing one read state with the other used to
+        // emit a whole-buffer barrier and, with dynamic rendering, tear down the render scope
+        // every draw. Accumulate both masks/stages so a later writer still waits for every
+        // preceding reader.
+        constexpr vk::AccessFlags2 WriteAccessMask =
+            vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransferWrite |
+            vk::AccessFlagBits2::eShaderWrite;
+        const bool src_read_only = !(access_mask & WriteAccessMask);
+        const bool dst_read_only = !(dst_acess_mask & WriteAccessMask);
+        if (src_read_only && dst_read_only) {
+            access_mask |= dst_acess_mask;
+            stage |= dst_stage;
             return {};
         }
 
@@ -165,7 +181,7 @@ public:
     vk::Flags<vk::AccessFlagBits2> access_mask{
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
-    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eAllCommands};
 };
 
 class StreamBuffer : public Buffer {
