@@ -80,6 +80,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    command_buffer_used = true;
     current_cmdbuf.beginRendering(rendering_info);
 }
 
@@ -93,6 +94,13 @@ void Scheduler::EndRendering() {
 
 void Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
+    if (!command_buffer_used && info.num_wait_semas == 0 && info.num_signal_semas == 0 &&
+        !info.fence && pending_ops.empty()) {
+        // Nothing was recorded since the last submission and nothing external depends on this
+        // one: submitting would only push an empty command buffer through the driver. Deferred
+        // operations keep their tick; the next real submission signals it.
+        return;
+    }
     SubmitExecution(info);
 }
 
@@ -104,6 +112,13 @@ void Scheduler::Flush() {
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    if (!command_buffer_used && pending_ops.empty()) {
+        // Nothing recorded since the last submission; every prior tick already has its signal
+        // in flight, so waiting on the previous tick drains the device without submitting an
+        // empty command buffer (which would also deadlock the tick we never signal).
+        Wait(presubmit_tick - 1);
+        return;
+    }
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
@@ -133,6 +148,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    command_buffer_used = false;
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();

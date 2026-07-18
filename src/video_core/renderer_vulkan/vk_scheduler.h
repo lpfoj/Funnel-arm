@@ -383,8 +383,10 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
+    /// Returns the current command buffer and marks it as carrying recorded work, which lets
+    /// Flush/Finish skip submitting untouched command buffers.
     vk::CommandBuffer CommandBuffer() const {
+        command_buffer_used = true;
         return current_cmdbuf;
     }
 
@@ -443,6 +445,10 @@ private:
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
     };
+    // Consumers fetch the command buffer through CommandBuffer() (also from const contexts), so
+    // the recorded-work marker is mutable. True initially: the constructor-begun buffer predates
+    // the marker and must submit as before.
+    mutable bool command_buffer_used{true};
     std::queue<PendingOp> pending_ops;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
