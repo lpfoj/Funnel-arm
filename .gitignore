@@ -421,3 +421,11 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# Funnel-arm: local-only, intentionally not tracked (ARM/Windows-focused layer).
+# On upstream merges these may raise modify/delete conflicts: resolve with `git rm` again.
+.github/
+flake.nix
+flake.lock
+src/sdl_window_apple.mm
+REUSE.toml

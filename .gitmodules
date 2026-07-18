@@ -158,3 +158,9 @@
 [submodule "externals/protobuf"]
 	path = externals/protobuf
 	url = https://github.com/shadexternals/protobuf.git
+[submodule "externals/orbis/liborbis"]
+	path = externals/orbis/liborbis
+	url = https://github.com/orbisdev/liborbis
+[submodule "externals/orbis/liborbisPad"]
+	path = externals/orbis/liborbisPad
+	url = https://github.com/orbisdev/liborbisPad
