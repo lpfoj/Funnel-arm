@@ -15,4 +15,4 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 Funnels upstream PC emulators into ARM-ready building blocks: ported components, narrow performance optimizations and integration groundwork.
 
-Raw foundations are drawn from Orbis and other upstream projects.
+Raw foundations are drawn from [shadPS4](https://github.com/shadps4-emu/shadPS4), [Orbis](https://github.com/orbisdev) and other upstream projects.
