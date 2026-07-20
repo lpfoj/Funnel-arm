@@ -32512,8 +32512,53 @@ void XaddMem(LsxMachineImage& state, void* target, const std::size_t src_state_o
 
 void XaddMemLocked(LsxMachineImage& state, void* target, const std::size_t src_state_offset,
                    const std::uint32_t size_bits) {
-    std::lock_guard lock{g_locked_memory_mutex};
-    XaddMem(state, target, src_state_offset, size_bits);
+    if (target == nullptr || size_bits == 0) {
+        return;
+    }
+
+    const std::uint32_t size_bytes = size_bits / 8;
+    const auto address = reinterpret_cast<std::uintptr_t>(target);
+    if ((size_bits != 8 && size_bits != 16 && size_bits != 32 && size_bits != 64) ||
+        size_bytes == 0 || (address & (size_bytes - 1u)) != 0) {
+        // AArch64 atomics require natural alignment. X86 also permits a split locked operand;
+        // retain the serialized byte-copy implementation for that uncommon form.
+        std::lock_guard lock{g_locked_memory_mutex};
+        XaddMem(state, target, src_state_offset, size_bits);
+        return;
+    }
+
+    const std::uint64_t mask = MaskToSize(~std::uint64_t{0}, size_bits);
+    const std::uint64_t source = LoadStateLane(state, src_state_offset) & mask;
+    std::uint64_t previous = 0;
+    switch (size_bits) {
+    case 8:
+        previous = __atomic_fetch_add(
+            reinterpret_cast<std::uint8_t*>(target), static_cast<std::uint8_t>(source),
+            __ATOMIC_SEQ_CST);
+        break;
+    case 16:
+        previous = __atomic_fetch_add(
+            reinterpret_cast<std::uint16_t*>(target), static_cast<std::uint16_t>(source),
+            __ATOMIC_SEQ_CST);
+        break;
+    case 32:
+        previous = __atomic_fetch_add(
+            reinterpret_cast<std::uint32_t*>(target), static_cast<std::uint32_t>(source),
+            __ATOMIC_SEQ_CST);
+        break;
+    case 64:
+        previous = __atomic_fetch_add(
+            reinterpret_cast<std::uint64_t*>(target), source, __ATOMIC_SEQ_CST);
+        break;
+    default:
+        return;
+    }
+
+    previous &= mask;
+    const std::uint64_t result = MaskToSize(previous + source, size_bits);
+    CommitAddFlags(state, previous, source, result, size_bits);
+    // XADD returns the pre-add destination through its register operand.
+    StoreStateLane(state, src_state_offset, previous, size_bits);
 }
 
 void Popcnt(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
