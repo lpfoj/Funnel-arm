@@ -3705,7 +3705,18 @@ void Rasterizer::UpdateDepthStencilState() const {
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        dynamic_state.SetStencilReferences(front.stencil_test_val, back.stencil_test_val);
+        const auto front_reference = LiverpoolToVK::StencilReference(
+            regs.depth_control.stencil_ref_func, depth_test_enabled, regs.depth_control.depth_func,
+            regs.stencil_control.stencil_zpass_front,
+            regs.stencil_control.stencil_zfail_front, front);
+        const auto back_reference = regs.depth_control.backface_enable
+                                        ? LiverpoolToVK::StencilReference(
+                                              regs.depth_control.stencil_bf_func,
+                                              depth_test_enabled, regs.depth_control.depth_func,
+                                              regs.stencil_control.stencil_zpass_back,
+                                              regs.stencil_control.stencil_zfail_back, back)
+                                        : front_reference;
+        dynamic_state.SetStencilReferences(front_reference, back_reference);
         dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
                                            !stencil_clear ? back.stencil_write_mask : 0U);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);

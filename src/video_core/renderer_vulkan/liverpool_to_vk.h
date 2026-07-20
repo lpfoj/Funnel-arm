@@ -19,6 +19,11 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op);
 
 vk::CompareOp CompareOp(AmdGpu::CompareFunc func);
 
+u32 StencilReference(AmdGpu::CompareFunc stencil_compare, bool depth_test_enabled,
+                     AmdGpu::CompareFunc depth_compare, AmdGpu::StencilFunc pass_op,
+                     AmdGpu::StencilFunc depth_fail_op,
+                     const AmdGpu::StencilRefMask& ref_mask);
+
 bool IsPrimitiveCulled(AmdGpu::PrimitiveType type);
 
 vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type);

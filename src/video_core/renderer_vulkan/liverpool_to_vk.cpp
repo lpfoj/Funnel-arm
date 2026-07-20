@@ -80,6 +80,47 @@ vk::CompareOp CompareOp(AmdGpu::CompareFunc func) {
     }
 }
 
+u32 StencilReference(AmdGpu::CompareFunc stencil_compare, bool depth_test_enabled,
+                     AmdGpu::CompareFunc depth_compare, AmdGpu::StencilFunc pass_op,
+                     AmdGpu::StencilFunc depth_fail_op,
+                     const AmdGpu::StencilRefMask& ref_mask) {
+    // Liverpool has distinct values for the stencil comparison and ReplaceOp operation. Vulkan
+    // exposes only one reference value for both. When the stencil comparison is Always, the fail
+    // operation is unreachable and the reference is free to represent the replacement source.
+    // Select it from the operations that can actually execute; this exactly represents the common
+    // clear/fill pattern without weakening subsequent stencil comparisons.
+    if (stencil_compare != AmdGpu::CompareFunc::Always) {
+        return ref_mask.stencil_test_val;
+    }
+
+    const bool pass_reachable =
+        !depth_test_enabled || depth_compare != AmdGpu::CompareFunc::Never;
+    const bool depth_fail_reachable =
+        depth_test_enabled && depth_compare != AmdGpu::CompareFunc::Always;
+    const auto reachable = [&](AmdGpu::StencilFunc op) {
+        return (pass_reachable && pass_op == op) ||
+               (depth_fail_reachable && depth_fail_op == op);
+    };
+
+    const bool replace_from_test = reachable(AmdGpu::StencilFunc::ReplaceTest);
+    const bool replace_from_op = reachable(AmdGpu::StencilFunc::ReplaceOp);
+    const bool replace_with_ones = reachable(AmdGpu::StencilFunc::Ones);
+    if (replace_from_test) {
+        return ref_mask.stencil_test_val;
+    }
+    if (replace_from_op && !replace_with_ones) {
+        return ref_mask.stencil_op_val;
+    }
+    if (replace_with_ones && !replace_from_op) {
+        return 0xffu;
+    }
+
+    // Keep/increment/decrement/invert do not consume the reference. Mixed replacement sources are
+    // not exactly expressible by fixed-function Vulkan; retaining the comparison value is the
+    // conservative behavior for those uncommon states.
+    return ref_mask.stencil_test_val;
+}
+
 bool IsPrimitiveCulled(AmdGpu::PrimitiveType type) {
     switch (type) {
     case AmdGpu::PrimitiveType::TriangleList:
