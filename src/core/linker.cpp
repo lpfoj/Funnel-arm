@@ -8,12 +8,14 @@
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/singleton.h"
 #include "common/string_util.h"
 #include "common/thread.h"
 #include "core/aerolib/aerolib.h"
 #include "core/aerolib/stubs.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/emulator_settings.h"
+#include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/threads.h"
@@ -185,6 +187,38 @@ void Linker::Execute(const std::vector<std::string>& args) {
                          fmt::UTF(entry.path().u8string()));
                 if (LoadAndStartModule(entry.path(), 0, nullptr, nullptr) == -1) {
                     LOG_ERROR(Core_Linker, "Failed to load custom module: {}",
+                              fmt::UTF(entry.path().u8string()));
+                }
+            }
+        }
+
+        // Load and start modules the game ships in /app0/prx (e.g. FMOD middleware). These
+        // are ordinary guest PRXs the executable links against but that are not Sony system
+        // modules, so HLE does not cover them. Loading them here, before the game entry runs,
+        // lets LoadAndStartModule re-relocate the executable and resolve imports that were
+        // stubbed while the module was still absent.
+        auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+        std::error_code bundled_ec;
+        const auto bundled_prx_dir = mnt->GetHostPath("/app0/prx");
+        if (std::filesystem::is_directory(bundled_prx_dir, bundled_ec)) {
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(bundled_prx_dir, bundled_ec)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".prx") {
+                    continue;
+                }
+                // Sony system modules are serviced by HLE or loaded on demand by
+                // sceSysmodule; only auto-load third-party middleware here.
+                const auto stem = entry.path().stem().string();
+                if (stem.starts_with("libSce") || stem == "libc") {
+                    continue;
+                }
+                if (FindByName(entry.path()) != -1) {
+                    continue;
+                }
+                LOG_INFO(Core_Linker, "Loading bundled module: {}",
+                         fmt::UTF(entry.path().u8string()));
+                if (LoadAndStartModule(entry.path(), 0, nullptr, nullptr) == -1) {
+                    LOG_ERROR(Core_Linker, "Failed to load bundled module: {}",
                               fmt::UTF(entry.path().u8string()));
                 }
             }
