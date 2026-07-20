@@ -18,7 +18,7 @@ inline constexpr X86DecodeStatus X86_STATUS_DECODE_FAILED = -2;
     return status == X86_STATUS_OK;
 }
 
-// Bump whenever the public operand normalization changes. Persistent Backend B
+// Bump whenever the public operand normalization changes. Persistent JIT
 // IR must never consume records produced under an older decoder contract.
 inline constexpr std::uint32_t X86_VERSION = 0x00011501u;
 inline constexpr std::size_t X86_MAX_INSTRUCTION_LENGTH = 15;

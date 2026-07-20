@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">LSX4</string><string name="library_scanning">Recherche des jeux installés…</string><string name="library_found">Jeux trouvés : %1$d</string><string name="library_empty_status">Aucun jeu trouvé</string><string name="library_empty">Aucun jeu installé. Utilisez + pour importer un dossier extrait ou un PKG.</string>
     <string name="menu_import_directory">Importer un dossier</string><string name="menu_import_pkg">Importer un PKG</string><string name="menu_settings">Paramètres</string><string name="menu_add">Ajouter un jeu</string><string name="menu_remove_game">Supprimer le jeu sélectionné</string><string name="game_removing">Suppression de %1$s…</string><string name="game_removed">%1$s supprimé</string><string name="game_remove_failed">Impossible de supprimer %1$s</string>
+    <string name="game_selected_for_removal">%1$s sélectionné pour suppression</string><string name="game_selection_cleared">Sélection de %1$s annulée</string><string name="game_marked_unsupported">%1$s ajouté aux jeux non pris en charge</string><string name="game_marked_supported">%1$s ajouté aux jeux pris en charge</string>
+    <string name="game_status_unclassified">Non classé</string><string name="game_status_unsupported">Non pris en charge</string><string name="game_status_supported">Pris en charge</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Maintenez 2 secondes pour sélectionner la suppression, 4 secondes pour marquer non pris en charge ou 8 secondes pour marquer pris en charge.</string>
     <string name="metadata_only">Métadonnées uniquement · eboot absent</string>
     <string name="settings_title">Paramètres</string><string name="settings_subtitle">Les modifications sont enregistrées automatiquement</string><string name="section_general">Général</string><string name="language">Langue de l’application</string>
     <string name="category_graphics">Graphismes</string><string name="category_graphics_summary">GPU, résolution et correctifs</string><string name="category_audio">Audio</string><string name="category_audio_summary">Sortie audio</string><string name="category_controls">Commandes</string><string name="category_controls_summary">Commandes à l’écran</string><string name="category_cache">Cache</string><string name="category_cache_summary">Cache des blocs compilés</string><string name="category_other">Autre</string><string name="category_other_summary">HUD de débogage</string>
@@ -30,4 +33,20 @@
     <string name="controls_gamepad_hint">Lorsqu’une manette compatible est connectée, les commandes à l’écran se masquent automatiquement. Les manettes sont prises en charge.</string>
     <string name="resolution_native">Native (appareil)</string>
     <string name="resolution_upscale_150">Mise à l’échelle 1,5× (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">Module audio NGS2 installé. Il sera utilisé au prochain lancement d’un jeu.</string>
+    <string name="audio_ngs2_module_missing">Le module audio NGS2 est absent. Les jeux utilisant NGS2 resteront muets.</string>
+    <string name="audio_import_ngs2_module">Importer libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">Importez uniquement un module de firmware déchiffré provenant de votre propre PlayStation 4. Relancez ensuite le jeu ; l’application elle-même ne doit pas être redémarrée.</string>
+    <string name="audio_ngs2_import_success">Module audio NGS2 importé. Relancez le jeu pour activer le son.</string>
+    <string name="audio_ngs2_import_failed">Impossible d’importer le module audio NGS2 : %1$s</string>
+    <string name="audio_ngs2_error_directory">Impossible de créer le dossier des modules système</string>
+    <string name="audio_ngs2_error_open">Impossible d’ouvrir le fichier sélectionné</string>
+    <string name="audio_ngs2_error_size">Le module sélectionné est trop volumineux</string>
+    <string name="audio_ngs2_error_name">Sélectionnez le module de firmware nommé %1$s</string>
+    <string name="audio_ngs2_error_format">Le fichier sélectionné n’est pas un module PS4 déchiffré</string>
+    <string name="game_hold_waiting">Maintenez : 2 s supprimer · 4 s non pris en charge · 8 s pris en charge</string>
+    <string name="game_hold_release_remove">Relâchez : sélectionner pour suppression</string>
+    <string name="game_hold_release_unsupported">Relâchez : marquer non pris en charge</string>
+    <string name="game_hold_release_supported">Relâchez : marquer pris en charge</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
 </resources>

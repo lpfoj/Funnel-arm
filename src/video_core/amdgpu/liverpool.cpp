@@ -73,7 +73,7 @@ std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 namespace {
 // Bounds-checked SET_*_REG write. reg_addr = base + a fully guest-controlled 16-bit reg_offset, and
 // `words` = a guest count; an unchecked memcpy into the fixed 0xD000-word reg_array overruns it into
-// adjacent .so BSS (Liverpool's Vulkan scheduler std::mutex etc.), giving Sonic Backend-B's shape-
+// adjacent .so BSS (Liverpool's Vulkan scheduler std::mutex etc.), giving Sonic JIT's shape-
 // shifting "destroyed mutex" FORTIFY/SIGSEGV corruption. Clamp/drop out-of-range writes.
 bool ExecutorSafeRegArrayWrite(u32* reg_array, u32 capacity, u32 reg_addr, const void* payload,
                                u32 words, const char* which) {
@@ -176,6 +176,11 @@ enum class ExecutorEopTraceStage : u32 {
     ParserEop,
     IrqSignal,
     EqTrigger,
+    EqWaitEnter,
+    EqWaitExit,
+    SemWaitEnter,
+    SemWaitExit,
+    SemPost,
     ParserEnd,
 };
 
@@ -261,6 +266,16 @@ const char* ExecutorEopTraceStageName(ExecutorEopTraceStage stage) {
         return "IRQ_SIGNAL";
     case ExecutorEopTraceStage::EqTrigger:
         return "EQ_TRIGGER";
+    case ExecutorEopTraceStage::EqWaitEnter:
+        return "EQ_WAIT_ENTER";
+    case ExecutorEopTraceStage::EqWaitExit:
+        return "EQ_WAIT_EXIT";
+    case ExecutorEopTraceStage::SemWaitEnter:
+        return "SEM_WAIT_ENTER";
+    case ExecutorEopTraceStage::SemWaitExit:
+        return "SEM_WAIT_EXIT";
+    case ExecutorEopTraceStage::SemPost:
+        return "SEM_POST";
     case ExecutorEopTraceStage::ParserEnd:
         return "PARSER_END";
     }
@@ -757,6 +772,29 @@ void ExecutorEopTraceEqTrigger(u64 id, s64 eq) {
                            static_cast<u64>(eq));
 }
 
+void ExecutorEopTraceEqWait(bool entering, s64 eq, s32 result, u64 id, s16 filter) {
+    if (!ExecutorEopTraceEnabled()) {
+        return;
+    }
+    ExecutorEopTraceRecord(
+        entering ? ExecutorEopTraceStage::EqWaitEnter : ExecutorEopTraceStage::EqWaitExit,
+        static_cast<uintptr_t>(eq), 0, 0, static_cast<u32>(id),
+        static_cast<u32>(static_cast<s32>(filter)), static_cast<u64>(static_cast<u32>(result)));
+}
+
+void ExecutorEopTraceSemSync(u32 operation, uintptr_t slot, uintptr_t native, s32 before,
+                             s32 after, s32 result, u32 thread_kind) {
+    if (!ExecutorEopTraceEnabled()) {
+        return;
+    }
+    const auto stage = operation == 0   ? ExecutorEopTraceStage::SemWaitEnter
+                       : operation == 1 ? ExecutorEopTraceStage::SemWaitExit
+                                        : ExecutorEopTraceStage::SemPost;
+    ExecutorEopTraceRecord(stage, slot, static_cast<u32>(before),
+                           static_cast<u32>(after), static_cast<u32>(result), thread_kind,
+                           static_cast<u64>(native));
+}
+
 void ExecutorEopTraceSubmitDonePulse(u64 pulse) {
     if (!ExecutorEopTraceEnabled()) {
         return;
@@ -772,7 +810,7 @@ void ExecutorEopTraceSubmitDonePulse(u64 pulse) {
     // Thread3's forced SubmitDone remains alive during the Coach wait. Two consecutive pulses with
     // no HLE submit and no parser/IRQ progress (~6 s in this title) are therefore a reliable bounded
     // stall trigger. Arm only after real graphics traffic so startup housekeeping cannot consume it.
-    if (hle_submits < 32 || state.parser_begin.load(std::memory_order_relaxed) == 0) {
+    if (hle_submits == 0 || state.parser_begin.load(std::memory_order_relaxed) == 0) {
         return;
     }
     const u64 previous_hle = state.pulse_last_hle.exchange(hle_submits, std::memory_order_relaxed);
@@ -1309,7 +1347,7 @@ static u32 ExecutorReadMappedWaitValueFast(const u64* wait_addr) {
     // polling contract used by desktop shadPS4.
     auto* const value_ptr =
         reinterpret_cast<u32*>(const_cast<u64*>(wait_addr));
-    return __atomic_load_n(value_ptr, __ATOMIC_ACQUIRE);
+    return std::atomic_ref<u32>{*value_ptr}.load(std::memory_order_acquire);
 }
 #else
 bool ExecutorWriteFenceToCpuAddress(const char*, void* address, u64 data, u32 num_bytes) {
@@ -1385,7 +1423,7 @@ void Liverpool::WaitRasterizerIdleForExecutor() {
         // (num_submits==0, num_commands==0) but ALSO run the submit-done OnSubmit/Flush block
         // (submit_done==false). Waiting on num_submits==0 alone races the OnSubmit/Flush tail.
         //
-        // Time-bound the wait: when a title (Sonic/RSDK on Backend B) submits a DCB whose tail flip
+        // Time-bound the wait: when a title (Sonic/RSDK on JIT) submits a DCB whose tail flip
         // WAIT_REG_MEM never resolves — the flip needs the present, and the present is gated BEHIND
         // this very drain — the coroutine never reaches the idle predicate and the render thread hangs
         // here forever, so no frame is ever presented. Bounding the wait lets the render thread fall
@@ -1395,7 +1433,7 @@ void Liverpool::WaitRasterizerIdleForExecutor() {
         // the render thread forever. try_lock_for lets it give up and present regardless.
         // Do NOT take submit_mutex here: num_submits/num_commands/submit_done are all std::atomic, so
         // they can be polled lock-free. Taking submit_mutex was fatal — a host-side heap corruption
-        // (Sonic Backend-B) intermittently makes bionic FORTIFY-abort pthread_mutex_lock on this very
+        // (Sonic JIT) intermittently makes bionic FORTIFY-abort pthread_mutex_lock on this very
         // mutex ("destroyed mutex"), killing the render thread right here (stuck at before_waitidle,
         // no timeout log). Lock-free polling with a bound lets the render always fall through to the
         // present regardless of the mutex's state or a parked GPU worker.
@@ -1946,7 +1984,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
         }
         case PM4ItOpcode::WriteConstRam: {
             const auto* write_const = reinterpret_cast<const PM4WriteConstRam*>(header);
-            // BOUNDS CHECK (Sonic Backend-B host-memory corruption root): constants_heap is a static
+            // BOUNDS CHECK (Sonic JIT host-memory corruption root): constants_heap is a static
             // 48KB array in the .so BSS. Offset() is a 16-bit guest CCB field (0..65535) and Size() a
             // 14-bit count<<2 — both can exceed 48KB, so an unchecked memcpy overruns constants_heap
             // into adjacent BSS globals (e.g. the Vulkan scheduler std::mutex), giving the shape-
@@ -2060,7 +2098,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // Coroutine parameters live in the coroutine frame until task.destroy(). When command-buffer
     // copying is enabled, bind the parser spans to these per-submit owners instead of Liverpool's
     // shared scratch vectors. SubmitDone may reset the shared frame offsets while this task is still
-    // queued, and Backend B can enter submit/submit-done HLEs concurrently from native guest threads.
+    // queued, and JIT can enter submit/submit-done HLEs concurrently from native guest threads.
     if (!owned_dcb.empty()) {
         dcb = std::span<const u32>{owned_dcb};
     }
@@ -4358,7 +4396,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     std::vector<u32> owned_ccb;
     bool own_submitted_buffers = Config::copyGPUCmdBuffers();
 #ifdef __ANDROID__
-    // Backend B maps each guest pthread to a native host pthread. Unity therefore starts rebuilding
+    // JIT maps each guest pthread to a native host pthread. Unity therefore starts rebuilding
     // its alternating command buffers as soon as the HLE submit returns, while Liverpool consumes
     // them asynchronously. A borrowed span can retain the draws yet lose the patched flip tail when
     // the next frame rewrites PrepareFlip in the same allocation. PC's timing often hides this race;
@@ -4366,7 +4404,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     own_submitted_buffers = true;
 #endif
     if (own_submitted_buffers) {
-        // The upstream shared copy arena assumes submit and SubmitDone cannot overlap. Backend B
+        // The upstream shared copy arena assumes submit and SubmitDone cannot overlap. JIT
         // exposes the guest's 1:1 native threads, so that assumption is false: SubmitDone can reset
         // the arena offsets, or another submit can resize it, while a queued coroutine only retains
         // spans into the arena. Give each task immutable storage with exactly the task's lifetime.

@@ -257,8 +257,12 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
 #ifdef __ANDROID__
-    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
-                        "[EXECUTOR_LIVE_VIDEOOUT_FLIP_RATE] handle=%d rate=%d", handle, rate);
+    // Unity may repeat this call every rendered frame. Keep the trace available for focused
+    // VideoOut diagnostics, but never make ordinary gameplay synchronously write to logcat.
+    if (ExecutorTraceVideoOutLabels()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_VIDEOOUT_FLIP_RATE] handle=%d rate=%d", handle, rate);
+    }
 #endif
     driver->GetPort(handle)->flip_rate = rate;
     return ORBIS_OK;

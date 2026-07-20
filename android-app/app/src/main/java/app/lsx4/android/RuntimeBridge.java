@@ -57,13 +57,13 @@ public final class RuntimeBridge {
     public static native int prepareBox64EntryTrampoline();
     public static native String box64EntryRequest();
     public static native String status();
-    public static native String backendBStatus();
+    public static native String jitStatus();
     /** Fixed counters: decoded/native/helper/unsupported/cache hits, then GNM build/draw/shader/submit/done/present. */
     public static native long[] runtimeHudStats();
-    public static native String backendBSelfTest();
+    public static native String jitSelfTest();
     public static native int scanGame(String path);
     public static native int launchGame(String path);
-    public static native int launchGameBackendB(String path);
+    public static native int launchGameJit(String path);
     public static native int prepareTranslatorLaunch(String path);
     public static native int reportTranslatorResult(int helperExitCode);
     public static native int reportTranslatorResultJson(String resultJson);

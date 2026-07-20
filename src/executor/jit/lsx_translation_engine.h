@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 LSX4 Project
+// SPDX-FileCopyrightText: Copyright 2026 Executor Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -13,7 +13,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace Executor::BackendB {
+namespace Executor::Jit {
 
 enum class LsxGpr : std::uint8_t {
     Rax = 0,
@@ -123,7 +123,7 @@ struct alignas(32) LsxMachineImage {
 // AAPCS64 returns this two-qword aggregate in x0/x1.  The leaf-HLE fast bridge uses the second
 // word as a fail-closed predicate so generated code can take the original guest CALL/PLT path if
 // a GOT slot is ever rebound to a non-leaf target.
-struct BackendBLeafHleCallResult {
+struct JitLeafHleCallResult {
     std::uint64_t result = 0;
     std::uint64_t executed = 0;
 };
@@ -251,7 +251,7 @@ struct LsxImmediateOperand {
     std::uint8_t size;
 };
 
-// Stable Backend B operand vocabulary. Decoder-specific layouts are translated once by
+// Stable JIT operand vocabulary. Decoder-specific layouts are translated once by
 // machine_code_lens.cpp; published regions and persistent-cache code retain only these fixed-width
 // architectural values.
 struct LsxOperandRecord {
@@ -455,8 +455,13 @@ LsxStackLease AcquireLsxStackLease(LsxMachineImage* state);
 void ReleaseLsxStackLease(const LsxStackLease& frame);
 LsxMachineImage* CurrentMachineImage();
 LsxMachineImage* SwapDiagnosticMachineImage(LsxMachineImage* state);
+// HLE implementations that perform an architectural context switch can replace the live machine
+// image and mark it authoritative. The bridge then skips its ordinary function-return epilogue,
+// which would otherwise overwrite the resumed RIP/RSP and callee-saved registers.
+bool MarkCurrentGuestStateOverride();
+bool ConsumeCurrentGuestStateOverride();
 LsxStackLease PrepareLsxEntry(LsxMachineImage& state, std::uint64_t guest_rip,
-                                         const LsxEntryPacket& ctx);
+                                          const LsxEntryPacket& ctx);
 bool RequestCurrentGuestExit(std::uint64_t result);
 bool IsGuestExitRequested();
 std::uint64_t GetGuestExitResult();
@@ -665,4 +670,4 @@ void FxsaveRestore(LsxMachineImage& state, std::uint64_t address, bool save,
                    bool is_64_bit_image = false);
 void Cmpxchg16bLocked(LsxMachineImage& state, std::uint64_t address);
 
-} // namespace Executor::BackendB
+} // namespace Executor::Jit

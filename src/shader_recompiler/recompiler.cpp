@@ -4,6 +4,11 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
+#include <algorithm>
+#include <fmt/format.h>
+#include "common/config.h"
+#include "common/io_file.h"
+#include "common/path_util.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
@@ -47,23 +52,17 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     program.ins_list.reserve(code.size());
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
-        // Real shaders end with S_ENDPGM; the remainder of the code buffer is padding. Stop at the
-        // first terminator so trailing zero/padding dwords are not decoded as bogus instructions.
-        if (program.ins_list.back().opcode == Gcn::Opcode::S_ENDPGM) {
-            break;
-        }
     }
 
-    // EXECUTOR (Sonic Backend-B, cont-12): guarantee a program terminator. A malformed/degenerate guest
-    // shader (wrong prologue, no S_ENDPGM, mostly-zero code -- e.g. the depth-only pass PS at hash
-    // 0x0f81f557) leaves the final CFG block with no terminator; LinkBlocks then redirects its
-    // fall-through to the first block (back-edge) and the structurizer wraps it into an INFINITE LOOP
-    // (OpBranchConditional %true ... + OpUnreachable merge). The Adreno driver's shader compiler
-    // heap-corrupts (destroyed-mutex FORTIFY) trying to compile such an infinite-loop shader inside
-    // vkCreateGraphicsPipelines. Appending an implicit S_ENDPGM makes the last block terminate with a
-    // proper Epilogue/OpReturn instead -> valid, non-infinite shader the driver can compile.
-    if (program.ins_list.empty() ||
-        program.ins_list.back().opcode != Gcn::Opcode::S_ENDPGM) {
+    // A shader may contain several legitimate exit paths with code after an earlier S_ENDPGM.
+    // Decode the complete guest program and only synthesize a terminator when none exists at all.
+    // Stopping at the first S_ENDPGM truncates forward branch targets and can turn a conditional
+    // discard path into an artificial back edge.
+    const bool has_terminator =
+        std::ranges::any_of(program.ins_list, [](const Gcn::GcnInst& inst) {
+            return inst.opcode == Gcn::Opcode::S_ENDPGM;
+        });
+    if (!has_terminator) {
         Gcn::GcnInst endpgm{};
         endpgm.opcode = Gcn::Opcode::S_ENDPGM;
         endpgm.category = Gcn::InstCategory::FlowControl;
@@ -72,7 +71,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
 #ifdef __ANDROID__
         __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
                             "[EXECUTOR_SHADER_NO_ENDPGM] stage=%u hash=%#llx appended implicit S_ENDPGM "
-                            "(degenerate shader; avoids infinite-loop -> Adreno pipeline crash)",
+                            "(malformed shader; using a bounded terminal path)",
                             static_cast<u32>(info.stage),
                             static_cast<unsigned long long>(info.pgm_hash));
 #endif
@@ -84,6 +83,16 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     // Create control flow graph
     Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
     Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+    if (Config::dumpShaders()) {
+        const auto dump_dir =
+            Common::FS::GetUserPath(Common::FS::PathType::ShaderDir) / "dumps";
+        std::filesystem::create_directories(dump_dir);
+        const auto filename =
+            fmt::format("{}_{:#018x}.cfg.dot", info.stage, info.pgm_hash);
+        Common::FS::IOFile file{dump_dir / filename, Common::FS::FileAccessMode::Create,
+                                Common::FS::FileType::TextFile};
+        file.WriteString(cfg.Dot());
+    }
 
     // Structurize control flow graph and create program.
     program.syntax_list =

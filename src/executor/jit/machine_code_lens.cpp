@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 PS4Run Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "executor/backend_b/machine_code_lens.h"
+#include "executor/jit/machine_code_lens.h"
 
 #include <algorithm>
 #include <cstring>
 
 #include "common/x86_decoder.h"
 
-#include "executor/backend_b/lsx_translation_engine.h"
+#include "executor/jit/lsx_translation_engine.h"
 
-namespace Executor::BackendB {
+namespace Executor::Jit {
 namespace {
 
 struct DecoderState {
@@ -129,4 +129,4 @@ const char* MachineRegisterName(const std::uint32_t code) noexcept {
     return X86RegisterGetString(static_cast<X86Register>(code));
 }
 
-} // namespace Executor::BackendB
+} // namespace Executor::Jit

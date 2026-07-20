@@ -22,6 +22,9 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#ifdef __ANDROID__
+#include "video_core/amdgpu/liverpool.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -245,6 +248,13 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     }
 
     int count = 0;
+#ifdef __ANDROID__
+    const bool is_gfx_eop_queue = m_name.find("EOP") != std::string::npos;
+    if (is_gfx_eop_queue) {
+        AmdGpu::ExecutorEopTraceEqWait(true, m_handle, 0, 0,
+                                      OrbisKernelEvent::Filter::GraphicsCore);
+    }
+#endif
 
     const auto predicate = [&] {
         count = GetTriggeredEvents(ev, num);
@@ -261,6 +271,13 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         m_cond.wait_for(lock, std::chrono::microseconds(micros), predicate);
     }
 
+#ifdef __ANDROID__
+    if (is_gfx_eop_queue) {
+        const u64 event_id = count > 0 ? ev[0].ident : 0;
+        const s16 event_filter = count > 0 ? ev[0].filter : OrbisKernelEvent::Filter::None;
+        AmdGpu::ExecutorEopTraceEqWait(false, m_handle, count, event_id, event_filter);
+    }
+#endif
     return count;
 }
 

@@ -10,6 +10,9 @@
     <string name="menu_settings">Ajustes</string>
     <string name="menu_add">Añadir juego</string>
     <string name="menu_remove_game">Eliminar el juego seleccionado</string><string name="game_removing">Eliminando %1$s…</string><string name="game_removed">%1$s eliminado</string><string name="game_remove_failed">No se pudo eliminar %1$s</string>
+    <string name="game_selected_for_removal">%1$s seleccionado para eliminar</string><string name="game_selection_cleared">Selección de %1$s cancelada</string><string name="game_marked_unsupported">%1$s añadido a los juegos no compatibles</string><string name="game_marked_supported">%1$s añadido a los juegos compatibles</string>
+    <string name="game_status_unclassified">Sin clasificar</string><string name="game_status_unsupported">No compatible</string><string name="game_status_supported">Compatible</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Mantén pulsado 2 segundos para seleccionar y eliminar, 4 segundos para marcar como no compatible u 8 segundos para marcar como compatible.</string>
     <string name="metadata_only">Solo metadatos · falta eboot</string>
     <string name="settings_title">Ajustes</string>
     <string name="settings_subtitle">Los cambios se guardan automáticamente</string>
@@ -54,4 +57,20 @@
     <string name="controls_gamepad_hint">Al conectar un mando compatible, el control en pantalla se oculta automáticamente. Se admiten mandos.</string>
     <string name="resolution_native">Nativa (dispositivo)</string>
     <string name="resolution_upscale_150">Escala 1,5× (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">Módulo de audio NGS2 instalado. Se usará al iniciar el próximo juego.</string>
+    <string name="audio_ngs2_module_missing">Falta el módulo de audio NGS2. Los juegos que usan NGS2 no tendrán sonido.</string>
+    <string name="audio_import_ngs2_module">Importar libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">Importa solo un módulo de firmware descifrado de tu propia PlayStation 4. Reinicia el juego tras importarlo; no es necesario reiniciar la aplicación.</string>
+    <string name="audio_ngs2_import_success">Módulo de audio NGS2 importado. Reinicia el juego para activar el sonido.</string>
+    <string name="audio_ngs2_import_failed">No se pudo importar el módulo de audio NGS2: %1$s</string>
+    <string name="audio_ngs2_error_directory">No se pudo crear el directorio de módulos del sistema</string>
+    <string name="audio_ngs2_error_open">No se pudo abrir el archivo seleccionado</string>
+    <string name="audio_ngs2_error_size">El módulo seleccionado es demasiado grande</string>
+    <string name="audio_ngs2_error_name">Selecciona el módulo de firmware llamado %1$s</string>
+    <string name="audio_ngs2_error_format">El archivo seleccionado no es un módulo de PS4 descifrado</string>
+    <string name="game_hold_waiting">Mantén: 2 s eliminar · 4 s no compatible · 8 s compatible</string>
+    <string name="game_hold_release_remove">Suelta ahora: seleccionar para eliminar</string>
+    <string name="game_hold_release_unsupported">Suelta ahora: marcar como no compatible</string>
+    <string name="game_hold_release_supported">Suelta ahora: marcar como compatible</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
 </resources>

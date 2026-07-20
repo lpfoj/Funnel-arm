@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <span>
 
-namespace Executor::BackendB {
+namespace Executor::Jit {
 
 struct LsxDecodedOp;
 
@@ -28,4 +28,4 @@ enum class ByteLensResult : std::uint8_t {
 // Diagnostic spelling for an architectural register code retained in LsxOperandRecord.
 [[nodiscard]] const char* MachineRegisterName(std::uint32_t code) noexcept;
 
-} // namespace Executor::BackendB
+} // namespace Executor::Jit

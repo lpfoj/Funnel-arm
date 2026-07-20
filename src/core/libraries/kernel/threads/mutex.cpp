@@ -15,6 +15,7 @@
 #include <vector>
 #ifdef __ANDROID__
 #include <android/log.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -57,6 +58,12 @@ extern "C" int executor_box64_embed_get_guest_thread_regs_by_pthread(
 extern "C" int executor_box64_embed_get_guest_thread_regs_by_tid(
     long host_tid, u64* rip, u64* rsp, u64* rbp, long* tid, char* host_name,
     std::size_t host_name_size) __attribute__((weak));
+extern "C" int executor_jit_get_guest_thread_regs_by_pthread(
+    std::uintptr_t pthread_handle, u64* rip, u64* rsp, u64* rbp, long* tid, char* host_name,
+    std::size_t host_name_size) __attribute__((weak));
+extern "C" int executor_jit_get_guest_thread_regs_by_tid(
+    long host_tid, u64* rip, u64* rsp, u64* rbp, long* tid, char* host_name,
+    std::size_t host_name_size) __attribute__((weak));
 extern "C" int executor_box64_embed_get_guest_thread_full_regs_by_pthread(
     std::uintptr_t pthread_handle, void* out, std::size_t out_size, long* tid, char* host_name,
     std::size_t host_name_size) __attribute__((weak));
@@ -83,7 +90,7 @@ extern "C" int executor_lsx4_android_get_current_guest_regs(void* out, std::size
 extern "C" int executor_lsx4_android_set_current_guest_regs(const void* in,
                                                                std::size_t in_size)
     __attribute__((weak));
-extern "C" bool executor_lsx4_android_backend_b_active() __attribute__((weak));
+extern "C" bool executor_lsx4_android_jit_active() __attribute__((weak));
 extern "C" int executor_live_signal_pending_mono_posix_sems(int max_posts)
     __attribute__((weak));
 extern "C" bool executor_live_signal_mono_resume_event_for_live_abba() __attribute__((weak));
@@ -119,8 +126,8 @@ static bool ExecutorStallMutexLedgerEnabled() {
         const char* env = std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP");
         return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
     }();
-    return marker_enabled && executor_lsx4_android_backend_b_active != nullptr &&
-           executor_lsx4_android_backend_b_active();
+    return marker_enabled && executor_lsx4_android_jit_active != nullptr &&
+           executor_lsx4_android_jit_active();
 }
 
 // The functions below this gate intentionally remain individually guarded for diagnostic builds,
@@ -161,6 +168,11 @@ extern std::array<OrbisKernelExceptionHandler, 130> Handlers;
 extern std::array<int, 130> HandlerFlags;
 
 static ExecutorGuestThreadRegsByPthreadFn ResolveGuestThreadRegsByPthread() {
+    if (executor_jit_get_guest_thread_regs_by_pthread &&
+        executor_lsx4_android_jit_active &&
+        executor_lsx4_android_jit_active()) {
+        return executor_jit_get_guest_thread_regs_by_pthread;
+    }
     if (executor_box64_embed_get_guest_thread_regs_by_pthread) {
         return executor_box64_embed_get_guest_thread_regs_by_pthread;
     }
@@ -192,6 +204,11 @@ static ExecutorGuestThreadRegsByPthreadFn ResolveGuestThreadRegsByPthread() {
 }
 
 static ExecutorGuestThreadRegsByTidFn ResolveGuestThreadRegsByTid() {
+    if (executor_jit_get_guest_thread_regs_by_tid &&
+        executor_lsx4_android_jit_active &&
+        executor_lsx4_android_jit_active()) {
+        return executor_jit_get_guest_thread_regs_by_tid;
+    }
     if (executor_box64_embed_get_guest_thread_regs_by_tid) {
         return executor_box64_embed_get_guest_thread_regs_by_tid;
     }
@@ -425,6 +442,11 @@ static bool IsMonoAbbaPcOracleSignalContractEnabled() {
             std::getenv("EXECUTOR_FEX_PS4_SIGNAL_FRAME") != nullptr;
         const bool fex_orbis_signal_frame = signal_delivery_enabled &&
             std::getenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS") != nullptr;
+        const bool jit_signal_frame =
+            executor_lsx4_android_jit_active != nullptr &&
+            executor_lsx4_android_jit_active();
+        const bool guest_signal_frame_available =
+            fex_orbis_signal_frame || jit_signal_frame;
         const bool explicit_contract =
             std::getenv("EXECUTOR_ENABLE_UNITYPRELOAD_CONTROL_SIGNAL_CONTRACT") != nullptr;
     // This path is an opt-in PC-contract experiment.  Light-oracle must not
@@ -439,18 +461,20 @@ static bool IsMonoAbbaPcOracleSignalContractEnabled() {
                    F_OK) == 0 ||
             access("/data/user/0/app.lsx4.android/files/lsx4-home/run-abba-standalone",
                    F_OK) == 0;
-        const bool value = explicit_contract && fex_orbis_signal_frame &&
+        const bool value = explicit_contract && guest_signal_frame_available &&
                            (ExecutorLightOracleMode() || abba_standalone);
         __android_log_print(ANDROID_LOG_WARN, "LSX4Mutex",
                             "[EXECUTOR_MONO_ABBA_CONTRACT] enabled=%d lightOracle=%d "
                             "helperMarker=%d signalDelivery=%d pathA_rc=%d pathA_errno=%d pathB_rc=%d "
                             "pathB_errno=%d fexOrbisSignalFrame=%d envSignalDeliver=%d "
-                            "explicitContract=%d source=opt_in_real_signal_contract noSyntheticAck=1",
+                            "jitSignalFrame=%d explicitContract=%d "
+                            "source=opt_in_real_signal_contract noSyntheticAck=1",
                             value ? 1 : 0, ExecutorLightOracleMode() ? 1 : 0,
                             helper_marker_enabled ? 1 : 0, signal_delivery_enabled ? 1 : 0,
                             rc_a, errno_a, rc_b, errno_b,
                             fex_orbis_signal_frame ? 1 : 0,
                             std::getenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER") != nullptr ? 1 : 0,
+                            jit_signal_frame ? 1 : 0,
                             explicit_contract ? 1 : 0);
         return value;
     }();
@@ -1507,7 +1531,7 @@ static void ClearMutexWaitSnapshot(Pthread* waiter, PthreadMutex* waiting_on) {
     ClearMonoSuspendAbbaSignalState(waiter);
 }
 
-// Passive Backend-B stall oracle. Waiters register before entering the unchanged TimedMutex park;
+// Passive JIT stall oracle. Waiters register before entering the unchanged TimedMutex park;
 // the existing SubmitDone heartbeat calls this reader. Reports are due at 2, 4, 8, 16... seconds,
 // capped by a process budget, so a long stall remains observable without turning mutex contention
 // into logcat load. No lock result, owner, wake, or scheduling decision is modified here.
@@ -1704,8 +1728,8 @@ static int QueueMonoSuspendSigusr1(Pthread* target) {
         return 0;
     }
     if (std::getenv("EXECUTOR_LIVE_MONO_SYNTHETIC_ACK") &&
-        !(executor_lsx4_android_backend_b_active != nullptr &&
-          executor_lsx4_android_backend_b_active()) &&
+        !(executor_lsx4_android_jit_active != nullptr &&
+          executor_lsx4_android_jit_active()) &&
         (ThreadNameContains(target, "mono thread") || ThreadNameContains(target, "UnityPreload")) &&
         executor_live_mono_synthetic_suspend_ack) {
         const int synth_rc =
@@ -1721,18 +1745,18 @@ static int QueueMonoSuspendSigusr1(Pthread* target) {
     }
     const auto pthr = NativePthreadHandle(target);
     if (std::getenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER") != nullptr) {
-        const bool backend_b_active =
-            executor_lsx4_android_backend_b_active != nullptr &&
-            executor_lsx4_android_backend_b_active();
-        if (backend_b_active) {
+        const bool jit_active =
+            executor_lsx4_android_jit_active != nullptr &&
+            executor_lsx4_android_jit_active();
+        if (jit_active) {
             MarkMonoSuspendSigusr1Pending(target);
-            static std::atomic_int backend_b_log_budget{128};
-            if (backend_b_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            static std::atomic_int jit_log_budget{128};
+            if (jit_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                 __android_log_print(
                     ANDROID_LOG_INFO, "LSX4Mutex",
                     "[EXECUTOR_MONO_ABBA_PENDING_SIGNAL] target=%p targetName=%s "
                     "targetNative=0x%zx queueRc=0 "
-                    "reason=backend_b_guest_safe_point_signal_delivery",
+                    "reason=jit_guest_safe_point_signal_delivery",
                     target, PthreadName(target), static_cast<std::size_t>(pthr));
             }
             return 0;
@@ -2641,26 +2665,38 @@ static int ScanGuestStackReturns(std::uint64_t rsp, std::uint64_t* out, int max_
 // can be disassembled from live memory.
 extern "C" void executor_live_dump_unity_thread_rips(const char* reason, int pulse) {
     auto* regs_fn = ResolveGuestThreadRegsByPthread();
-    if (regs_fn == nullptr) {
+    auto* regs_by_tid_fn = ResolveGuestThreadRegsByTid();
+    if (regs_fn == nullptr && regs_by_tid_fn == nullptr) {
         return;
     }
     Pthread* targets[24];
     int target_count = 0;
+    bool thread_list_locked = false;
     if (auto* state = ThrState::Instance()) {
-        std::scoped_lock lock(state->thread_list_lock);
-        for (Pthread* thread : state->threads) {
-            if (thread == nullptr || target_count >= 24) {
-                continue;
-            }
-            if (ThreadNameContains(thread, "Unity") || ThreadNameContains(thread, "Game:Main") ||
-                ThreadNameContains(thread, "mono") || ThreadNameContains(thread, "Mono") ||
-                ThreadNameContains(thread, "Loading.") ||
-                ThreadNameContains(thread, "Background Job")) {
-                targets[target_count++] = thread;
+        std::unique_lock lock(state->thread_list_lock, std::try_to_lock);
+        thread_list_locked = lock.owns_lock();
+        if (thread_list_locked) {
+            for (Pthread* thread : state->threads) {
+                if (thread == nullptr || target_count >= 24) {
+                    continue;
+                }
+                if (ThreadNameContains(thread, "Unity") ||
+                    ThreadNameContains(thread, "Game:Main") ||
+                    ThreadNameContains(thread, "mono") || ThreadNameContains(thread, "Mono") ||
+                    ThreadNameContains(thread, "Loading.") ||
+                    ThreadNameContains(thread, "Background Job")) {
+                    targets[target_count++] = thread;
+                }
             }
         }
     }
-    auto* regs_by_tid_fn = ResolveGuestThreadRegsByTid();
+    if (pulse == 12) {
+        __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                            "[EXECUTOR_LIVE_THREAD_RIP_TARGETS] reason=%s pulse=%d count=%d "
+                            "threadListLocked=%d",
+                            reason ? reason : "?", pulse, target_count,
+                            thread_list_locked ? 1 : 0);
+    }
     for (int i = 0; i < target_count; ++i) {
         Pthread* thread = targets[i];
         u64 rip = 0;
@@ -2668,8 +2704,11 @@ extern "C" void executor_live_dump_unity_thread_rips(const char* reason, int pul
         u64 rbp = 0;
         long fex_tid = 0;
         char fex_host[32]{};
-        int rc = regs_fn(thread->native_thr.GetHandle(), &rip, &rsp, &rbp, &fex_tid,
+        int rc = -1;
+        if (regs_fn != nullptr) {
+            rc = regs_fn(thread->native_thr.GetHandle(), &rip, &rsp, &rbp, &fex_tid,
                          fex_host, sizeof(fex_host));
+        }
         // Game:Main (the primary guest thread) is not registered by pthread handle in the FEX
         // thread registry, so the by-handle lookup returns -1 for it. Fall back to the host-tid
         // lookup so the main thread's poll site is visible during a standoff phase.
@@ -2708,6 +2747,53 @@ extern "C" void executor_live_dump_unity_thread_rips(const char* reason, int pul
             __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
                                 "[EXECUTOR_LIVE_THREAD_STACK] pulse=%d idx=%d name=%s frames=%d %s",
                                 pulse, i, PthreadName(thread), nf, chain);
+        }
+    }
+    if (pulse == 12 && regs_by_tid_fn != nullptr) {
+        if (DIR* task_dir = ::opendir("/proc/self/task")) {
+            while (dirent* entry = ::readdir(task_dir)) {
+                char* end = nullptr;
+                const long host_tid = std::strtol(entry->d_name, &end, 10);
+                if (host_tid <= 0 || end == entry->d_name || *end != '\0') {
+                    continue;
+                }
+                char path[96]{};
+                std::snprintf(path, sizeof(path), "/proc/self/task/%ld/comm", host_tid);
+                FILE* comm_file = std::fopen(path, "r");
+                if (comm_file == nullptr) {
+                    continue;
+                }
+                char name[64]{};
+                const bool read_name = std::fgets(name, sizeof(name), comm_file) != nullptr;
+                std::fclose(comm_file);
+                if (!read_name) {
+                    continue;
+                }
+                name[std::strcspn(name, "\r\n")] = '\0';
+                const std::string_view thread_name{name};
+                if (thread_name.find("Unity") == std::string_view::npos &&
+                    thread_name.find("Game:Main") == std::string_view::npos &&
+                    thread_name.find("mono") == std::string_view::npos &&
+                    thread_name.find("Mono") == std::string_view::npos) {
+                    continue;
+                }
+                u64 rip = 0;
+                u64 rsp = 0;
+                u64 rbp = 0;
+                long fex_tid = 0;
+                char fex_host[32]{};
+                const int rc = regs_by_tid_fn(host_tid, &rip, &rsp, &rbp, &fex_tid, fex_host,
+                                              sizeof(fex_host));
+                const std::string symbol = SymbolizeOwnerPcForLog(rip);
+                __android_log_print(
+                    ANDROID_LOG_WARN, "LSX4Native",
+                    "[EXECUTOR_LIVE_OS_THREAD_RIP] hostTid=%ld name=%s rc=%d fexTid=%ld "
+                    "rip=0x%llx rsp=0x%llx rbp=0x%llx %s",
+                    host_tid, name, rc, fex_tid, static_cast<unsigned long long>(rip),
+                    static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(rbp),
+                    symbol.c_str());
+            }
+            ::closedir(task_dir);
         }
     }
 }

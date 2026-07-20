@@ -118,7 +118,7 @@ public:
     /// and pick the final composite (full-resolution target with real multi-channel color) to present --
     /// the last-bound target is often an intermediate/aux pass (e.g. a single-channel or 16x16 buffer).
     std::vector<ImageId> executor_replay_color_candidates;
-    /// Live Backend-B presentation candidates are recorded only after a real Vulkan write has been
+    /// Live JIT presentation candidates are recorded only after a real Vulkan write has been
     /// emitted (draw or resolve). Unlike the replay candidate list, selecting one never performs a
     /// CPU readback.
     std::vector<ImageId> executor_live_drawn_color_candidates;

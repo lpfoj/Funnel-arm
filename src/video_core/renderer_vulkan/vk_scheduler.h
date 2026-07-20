@@ -45,7 +45,8 @@ enum class ExecutorVkJournalDrawType : u32 {
 
 u64 ExecutorVkJournalGraphicsDraw(const void* stream, u64 tick, u64 pipeline_key_hash,
                                   u64 pipeline_handle, u64 vs_hash, u64 ps_hash,
-                                  ExecutorVkJournalDrawType draw_type, u32 element_count,
+                                  ExecutorVkJournalDrawType draw_type, u32 primitive_type,
+                                  u32 element_count,
                                   u32 instance_count, u32 max_draw_count, u32 stride,
                                   VAddr argument_address, VAddr count_address,
                                   VAddr color_address, VAddr depth_address,

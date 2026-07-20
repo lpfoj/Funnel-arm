@@ -23,7 +23,7 @@ namespace Serialization {
 // restores the upstream/reference packed SSBO-offset extraction with OpBitFieldUExtract; V18 also
 // restores raw sign-bit VOP3 integer source modifiers. Older modules must not survive either
 // semantic change.
-static constexpr u32 ShaderBinaryVersion = 18u;
+static constexpr u32 ShaderBinaryVersion = 22u;
 static constexpr u32 ShaderMetaVersion = 1u;
 static constexpr u32 PipelineKeyVersion = 1u;
 } // namespace Serialization

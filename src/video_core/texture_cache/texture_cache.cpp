@@ -946,6 +946,30 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
         return id && slot_images.is_allocated(id);
     };
 
+    // A narrow source trace must show every image that was actually drawn between two flips, not
+    // only the scanout image eventually selected below. This is intentionally a one-shot diagnostic:
+    // each readback waits for the corresponding GPU work and therefore cannot live on the frame hot
+    // path. It lets a white/black registered scanout be distinguished from a valid intermediate
+    // composite without changing the source-selection policy being measured.
+    static std::atomic<bool> traced_live_candidate_set{false};
+    if (std::getenv("EXECUTOR_TRACE_VIDEOOUT_SOURCE") != nullptr &&
+        !traced_live_candidate_set.exchange(true, std::memory_order_relaxed)) {
+        std::array<u32, 16> traced_ids{};
+        std::size_t traced_count = 0;
+        for (const ImageId id : candidates) {
+            if (!candidate_valid(id) ||
+                std::ranges::find(traced_ids.begin(), traced_ids.begin() + traced_count, id.index) !=
+                    traced_ids.begin() + traced_count) {
+                continue;
+            }
+            traced_ids[traced_count++] = id.index;
+            ExecutorTraceVideoOutSource(id, 0x10000u + traced_count, 0);
+            if (traced_count == traced_ids.size()) {
+                break;
+            }
+        }
+    }
+
     // A VideoOut flip names the scanout buffer that owns this presentation. Preserve that exact PC
     // contract whenever the selected buffer was among the images actually written in this batch.
     // The full-resolution heuristic below is only a fallback for engines that render the final

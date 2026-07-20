@@ -37,7 +37,7 @@ public:
 
     // Number of valid L1 entries (first_level_map.size() == 1<<FirstLevelBits). A `page` derived from
     // a guest address >= the 2^AddressSpaceBits GPU ceiling yields l1_page >= this, and the raw
-    // std::vector::operator[] below would read/WRITE far out of bounds — the Sonic Backend-B root
+    // std::vector::operator[] below would read/WRITE far out of bounds — the Sonic JIT root
     // corruption: a 44-bit guest V# base_address (never masked to 40 bits) drives an 8-byte pointer
     // store up to ~8MB past first_level_map, preferentially over zero slots (unlocked std::mutex /
     // bionic pthread_mutex_t), giving the shape-shifting "destroyed mutex" FORTIFY/SIGSEGV crashes.

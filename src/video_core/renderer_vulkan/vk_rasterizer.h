@@ -225,6 +225,8 @@ private:
     u64 executor_unpublished_actual_draws{};
     u64 executor_completion_barrier_epoch{};
     u64 executor_completion_barrier_tick{};
+    u64 executor_completion_work_serial{};
+    u64 executor_completion_barrier_work_serial{};
     u64 executor_completion_barrier_calls{};
     u64 executor_completion_barrier_emitted{};
     u64 executor_completion_barrier_elided{};

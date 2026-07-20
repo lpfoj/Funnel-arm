@@ -1,7 +1,7 @@
-// SPDX-FileCopyrightText: Copyright 2026 LSX4 Project
+// SPDX-FileCopyrightText: Copyright 2026 Executor Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "backend_b_ir_cache.h"
+#include "jit_ir_cache.h"
 #include "common/content_fingerprint.h"
 
 #include <algorithm>
@@ -27,7 +27,7 @@
 #include <unistd.h>
 #endif
 
-namespace Executor::BackendB {
+namespace Executor::Jit {
 namespace {
 
 constexpr std::array<std::uint8_t, 8> kCacheMagic = {
@@ -36,22 +36,22 @@ constexpr std::array<std::uint8_t, 8> kCacheMagic = {
 constexpr std::uint32_t kHeaderSize = 88;
 constexpr std::uint16_t kRecordSchemaVersion = 2;
 constexpr std::uint32_t kKnownNativeFlags =
-    kBackendBNativeFlagValid | kBackendBNativeFlagLeafHleFused |
-    kBackendBNativeFlagScalarFloatDirectV1 |
-    kBackendBNativeFlagScalarFloatDirectV2 |
-    kBackendBNativeFlagPackedFloatDirectV3 |
-    kBackendBNativeFlagMixedHotDirectV4 |
-    kBackendBNativeFlagWideHotDirectV5 |
-    kBackendBNativeFlagPostLoadDirectV6 |
-    kBackendBNativeFlagPostLoadDirectV7 |
-    kBackendBNativeFlagPostLoadDirectV8 |
-    kBackendBNativeFlagPostLoadDirectV9 |
-    kBackendBNativeFlagDirectFaultSlotV10 |
-    kBackendBNativeFlagInlineLseXchgV11 |
-    kBackendBNativeFlagDirectLseXchgV12 |
-    kBackendBNativeFlagSharedChainAbiV13 |
-    kBackendBNativeFlagScalarLogicDirectV14 |
-    kBackendBNativeFlagVpslldImmDirectV15;
+    kJitNativeFlagValid | kJitNativeFlagLeafHleFused |
+    kJitNativeFlagScalarFloatDirectV1 |
+    kJitNativeFlagScalarFloatDirectV2 |
+    kJitNativeFlagPackedFloatDirectV3 |
+    kJitNativeFlagMixedHotDirectV4 |
+    kJitNativeFlagWideHotDirectV5 |
+    kJitNativeFlagPostLoadDirectV6 |
+    kJitNativeFlagPostLoadDirectV7 |
+    kJitNativeFlagPostLoadDirectV8 |
+    kJitNativeFlagPostLoadDirectV9 |
+    kJitNativeFlagDirectFaultSlotV10 |
+    kJitNativeFlagInlineLseXchgV11 |
+    kJitNativeFlagDirectLseXchgV12 |
+    kJitNativeFlagSharedChainAbiV13 |
+    kJitNativeFlagScalarLogicDirectV14 |
+    kJitNativeFlagVpslldImmDirectV15;
 constexpr std::uint32_t kAarch64PointerMaterializationBytes = 4 * sizeof(std::uint32_t);
 
 constexpr std::uint16_t kBlockFlagCanJitInitial = 1u << 0;
@@ -289,7 +289,7 @@ private:
 }
 
 [[nodiscard]] bool ValidateInstruction(const LsxDecodedOp& instruction,
-                                       const BackendBIrCacheLimits& limits, std::string& error) {
+                                       const JitIrCacheLimits& limits, std::string& error) {
     if (instruction.length == 0 || instruction.length > limits.max_synthetic_instruction_length) {
         error = "invalid instruction length";
         return false;
@@ -323,7 +323,7 @@ private:
             return false;
         }
     } else if (instruction.decoded.length != 0 || instruction.operand_count != 0) {
-        // Backend B's HLE bridge marker is a synthetic system instruction wider than x86's
+        // JIT's HLE bridge marker is a synthetic system instruction wider than x86's
         // architectural 15-byte maximum and intentionally has no decoded length/operands.
         error = "invalid synthetic system instruction metadata";
         return false;
@@ -336,9 +336,9 @@ private:
     return true;
 }
 
-[[nodiscard]] bool ValidNativeRelocationKind(const BackendBNativeRelocationKind kind) noexcept {
+[[nodiscard]] bool ValidNativeRelocationKind(const JitNativeRelocationKind kind) noexcept {
     return static_cast<std::uint8_t>(kind) <=
-           static_cast<std::uint8_t>(BackendBNativeRelocationKind::PolymorphicChainSite);
+           static_cast<std::uint8_t>(JitNativeRelocationKind::PolymorphicChainSite);
 }
 
 [[nodiscard]] std::uint32_t ReadLittleEndianU32(const std::uint8_t* bytes) noexcept {
@@ -349,7 +349,7 @@ private:
 }
 
 [[nodiscard]] bool ValidPointerMaterializationSequence(
-    const BackendBNativeSegment& segment, const BackendBNativeRelocation& relocation) noexcept {
+    const JitNativeSegment& segment, const JitNativeRelocation& relocation) noexcept {
     constexpr std::uint32_t kImmediateMask = 0x001fffe0u;
     const std::array<std::uint32_t, 4> expected = {
         0xd2800000u | relocation.register_index,
@@ -367,8 +367,8 @@ private:
     return true;
 }
 
-[[nodiscard]] bool ValidateNativeSegments(const BackendBIrCacheRecord& record,
-                                          const BackendBIrCacheLimits& limits,
+[[nodiscard]] bool ValidateNativeSegments(const JitIrCacheRecord& record,
+                                          const JitIrCacheLimits& limits,
                                           std::uint64_t& native_bytes,
                                           std::uint64_t& native_relocations,
                                           std::string& error) {
@@ -379,11 +379,11 @@ private:
         return false;
     }
 
-    const bool valid = (record.native_flags & kBackendBNativeFlagValid) != 0;
+    const bool valid = (record.native_flags & kJitNativeFlagValid) != 0;
     if (!valid) {
         if (!record.native_segments.empty() ||
-            record.entry_segment_index != kBackendBNativeNoSegment ||
-            record.direct_segment_index != kBackendBNativeNoSegment) {
+            record.entry_segment_index != kJitNativeNoSegment ||
+            record.direct_segment_index != kJitNativeNoSegment) {
             error = "native segments present without valid marker";
             return false;
         }
@@ -395,13 +395,13 @@ private:
         return false;
     }
     if (record.entry_segment_index >= record.native_segments.size() ||
-        (record.direct_segment_index != kBackendBNativeNoSegment &&
+        (record.direct_segment_index != kJitNativeNoSegment &&
          record.direct_segment_index >= record.native_segments.size())) {
         error = "cached native entry/direct segment index out of bounds";
         return false;
     }
 
-    for (const BackendBNativeSegment& segment : record.native_segments) {
+    for (const JitNativeSegment& segment : record.native_segments) {
         if (segment.bytes.empty() || segment.bytes.size() % sizeof(std::uint32_t) != 0 ||
             segment.bytes.size() > limits.max_native_segment_bytes) {
             error = "invalid cached native segment size";
@@ -422,7 +422,7 @@ private:
 
         std::vector<std::uint32_t> relocation_offsets;
         relocation_offsets.reserve(segment.relocs.size());
-        for (const BackendBNativeRelocation& relocation : segment.relocs) {
+        for (const JitNativeRelocation& relocation : segment.relocs) {
             if (!ValidNativeRelocationKind(relocation.kind) || relocation.register_index > 30) {
                 error = "invalid cached native relocation kind or register";
                 return false;
@@ -439,40 +439,40 @@ private:
                 return false;
             }
             switch (relocation.kind) {
-            case BackendBNativeRelocationKind::IrBlock:
+            case JitNativeRelocationKind::IrBlock:
                 if (relocation.target_index != 0) {
                     error = "cached IR-block relocation has nonzero target index";
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::IrInstruction:
+            case JitNativeRelocationKind::IrInstruction:
                 if (relocation.target_index >= record.block.instructions.size()) {
                     error = "cached IR-instruction relocation target out of bounds";
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::SegmentAddress:
+            case JitNativeRelocationKind::SegmentAddress:
                 if (relocation.target_index >= record.native_segments.size()) {
                     error = "cached segment-address relocation target out of bounds";
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::ModuleRelative:
-            case BackendBNativeRelocationKind::BackendRelative:
+            case JitNativeRelocationKind::ModuleRelative:
+            case JitNativeRelocationKind::BackendRelative:
                 break;
-            case BackendBNativeRelocationKind::ChainPatchCell:
+            case JitNativeRelocationKind::ChainPatchCell:
                 if (relocation.target_index > 1) {
                     error = "cached direct-link relocation edge out of bounds";
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::StableExternal:
+            case JitNativeRelocationKind::StableExternal:
                 if (relocation.target_index == 0 || relocation.addend != 0) {
                     error = "invalid cached stable-external relocation";
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::PolymorphicChainSite:
+            case JitNativeRelocationKind::PolymorphicChainSite:
                 if (relocation.target_index != 0 || relocation.addend != 0) {
                     error = "invalid cached indirect-link-site relocation";
                     return false;
@@ -493,8 +493,8 @@ private:
     return true;
 }
 
-[[nodiscard]] bool ValidateRecord(const BackendBIrCacheRecord& record,
-                                  const BackendBIrCacheLimits& limits, std::string& error,
+[[nodiscard]] bool ValidateRecord(const JitIrCacheRecord& record,
+                                  const JitIrCacheLimits& limits, std::string& error,
                                   std::uint64_t* native_bytes_out = nullptr,
                                   std::uint64_t* native_relocations_out = nullptr) {
     const LsxDecodedRegion& block = record.block;
@@ -614,7 +614,7 @@ void WriteInstruction(ByteWriter& writer, const LsxDecodedOp& instruction) {
 }
 
 void WriteNativeRelocation(ByteWriter& writer,
-                           const BackendBNativeRelocation& relocation) {
+                           const JitNativeRelocation& relocation) {
     writer.U8(static_cast<std::uint8_t>(relocation.kind));
     writer.U8(relocation.register_index);
     writer.U16(0); // Reserved; a nonzero value requires a future record schema.
@@ -624,7 +624,7 @@ void WriteNativeRelocation(ByteWriter& writer,
 }
 
 [[nodiscard]] bool ReadNativeRelocation(ByteReader& reader,
-                                        BackendBNativeRelocation& relocation,
+                                        JitNativeRelocation& relocation,
                                         std::string& error) {
     std::uint8_t kind = 0;
     std::uint16_t reserved = 0;
@@ -635,7 +635,7 @@ void WriteNativeRelocation(ByteWriter& writer,
         error = "truncated cached native relocation";
         return false;
     }
-    relocation.kind = static_cast<BackendBNativeRelocationKind>(kind);
+    relocation.kind = static_cast<JitNativeRelocationKind>(kind);
     relocation.addend = std::bit_cast<std::int64_t>(addend);
     if (reserved != 0 || !ValidNativeRelocationKind(relocation.kind)) {
         error = "invalid cached native relocation kind or reserved bits";
@@ -721,7 +721,7 @@ void WriteNativeRelocation(ByteWriter& writer,
 }
 
 [[nodiscard]] bool ReadInstruction(ByteReader& reader, LsxDecodedOp& instruction,
-                                   const BackendBIrCacheLimits& limits, std::string& error) {
+                                   const JitIrCacheLimits& limits, std::string& error) {
     std::uint8_t category = 0;
     std::uint8_t flags = 0;
     std::span<const std::uint8_t> instruction_bytes;
@@ -767,7 +767,7 @@ void WriteNativeRelocation(ByteWriter& writer,
 
     // These fields are compiler products, not decoded guest facts.  Keep their serialized bytes
     // only for format compatibility/strict validation, then discard them fail-closed.  The
-    // current Backend-B production classifiers reconstruct them before a loaded block can be
+    // current JIT production classifiers reconstruct them before a loaded block can be
     // lowered or published.
     instruction.attributes = 0;
     instruction.category = LsxOpClass::Unsupported;
@@ -779,8 +779,8 @@ void WriteNativeRelocation(ByteWriter& writer,
     return true;
 }
 
-[[nodiscard]] bool WriteRecord(const BackendBIrCacheRecord& record, ByteWriter& payload,
-                               const BackendBIrCacheLimits& limits, std::string& error) {
+[[nodiscard]] bool WriteRecord(const JitIrCacheRecord& record, ByteWriter& payload,
+                               const JitIrCacheLimits& limits, std::string& error) {
     if (!ValidateRecord(record, limits, error)) {
         return false;
     }
@@ -807,12 +807,12 @@ void WriteNativeRelocation(ByteWriter& writer,
     for (const LsxDecodedOp& instruction : record.block.instructions) {
         WriteInstruction(body, instruction);
     }
-    for (const BackendBNativeSegment& segment : record.native_segments) {
+    for (const JitNativeSegment& segment : record.native_segments) {
         body.U32(static_cast<std::uint32_t>(segment.bytes.size()));
         body.U32(static_cast<std::uint32_t>(segment.relocs.size()));
         body.U64(FingerprintNativeSegment(segment.bytes));
         body.Bytes(segment.bytes);
-        for (const BackendBNativeRelocation& relocation : segment.relocs) {
+        for (const JitNativeRelocation& relocation : segment.relocs) {
             WriteNativeRelocation(body, relocation);
         }
     }
@@ -829,11 +829,11 @@ void WriteNativeRelocation(ByteWriter& writer,
     return true;
 }
 
-[[nodiscard]] bool ReadRecord(ByteReader& body, BackendBIrCacheRecord& record,
+[[nodiscard]] bool ReadRecord(ByteReader& body, JitIrCacheRecord& record,
                               std::uint64_t& total_instructions,
                               std::uint64_t& total_native_bytes,
                               std::uint64_t& total_native_relocations,
-                              const BackendBIrCacheLimits& limits, std::string& error) {
+                              const JitIrCacheLimits& limits, std::string& error) {
     std::uint16_t schema = 0;
     std::uint16_t flags = 0;
     std::uint32_t instruction_count = 0;
@@ -896,7 +896,7 @@ void WriteNativeRelocation(ByteWriter& writer,
     std::uint64_t record_native_bytes = 0;
     std::uint64_t record_native_relocations = 0;
     record.native_segments.resize(native_segment_count);
-    for (BackendBNativeSegment& segment : record.native_segments) {
+    for (JitNativeSegment& segment : record.native_segments) {
         std::uint32_t segment_size = 0;
         std::uint32_t relocation_count = 0;
         std::uint64_t segment_hash = 0;
@@ -939,7 +939,7 @@ void WriteNativeRelocation(ByteWriter& writer,
             return false;
         }
         segment.relocs.resize(relocation_count);
-        for (BackendBNativeRelocation& relocation : segment.relocs) {
+        for (JitNativeRelocation& relocation : segment.relocs) {
             if (!ReadNativeRelocation(body, relocation, error)) {
                 return false;
             }
@@ -1047,10 +1047,10 @@ void WriteNativeRelocation(ByteWriter& writer,
 
 } // namespace
 
-bool SerializeBackendBIrCache(const BackendBIrCacheIdentity& identity,
-                              const std::span<const BackendBIrCacheRecord> records,
+bool SerializeJitIrCache(const JitIrCacheIdentity& identity,
+                              const std::span<const JitIrCacheRecord> records,
                               std::vector<std::uint8_t>& output, std::string& error,
-                              const BackendBIrCacheLimits& limits) {
+                              const JitIrCacheLimits& limits) {
     output.clear();
     error.clear();
     if (limits.max_file_bytes < kHeaderSize || records.size() > limits.max_records) {
@@ -1063,7 +1063,7 @@ bool SerializeBackendBIrCache(const BackendBIrCacheIdentity& identity,
         std::uint64_t total_instructions = 0;
         std::uint64_t total_native_bytes = 0;
         std::uint64_t total_native_relocations = 0;
-        for (const BackendBIrCacheRecord& record : records) {
+        for (const JitIrCacheRecord& record : records) {
             if (record.block.instructions.size() > limits.max_total_instructions ||
                 total_instructions >
                     limits.max_total_instructions - record.block.instructions.size()) {
@@ -1092,7 +1092,7 @@ bool SerializeBackendBIrCache(const BackendBIrCacheIdentity& identity,
 
         ByteWriter file{limits.max_file_bytes};
         file.Bytes(kCacheMagic);
-        file.U32(kBackendBIrCacheFormatVersion);
+        file.U32(kJitIrCacheFormatVersion);
         file.U32(kHeaderSize);
         file.U64(identity.jit_abi_version);
         file.Bytes(identity.content_key);
@@ -1114,17 +1114,17 @@ bool SerializeBackendBIrCache(const BackendBIrCacheIdentity& identity,
     }
 }
 
-BackendBIrCacheLoadResult DeserializeBackendBIrCache(
-    const std::span<const std::uint8_t> bytes, const BackendBIrCacheIdentity& expected_identity,
-    const BackendBIrCacheLimits& limits) {
-    BackendBIrCacheLoadResult result{};
+JitIrCacheLoadResult DeserializeJitIrCache(
+    const std::span<const std::uint8_t> bytes, const JitIrCacheIdentity& expected_identity,
+    const JitIrCacheLimits& limits) {
+    JitIrCacheLoadResult result{};
     if (bytes.size() > limits.max_file_bytes) {
-        result.status = BackendBIrCacheStatus::LimitExceeded;
+        result.status = JitIrCacheStatus::LimitExceeded;
         result.detail = "cache file exceeds configured size limit";
         return result;
     }
     if (bytes.size() < kHeaderSize) {
-        result.status = BackendBIrCacheStatus::Corrupt;
+        result.status = JitIrCacheStatus::Corrupt;
         result.detail = "truncated cache header";
         return result;
     }
@@ -1134,7 +1134,7 @@ BackendBIrCacheLoadResult DeserializeBackendBIrCache(
         std::span<const std::uint8_t> magic;
         std::uint32_t version = 0;
         std::uint32_t header_size = 0;
-        BackendBIrCacheIdentity identity{};
+        JitIrCacheIdentity identity{};
         std::span<const std::uint8_t> content_key;
         std::uint64_t record_count = 0;
         std::uint64_t payload_size = 0;
@@ -1144,38 +1144,38 @@ BackendBIrCacheLoadResult DeserializeBackendBIrCache(
             !reader.U32(header_size) || !reader.U64(identity.jit_abi_version) ||
             !reader.Bytes(identity.content_key.size(), content_key) || !reader.U64(record_count) ||
             !reader.U64(payload_size) || !reader.U64(payload_hash) || !reader.U64(header_flags)) {
-            result.status = BackendBIrCacheStatus::Corrupt;
+            result.status = JitIrCacheStatus::Corrupt;
             result.detail = "truncated cache header";
             return result;
         }
         std::copy(content_key.begin(), content_key.end(), identity.content_key.begin());
         if (!std::equal(magic.begin(), magic.end(), kCacheMagic.begin())) {
-            result.status = BackendBIrCacheStatus::Corrupt;
+            result.status = JitIrCacheStatus::Corrupt;
             result.detail = "invalid cache magic";
             return result;
         }
-        if (version != kBackendBIrCacheFormatVersion) {
-            result.status = BackendBIrCacheStatus::UnsupportedVersion;
+        if (version != kJitIrCacheFormatVersion) {
+            result.status = JitIrCacheStatus::UnsupportedVersion;
             result.detail = "unsupported cache format version";
             return result;
         }
         if (header_size != kHeaderSize || header_flags != 0) {
-            result.status = BackendBIrCacheStatus::Corrupt;
+            result.status = JitIrCacheStatus::Corrupt;
             result.detail = "invalid cache header size or flags";
             return result;
         }
         if (identity != expected_identity) {
-            result.status = BackendBIrCacheStatus::IdentityMismatch;
+            result.status = JitIrCacheStatus::IdentityMismatch;
             result.detail = "cache title/content key or JIT ABI does not match";
             return result;
         }
         if (record_count > limits.max_records) {
-            result.status = BackendBIrCacheStatus::LimitExceeded;
+            result.status = JitIrCacheStatus::LimitExceeded;
             result.detail = "cache record count exceeds configured limit";
             return result;
         }
         if (payload_size != reader.remaining()) {
-            result.status = BackendBIrCacheStatus::Corrupt;
+            result.status = JitIrCacheStatus::Corrupt;
             result.detail = "cache payload length mismatch";
             return result;
         }
@@ -1183,7 +1183,7 @@ BackendBIrCacheLoadResult DeserializeBackendBIrCache(
         std::span<const std::uint8_t> payload;
         if (!reader.Bytes(static_cast<std::size_t>(payload_size), payload) ||
             FingerprintPayload(payload) != payload_hash) {
-            result.status = BackendBIrCacheStatus::Corrupt;
+            result.status = JitIrCacheStatus::Corrupt;
             result.detail = "cache payload checksum mismatch";
             return result;
         }
@@ -1196,27 +1196,27 @@ BackendBIrCacheLoadResult DeserializeBackendBIrCache(
         for (std::uint64_t index = 0; index < record_count; ++index) {
             std::uint32_t body_size = 0;
             if (!payload_reader.U32(body_size) || body_size > payload_reader.remaining()) {
-                result.status = BackendBIrCacheStatus::Corrupt;
+                result.status = JitIrCacheStatus::Corrupt;
                 result.detail = "truncated cache record";
                 result.records.clear();
                 return result;
             }
             std::span<const std::uint8_t> body_bytes;
             if (!payload_reader.Bytes(body_size, body_bytes)) {
-                result.status = BackendBIrCacheStatus::Corrupt;
+                result.status = JitIrCacheStatus::Corrupt;
                 result.detail = "truncated cache record body";
                 result.records.clear();
                 return result;
             }
             ByteReader body{body_bytes};
-            BackendBIrCacheRecord record{};
+            JitIrCacheRecord record{};
             std::string error;
             if (!ReadRecord(body, record, total_instructions, total_native_bytes,
                             total_native_relocations, limits, error) ||
                 !body.empty()) {
                 result.status = error.find("limit") != std::string::npos
-                                    ? BackendBIrCacheStatus::LimitExceeded
-                                    : BackendBIrCacheStatus::Corrupt;
+                                    ? JitIrCacheStatus::LimitExceeded
+                                    : JitIrCacheStatus::Corrupt;
                 result.detail = error.empty() ? "cache record has trailing bytes" : error;
                 result.records.clear();
                 return result;
@@ -1224,48 +1224,48 @@ BackendBIrCacheLoadResult DeserializeBackendBIrCache(
             result.records.push_back(std::move(record));
         }
         if (!payload_reader.empty()) {
-            result.status = BackendBIrCacheStatus::Corrupt;
+            result.status = JitIrCacheStatus::Corrupt;
             result.detail = "cache payload has trailing bytes";
             result.records.clear();
             return result;
         }
-        result.status = BackendBIrCacheStatus::Ok;
+        result.status = JitIrCacheStatus::Ok;
         result.detail.clear();
         return result;
     } catch (const std::exception& exception) {
-        result.status = BackendBIrCacheStatus::Corrupt;
+        result.status = JitIrCacheStatus::Corrupt;
         result.detail = std::string{"cache deserialization failed: "} + exception.what();
         result.records.clear();
         return result;
     }
 }
 
-BackendBIrCacheLoadResult LoadBackendBIrCacheFile(const std::filesystem::path& path,
-                                                  const BackendBIrCacheIdentity& expected_identity,
-                                                  const BackendBIrCacheLimits& limits) {
-    BackendBIrCacheLoadResult result{};
+JitIrCacheLoadResult LoadJitIrCacheFile(const std::filesystem::path& path,
+                                                  const JitIrCacheIdentity& expected_identity,
+                                                  const JitIrCacheLimits& limits) {
+    JitIrCacheLoadResult result{};
     std::error_code filesystem_error;
     const bool exists = std::filesystem::exists(path, filesystem_error);
     if (filesystem_error) {
-        result.status = BackendBIrCacheStatus::IoError;
+        result.status = JitIrCacheStatus::IoError;
         result.detail = "stat cache file: " + filesystem_error.message();
         return result;
     }
     if (!exists) {
-        result.status = BackendBIrCacheStatus::NotFound;
+        result.status = JitIrCacheStatus::NotFound;
         result.detail = "cache file not found";
         return result;
     }
     const std::uintmax_t file_size = std::filesystem::file_size(path, filesystem_error);
     if (filesystem_error) {
-        result.status = BackendBIrCacheStatus::IoError;
+        result.status = JitIrCacheStatus::IoError;
         result.detail = "read cache file size: " + filesystem_error.message();
         return result;
     }
     if (file_size > limits.max_file_bytes ||
         file_size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max()) ||
         file_size > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
-        result.status = BackendBIrCacheStatus::LimitExceeded;
+        result.status = JitIrCacheStatus::LimitExceeded;
         result.detail = "cache file exceeds configured size limit";
         return result;
     }
@@ -1273,7 +1273,7 @@ BackendBIrCacheLoadResult LoadBackendBIrCacheFile(const std::filesystem::path& p
     try {
         std::ifstream stream{path, std::ios::binary};
         if (!stream) {
-            result.status = BackendBIrCacheStatus::IoError;
+            result.status = JitIrCacheStatus::IoError;
             result.detail = "open cache file failed";
             return result;
         }
@@ -1282,25 +1282,25 @@ BackendBIrCacheLoadResult LoadBackendBIrCacheFile(const std::filesystem::path& p
             stream.read(reinterpret_cast<char*>(bytes.data()),
                         static_cast<std::streamsize>(bytes.size()));
             if (!stream || stream.gcount() != static_cast<std::streamsize>(bytes.size())) {
-                result.status = BackendBIrCacheStatus::IoError;
+                result.status = JitIrCacheStatus::IoError;
                 result.detail = "short read from cache file";
                 return result;
             }
         }
-        return DeserializeBackendBIrCache(bytes, expected_identity, limits);
+        return DeserializeJitIrCache(bytes, expected_identity, limits);
     } catch (const std::exception& exception) {
-        result.status = BackendBIrCacheStatus::IoError;
+        result.status = JitIrCacheStatus::IoError;
         result.detail = std::string{"read cache file failed: "} + exception.what();
         return result;
     }
 }
 
-bool SaveBackendBIrCacheFileAtomic(const std::filesystem::path& path,
-                                   const BackendBIrCacheIdentity& identity,
-                                   const std::span<const BackendBIrCacheRecord> records,
-                                   std::string& error, const BackendBIrCacheLimits& limits) {
+bool SaveJitIrCacheFileAtomic(const std::filesystem::path& path,
+                                   const JitIrCacheIdentity& identity,
+                                   const std::span<const JitIrCacheRecord> records,
+                                   std::string& error, const JitIrCacheLimits& limits) {
     std::vector<std::uint8_t> bytes;
-    if (!SerializeBackendBIrCache(identity, records, bytes, error, limits)) {
+    if (!SerializeJitIrCache(identity, records, bytes, error, limits)) {
         return false;
     }
 
@@ -1340,4 +1340,4 @@ bool SaveBackendBIrCacheFileAtomic(const std::filesystem::path& path,
     }
 }
 
-} // namespace Executor::BackendB
+} // namespace Executor::Jit

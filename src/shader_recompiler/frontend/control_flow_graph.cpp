@@ -312,11 +312,8 @@ void CFG::LinkBlocks() {
     const auto get_block = [this](u32 address) -> Block* {
         auto it = blocks.find(address, Compare{});
         if (it == blocks.cend() || it->begin != address) {
-            // Reference-release parity: asserts are non-fatal, so guard against dereferencing a
-            // missing branch-target block (would be UB) when a recompiled shader's CFG is malformed.
-            LOG_WARNING(Render_Recompiler, "LinkBlocks: no block at target {:#x}; using first block",
-                        address);
-            return &*blocks.begin();
+            LOG_ERROR(Render_Recompiler, "LinkBlocks: no block at target {:#x}", address);
+            return nullptr;
         }
         return &*it;
     };
@@ -329,6 +326,14 @@ void CFG::LinkBlocks() {
         // need to link with the next block.
         if (!end_inst.IsTerminateInstruction()) {
             auto* next_block = get_block(block.end);
+            if (!next_block) {
+                // A malformed fall-through must terminate. Redirecting it to an arbitrary block
+                // creates a synthetic back edge and can hang the GPU.
+                block.end_class = EndClass::Exit;
+                block.branch_true = nullptr;
+                block.branch_false = nullptr;
+                continue;
+            }
             block.branch_true = next_block;
             block.end_class = EndClass::Branch;
             continue;
@@ -358,11 +363,33 @@ void CFG::LinkBlocks() {
 
         if (end_inst.IsUnconditionalBranch()) {
             auto* target_block = get_block(target_pc);
+            if (!target_block) {
+                block.end_class = EndClass::Exit;
+                block.branch_true = nullptr;
+                block.branch_false = nullptr;
+                continue;
+            }
             block.branch_true = target_block;
             block.end_class = EndClass::Branch;
         } else if (end_inst.IsConditionalBranch()) {
             auto* target_block = get_block(target_pc);
             auto* end_block = get_block(block.end);
+            if (!end_block) {
+                block.end_class = EndClass::Exit;
+                block.branch_true = nullptr;
+                block.branch_false = nullptr;
+                continue;
+            }
+            if (!target_block) {
+                // Preserve the valid fall-through and drop only the malformed edge. In
+                // particular, never use the entry block as a generic fallback: that changes a
+                // recoverable bad target into an unbounded loop.
+                block.cond = IR::Condition::True;
+                block.branch_true = end_block;
+                block.branch_false = nullptr;
+                block.end_class = EndClass::Branch;
+                continue;
+            }
             block.branch_true = target_block;
             block.branch_false = end_block;
             block.end_class = EndClass::Branch;

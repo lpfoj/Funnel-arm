@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 LSX4 Project
+// SPDX-FileCopyrightText: Copyright 2026 Executor Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/config.h"
@@ -29,7 +29,7 @@
 #include "core/loader/elf.h"
 #include "core/memory.h"
 #include "core/tls.h"
-#include "executor/backend_b/lsx_translation_engine.h"
+#include "executor/jit/lsx_translation_engine.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -69,6 +69,7 @@
 #include <string_view>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <thread>
 #include <chrono>
 #include <unistd.h>
@@ -108,7 +109,7 @@ namespace {
 constexpr std::uint32_t ExecutorBox64MappedEntryAbiVersion = 4;
 constexpr std::uint32_t ExecutorBox64MappedEntryMaxSegments = 64;
 // The mapped-entry primary thread executes on a separate guest stack instead of the native host
-// stack used by desktop shadPS4.  Keep its capacity aligned with Backend B's own guest-stack
+// stack used by desktop shadPS4.  Keep its capacity aligned with JIT's own guest-stack
 // fallback so deep native-game call chains do not run off the synthetic 1 MiB mapping.
 constexpr std::size_t ExecutorBox64InitialStackSize = 8 * 1024 * 1024;
 // Short-lived module lifecycle/callback invocations do not share the primary stack and retain their
@@ -134,7 +135,7 @@ constexpr std::array<std::uint8_t, 32> ExecutorFexHleThunkHash = {
     0x3a, 0x66, 0x65, 0x78, 0x63, 0x6f, 0x72, 0x65,
     0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x30, 0x31,
 };
-constexpr std::array<std::uint8_t, 32> ExecutorBackendBHleThunkHash = {
+constexpr std::array<std::uint8_t, 32> ExecutorJitHleThunkHash = {
     0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
     0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
     0x3a, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64,
@@ -205,28 +206,28 @@ struct ExecutorBox64GuestRegsSnapshot {
 extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const void* regs, std::size_t regs_size);
 
-// BDWGC stops Backend-B guest threads through the guest SIGUSR1/SIG30 handler.  The collector can
+// BDWGC stops JIT guest threads through the guest SIGUSR1/SIG30 handler.  The collector can
 // scan the separate x86 stacks once they are registered below, but a managed reference may exist
 // only in an emulated x86 GPR at that exact safepoint.  Native AArch64 ucontext registers do not
 // contain those values.  Keep one compact, permanently-rooted register image per host TID; the
 // signal bridge refreshes the slot before it enters Mono's suspend handler.
-constexpr std::size_t kBackendBGcRegisterRootSlots = 256;
-alignas(64) std::array<ExecutorBox64GuestRegsSnapshot, kBackendBGcRegisterRootSlots>
-    g_backend_b_gc_register_roots{};
-std::array<std::atomic<std::uint32_t>, kBackendBGcRegisterRootSlots>
-    g_backend_b_gc_register_root_tids{};
+constexpr std::size_t kJitGcRegisterRootSlots = 256;
+alignas(64) std::array<ExecutorBox64GuestRegsSnapshot, kJitGcRegisterRootSlots>
+    g_jit_gc_register_roots{};
+std::array<std::atomic<std::uint32_t>, kJitGcRegisterRootSlots>
+    g_jit_gc_register_root_tids{};
 
 std::mutex g_lock;
 std::string g_root;
 std::string g_status = R"({"state":"created","core":"lsx4-native"})";
 std::atomic<int> g_runtime_guest_backend{1};
-std::atomic<bool> g_backend_b_launch_entry_requested{false};
-struct BackendBGuestSignalHandler {
+std::atomic<bool> g_jit_launch_entry_requested{false};
+struct JitGuestSignalHandler {
     std::uint64_t handler = 0;
     int flags = 0;
 };
-std::mutex g_backend_b_signal_lock;
-std::array<BackendBGuestSignalHandler, 129> g_backend_b_signal_handlers{};
+std::mutex g_jit_signal_lock;
+std::array<JitGuestSignalHandler, 129> g_jit_signal_handlers{};
 std::string g_firmware_status =
     R"({"enabled":false,"reason":"runtime not initialized"})";
 std::array<std::string, 33> g_entry_arg_storage;
@@ -249,12 +250,12 @@ std::filesystem::path ExecutorProbeRoot() {
 #endif
 }
 
-bool RuntimeGuestBackendBActive() {
+bool RuntimeGuestJitActive() {
     return g_runtime_guest_backend.load(std::memory_order_acquire) == 1;
 }
 
 #ifdef __ANDROID__
-void RecordBackendBSignalBridgeFailure(const char* stage, std::uint64_t handler,
+void RecordJitSignalBridgeFailure(const char* stage, std::uint64_t handler,
                                        std::uint64_t arg0, std::uint64_t arg1,
                                        std::uint64_t arg2, const char* detail) {
     char line[1024];
@@ -265,7 +266,7 @@ void RecordBackendBSignalBridgeFailure(const char* stage, std::uint64_t handler,
         static_cast<unsigned long long>(arg0), static_cast<unsigned long long>(arg1),
         static_cast<unsigned long long>(arg2), detail ? detail : "none");
     const int fd = ::open(
-        "/data/data/app.lsx4.android/files/executor-backend-b-signal-failure.log",
+        "/data/data/app.lsx4.android/files/executor-jit-signal-failure.log",
         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd >= 0) {
         if (length > 0) {
@@ -278,25 +279,25 @@ void RecordBackendBSignalBridgeFailure(const char* stage, std::uint64_t handler,
 }
 #endif
 
-bool RuntimeGuestBackendBRequestedOrActive() {
-    return RuntimeGuestBackendBActive() ||
-           g_backend_b_launch_entry_requested.load(std::memory_order_acquire);
+bool RuntimeGuestJitRequestedOrActive() {
+    return RuntimeGuestJitActive() ||
+           g_jit_launch_entry_requested.load(std::memory_order_acquire);
 }
 
-extern "C" int executor_lsx4_android_runtime_backend_b_active() {
-    return RuntimeGuestBackendBActive() ? 1 : 0;
+extern "C" int executor_lsx4_android_runtime_jit_active() {
+    return RuntimeGuestJitActive() ? 1 : 0;
 }
 
 const char* RuntimeGuestBackendName() {
-    return "backend-b-aarch64-jit";
+    return "jit-aarch64-jit";
 }
 
-std::uint64_t RunBackendBMappedFunction(const std::uint64_t guest_rip,
+std::uint64_t RunJitMappedFunction(const std::uint64_t guest_rip,
                                         const std::initializer_list<std::uint64_t> args,
                                         const std::uint64_t segment_base = 0,
                                         const std::uint64_t stack_base = 0,
                                         const std::uint64_t stack_size = 0) {
-    Executor::BackendB::LsxEntryPacket ctx{};
+    Executor::Jit::LsxEntryPacket ctx{};
     ctx.arg_count = static_cast<std::uint32_t>(
         std::min<std::size_t>(args.size(), ctx.args.size()));
     ctx.stack_args_enabled = args.size() > 6 ? 1 : 0;
@@ -311,89 +312,89 @@ std::uint64_t RunBackendBMappedFunction(const std::uint64_t guest_rip,
     ctx.stack_base = stack_base;
     ctx.stack_size = stack_size;
     ctx.allow_guest_return_sentinel = 1;
-    return Executor::BackendB::RunArm64Translation(guest_rip, ctx);
+    return Executor::Jit::RunArm64Translation(guest_rip, ctx);
 }
 
-constexpr std::size_t BackendBFsBaseStateOffset =
-    offsetof(Executor::BackendB::LsxMachineImage, fs_base);
-constexpr std::size_t BackendBGsBaseStateOffset =
-    offsetof(Executor::BackendB::LsxMachineImage, gs_base);
-static_assert(BackendBGsBaseStateOffset + sizeof(std::uint64_t) <=
-              sizeof(Executor::BackendB::LsxMachineImage));
+constexpr std::size_t JitFsBaseStateOffset =
+    offsetof(Executor::Jit::LsxMachineImage, fs_base);
+constexpr std::size_t JitGsBaseStateOffset =
+    offsetof(Executor::Jit::LsxMachineImage, gs_base);
+static_assert(JitGsBaseStateOffset + sizeof(std::uint64_t) <=
+              sizeof(Executor::Jit::LsxMachineImage));
 
-std::uint64_t ReadBackendBStateQword(const Executor::BackendB::LsxMachineImage& state,
+std::uint64_t ReadJitStateQword(const Executor::Jit::LsxMachineImage& state,
                                      const std::size_t offset) {
     std::uint64_t value = 0;
     std::memcpy(&value, reinterpret_cast<const std::uint8_t*>(&state) + offset, sizeof(value));
     return value;
 }
 
-std::uint64_t BackendBGpr(const Executor::BackendB::LsxMachineImage& state,
-                          const Executor::BackendB::LsxGpr reg) {
-    return Executor::BackendB::GetGpr64(state, reg);
+std::uint64_t JitGpr(const Executor::Jit::LsxMachineImage& state,
+                          const Executor::Jit::LsxGpr reg) {
+    return Executor::Jit::GetGpr64(state, reg);
 }
 
-void FillBox64RegsFromBackendBState(const Executor::BackendB::LsxMachineImage& state,
+void FillBox64RegsFromJitState(const Executor::Jit::LsxMachineImage& state,
                                     ExecutorBox64GuestRegsSnapshot& out) {
     out = {};
-    out.regs[0] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rax);
-    out.regs[1] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rcx);
-    out.regs[2] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rdx);
-    out.regs[3] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rbx);
-    out.regs[4] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rsp);
-    out.regs[5] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rbp);
-    out.regs[6] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rsi);
-    out.regs[7] = BackendBGpr(state, Executor::BackendB::LsxGpr::Rdi);
-    out.regs[8] = BackendBGpr(state, Executor::BackendB::LsxGpr::R8);
-    out.regs[9] = BackendBGpr(state, Executor::BackendB::LsxGpr::R9);
-    out.regs[10] = BackendBGpr(state, Executor::BackendB::LsxGpr::R10);
-    out.regs[11] = BackendBGpr(state, Executor::BackendB::LsxGpr::R11);
-    out.regs[12] = BackendBGpr(state, Executor::BackendB::LsxGpr::R12);
-    out.regs[13] = BackendBGpr(state, Executor::BackendB::LsxGpr::R13);
-    out.regs[14] = BackendBGpr(state, Executor::BackendB::LsxGpr::R14);
-    out.regs[15] = BackendBGpr(state, Executor::BackendB::LsxGpr::R15);
+    out.regs[0] = JitGpr(state, Executor::Jit::LsxGpr::Rax);
+    out.regs[1] = JitGpr(state, Executor::Jit::LsxGpr::Rcx);
+    out.regs[2] = JitGpr(state, Executor::Jit::LsxGpr::Rdx);
+    out.regs[3] = JitGpr(state, Executor::Jit::LsxGpr::Rbx);
+    out.regs[4] = JitGpr(state, Executor::Jit::LsxGpr::Rsp);
+    out.regs[5] = JitGpr(state, Executor::Jit::LsxGpr::Rbp);
+    out.regs[6] = JitGpr(state, Executor::Jit::LsxGpr::Rsi);
+    out.regs[7] = JitGpr(state, Executor::Jit::LsxGpr::Rdi);
+    out.regs[8] = JitGpr(state, Executor::Jit::LsxGpr::R8);
+    out.regs[9] = JitGpr(state, Executor::Jit::LsxGpr::R9);
+    out.regs[10] = JitGpr(state, Executor::Jit::LsxGpr::R10);
+    out.regs[11] = JitGpr(state, Executor::Jit::LsxGpr::R11);
+    out.regs[12] = JitGpr(state, Executor::Jit::LsxGpr::R12);
+    out.regs[13] = JitGpr(state, Executor::Jit::LsxGpr::R13);
+    out.regs[14] = JitGpr(state, Executor::Jit::LsxGpr::R14);
+    out.regs[15] = JitGpr(state, Executor::Jit::LsxGpr::R15);
     out.rip = state.rip_or_exit;
     out.old_ip = state.rip_or_exit;
-    out.fsbase = ReadBackendBStateQword(state, BackendBFsBaseStateOffset);
-    out.gsbase = ReadBackendBStateQword(state, BackendBGsBaseStateOffset);
+    out.fsbase = ReadJitStateQword(state, JitFsBaseStateOffset);
+    out.gsbase = ReadJitStateQword(state, JitGsBaseStateOffset);
 }
 
-void RestoreBackendBStateFromBox64Regs(Executor::BackendB::LsxMachineImage& state,
+void RestoreJitStateFromBox64Regs(Executor::Jit::LsxMachineImage& state,
                                        const ExecutorBox64GuestRegsSnapshot& in) {
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rax, in.regs[0]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rcx, in.regs[1]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rdx, in.regs[2]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rbx, in.regs[3]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rsp, in.regs[4]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rbp, in.regs[5]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rsi, in.regs[6]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::Rdi, in.regs[7]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R8, in.regs[8]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R9, in.regs[9]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R10, in.regs[10]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R11, in.regs[11]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R12, in.regs[12]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R13, in.regs[13]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R14, in.regs[14]);
-    Executor::BackendB::SetGpr64(state, Executor::BackendB::LsxGpr::R15, in.regs[15]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rax, in.regs[0]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rcx, in.regs[1]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rdx, in.regs[2]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rbx, in.regs[3]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rsp, in.regs[4]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rbp, in.regs[5]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rsi, in.regs[6]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rdi, in.regs[7]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R8, in.regs[8]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R9, in.regs[9]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R10, in.regs[10]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R11, in.regs[11]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R12, in.regs[12]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R13, in.regs[13]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R14, in.regs[14]);
+    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R15, in.regs[15]);
     state.rip_or_exit = in.rip;
     state.fs_base = in.fsbase;
     state.gs_base = in.gsbase;
 }
 
-std::uint64_t BackendBTcbBaseForGuestThread(void* guest_thread) {
+std::uint64_t JitTcbBaseForGuestThread(void* guest_thread) {
     auto* thread = static_cast<Libraries::Kernel::Pthread*>(guest_thread);
     return thread != nullptr && thread->tcb != nullptr
                ? reinterpret_cast<std::uint64_t>(thread->tcb)
                : 0;
 }
 
-std::uint64_t BackendBSignalHandlerForSignum(const int signum) {
-    if (signum < 0 || static_cast<std::size_t>(signum) >= g_backend_b_signal_handlers.size()) {
+std::uint64_t JitSignalHandlerForSignum(const int signum) {
+    if (signum < 0 || static_cast<std::size_t>(signum) >= g_jit_signal_handlers.size()) {
         return 0;
     }
-    std::lock_guard lock(g_backend_b_signal_lock);
-    return g_backend_b_signal_handlers[static_cast<std::size_t>(signum)].handler;
+    std::lock_guard lock(g_jit_signal_lock);
+    return g_jit_signal_handlers[static_cast<std::size_t>(signum)].handler;
 }
 
 struct ExecutorConformanceState {
@@ -430,58 +431,58 @@ std::vector<ExecutorGuestReadableRange> g_box64_guest_stack_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_gc_sideband_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_readable_ranges;
 
-// Backend-B reference validation reads guest stacks through ExecutorBackendBReadGuestBytes.
+// JIT reference validation reads guest stacks through ExecutorJitReadGuestBytes.
 // Those mmap-backed stacks are intentionally outside Core::MemoryManager, so the old path first
 // missed its VMA tree and then serialized on g_box64_guest_stack_lock for every operand.  Registered
 // readable ranges are process-lifetime objects in this runtime; publish only pages fully contained
 // by a range into an exact-address lock-free cache.  A hit is therefore a sufficient containment
 // proof, while unaligned/cross-page accesses retain the authoritative locked range check.
-constexpr std::uint64_t BackendBRegisteredPageSize = 4_KB;
-constexpr std::uint64_t BackendBRegisteredPageMask = BackendBRegisteredPageSize - 1;
-constexpr std::size_t BackendBRegisteredPageCacheSlots = 16384;
-static_assert((BackendBRegisteredPageCacheSlots &
-               (BackendBRegisteredPageCacheSlots - 1)) == 0);
-std::array<std::atomic<std::uint64_t>, BackendBRegisteredPageCacheSlots>
-    g_backendb_registered_page_cache{};
+constexpr std::uint64_t JitRegisteredPageSize = 4_KB;
+constexpr std::uint64_t JitRegisteredPageMask = JitRegisteredPageSize - 1;
+constexpr std::size_t JitRegisteredPageCacheSlots = 16384;
+static_assert((JitRegisteredPageCacheSlots &
+               (JitRegisteredPageCacheSlots - 1)) == 0);
+std::array<std::atomic<std::uint64_t>, JitRegisteredPageCacheSlots>
+    g_jit_registered_page_cache{};
 
-std::size_t BackendBRegisteredPageCacheIndex(const std::uint64_t page_base) {
+std::size_t JitRegisteredPageCacheIndex(const std::uint64_t page_base) {
     constexpr std::uint64_t GoldenRatio = 0x9e3779b97f4a7c15ull;
     const std::uint64_t mixed = (page_base >> 12u) * GoldenRatio;
     return static_cast<std::size_t>(
-        mixed >> (64u - std::countr_zero(BackendBRegisteredPageCacheSlots)));
+        mixed >> (64u - std::countr_zero(JitRegisteredPageCacheSlots)));
 }
 
-bool IsBackendBRegisteredPageCached(const std::uint64_t address,
+bool IsJitRegisteredPageCached(const std::uint64_t address,
                                     const std::size_t size) {
     if (address == 0 || size == 0 ||
         static_cast<std::uint64_t>(size) > ~std::uint64_t{0} - address + 1) {
         return false;
     }
     const std::uint64_t last = address + static_cast<std::uint64_t>(size) - 1;
-    const std::uint64_t page_base = address & ~BackendBRegisteredPageMask;
-    if ((last & ~BackendBRegisteredPageMask) != page_base || page_base == 0) {
+    const std::uint64_t page_base = address & ~JitRegisteredPageMask;
+    if ((last & ~JitRegisteredPageMask) != page_base || page_base == 0) {
         return false;
     }
-    return g_backendb_registered_page_cache[BackendBRegisteredPageCacheIndex(page_base)]
+    return g_jit_registered_page_cache[JitRegisteredPageCacheIndex(page_base)]
                .load(std::memory_order_acquire) == page_base;
 }
 
-void PublishBackendBRegisteredFullPages(const std::uint64_t base,
+void PublishJitRegisteredFullPages(const std::uint64_t base,
                                         const std::size_t size) {
     if (base == 0 || size == 0 ||
         static_cast<std::uint64_t>(size) > ~std::uint64_t{0} - base) {
         return;
     }
     const std::uint64_t end = base + static_cast<std::uint64_t>(size);
-    if (base > ~std::uint64_t{0} - BackendBRegisteredPageMask) {
+    if (base > ~std::uint64_t{0} - JitRegisteredPageMask) {
         return;
     }
     const std::uint64_t first_full_page =
-        (base + BackendBRegisteredPageMask) & ~BackendBRegisteredPageMask;
-    const std::uint64_t full_page_end = end & ~BackendBRegisteredPageMask;
+        (base + JitRegisteredPageMask) & ~JitRegisteredPageMask;
+    const std::uint64_t full_page_end = end & ~JitRegisteredPageMask;
     for (std::uint64_t page = first_full_page; page < full_page_end;
-         page += BackendBRegisteredPageSize) {
-        g_backendb_registered_page_cache[BackendBRegisteredPageCacheIndex(page)].store(
+         page += JitRegisteredPageSize) {
+        g_jit_registered_page_cache[JitRegisteredPageCacheIndex(page)].store(
             page, std::memory_order_release);
     }
 }
@@ -598,13 +599,13 @@ std::atomic_int g_box64_load_exec_handoff_count{0};
 std::atomic_bool g_load_exec_process_worker_active{false};
 
 int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
-    if (RuntimeGuestBackendBActive()) {
-        auto* state = Executor::BackendB::CurrentMachineImage();
+    if (RuntimeGuestJitActive()) {
+        auto* state = Executor::Jit::CurrentMachineImage();
         if (state == nullptr) {
             out = {};
             return -1;
         }
-        FillBox64RegsFromBackendBState(*state, out);
+        FillBox64RegsFromJitState(*state, out);
         return 0;
     }
     if (g_box64_get_current_guest_regs == nullptr) {
@@ -614,8 +615,8 @@ int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
     return g_box64_get_current_guest_regs(&out, sizeof(out));
 }
 
-void PublishCurrentBackendBGcRegisterRootsAtHleBoundary() {
-    if (!ExecutorGcGuestRootsEnabled() || !RuntimeGuestBackendBActive()) {
+void PublishCurrentJitGcRegisterRootsAtHleBoundary() {
+    if (!ExecutorGcGuestRootsEnabled() || !RuntimeGuestJitActive()) {
         return;
     }
 
@@ -1244,10 +1245,10 @@ extern "C" bool executor_lsx4_android_should_suppress_guest_thread(void* start_r
     (void)arg;
     // On Android every *guest* pthread MUST run through the mapped guest-thread path
     // (RunBox64GuestThread -> run_guest_thread). In the FEX route this registers the thread's FEX
-    // TLS/alt-stack, and in Backend B it dispatches the x86 start routine through the reconstructed
+    // TLS/alt-stack, and in JIT it dispatches the x86 start routine through the reconstructed
     // AArch64 JIT. The fallthrough RunThread path calls start_routine() directly as host code; on
     // arm64 that executes the guest x86 bytes as arm64 -> SIGILL/ILL_ILLOPC (host pc == guest addr).
-    // That is exactly what kills Backend B worker threads once Mono creates Thread2.
+    // That is exactly what kills JIT worker threads once Mono creates Thread2.
     //
     // A prior name filter returned false (=> raw RunThread) for threads whose name contained
     // Worker/GC/Mono/SGen/Finalizer/Marker/Suspend. "UnityGfxDeviceWorker" matches "Worker", so it
@@ -1257,14 +1258,14 @@ extern "C" bool executor_lsx4_android_should_suppress_guest_thread(void* start_r
     // thread run path.)
     //
     // Do not route shadPS4's own HOST_CALL pthreads through that path. Kernel::Thread::Run also uses
-    // posix_pthread_create, with an AArch64 RunWrapper address. The old unconditional Backend-B
+    // posix_pthread_create, with an AArch64 RunWrapper address. The old unconditional JIT
     // decision sent that host address to the x86 decoder; run_guest_thread then papered over the
     // failed address lookup with g_last_module_handle and decoded AArch64 bytes as x86 (typically an
     // immediate HLT/decode failure). A real guest pthread entry belongs to one of Linker's executable
     // modules, whereas a HOST_CALL entry does not. Keep the two thread domains disjoint, matching
     // upstream shadPS4's native host-thread contract.
     const bool mapped_backend_active =
-        RuntimeGuestBackendBActive() || g_box64_guest_entry_active.load(std::memory_order_acquire);
+        RuntimeGuestJitActive() || g_box64_guest_entry_active.load(std::memory_order_acquire);
     if (!mapped_backend_active || start_routine == nullptr) {
         return false;
     }
@@ -1273,9 +1274,9 @@ extern "C" bool executor_lsx4_android_should_suppress_guest_thread(void* start_r
     const bool is_guest_entry = linker != nullptr && linker->FindByAddress(start_address) != nullptr;
     if (!is_guest_entry) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_HOST_THREAD_ROUTE] native start=%p name=%s backendB=%d; "
+                  "[EXECUTOR_HOST_THREAD_ROUTE] native start=%p name=%s jit=%d; "
                   "bypassing guest x86 dispatcher",
-                  start_routine, name ? name : "<unnamed>", RuntimeGuestBackendBActive() ? 1 : 0);
+                  start_routine, name ? name : "<unnamed>", RuntimeGuestJitActive() ? 1 : 0);
     }
     return is_guest_entry;
 }
@@ -2077,11 +2078,11 @@ bool GuestReadQwordCheckedLocked(const std::uint64_t address, std::uint64_t& out
     return true;
 }
 
-std::uint64_t BackendBCanonicalHostPointer(const std::uint64_t address) {
+std::uint64_t JitCanonicalHostPointer(const std::uint64_t address) {
 #if defined(__ANDROID__) && defined(__aarch64__)
     // Android's tagged-address ABI permits a non-zero top byte on heap and
     // alternate-signal-stack pointers. /proc/self/maps contains canonical
-    // addresses, so Backend B must remove the tag for validation and memcpy.
+    // addresses, so JIT must remove the tag for validation and memcpy.
     // Ordinary PS4 guest VAs are below bit 40 and are therefore unchanged.
     return address & 0x00ffffffffffffffull;
 #else
@@ -2089,18 +2090,18 @@ std::uint64_t BackendBCanonicalHostPointer(const std::uint64_t address) {
 #endif
 }
 
-bool BackendBRangeContained(const std::uint64_t address, const std::size_t size,
+bool JitRangeContained(const std::uint64_t address, const std::size_t size,
                             const std::uint64_t range_base, const std::uint64_t range_size) {
     return size != 0 && range_base != 0 && range_size != 0 && address >= range_base &&
            static_cast<std::uint64_t>(size) <= range_size &&
            address - range_base <= range_size - static_cast<std::uint64_t>(size);
 }
 
-bool IsBackendBRegisteredGuestRange(const std::uint64_t address, const std::size_t size) {
-    if (IsBackendBRegisteredPageCached(address, size)) {
+bool IsJitRegisteredGuestRange(const std::uint64_t address, const std::size_t size) {
+    if (IsJitRegisteredPageCached(address, size)) {
         return true;
     }
-    if (BackendBRangeContained(address, size, g_box64_boundary_probe.stack_base,
+    if (JitRangeContained(address, size, g_box64_boundary_probe.stack_base,
                                g_box64_boundary_probe.stack_size)) {
         return true;
     }
@@ -2108,11 +2109,11 @@ bool IsBackendBRegisteredGuestRange(const std::uint64_t address, const std::size
     return std::any_of(g_box64_guest_readable_ranges.begin(),
                        g_box64_guest_readable_ranges.end(),
                        [&](const ExecutorGuestReadableRange& range) {
-                           return BackendBRangeContained(address, size, range.base, range.size);
+                           return JitRangeContained(address, size, range.base, range.size);
                        });
 }
 
-bool IsBackendBOrdinaryGuestRange(const std::uint64_t address, const std::size_t size) {
+bool IsJitOrdinaryGuestRange(const std::uint64_t address, const std::size_t size) {
     // PS4 CPU/GPU virtual addresses are 40-bit. Keeping this numeric gate in front of the memory
     // manager prevents a tagged/high Android host pointer from ever being mistaken for guest memory.
     constexpr std::uint64_t GuestAddressLimit = 0x10000000000ull;
@@ -2159,7 +2160,7 @@ bool IsBackendBOrdinaryGuestRange(const std::uint64_t address, const std::size_t
     return memory->IsValidMapping(address, size);
 }
 
-bool IsBackendBCurrentThreadStackRange(const std::uint64_t address, const std::size_t size) {
+bool IsJitCurrentThreadStackRange(const std::uint64_t address, const std::size_t size) {
 #if defined(__ANDROID__)
     struct HostStackRange {
         std::uint64_t base = 0;
@@ -2180,11 +2181,11 @@ bool IsBackendBCurrentThreadStackRange(const std::uint64_t address, const std::s
         if (result != 0 || base == nullptr || size == 0) {
             return HostStackRange{};
         }
-        return HostStackRange{BackendBCanonicalHostPointer(
+        return HostStackRange{JitCanonicalHostPointer(
                                   reinterpret_cast<std::uint64_t>(base)),
                               static_cast<std::uint64_t>(size)};
     }();
-    return BackendBRangeContained(address, size, stack.base, stack.size);
+    return JitRangeContained(address, size, stack.base, stack.size);
 #else
     (void)address;
     (void)size;
@@ -2192,40 +2193,40 @@ bool IsBackendBCurrentThreadStackRange(const std::uint64_t address, const std::s
 #endif
 }
 
-bool IsBackendBGuestRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
+bool IsJitGuestRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
     // Registered pthread/fallback stacks live outside Core::MemoryManager.  Check their
     // process-lifetime page publication first so hot reference-validation operands do not pay an
     // expected VMA miss before reaching the range which actually owns them.
-    return IsBackendBRegisteredPageCached(address, size) ||
-           IsBackendBOrdinaryGuestRange(address, size) ||
-           IsBackendBRegisteredGuestRange(address, size);
+    return IsJitRegisteredPageCached(address, size) ||
+           IsJitOrdinaryGuestRange(address, size) ||
+           IsJitRegisteredGuestRange(address, size);
 }
 
-bool IsBackendBSourceRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
-    return IsBackendBCurrentThreadStackRange(address, size) ||
-           IsBackendBGuestRangeWithoutProcMaps(address, size);
+bool IsJitSourceRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
+    return IsJitCurrentThreadStackRange(address, size) ||
+           IsJitGuestRangeWithoutProcMaps(address, size);
 }
 
-extern "C" bool ExecutorBackendBIsReadableGuestRange(const std::uint64_t address,
+extern "C" bool ExecutorJitIsReadableGuestRange(const std::uint64_t address,
                                                        const std::size_t size) {
     // This is a pointer-free proof API for HLE consumers that need a direct span rather than a
     // copied buffer.  Canonicalize Android top-byte tags once, reject wraparound, then consult the
-    // same authoritative sources as Backend B's byte reader: the current native source stack,
+    // same authoritative sources as JIT's byte reader: the current native source stack,
     // ordinary identity-mapped guest VMAs, and explicitly registered guest/stack ranges.  Do not
     // fall back to arbitrary /proc/self/maps entries here: a readable low fixed host mmap is not by
     // itself proof that the address is guest-owned.
     if (address == 0 || size == 0) {
         return false;
     }
-    const std::uint64_t host_address = BackendBCanonicalHostPointer(address);
+    const std::uint64_t host_address = JitCanonicalHostPointer(address);
     if (host_address == 0 ||
         static_cast<std::uint64_t>(size - 1) > ~std::uint64_t{0} - host_address) {
         return false;
     }
-    return IsBackendBSourceRangeWithoutProcMaps(host_address, size);
+    return IsJitSourceRangeWithoutProcMaps(host_address, size);
 }
 
-extern "C" bool ExecutorBackendBReadGuestBytes(const std::uint64_t address, void* dst,
+extern "C" bool ExecutorJitReadGuestBytes(const std::uint64_t address, void* dst,
                                                const std::size_t size) {
     if (size == 0) {
         return true;
@@ -2233,21 +2234,21 @@ extern "C" bool ExecutorBackendBReadGuestBytes(const std::uint64_t address, void
     if (address == 0 || dst == nullptr || address > (~std::uint64_t{0} - (size - 1))) {
         return false;
     }
-    const std::uint64_t host_address = BackendBCanonicalHostPointer(address);
+    const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_dst =
-        BackendBCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
+        JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
     if (host_address == 0 || host_dst == 0 ||
         host_address > (~std::uint64_t{0} - (size - 1))) {
         return false;
     }
     // Ordinary guest mappings and registered guest stacks are already authoritative. Avoid the
     // process-global /proc/self/maps cache mutex on every interpreted/JIT memory operand.
-    if (IsBackendBGuestRangeWithoutProcMaps(host_address, size)) {
+    if (IsJitGuestRangeWithoutProcMaps(host_address, size)) {
         std::memcpy(reinterpret_cast<void*>(host_dst),
                     reinterpret_cast<const void*>(host_address), size);
         return true;
     }
-    // Backend B also decodes high host self-test buffers before the guest Linker/MemoryManager is
+    // JIT also decodes high host self-test buffers before the guest Linker/MemoryManager is
     // initialized. Keep the guarded host fallback for those buffers only.
     if (IsHostAddressReadableByProcMaps(host_address) &&
         IsHostAddressReadableByProcMaps(host_address + size - 1)) {
@@ -2264,8 +2265,42 @@ extern "C" bool ExecutorBackendBReadGuestBytes(const std::uint64_t address, void
     return true;
 }
 
+extern "C" bool ExecutorJitReadGuestBytesStable(const std::uint64_t address, void* dst,
+                                                     const std::size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (address == 0 || dst == nullptr || address > (~std::uint64_t{0} - (size - 1))) {
+        return false;
+    }
+    const std::uint64_t host_address = JitCanonicalHostPointer(address);
+    if (host_address == 0 ||
+        host_address > (~std::uint64_t{0} - (size - 1)) ||
+        !IsJitGuestRangeWithoutProcMaps(host_address, size)) {
+        return false;
+    }
+#if (defined(__ANDROID__) || defined(__linux__)) && defined(SYS_process_vm_readv)
+    iovec local{
+        .iov_base = dst,
+        .iov_len = size,
+    };
+    iovec remote{
+        .iov_base = reinterpret_cast<void*>(host_address),
+        .iov_len = size,
+    };
+    // Unlike a validate-then-memcpy sequence, process_vm_readv performs the copy while the kernel
+    // owns the remote-mm lookup. If another guest thread unmaps a module concurrently, the read
+    // fails with a short result/EFAULT instead of taking SIGBUS between validation and memcpy.
+    const long copied =
+        syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
+    return copied == static_cast<long>(size);
+#else
+    return ExecutorJitReadGuestBytes(address, dst, size);
+#endif
+}
+
 // Range [lo,hi) of our own loaded host image (liblsx4_executor_android.so). A guest store must
-// never land inside a loaded HOST shared object — that only happens when a native Backend-B block
+// never land inside a loaded HOST shared object — that only happens when a native JIT block
 // computes a store base from a garbage/host pointer (observed: the RSDK audio worker Thread2 stores
 // into our .so BSS, corrupting a std::mutex / unordered_map and later FORTIFY-aborting or SIGSEGVing
 // a different thread with a shape-shifting victim address). Computed once from /proc/self/maps.
@@ -2341,7 +2376,7 @@ static bool ExecutorOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi) {
 #endif
 }
 
-extern "C" bool ExecutorBackendBWriteGuestBytes(const std::uint64_t address, const void* src,
+extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const void* src,
                                                 const std::size_t size) {
     if (size == 0) {
         return true;
@@ -2349,9 +2384,9 @@ extern "C" bool ExecutorBackendBWriteGuestBytes(const std::uint64_t address, con
     if (address == 0 || src == nullptr || address > (~std::uint64_t{0} - (size - 1))) {
         return false;
     }
-    const std::uint64_t host_address = BackendBCanonicalHostPointer(address);
+    const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_src =
-        BackendBCanonicalHostPointer(reinterpret_cast<std::uint64_t>(src));
+        JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(src));
     if (host_address == 0 || host_src == 0 ||
         host_address > (~std::uint64_t{0} - (size - 1)) ||
         host_src > (~std::uint64_t{0} - (size - 1))) {
@@ -2365,12 +2400,12 @@ extern "C" bool ExecutorBackendBWriteGuestBytes(const std::uint64_t address, con
         if (n < 64) {
             NativeLog(ANDROID_LOG_ERROR,
                       "[EXECUTOR_GUEST_STORE_INTO_HOST_IMAGE] n=%u dst=0x%llx size=%zu "
-                      "image=[0x%llx,0x%llx) (rejected; Backend-B garbage store base)",
+                      "image=[0x%llx,0x%llx) (rejected; JIT garbage store base)",
                       n, static_cast<unsigned long long>(address), size,
                       static_cast<unsigned long long>(img_lo),
                       static_cast<unsigned long long>(img_hi));
             std::FILE* cf = std::fopen(
-                "/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt", "a");
+                "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a");
             if (cf != nullptr) {
                 std::fprintf(cf, "GUEST_STORE_INTO_HOST_IMAGE dst=0x%llx size=%zu\n",
                              static_cast<unsigned long long>(address), size);
@@ -2389,7 +2424,7 @@ extern "C" bool ExecutorBackendBWriteGuestBytes(const std::uint64_t address, con
         return false;
     }
     const bool destination_is_guest =
-        IsBackendBGuestRangeWithoutProcMaps(host_address, size);
+        IsJitGuestRangeWithoutProcMaps(host_address, size);
     if (!destination_is_guest) {
         const bool destination_writable =
             IsHostAddressWritableByProcMaps(host_address) &&
@@ -2401,7 +2436,7 @@ extern "C" bool ExecutorBackendBWriteGuestBytes(const std::uint64_t address, con
             return false;
         }
     }
-    if (!IsBackendBSourceRangeWithoutProcMaps(host_src, size) &&
+    if (!IsJitSourceRangeWithoutProcMaps(host_src, size) &&
         (!IsHostAddressReadableByProcMaps(host_src) ||
          !IsHostAddressReadableByProcMaps(host_src + size - 1))) {
         return false;
@@ -2533,7 +2568,7 @@ void RegisterBox64GuestReadableRange(const void* base, const std::size_t size,
             added = true;
         }
     }
-    PublishBackendBRegisteredFullPages(address, size);
+    PublishJitRegisteredFullPages(address, size);
     static std::atomic_uint32_t readable_range_log_count{0};
     if (added && readable_range_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
         NativeLog(ANDROID_LOG_INFO,
@@ -3842,14 +3877,14 @@ extern "C" void executor_lsx4_android_note_guest_thread_create(void* thread,
         }
         if (offset == 0x51c20) {
             const auto arg_base = reinterpret_cast<std::uint64_t>(arg);
-            const bool backend_b_active = RuntimeGuestBackendBActive();
+            const bool jit_active = RuntimeGuestJitActive();
             constexpr std::uint64_t kUnityPthreadWrapperCookie = 0x2bcULL;
             std::uint64_t old_q2 = 0;
             std::uint64_t old_q3 = 0;
             (void)GuestReadQwordBestEffortLocked(arg_base + 0x10, old_q2);
             (void)GuestReadQwordBestEffortLocked(arg_base + 0x18, old_q3);
             const bool wrote_q2 =
-                backend_b_active || thread == nullptr ||
+                jit_active || thread == nullptr ||
                 old_q2 == reinterpret_cast<std::uint64_t>(thread) ||
                 GuestWriteQwordBestEffortLocked(arg_base + 0x10,
                                                 reinterpret_cast<std::uint64_t>(thread));
@@ -3858,15 +3893,15 @@ extern "C" void executor_lsx4_android_note_guest_thread_create(void* thread,
                 ((old_q3 & 0xffffffffULL) != 0 ? (old_q3 & 0xffffffffULL)
                                                : kUnityPthreadWrapperCookie);
             const bool wrote_q3 =
-                backend_b_active || old_q3 == wanted_q3 ||
+                jit_active || old_q3 == wanted_q3 ||
                 GuestWriteQwordBestEffortLocked(arg_base + 0x18, wanted_q3);
             const bool wrapper_repaired =
-                !backend_b_active &&
+                !jit_active &&
                 RepairUnityPthreadWrapperForPcContract(arg_base,
                                                        reinterpret_cast<std::uint64_t>(thread),
                                                        name);
             const bool bulk_repair_enabled =
-                !backend_b_active && UnityPreloadBulkPcContractRepairEnabled();
+                !jit_active && UnityPreloadBulkPcContractRepairEnabled();
             const bool control_repaired =
                 bulk_repair_enabled && RepairUnityPreloadControlBlockForPcContract(arg_base, name);
             const bool work_repaired =
@@ -3877,12 +3912,12 @@ extern "C" void executor_lsx4_android_note_guest_thread_create(void* thread,
                 NativeLog(ANDROID_LOG_WARN,
                           "[EXECUTOR_UNITYPRELOAD_CREATE_CONTRACT] thread=%p arg=%p "
                           "oldQ2=0x%llx oldQ3=0x%llx wantedQ3=0x%llx wroteQ2=%d "
-                          "wroteQ3=%d backendB=%d wrapperRepair=%d bulkRepairEnabled=%d "
+                          "wroteQ3=%d jit=%d wrapperRepair=%d bulkRepairEnabled=%d "
                           "controlRepair=%d workRepair=%d",
                           thread, arg, static_cast<unsigned long long>(old_q2),
                           static_cast<unsigned long long>(old_q3),
                           static_cast<unsigned long long>(wanted_q3), wrote_q2 ? 1 : 0,
-                          wrote_q3 ? 1 : 0, backend_b_active ? 1 : 0,
+                          wrote_q3 ? 1 : 0, jit_active ? 1 : 0,
                           wrapper_repaired ? 1 : 0,
                           bulk_repair_enabled ? 1 : 0,
                           control_repaired ? 1 : 0,
@@ -4846,6 +4881,25 @@ extern "C" void executor_live_record_posix_sem_hle_site(const char* op, void* se
                                                         std::uint64_t module_offset,
                                                         const char* module_name)
     __attribute__((weak));
+
+void RecordPosixSemHleSite(const char* op, const std::uint64_t sem_addr,
+                           const std::uint64_t guest_rsp) {
+    static const bool enabled =
+        ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_WIDE") ||
+        ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_SYNC") ||
+        ExecutorEnvFlag("EXECUTOR_SYNC_FRONTIER") ||
+        ExecutorEnvFlag("EXECUTOR_LIVE_HLE_FLIGHT") || ExecutorLightOracleMode();
+    if (!enabled || op == nullptr || executor_live_record_posix_sem_hle_site == nullptr) {
+        return;
+    }
+
+    const std::uint64_t guest_return = GuestReturnAddress(guest_rsp);
+    Core::Module* module = FindGuestModuleByAddress(guest_return);
+    executor_live_record_posix_sem_hle_site(
+        op, reinterpret_cast<void*>(sem_addr), guest_return,
+        module ? GuestModuleOffset(*module, guest_return) : 0,
+        module ? module->file.string().c_str() : "<unknown>");
+}
 
 bool IsLibcCompareHleTarget(const char* name, const char* symbol_name) {
     return HleNameMatches(name, "strcmp", "Ovb2dSJOAuE") ||
@@ -6162,19 +6216,19 @@ struct ExecutorHleTargetMetadata {
     bool gnm_draw_indirect_multi = false;
     bool gnm_submit_and_flip = false;
     bool gnm_submit_and_flip_for_workload = false;
-    // Pure fixed-size GNM command writers do not call back into guest code, block, allocate
-    // guest-visible objects or consume stack arguments.  Backend B may therefore cross these
-    // imports through the compact leaf bridge instead of paying the full diagnostic/thread
-    // context bridge on every draw-state update.  This is deliberately an exact allow-list;
-    // every unknown HLE remains fail-closed on the established path.
-    bool backend_b_leaf_direct_safe = false;
-    // Backend B owns one native pthread per guest pthread and binds g_curthread for that
+    // Pure fixed-size GNM command writers and checked libc byte/string readers do not call back
+    // into guest code, block, allocate guest-visible objects or consume stack arguments.
+    // JIT may therefore cross these imports through the compact leaf bridge instead of
+    // paying the full diagnostic/thread context bridge. This is deliberately an exact
+    // allow-list; every unknown HLE remains fail-closed on the established path.
+    bool jit_leaf_direct_safe = false;
+    // JIT owns one native pthread per guest pthread and binds g_curthread for that
     // pthread's complete lifetime.  Common integer-only synchronization, clock, network-wait
     // and memory leaves can therefore call the same HLE implementation without reconstructing
     // the diagnostic HLE context and re-binding the already-current thread on every crossing.
-    // Unlike backend_b_leaf_direct_safe this route remains inside the catching bridge, so a host
+    // Unlike jit_leaf_direct_safe this route remains inside the catching bridge, so a host
     // exception still cannot unwind through generated code.
-    bool backend_b_runtime_direct_safe = false;
+    bool jit_runtime_direct_safe = false;
 };
 
 ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t native_function) {
@@ -6252,7 +6306,7 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "sceGnmSubmitAndFlipCommandBuffers", "xbxNatawohc");
     metadata.gnm_submit_and_flip_for_workload = HleNameMatches(
         name, "sceGnmSubmitAndFlipCommandBuffersForWorkload", "Ga6r7H6Y0RI");
-    metadata.backend_b_leaf_direct_safe =
+    metadata.jit_leaf_direct_safe =
         HleNameMatches(name, "sceGnmSetPsShader", "bQVd5YzCal0") ||
         HleNameMatches(name, "sceGnmSetPsShader350", "5uFKckiJYRM") ||
         HleNameMatches(name, "sceGnmSetVsShader", "gAhCn6UiU4Y") ||
@@ -6270,6 +6324,10 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "memcpy", "Q3VBxCXhUHs") ||
         HleNameMatches(name, "memmove", "+P6FRGH4LfA") ||
         HleNameMatches(name, "memset", "8zTFvBIAIN8") ||
+        HleNameMatches(name, "strlen", "j4ViWNHEgww") ||
+        HleNameMatches(name, "strcmp", "Ovb2dSJOAuE") ||
+        HleNameMatches(name, "strncmp", "aesyjrHVWy4") ||
+        HleNameMatches(name, "memcmp", "DfivPArhucg") ||
         SymbolNameContains(symbol_name, "sceGnmSetPsShader") ||
         SymbolNameContains(symbol_name, "sceGnmSetVsShader") ||
         SymbolNameContains(symbol_name, "posix_pthread_mutex_lock") ||
@@ -6285,9 +6343,13 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         SymbolNameContains(symbol_name, "sceKernelCancelSema") ||
         SymbolNameContains(symbol_name, "ExecutorLibcMemcpy") ||
         SymbolNameContains(symbol_name, "ExecutorLibcMemmove") ||
-        SymbolNameContains(symbol_name, "ExecutorLibcMemset");
-    metadata.backend_b_runtime_direct_safe =
-        metadata.backend_b_leaf_direct_safe ||
+        SymbolNameContains(symbol_name, "ExecutorLibcMemset") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcStrlen") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcStrcmp") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcStrncmp") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcMemcmp");
+    metadata.jit_runtime_direct_safe =
+        metadata.jit_leaf_direct_safe ||
         metadata.pthread_target ||
         metadata.blocking_sem_wait_target ||
         metadata.posix_sem_site_op != nullptr ||
@@ -6448,10 +6510,10 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     // and periodically publish managed roots, but call an exact, metadata-proven leaf directly.
     // The allow-list is built above from both the public name and NID and excludes every HLE with
     // stack arguments, FP ABI, callbacks, allocation, waits or process/thread side effects.
-    if (target_metadata.executable && target_metadata.backend_b_leaf_direct_safe &&
+    if (target_metadata.executable && target_metadata.jit_leaf_direct_safe &&
         target_metadata.fp_abi == ExecutorHleFpAbi::None) {
         if (ExecutorGcGuestRootsEnabled()) {
-            PublishCurrentBackendBGcRegisterRootsAtHleBoundary();
+            PublishCurrentJitGcRegisterRootsAtHleBoundary();
         }
         using NativeLeafFn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
                                                std::uint64_t, std::uint64_t, std::uint64_t,
@@ -6461,14 +6523,14 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         std::atomic_thread_fence(std::memory_order_release);
         return result;
     }
-    // The Backend-B thread model is one host pthread per guest Pthread. The universal bridge used
+    // The JIT thread model is one host pthread per guest Pthread. The universal bridge used
     // to bind g_curthread for one HLE call and immediately restore nullptr, forcing the next mutex,
     // clock or semaphore crossing to reconstruct the same context again. Resolve the authoritative
     // guest thread once through the existing bridge callback and retain it for this host pthread.
     // No thread can subsequently execute a different guest Pthread under this backend.
-    if (target_metadata.executable && target_metadata.backend_b_runtime_direct_safe &&
+    if (target_metadata.executable && target_metadata.jit_runtime_direct_safe &&
         target_metadata.fp_abi == ExecutorHleFpAbi::None &&
-        RuntimeGuestBackendBActive() && Libraries::Kernel::g_curthread == nullptr &&
+        RuntimeGuestJitActive() && Libraries::Kernel::g_curthread == nullptr &&
         g_box64_current_guest_thread != nullptr) {
         const std::uint64_t guest_thread = g_box64_current_guest_thread();
         if (guest_thread != 0) {
@@ -6476,17 +6538,18 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                 reinterpret_cast<Libraries::Kernel::Pthread*>(guest_thread);
         }
     }
-    if (target_metadata.executable && target_metadata.backend_b_runtime_direct_safe &&
+    if (target_metadata.executable && target_metadata.jit_runtime_direct_safe &&
         target_metadata.fp_abi == ExecutorHleFpAbi::None &&
-        RuntimeGuestBackendBActive() && Libraries::Kernel::g_curthread != nullptr) {
-        // RunAndroidMappedGuestThread and the primary Backend-B entry worker bind g_curthread
+        RuntimeGuestJitActive() && Libraries::Kernel::g_curthread != nullptr) {
+        // RunAndroidMappedGuestThread and the primary JIT entry worker bind g_curthread
         // before guest execution and never multiplex another guest on that host pthread.  The
         // full bridge's g_box64_current_guest_thread call, TLS context save/restore and
         // ScopedExecutorHleGuestThreadBind were therefore pure overhead for these exact HLEs.
         // Preserve the GC publication contract for configurations that enable guest roots.
         if (ExecutorGcGuestRootsEnabled()) {
-            PublishCurrentBackendBGcRegisterRootsAtHleBoundary();
+            PublishCurrentJitGcRegisterRootsAtHleBoundary();
         }
+        RecordPosixSemHleSite(target_metadata.posix_sem_site_op, arg0, guest_rsp);
         using NativeRuntimeLeafFn =
             std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
                               std::uint64_t, std::uint64_t, std::uint64_t,
@@ -6497,7 +6560,7 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         return result;
     }
 
-    PublishCurrentBackendBGcRegisterRootsAtHleBoundary();
+    PublishCurrentJitGcRegisterRootsAtHleBoundary();
     ScopedExecutorCurrentHleContext current_hle_context(guest_rsp, name, symbol_name);
     const std::uint64_t hle_guest_thread =
         g_box64_current_guest_thread ? g_box64_current_guest_thread() : 0;
@@ -6519,19 +6582,7 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                 guest_rsp, target_metadata.pthread_create_target);
         }
     }
-    static const bool trace_posix_sem_sites = ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_WIDE") ||
-                                              ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_SYNC") ||
-                                              ExecutorLightOracleMode();
-    if (const char* sem_site_op = target_metadata.posix_sem_site_op;
-        trace_posix_sem_sites && sem_site_op != nullptr &&
-        executor_live_record_posix_sem_hle_site) {
-        const std::uint64_t guest_return = GuestReturnAddress(guest_rsp);
-        Core::Module* module = FindGuestModuleByAddress(guest_return);
-        executor_live_record_posix_sem_hle_site(
-            sem_site_op, reinterpret_cast<void*>(arg0), guest_return,
-            module ? GuestModuleOffset(*module, guest_return) : 0,
-            module ? module->file.string().c_str() : "<unknown>");
-    }
+    RecordPosixSemHleSite(target_metadata.posix_sem_site_op, arg0, guest_rsp);
     if (target_metadata.libc_compare_target) {
         RecordLibcCompareBadPtr(name, symbol_name, native_function, arg0, arg1, arg2, arg3, arg4,
                                 arg5, guest_rsp, target_metadata.libc_compare_target);
@@ -6676,7 +6727,7 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     // The x86-64 SysV ABI allocates GP and SSE arguments independently.  A generic integer
     // function-pointer cast cannot call any of these signatures: it both reads the wrong input
     // registers and returns scalar FP values through the wrong architectural bank.  Encode the
-    // scalar return lane as raw bits for Backend B to restore into XMM0.
+    // scalar return lane as raw bits for JIT to restore into XMM0.
     switch (target_metadata.fp_abi) {
     case ExecutorHleFpAbi::UnaryF32: {
         using Fn = float (*)(float);
@@ -7332,7 +7383,7 @@ extern "C" std::uint64_t ExecutorBox64HleBridgeCallback(const std::uint64_t nati
                                              xmm2, xmm3);
 }
 
-extern "C" std::uint64_t ExecutorBackendBHleBridgeCallback(const std::uint64_t native_function,
+extern "C" std::uint64_t ExecutorJitHleBridgeCallback(const std::uint64_t native_function,
                                                            const std::uint64_t arg0,
                                                            const std::uint64_t arg1,
                                                            const std::uint64_t arg2,
@@ -7344,18 +7395,18 @@ extern "C" std::uint64_t ExecutorBackendBHleBridgeCallback(const std::uint64_t n
                                                            const std::uint64_t xmm1,
                                                            const std::uint64_t xmm2,
                                                            const std::uint64_t xmm3) {
-    return ExecutorHleBridgeCallbackCatching("backend_b_hle_bridge", native_function, arg0,
+    return ExecutorHleBridgeCallbackCatching("jit_hle_bridge", native_function, arg0,
                                              arg1, arg2, arg3, arg4, arg5, guest_rsp, xmm0,
                                              xmm1, xmm2, xmm3);
 }
 
-extern "C" int executor_backend_b_lookup_leaf_hle_thunk(
+extern "C" int executor_jit_lookup_leaf_hle_thunk(
     std::uint64_t thunk, std::uint64_t* native_function);
 
-// Compact bridge used only after executor_backend_b_lookup_leaf_hle_thunk has proven the exact
+// Compact bridge used only after executor_jit_lookup_leaf_hle_thunk has proven the exact
 // immutable thunk/native pair.  It intentionally contains no registry lookup or diagnostic
 // context construction; the emitted caller also guards the live GOT slot before entering it.
-extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
+extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
     const std::uint64_t native_function, const std::uint64_t arg0,
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
     const std::uint64_t arg4, const std::uint64_t arg5, const std::uint64_t guest_rsp) {
@@ -7363,7 +7414,7 @@ extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
     // entirely off the production leaf-HLE path; Android's dlopen TLS resolver was otherwise a
     // measurable Game:Main cost on every semaphore/time/libc leaf call.
     static const bool trace_hot_edges =
-        ExecutorEnvFlag("EXECUTOR_TRACE_BACKEND_B_HOT_HLE_EDGE") ||
+        ExecutorEnvFlag("EXECUTOR_TRACE_JIT_HOT_HLE_EDGE") ||
         ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_HLE");
     if (trace_hot_edges) {
         struct HotLeafHleEdge {
@@ -7372,7 +7423,7 @@ extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
             std::uint64_t calls{};
         };
         static thread_local std::array<HotLeafHleEdge, 16> hot_edges{};
-        const auto* const guest_state = Executor::BackendB::CurrentMachineImage();
+        const auto* const guest_state = Executor::Jit::CurrentMachineImage();
         const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
         const std::size_t hot_index =
             static_cast<std::size_t>(((native_function >> 4) ^ (guest_rip >> 4)) &
@@ -7396,7 +7447,7 @@ extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
             (void)pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
             NativeLog(
                 ANDROID_LOG_WARN,
-                "[EXECUTOR_BACKEND_B_HOT_HLE_EDGE] thread=%s calls=%llu rip=0x%llx "
+                "[EXECUTOR_JIT_HOT_HLE_EDGE] thread=%s calls=%llu rip=0x%llx "
                 "native=0x%llx symbol=%s arg0=0x%llx arg1=0x%llx arg2=0x%llx rsp=0x%llx",
                 thread_name, static_cast<unsigned long long>(hot_edge.calls),
                 static_cast<unsigned long long>(guest_rip),
@@ -7411,7 +7462,7 @@ extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
     }
     std::atomic_thread_fence(std::memory_order_acquire);
     if (ExecutorGcGuestRootsEnabled()) {
-        PublishCurrentBackendBGcRegisterRootsAtHleBoundary();
+        PublishCurrentJitGcRegisterRootsAtHleBoundary();
     }
     try {
         using NativeLeafFn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
@@ -7423,36 +7474,36 @@ extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
         return result;
     } catch (const std::exception& e) {
         NativeLog(ANDROID_LOG_ERROR,
-                  "[EXECUTOR_BACKEND_B_LEAF_HLE_THROW] native=0x%llx what=%s",
+                  "[EXECUTOR_JIT_LEAF_HLE_THROW] native=0x%llx what=%s",
                   static_cast<unsigned long long>(native_function), e.what());
     } catch (...) {
         NativeLog(ANDROID_LOG_ERROR,
-                  "[EXECUTOR_BACKEND_B_LEAF_HLE_THROW] native=0x%llx what=<non-std>",
+                  "[EXECUTOR_JIT_LEAF_HLE_THROW] native=0x%llx what=<non-std>",
                   static_cast<unsigned long long>(native_function));
     }
     std::atomic_thread_fence(std::memory_order_release);
     return 0;
 }
 
-extern "C" Executor::BackendB::BackendBLeafHleCallResult
-ExecutorBackendBTryLeafHleThunkCallback(
+extern "C" Executor::Jit::JitLeafHleCallResult
+ExecutorJitTryLeafHleThunkCallback(
     const std::uint64_t thunk, const std::uint64_t arg0,
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
     const std::uint64_t arg4, const std::uint64_t arg5,
     const std::uint64_t guest_rsp) {
     std::uint64_t native_function = 0;
-    if (executor_backend_b_lookup_leaf_hle_thunk(thunk, &native_function) == 0 ||
+    if (executor_jit_lookup_leaf_hle_thunk(thunk, &native_function) == 0 ||
         native_function == 0) {
         return {};
     }
     return {
-        .result = ExecutorBackendBResolvedLeafHleCallback(
+        .result = ExecutorJitResolvedLeafHleCallback(
             native_function, arg0, arg1, arg2, arg3, arg4, arg5, guest_rsp),
         .executed = 1,
     };
 }
 
-extern "C" int executor_backend_b_hle_fp_result_kind(
+extern "C" int executor_jit_hle_fp_result_kind(
     const std::uint64_t native_function) {
     switch (GetExecutorHleTargetMetadata(native_function).fp_abi) {
     case ExecutorHleFpAbi::UnaryF32:
@@ -7519,29 +7570,29 @@ const HleTargetTelemetry* FindKnownHleFunctionTarget(const std::uint64_t native_
     return nullptr;
 }
 
-enum class BackendBHleThunkKind : std::uint8_t {
+enum class JitHleThunkKind : std::uint8_t {
     Empty = 0,
     NotHle,
     ReturnZero,
     Native,
 };
 
-struct BackendBHleThunkResolution {
+struct JitHleThunkResolution {
     std::uint64_t thunk = 0;
     std::uint64_t native_function = 0;
     std::uint64_t leaf_native_function = 0;
-    BackendBHleThunkKind kind = BackendBHleThunkKind::Empty;
+    JitHleThunkKind kind = JitHleThunkKind::Empty;
 };
 
-BackendBHleThunkResolution ResolveBackendBHleThunkUncached(const std::uint64_t thunk) {
-    BackendBHleThunkResolution result{
-        thunk, 0, 0, BackendBHleThunkKind::NotHle};
-    const auto finish = [](BackendBHleThunkResolution value) {
-        if (value.kind == BackendBHleThunkKind::Native &&
+JitHleThunkResolution ResolveJitHleThunkUncached(const std::uint64_t thunk) {
+    JitHleThunkResolution result{
+        thunk, 0, 0, JitHleThunkKind::NotHle};
+    const auto finish = [](JitHleThunkResolution value) {
+        if (value.kind == JitHleThunkKind::Native &&
             value.native_function != 0) {
             const auto& metadata =
                 GetExecutorHleTargetMetadata(value.native_function);
-            if (metadata.executable && metadata.backend_b_leaf_direct_safe &&
+            if (metadata.executable && metadata.jit_leaf_direct_safe &&
                 metadata.fp_abi == ExecutorHleFpAbi::None) {
                 value.leaf_native_function = value.native_function;
             }
@@ -7557,49 +7608,49 @@ BackendBHleThunkResolution ResolveBackendBHleThunkUncached(const std::uint64_t t
     // turn into an HLE thunk. This invariant lets the per-thread cache below retain negative hits
     // without coupling the guest dispatch loop to the Aerolib registry mutex.
     if (Core::AeroLib::IsAndroidX64NativeHleReturnZeroStub(thunk)) {
-        result.kind = BackendBHleThunkKind::ReturnZero;
+        result.kind = JitHleThunkKind::ReturnZero;
         return result;
     }
 
     for (const auto& target : g_box64_hle_targets) {
         if (target.thunk == thunk) {
             result.native_function = target.native_function;
-            result.kind = target.native_function != 0 ? BackendBHleThunkKind::Native
-                                                       : BackendBHleThunkKind::NotHle;
+            result.kind = target.native_function != 0 ? JitHleThunkKind::Native
+                                                       : JitHleThunkKind::NotHle;
             return finish(result);
         }
         if (target.native_function == thunk) {
             result.native_function = target.native_function;
-            result.kind = target.native_function != 0 ? BackendBHleThunkKind::Native
-                                                       : BackendBHleThunkKind::NotHle;
+            result.kind = target.native_function != 0 ? JitHleThunkKind::Native
+                                                       : JitHleThunkKind::NotHle;
             return finish(result);
         }
     }
 
     if (Core::AeroLib::TryGetAndroidX64NativeHleTarget(thunk, &result.native_function)) {
-        result.kind = result.native_function != 0 ? BackendBHleThunkKind::Native
-                                                  : BackendBHleThunkKind::NotHle;
+        result.kind = result.native_function != 0 ? JitHleThunkKind::Native
+                                                  : JitHleThunkKind::NotHle;
         return finish(result);
     }
     const std::string native_name = Core::AeroLib::GetAndroidX64HleNameForNative(thunk);
     if (!native_name.empty()) {
         result.native_function = thunk;
-        result.kind = BackendBHleThunkKind::Native;
+        result.kind = JitHleThunkKind::Native;
     }
     return finish(result);
 }
 
-const BackendBHleThunkResolution& ResolveBackendBHleThunkCached(const std::uint64_t thunk) {
+const JitHleThunkResolution& ResolveJitHleThunkCached(const std::uint64_t thunk) {
     constexpr std::size_t CacheBuckets = 4096;
     constexpr std::size_t CacheWays = 2;
     constexpr std::uint64_t GoldenRatio = 0x9e3779b97f4a7c15ull;
     struct ProcessCacheEntry {
         std::atomic<std::uint64_t> thunk{0};
-        std::atomic<const BackendBHleThunkResolution*> resolution{nullptr};
+        std::atomic<const JitHleThunkResolution*> resolution{nullptr};
     };
     static std::array<std::array<ProcessCacheEntry, CacheWays>, CacheBuckets> front_cache{};
     static std::mutex cache_mutex;
-    static std::unordered_map<std::uint64_t, std::unique_ptr<BackendBHleThunkResolution>>
+    static std::unordered_map<std::uint64_t, std::unique_ptr<JitHleThunkResolution>>
         process_cache;
     static std::atomic<std::uint64_t> replacement{0};
 
@@ -7615,7 +7666,7 @@ const BackendBHleThunkResolution& ResolveBackendBHleThunkCached(const std::uint6
         }
     }
 
-    const BackendBHleThunkResolution* resolution = nullptr;
+    const JitHleThunkResolution* resolution = nullptr;
     {
         std::lock_guard lock(cache_mutex);
         auto it = process_cache.find(thunk);
@@ -7623,8 +7674,8 @@ const BackendBHleThunkResolution& ResolveBackendBHleThunkCached(const std::uint6
             if (process_cache.empty()) {
                 process_cache.reserve(1024);
             }
-            auto inserted = std::make_unique<BackendBHleThunkResolution>(
-                ResolveBackendBHleThunkUncached(thunk));
+            auto inserted = std::make_unique<JitHleThunkResolution>(
+                ResolveJitHleThunkUncached(thunk));
             resolution = inserted.get();
             process_cache.emplace(thunk, std::move(inserted));
         } else {
@@ -7641,27 +7692,27 @@ const BackendBHleThunkResolution& ResolveBackendBHleThunkCached(const std::uint6
     return *resolution;
 }
 
-extern "C" int executor_backend_b_classify_hle_thunk(const std::uint64_t thunk) {
-    const auto kind = ResolveBackendBHleThunkCached(thunk).kind;
-    if (kind == BackendBHleThunkKind::ReturnZero) {
+extern "C" int executor_jit_classify_hle_thunk(const std::uint64_t thunk) {
+    const auto kind = ResolveJitHleThunkCached(thunk).kind;
+    if (kind == JitHleThunkKind::ReturnZero) {
         return 1;
     }
-    if (kind == BackendBHleThunkKind::Native) {
+    if (kind == JitHleThunkKind::Native) {
         return 2;
     }
     return 0;
 }
 
-extern "C" int executor_backend_b_resolve_hle_thunk(const std::uint64_t thunk,
+extern "C" int executor_jit_resolve_hle_thunk(const std::uint64_t thunk,
                                                       std::uint64_t* native_function) {
     if (native_function != nullptr) {
         *native_function = 0;
     }
-    const auto& resolution = ResolveBackendBHleThunkCached(thunk);
-    if (resolution.kind == BackendBHleThunkKind::ReturnZero) {
+    const auto& resolution = ResolveJitHleThunkCached(thunk);
+    if (resolution.kind == JitHleThunkKind::ReturnZero) {
         return 1;
     }
-    if (resolution.kind == BackendBHleThunkKind::Native &&
+    if (resolution.kind == JitHleThunkKind::Native &&
         resolution.native_function != 0) {
         if (native_function != nullptr) {
             *native_function = resolution.native_function;
@@ -7671,25 +7722,25 @@ extern "C" int executor_backend_b_resolve_hle_thunk(const std::uint64_t thunk,
     return 0;
 }
 
-extern "C" int executor_backend_b_lookup_hle_thunk(const std::uint64_t thunk,
+extern "C" int executor_jit_lookup_hle_thunk(const std::uint64_t thunk,
                                                    std::uint64_t* native_function) {
     if (native_function == nullptr || thunk == 0) {
         return 0;
     }
-    const auto& resolution = ResolveBackendBHleThunkCached(thunk);
-    if (resolution.kind != BackendBHleThunkKind::Native || resolution.native_function == 0) {
+    const auto& resolution = ResolveJitHleThunkCached(thunk);
+    if (resolution.kind != JitHleThunkKind::Native || resolution.native_function == 0) {
         return 0;
     }
     *native_function = resolution.native_function;
     return 1;
 }
 
-extern "C" int executor_backend_b_lookup_leaf_hle_thunk(
+extern "C" int executor_jit_lookup_leaf_hle_thunk(
     const std::uint64_t thunk, std::uint64_t* native_function) {
     if (native_function == nullptr || thunk == 0) {
         return 0;
     }
-    const auto& resolution = ResolveBackendBHleThunkCached(thunk);
+    const auto& resolution = ResolveJitHleThunkCached(thunk);
     if (resolution.leaf_native_function == 0) {
         return 0;
     }
@@ -7697,8 +7748,8 @@ extern "C" int executor_backend_b_lookup_leaf_hle_thunk(
     return 1;
 }
 
-extern "C" int executor_backend_b_hle_thunk_returns_zero(const std::uint64_t thunk) {
-    return ResolveBackendBHleThunkCached(thunk).kind == BackendBHleThunkKind::ReturnZero ? 1 : 0;
+extern "C" int executor_jit_hle_thunk_returns_zero(const std::uint64_t thunk) {
+    return ResolveJitHleThunkCached(thunk).kind == JitHleThunkKind::ReturnZero ? 1 : 0;
 }
 
 using ExecutorFexRegisterGuestExecutableRangeFn = int (*)(std::uint64_t address,
@@ -8166,7 +8217,7 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x0f;
         code[cursor++] = 0x3f;
         const auto& hle_hash =
-            RuntimeGuestBackendBActive() ? ExecutorBackendBHleThunkHash : ExecutorFexHleThunkHash;
+            RuntimeGuestJitActive() ? ExecutorJitHleThunkHash : ExecutorFexHleThunkHash;
         std::memcpy(code + cursor, hle_hash.data(), hle_hash.size());
         cursor += hle_hash.size();
     }
@@ -8187,7 +8238,7 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_HLE_THUNK_MODE] mode=%s name=%s thunk=%p target=%p "
               "guest_exit=%d",
-              RuntimeGuestBackendBActive() ? "backend-b-native-marker-r1"
+              RuntimeGuestJitActive() ? "jit-native-marker-r1"
                                            : "fex-stack-or-pool-sideband-r3",
               name.c_str(), reinterpret_cast<void*>(thunk),
               reinterpret_cast<void*>(native_function), is_guest_exit ? 1 : 0);
@@ -8554,7 +8605,7 @@ static std::uint64_t ExecutorBuildManagedSpawnProbeWrapper(const std::size_t ind
 // pointer replaced by a transparent entry/return-counting wrapper.
 static int ExecutorInstallManagedSpawnProbe(void* seg_host, const std::size_t seg_size) {
     auto* bytes = static_cast<std::uint8_t*>(seg_host);
-    if (!ExecutorManagedSpawnProbeEnabled() || !RuntimeGuestBackendBRequestedOrActive()) {
+    if (!ExecutorManagedSpawnProbeEnabled() || !RuntimeGuestJitRequestedOrActive()) {
         return 0;
     }
     constexpr std::size_t kCompileEntryOff = 0x0e8080;
@@ -8851,9 +8902,9 @@ static void ExecutorStartManagedSpawnProbePoller() {
 }
 
 extern "C" int executor_lsx4_probe_env_newline_icall_table(std::uint64_t mono_base) {
-    if (RuntimeGuestBackendBRequestedOrActive()) {
+    if (RuntimeGuestJitRequestedOrActive()) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_ENV_NEWLINE_RET] backend-b-skip wrap base=0x%llx reason=use-native-mono-icall-table",
+                  "[EXECUTOR_ENV_NEWLINE_RET] jit-skip wrap base=0x%llx reason=use-native-mono-icall-table",
                   (unsigned long long)mono_base);
         return 0;
     }
@@ -9010,19 +9061,19 @@ static int ExecutorInstallMonoNameCacheBypass(void* seg_host, std::size_t seg_si
     return 0;
 }
 
-// Backend-B hot-path fix for Mono's metadata/name-cache code.  This mono build routes even the
-// two tiniest string primitives through imported libc PLT entries.  Under Backend B each such
+// JIT hot-path fix for Mono's metadata/name-cache code.  This mono build routes even the
+// two tiniest string primitives through imported libc PLT entries.  Under JIT each such
 // call crosses the guest/HLE boundary; get_class_from_name alone calls strlen twice on every
 // cache miss, and every successful string-key GHash lookup reaches g_str_equal -> strcmp HLE.
-// Replace those two exact, leaf semantics with guest x86 loops so Backend B lowers them to native
+// Replace those two exact, leaf semantics with guest x86 loops so JIT lowers them to native
 // AArch64 along with their callers.  This changes neither the hash-table layout nor lookup rules:
 // strlen still faults on an invalid pointer and g_str_equal still returns exactly strcmp(a,b)==0.
 //
-// The patch is deliberately tied to this mono-ps4 image by byte signatures.  Backend B's required
+// The patch is deliberately tied to this mono-ps4 image by byte signatures.  JIT's required
 // the normal fast guest-libc profile, run-mono-ghash-cycle-guard and run-box64-fast opt into it
 // automatically; run-mono-libc-string-fastpath is the narrow standalone A/B marker.
 static bool ExecutorMonoLibcStringFastpathEnabled() {
-    if (!RuntimeGuestBackendBActive()) {
+    if (!RuntimeGuestJitActive()) {
         return false;
     }
     static const bool on = [] {
@@ -9367,7 +9418,7 @@ static bool ExecutorMonoAotChainPolicySelfTest() {
 
 static int ExecutorInstallMonoAotClassNameChainGuard(void* seg_host, std::size_t seg_size) {
     auto* bytes = static_cast<std::uint8_t*>(seg_host);
-    if (!RuntimeGuestBackendBActive()) {
+    if (!RuntimeGuestJitActive()) {
         return 2;  // Backend A/reference path is intentionally untouched.
     }
     if (!bytes || !ExecutorMonoSetupImtPool() || !ExecutorMonoAotChainPolicySelfTest()) {
@@ -10788,7 +10839,7 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
     if (ExecutorMonoGHashCycleGuardEnabled()) {
         (void)ExecutorInstallGHashCycleGuard(seg_host, seg_size);
     }
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         (void)ExecutorInstallMonoAotClassNameChainGuard(seg_host, seg_size);
     }
     // CONFIRMED-ROOT FIX (2026-07-05): the class.c:2887 interface-offset assert is the FIRST fatal on
@@ -11875,7 +11926,7 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         //   class->vtable_size = cur_slot;
         //
         // The assignment is the stock continuation path and is exactly what a non-assert build
-        // would do. Backend B now reaches this during System.Reflection/_MemberInfo setup; the
+        // would do. JIT now reaches this during System.Reflection/_MemberInfo setup; the
         // same assert was also seen in older FEX artifacts, so this is not an opcode-coverage
         // failure. Demote this single debug check to release behavior by turning the post-cmp
         // JE into an unconditional JMP to the assignment block. Do not touch any other g_assert.
@@ -11943,7 +11994,7 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         }
         // MONO CURRENT-THREAD SPECIAL-STATIC RECOVERY (2026-06-23): get_current_thread_ptr_for_domain
         // expects mono_class_vtable_checked(System.Threading.Thread) to register Thread.current_thread in
-        // domain->special_static_fields. Backend B now reaches a PS4 Unity mono debug assert where that
+        // domain->special_static_fields. JIT now reaches a PS4 Unity mono debug assert where that
         // lookup returns offset=0:
         //
         //   offset = g_hash_table_lookup(domain->special_static_fields, current_thread_field);
@@ -12076,7 +12127,7 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         // asserts `klass->generic_container` while building reflection Type objects for generic
         // TypeDef classes. Source Mono initializes this field in the typedef setup path by calling
         // mono_metadata_load_generic_params(image, klass->type_token, NULL), then stores the owner
-        // klass and clears the anonymous-container bit. Backend B can reach reflection with a valid
+        // klass and clears the anonymous-container bit. JIT can reach reflection with a valid
         // generic TypeDef whose container was not materialized yet. Recreate that exact source path
         // on demand. Non-TypeDef or helper-failure cases fall through to the original assert.
         {
@@ -13339,8 +13390,8 @@ extern "C" void executor_mono_vcall_entry_dump() {
                         (unsigned long long)this_ptr, (unsigned long long)r11, pre.c_str());
 }
 
-// Register Backend-B guest stacks/TLS as Boehm GC roots. Boehm scans the native AArch64 stacks (and
-// therefore the current Backend-B LsxMachineImage/register spill), but it cannot discover references
+// Register JIT guest stacks/TLS as Boehm GC roots. Boehm scans the native AArch64 stacks (and
+// therefore the current JIT LsxMachineImage/register spill), but it cannot discover references
 // that exist only on the separate x86-64 guest stacks. Register only real guest stack/TLS ranges:
 // pinning the heap or disabling collection masks this boundary bug and eventually exhausts mspace.
 //
@@ -13360,13 +13411,13 @@ extern "C" void executor_lsx4_register_guest_gc_roots() {
     if (!guest_roots_enabled && !force_no_gc) {
         return;
     }
-    const bool backend_b_active = RuntimeGuestBackendBActive();
+    const bool jit_active = RuntimeGuestJitActive();
     static std::atomic<std::uint64_t> applied_generation{0};
-    static std::atomic<bool> applied_backend_b_active{false};
+    static std::atomic<bool> applied_jit_active{false};
     const std::uint64_t requested_generation =
         g_box64_guest_gc_roots_generation.load(std::memory_order_acquire);
     if (applied_generation.load(std::memory_order_acquire) == requested_generation &&
-        applied_backend_b_active.load(std::memory_order_acquire) == backend_b_active) {
+        applied_jit_active.load(std::memory_order_acquire) == jit_active) {
         return;
     }
     static std::mutex reg_mutex;
@@ -13375,7 +13426,7 @@ extern "C" void executor_lsx4_register_guest_gc_roots() {
     const std::uint64_t refresh_generation =
         g_box64_guest_gc_roots_generation.load(std::memory_order_acquire);
     if (applied_generation.load(std::memory_order_acquire) == refresh_generation &&
-        applied_backend_b_active.load(std::memory_order_acquire) == backend_b_active) {
+        applied_jit_active.load(std::memory_order_acquire) == jit_active) {
         return;
     }
     // Persistent file log (the early calls happen before the live-widechecks logcat capture window).
@@ -13484,7 +13535,7 @@ extern "C" void executor_lsx4_register_guest_gc_roots() {
         }
     }
     if (!guest_roots_enabled) {
-        applied_backend_b_active.store(backend_b_active, std::memory_order_release);
+        applied_jit_active.store(jit_active, std::memory_order_release);
         applied_generation.store(refresh_generation, std::memory_order_release);
         return;
     }
@@ -13497,10 +13548,10 @@ extern "C" void executor_lsx4_register_guest_gc_roots() {
         ranges.insert(ranges.end(), g_box64_guest_gc_sideband_ranges.begin(),
                       g_box64_guest_gc_sideband_ranges.end());
     }
-    if (backend_b_active) {
+    if (jit_active) {
         ranges.push_back(
-            {reinterpret_cast<std::uint64_t>(g_backend_b_gc_register_roots.data()),
-             sizeof(g_backend_b_gc_register_roots), "backend_b_gc_register_snapshots"});
+            {reinterpret_cast<std::uint64_t>(g_jit_gc_register_roots.data()),
+             sizeof(g_jit_gc_register_roots), "jit_gc_register_snapshots"});
     }
     // The mapped-entry boot path does not push the main Game:Main stack into the readable-ranges
     // vector; pull it straight from the boundary probe so the thread that builds the scene (and holds
@@ -13584,16 +13635,16 @@ extern "C" void executor_lsx4_register_guest_gc_roots() {
     }
     (void)Libraries::Kernel::posix_pthread_mutex_unlock(gc_root_mutex);
     if (refresh_complete) {
-        // Publish the backend bit first; the generation release is the clean-generation commit.
+        // Publish the JITit first; the generation release is the clean-generation commit.
         // If a range was added after our snapshot, its newer generation remains pending.
-        applied_backend_b_active.store(backend_b_active, std::memory_order_release);
+        applied_jit_active.store(jit_active, std::memory_order_release);
         applied_generation.store(refresh_generation, std::memory_order_release);
     }
 }
 
 extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const void* regs, const std::size_t regs_size) {
-    if (!ExecutorGcGuestRootsEnabled() || !RuntimeGuestBackendBActive() || regs == nullptr ||
+    if (!ExecutorGcGuestRootsEnabled() || !RuntimeGuestJitActive() || regs == nullptr ||
         regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
         return;
     }
@@ -13603,13 +13654,13 @@ extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const auto tid = static_cast<std::uint32_t>(
         std::hash<std::thread::id>{}(std::this_thread::get_id()));
 #endif
-    const std::size_t slot = tid % g_backend_b_gc_register_roots.size();
+    const std::size_t slot = tid % g_jit_gc_register_roots.size();
     // This function runs from the native signal bridge.  Avoid locks, allocation and logging.  A
     // simple fixed-size copy is sufficient because Mono does not begin its mark phase until all
     // target threads have acknowledged the stop signal.
     const auto* source = static_cast<const ExecutorBox64GuestRegsSnapshot*>(regs);
-    g_backend_b_gc_register_roots[slot] = *source;
-    g_backend_b_gc_register_root_tids[slot].store(tid, std::memory_order_release);
+    g_jit_gc_register_roots[slot] = *source;
+    g_jit_gc_register_root_tids[slot].store(tid, std::memory_order_release);
 }
 
 // Disable Boehm GC collection via two load-time code byte-patches (verified unique + decoded with
@@ -19799,7 +19850,7 @@ std::uint64_t DoubleToXmmLow64(const double value) {
     return raw;
 }
 
-std::uint64_t HashBackendBCacheExecutable(const std::filesystem::path& path) {
+std::uint64_t HashJitCacheExecutable(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         return 0;
@@ -19821,7 +19872,7 @@ std::uint64_t HashBackendBCacheExecutable(const std::filesystem::path& path) {
     return file.bad() ? 0 : fingerprint.Finish();
 }
 
-std::uint64_t HashBackendBCacheExecutableMemoized(
+std::uint64_t HashJitCacheExecutableMemoized(
     const std::filesystem::path& path, const std::filesystem::path& memo_path,
     bool& memo_hit) {
     memo_hit = false;
@@ -19861,7 +19912,7 @@ std::uint64_t HashBackendBCacheExecutableMemoized(
         }
     }
 
-    const std::uint64_t full_hash = HashBackendBCacheExecutable(path);
+    const std::uint64_t full_hash = HashJitCacheExecutable(path);
     if (full_hash == 0) {
         return 0;
     }
@@ -19885,7 +19936,7 @@ std::uint64_t HashBackendBCacheExecutableMemoized(
     return full_hash;
 }
 
-std::string BackendBCacheTitleId(const std::filesystem::path& app0_path,
+std::string JitCacheTitleId(const std::filesystem::path& app0_path,
                                  const std::filesystem::path& launch_path,
                                  const std::uint64_t executable_fingerprint) {
     const auto param_path = app0_path / "sce_sys" / "param.sfo";
@@ -19921,43 +19972,43 @@ std::string BackendBCacheTitleId(const std::filesystem::path& app0_path,
     return fallback.str();
 }
 
-void ConfigureBackendBPersistentCacheForLaunch(
-    const bool backend_b_launch, const std::filesystem::path& app0_path,
+void ConfigureJitPersistentCacheForLaunch(
+    const bool jit_launch, const std::filesystem::path& app0_path,
     const std::filesystem::path& executable_path) {
-    if (!backend_b_launch) {
-        Executor::BackendB::ConfigurePersistentBlockCache({}, {}, 0, false);
+    if (!jit_launch) {
+        Executor::Jit::ConfigurePersistentBlockCache({}, {}, 0, false);
         return;
     }
 
     const auto cache_marker =
-        std::filesystem::path(g_root) / "run-backend-b-persistent-jit-cache";
+        std::filesystem::path(g_root) / "run-jit-persistent-jit-cache";
     const bool cache_enabled = std::filesystem::is_regular_file(cache_marker);
-    // The upstream shader/pipeline archive is the other half of a useful warm launch. Backend B
+    // The upstream shader/pipeline archive is the other half of a useful warm launch. JIT
     // block caching without it still recompiles SPIR-V and Adreno VkPipelines synchronously at
     // every scene transition. Tie both universal caches to the same user-facing cache switch.
     Config::setPipelineCacheEnabled(cache_enabled);
     Config::setPipelineCacheArchived(false);
     const auto fingerprint_begin = std::chrono::steady_clock::now();
     const std::string preliminary_title =
-        BackendBCacheTitleId(app0_path, executable_path, 0);
+        JitCacheTitleId(app0_path, executable_path, 0);
     const auto fingerprint_memo = std::filesystem::path(g_root) / "cache" /
-                                  "backend-b-fingerprints" /
+                                  "jit-fingerprints" /
                                   (preliminary_title + ".txt");
     bool fingerprint_memo_hit = false;
     const std::uint64_t executable_fingerprint = cache_enabled
-        ? HashBackendBCacheExecutableMemoized(executable_path, fingerprint_memo,
+        ? HashJitCacheExecutableMemoized(executable_path, fingerprint_memo,
                                               fingerprint_memo_hit)
         : 0;
     const std::string cache_title =
-        BackendBCacheTitleId(app0_path, executable_path, executable_fingerprint);
-    Executor::BackendB::ConfigurePersistentBlockCache(
+        JitCacheTitleId(app0_path, executable_path, executable_fingerprint);
+    Executor::Jit::ConfigurePersistentBlockCache(
         g_root, cache_title, executable_fingerprint,
         cache_enabled && executable_fingerprint != 0);
     const auto fingerprint_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - fingerprint_begin)
                                     .count();
     NativeLog(ANDROID_LOG_INFO,
-              "[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_CONFIG] enabled=%d marker=%s "
+              "[EXECUTOR_JIT_PERSISTENT_CACHE_CONFIG] enabled=%d marker=%s "
               "title=%s executableHash=0x%llx fingerprintMs=%lld fingerprintMemo=%s "
               "pipelineCache=%d executable=%s",
               cache_enabled && executable_fingerprint != 0 ? 1 : 0,
@@ -20788,9 +20839,9 @@ bool EnsureMappedEntryProcessBootstrap(std::string& error) {
 }
 
 extern "C" int executor_lsx4_android_run_guest_once(void* once_control, void* init_routine) {
-    const bool backend_b_active = RuntimeGuestBackendBActive();
+    const bool jit_active = RuntimeGuestJitActive();
     const bool box64_active = g_box64_guest_entry_active.load(std::memory_order_acquire);
-    if ((!backend_b_active && !box64_active) || init_routine == nullptr) {
+    if ((!jit_active && !box64_active) || init_routine == nullptr) {
         return 0;
     }
 
@@ -20819,12 +20870,12 @@ extern "C" int executor_lsx4_android_run_guest_once(void* once_control, void* in
     // PC shadPS4 calls the x86-64 init routine directly because guest and host share an ISA.
     // Android must preserve the same synchronous pthread_once contract while crossing the ISA
     // boundary.  In particular, never fall through to `init_routine()` below pthread.cpp when
-    // Backend B owns the guest: that would execute an x86-64 text address as AArch64 and end in
+    // JIT owns the guest: that would execute an x86-64 text address as AArch64 and end in
     // UNREACHABLE/SIGTRAP.  Use the same mapped-function path as guest callbacks and destructors.
-    if (backend_b_active) {
+    if (jit_active) {
         try {
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_GUEST_ONCE] running guest pthread_once through Backend B "
+                      "[EXECUTOR_GUEST_ONCE] running guest pthread_once through JIT "
                       "once=%p init=%p offset=0x%llx stack=0x%llx size=0x%llx tcb=0x%llx",
                       once_control, init_routine,
                       static_cast<unsigned long long>(GuestModuleOffset(*module, init_address)),
@@ -20832,20 +20883,20 @@ extern "C" int executor_lsx4_android_run_guest_once(void* once_control, void* in
                       static_cast<unsigned long long>(stack_size),
                       static_cast<unsigned long long>(tcb_base));
             const std::uint64_t result =
-                RunBackendBMappedFunction(init_address, {}, tcb_base, stack_base, stack_size);
+                RunJitMappedFunction(init_address, {}, tcb_base, stack_base, stack_size);
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_GUEST_ONCE] Backend B pthread_once init result=0x%llx",
+                      "[EXECUTOR_GUEST_ONCE] JIT pthread_once init result=0x%llx",
                       static_cast<unsigned long long>(result));
             return 1;
         } catch (const std::exception& e) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_ONCE] Backend B pthread_once exception once=%p init=%p "
+                      "[EXECUTOR_GUEST_ONCE] JIT pthread_once exception once=%p init=%p "
                       "what=%s",
                       once_control, init_routine, e.what());
             return -1;
         } catch (...) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_ONCE] Backend B pthread_once exception once=%p init=%p "
+                      "[EXECUTOR_GUEST_ONCE] JIT pthread_once exception once=%p init=%p "
                       "what=unknown",
                       once_control, init_routine);
             return -1;
@@ -20921,18 +20972,18 @@ extern "C" int executor_lsx4_android_run_guest_callback(void* callback, void* ar
     }
 
     // TLS destructors and other pthread cleanup hooks run after the guest start routine has
-    // returned, so the process-entry-active flag is already false. Backend B still owns the same
+    // returned, so the process-entry-active flag is already false. JIT still owns the same
     // native pthread, TCB and thread-local guest-stack arena; route the callback through that
     // mapped-function boundary instead of rejecting every Mono destructor as `no_backend`.
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         try {
-            const std::uint64_t result = RunBackendBMappedFunction(
+            const std::uint64_t result = RunJitMappedFunction(
                 callback_address, {reinterpret_cast<std::uint64_t>(arg)},
                 reinterpret_cast<std::uint64_t>(guest_thread->tcb), 0, 0);
             static std::atomic_int callback_trace_budget{8};
             if (callback_trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                 NativeLog(ANDROID_LOG_INFO,
-                          "[EXECUTOR_GUEST_CALLBACK] stage=backend_b_done reason=%s callback=%p "
+                          "[EXECUTOR_GUEST_CALLBACK] stage=jit_done reason=%s callback=%p "
                           "arg=%p result=0x%llx thread=%p name=%s",
                           reason ? reason : "<unknown>", callback, arg,
                           static_cast<unsigned long long>(result),
@@ -20941,13 +20992,13 @@ extern "C" int executor_lsx4_android_run_guest_callback(void* callback, void* ar
             return 1;
         } catch (const std::exception& e) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_CALLBACK] result=backend_b_exception reason=%s "
+                      "[EXECUTOR_GUEST_CALLBACK] result=jit_exception reason=%s "
                       "callback=%p arg=%p what=%s",
                       reason ? reason : "<unknown>", callback, arg, e.what());
             return -1;
         } catch (...) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_CALLBACK] result=backend_b_exception reason=%s "
+                      "[EXECUTOR_GUEST_CALLBACK] result=jit_exception reason=%s "
                       "callback=%p arg=%p what=unknown",
                       reason ? reason : "<unknown>", callback, arg);
             return -1;
@@ -21048,34 +21099,34 @@ executor_lsx4_android_run_guest_callback6(
         return -1;
     }
 
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         const auto tcb_base = reinterpret_cast<std::uint64_t>(guest_thread->tcb);
         try {
             std::uint64_t result = 0;
             switch (arg_count) {
             case 0:
-                result = RunBackendBMappedFunction(callback_address, {}, tcb_base);
+                result = RunJitMappedFunction(callback_address, {}, tcb_base);
                 break;
             case 1:
-                result = RunBackendBMappedFunction(callback_address, {arg0}, tcb_base);
+                result = RunJitMappedFunction(callback_address, {arg0}, tcb_base);
                 break;
             case 2:
-                result = RunBackendBMappedFunction(callback_address, {arg0, arg1}, tcb_base);
+                result = RunJitMappedFunction(callback_address, {arg0, arg1}, tcb_base);
                 break;
             case 3:
                 result =
-                    RunBackendBMappedFunction(callback_address, {arg0, arg1, arg2}, tcb_base);
+                    RunJitMappedFunction(callback_address, {arg0, arg1, arg2}, tcb_base);
                 break;
             case 4:
-                result = RunBackendBMappedFunction(callback_address, {arg0, arg1, arg2, arg3},
+                result = RunJitMappedFunction(callback_address, {arg0, arg1, arg2, arg3},
                                                    tcb_base);
                 break;
             case 5:
-                result = RunBackendBMappedFunction(
+                result = RunJitMappedFunction(
                     callback_address, {arg0, arg1, arg2, arg3, arg4}, tcb_base);
                 break;
             case 6:
-                result = RunBackendBMappedFunction(
+                result = RunJitMappedFunction(
                     callback_address, {arg0, arg1, arg2, arg3, arg4, arg5}, tcb_base);
                 break;
             default:
@@ -21089,7 +21140,7 @@ executor_lsx4_android_run_guest_callback6(
                 completed_count.fetch_add(1, std::memory_order_relaxed) + 1;
             if (completed <= 8 || (completed & (completed - 1)) == 0) {
                 NativeLog(ANDROID_LOG_INFO,
-                          "[EXECUTOR_GUEST_CALLBACK6] stage=backend_b_done count=%llu reason=%s "
+                          "[EXECUTOR_GUEST_CALLBACK6] stage=jit_done count=%llu reason=%s "
                           "callback=%p offset=0x%llx argCount=%u result=0x%llx thread=%p name=%s",
                           static_cast<unsigned long long>(completed),
                           reason ? reason : "<unknown>", callback,
@@ -21101,14 +21152,14 @@ executor_lsx4_android_run_guest_callback6(
             return 1;
         } catch (const std::exception& e) {
             NativeLog(ANDROID_LOG_ERROR,
-                       "[EXECUTOR_GUEST_CALLBACK6] result=backend_b_exception reason=%s "
+                       "[EXECUTOR_GUEST_CALLBACK6] result=jit_exception reason=%s "
                        "callback=%p argCount=%u thread=%p name=%s what=%s",
                        reason ? reason : "<unknown>", callback, arg_count,
                        static_cast<const void*>(guest_thread), guest_thread->name.c_str(), e.what());
             return -10;
         } catch (...) {
             NativeLog(ANDROID_LOG_ERROR,
-                       "[EXECUTOR_GUEST_CALLBACK6] result=backend_b_exception reason=%s "
+                       "[EXECUTOR_GUEST_CALLBACK6] result=jit_exception reason=%s "
                        "callback=%p argCount=%u thread=%p name=%s what=unknown",
                        reason ? reason : "<unknown>", callback, arg_count,
                        static_cast<const void*>(guest_thread), guest_thread->name.c_str());
@@ -21118,7 +21169,7 @@ executor_lsx4_android_run_guest_callback6(
 
     // The legacy embed primitive has a three-argument signal-call ABI. It is sufficient for
     // callbacks with <=3 arguments; wider callbacks remain fail-closed instead of ever jumping
-    // into x86 text natively. Backend B, the Android production path, handles all six register
+    // into x86 text natively. JIT, the Android production path, handles all six register
     // arguments above.
     if (arg_count <= 3 && g_box64_run_guest_signal_handler != nullptr) {
         return g_box64_run_guest_signal_handler(callback_address, arg0, arg1, arg2, result_out) == 0
@@ -21901,7 +21952,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                   arg, name ? name : "<unnamed>", module->file.string().c_str());
     }
 
-    if (!RuntimeGuestBackendBActive() && !g_box64_run_mapped_function) {
+    if (!RuntimeGuestJitActive() && !g_box64_run_mapped_function) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] Box64 mapped-function ABI unavailable; start=%p arg=%p name=%s",
                   start_routine, arg, name ? name : "<unnamed>");
@@ -21995,7 +22046,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
     std::uint64_t thread_arg_q0 = 0;
     std::uint64_t thread_arg_q14 = 0;
     if (is_unity_pthread_wrapper) {
-        const bool backend_b_active = RuntimeGuestBackendBActive();
+        const bool jit_active = RuntimeGuestJitActive();
         const auto arg_base = reinterpret_cast<std::uint64_t>(arg);
         constexpr std::uint64_t kUnityPthreadWrapperCookie = 0x2bc;
         for (int attempt = 0; attempt < 64; ++attempt) {
@@ -22011,7 +22062,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
             std::this_thread::sleep_for(std::chrono::microseconds(250));
         }
 
-        if (!backend_b_active) {
+        if (!jit_active) {
             const std::uint64_t expected_q2 = reinterpret_cast<std::uint64_t>(guest_thread);
             if (expected_q2 != 0 && thread_arg_q2 != expected_q2 &&
                 GuestWriteQwordBestEffortLocked(arg_base + 0x10, expected_q2)) {
@@ -22026,7 +22077,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
             }
         }
         const bool bulk_repair_enabled =
-            !backend_b_active && UnityPreloadBulkPcContractRepairEnabled();
+            !jit_active && UnityPreloadBulkPcContractRepairEnabled();
         if (bulk_repair_enabled) {
             (void)RepairUnityPreloadControlBlockForPcContract(arg_base, name);
         }
@@ -22035,7 +22086,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         (void)GuestReadQwordBestEffortLocked(arg_base + 0x70, thread_arg_q14);
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD_ARG_MATERIALIZE] name=%s arg=%p q0=0x%llx "
-                  "q1=0x%llx q2=0x%llx q3=0x%llx q14=0x%llx backendB=%d "
+                  "q1=0x%llx q2=0x%llx q3=0x%llx q14=0x%llx jit=%d "
                   "bulkRepairEnabled=%d",
                   name ? name : "<unnamed>", arg,
                   static_cast<unsigned long long>(thread_arg_q0),
@@ -22043,7 +22094,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                   static_cast<unsigned long long>(thread_arg_q2),
                   static_cast<unsigned long long>(thread_arg_q3),
                   static_cast<unsigned long long>(thread_arg_q14),
-                  backend_b_active ? 1 : 0,
+                  jit_active ? 1 : 0,
                   bulk_repair_enabled ? 1 : 0);
         if (bulk_repair_enabled) {
             (void)RepairUnityPreloadMainDataWorkItemForPcContract(arg_base, name);
@@ -22070,11 +22121,11 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                   static_cast<unsigned long long>(thread_arg_q3));
     }
 
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         try {
             if (trace_guest_thread) {
                 NativeLog(ANDROID_LOG_INFO,
-                          "[EXECUTOR_GUEST_THREAD_BACKEND_B] run thread=%p start=%p off=0x%llx "
+                          "[EXECUTOR_GUEST_THREAD_JIT] run thread=%p start=%p off=0x%llx "
                           "arg=%p name=%s module=%s route=%s pthread_abi=%s entry_params=%p "
                           "proc_param=%p stack=%p size=0x%llx tcb=%p threadArgQ1=0x%llx "
                           "threadArgQ3=0x%llx",
@@ -22093,28 +22144,28 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
             }
             const std::uint64_t result =
                 is_unity_pthread_wrapper
-                    ? RunBackendBMappedFunction(start_address,
+                    ? RunJitMappedFunction(start_address,
                                                 {reinterpret_cast<std::uint64_t>(arg),
                                                  request.entry_params, request.proc_param},
                                                 tcb_base, stack_base, stack_size)
-                    : RunBackendBMappedFunction(start_address,
+                    : RunJitMappedFunction(start_address,
                                                 {reinterpret_cast<std::uint64_t>(arg)}, tcb_base,
                                                 stack_base, stack_size);
             if (trace_guest_thread) {
                 NativeLog(ANDROID_LOG_INFO,
-                          "[EXECUTOR_GUEST_THREAD_BACKEND_B] result thread=%p start=%p rc=0x%llx",
+                          "[EXECUTOR_GUEST_THREAD_JIT] result thread=%p start=%p rc=0x%llx",
                           thread, start_routine, static_cast<unsigned long long>(result));
             }
             return reinterpret_cast<void*>(static_cast<std::uintptr_t>(result));
         } catch (const std::exception& e) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_THREAD_BACKEND_B] exception thread=%p start=%p "
+                      "[EXECUTOR_GUEST_THREAD_JIT] exception thread=%p start=%p "
                       "arg=%p name=%s what=%s",
                       thread, start_routine, arg, name ? name : "<unnamed>", e.what());
             return nullptr;
         } catch (...) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_THREAD_BACKEND_B] exception thread=%p start=%p "
+                      "[EXECUTOR_GUEST_THREAD_JIT] exception thread=%p start=%p "
                       "arg=%p name=%s what=unknown",
                       thread, start_routine, arg, name ? name : "<unnamed>");
             return nullptr;
@@ -22176,7 +22227,7 @@ extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
                   module_path.c_str(), module_filename.c_str());
     }
 
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         // Match Core::Module::Start: PS4 DT_INIT is the module entry point.  It owns any
         // constructor-array dispatch and returns the module-start result.  Running the arrays
         // separately here both diverged from desktop shadPS4 and could initialize a PRX twice.
@@ -22188,7 +22239,7 @@ extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
                 ? reinterpret_cast<std::uint64_t>(current_thread->tcb)
                 : 0;
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_MODULE_START_BACKEND_B] run path=%s function=%p off=0x%llx "
+                  "[EXECUTOR_MODULE_START_JIT] run path=%s function=%p off=0x%llx "
                   "args=0x%llx argp=%p param=%p tcb=%p route=%s",
                   module->file.string().c_str(),
                   reinterpret_cast<void*>(function),
@@ -22196,7 +22247,7 @@ extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
                   static_cast<unsigned long long>(args), argp, param,
                   reinterpret_cast<void*>(tcb_base), RuntimeGuestBackendName());
         try {
-            const std::uint64_t guest_result = RunBackendBMappedFunction(
+            const std::uint64_t guest_result = RunJitMappedFunction(
                 function,
                 {args, reinterpret_cast<std::uint64_t>(argp),
                  reinterpret_cast<std::uint64_t>(param)},
@@ -22205,19 +22256,19 @@ extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
                 *result_out = static_cast<std::int32_t>(guest_result);
             }
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_MODULE_START_BACKEND_B] result path=%s transportRc=1 "
+                      "[EXECUTOR_MODULE_START_JIT] result path=%s transportRc=1 "
                       "guestResult=0x%llx",
                       module->file.string().c_str(),
                       static_cast<unsigned long long>(guest_result));
             return 1;
         } catch (const std::exception& e) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_MODULE_START_BACKEND_B] exception path=%s function=%p what=%s",
+                      "[EXECUTOR_MODULE_START_JIT] exception path=%s function=%p what=%s",
                       module->file.string().c_str(), reinterpret_cast<void*>(function), e.what());
             return -10;
         } catch (...) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_MODULE_START_BACKEND_B] exception path=%s function=%p "
+                      "[EXECUTOR_MODULE_START_JIT] exception path=%s function=%p "
                       "what=unknown",
                       module->file.string().c_str(), reinterpret_cast<void*>(function));
             return -11;
@@ -22403,9 +22454,9 @@ extern "C" int executor_lsx4_android_run_main_entry(std::uint64_t entry_addr,
                   params, exit_func, RuntimeGuestBackendName());
         return -1;
     }
-    if (!RuntimeGuestBackendBActive()) {
+    if (!RuntimeGuestJitActive()) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_MAIN_ENTRY_BACKEND] result=not_backend_b_route entry=%p params=%p "
+                  "[EXECUTOR_MAIN_ENTRY_BACKEND] result=not_jit_route entry=%p params=%p "
                   "exit=%p route=%s",
                   reinterpret_cast<void*>(entry_addr), params, exit_func,
                   RuntimeGuestBackendName());
@@ -22414,23 +22465,23 @@ extern "C" int executor_lsx4_android_run_main_entry(std::uint64_t entry_addr,
 
     try {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_MAIN_ENTRY_BACKEND_B] run entry=%p params=%p exit=%p",
+                  "[EXECUTOR_MAIN_ENTRY_JIT] run entry=%p params=%p exit=%p",
                   reinterpret_cast<void*>(entry_addr), params, exit_func);
-        const std::uint64_t result = RunBackendBMappedFunction(
+        const std::uint64_t result = RunJitMappedFunction(
             entry_addr,
             {reinterpret_cast<std::uint64_t>(params), reinterpret_cast<std::uint64_t>(exit_func)});
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_MAIN_ENTRY_BACKEND_B] result entry=%p rc=0x%llx",
+                  "[EXECUTOR_MAIN_ENTRY_JIT] result entry=%p rc=0x%llx",
                   reinterpret_cast<void*>(entry_addr), static_cast<unsigned long long>(result));
         return static_cast<int>(result);
     } catch (const std::exception& e) {
         NativeLog(ANDROID_LOG_ERROR,
-                  "[EXECUTOR_MAIN_ENTRY_BACKEND_B] exception entry=%p params=%p what=%s",
+                  "[EXECUTOR_MAIN_ENTRY_JIT] exception entry=%p params=%p what=%s",
                   reinterpret_cast<void*>(entry_addr), params, e.what());
         return -10;
     } catch (...) {
         NativeLog(ANDROID_LOG_ERROR,
-                  "[EXECUTOR_MAIN_ENTRY_BACKEND_B] exception entry=%p params=%p what=unknown",
+                  "[EXECUTOR_MAIN_ENTRY_JIT] exception entry=%p params=%p what=unknown",
                   reinterpret_cast<void*>(entry_addr), params);
         return -11;
     }
@@ -22444,31 +22495,31 @@ executor_lsx4_android_register_box64_module_segments(void* module_ptr) {
 }
 
 extern "C" __attribute__((visibility("default"), used)) bool
-executor_lsx4_android_backend_b_active() {
-    return RuntimeGuestBackendBActive();
+executor_lsx4_android_jit_active() {
+    return RuntimeGuestJitActive();
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_register_guest_signal_handler(int signum,
                                                        std::uint64_t handler,
                                                        int flags) {
-    if (RuntimeGuestBackendBActive()) {
-        if (signum < 0 || static_cast<std::size_t>(signum) >= g_backend_b_signal_handlers.size()) {
+    if (RuntimeGuestJitActive()) {
+        if (signum < 0 || static_cast<std::size_t>(signum) >= g_jit_signal_handlers.size()) {
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=register_guest_signal "
-                      "result=backend_b_invalid_signum signum=%d handler=%p flags=0x%x",
+                      "result=jit_invalid_signum signum=%d handler=%p flags=0x%x",
                       signum, reinterpret_cast<void*>(handler), flags);
             return -2;
         }
         {
-            std::lock_guard lock(g_backend_b_signal_lock);
-            auto& slot = g_backend_b_signal_handlers[static_cast<std::size_t>(signum)];
+            std::lock_guard lock(g_jit_signal_lock);
+            auto& slot = g_jit_signal_handlers[static_cast<std::size_t>(signum)];
             slot.handler = handler;
             slot.flags = flags;
         }
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=register_guest_signal "
-                  "result=backend_b_register_ok signum=%d handler=%p flags=0x%x",
+                  "result=jit_register_ok signum=%d handler=%p flags=0x%x",
                   signum, reinterpret_cast<void*>(handler), flags);
         return 0;
     }
@@ -22489,10 +22540,10 @@ executor_lsx4_android_register_guest_signal_handler(int signum,
 
 extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_queue_guest_signal(std::uintptr_t pthread_handle, int signum) {
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=queue_guest_signal "
-                  "result=backend_b_defer_to_safe_point pthread=0x%zx signum=%d",
+                  "result=jit_defer_to_safe_point pthread=0x%zx signum=%d",
                   static_cast<std::size_t>(pthread_handle), signum);
         return -11;
     }
@@ -22525,10 +22576,10 @@ executor_lsx4_android_queue_guest_signal_for_thread(void* guest_thread,
                   rc, guest_thread, static_cast<std::size_t>(pthread_handle), signum);
         return rc;
     }
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=queue_guest_signal_for_thread "
-                  "result=backend_b_defer_to_safe_point guestThread=%p pthread=0x%zx signum=%d",
+                  "result=jit_defer_to_safe_point guestThread=%p pthread=0x%zx signum=%d",
                   guest_thread, static_cast<std::size_t>(pthread_handle), signum);
         return -11;
     }
@@ -22552,10 +22603,10 @@ executor_lsx4_android_queue_guest_signal_for_thread_context(void* guest_thread,
                   static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rsp));
         return rc;
     }
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=queue_guest_signal_for_thread_context "
-                  "result=backend_b_defer_to_safe_point guestThread=%p pthread=0x%zx signum=%d "
+                  "result=jit_defer_to_safe_point guestThread=%p pthread=0x%zx signum=%d "
                   "rip=0x%llx rsp=0x%llx",
                   guest_thread, static_cast<std::size_t>(pthread_handle), signum,
                   static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rsp));
@@ -22571,11 +22622,11 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
                                                   std::uint64_t arg1,
                                                   std::uint64_t arg2,
                                                   std::uint64_t* guest_result) {
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         if (handler == 0) {
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=run_guest_signal "
-                      "result=backend_b_null_handler arg0=0x%llx arg1=0x%llx arg2=0x%llx",
+                      "result=jit_null_handler arg0=0x%llx arg1=0x%llx arg2=0x%llx",
                       static_cast<unsigned long long>(arg0),
                       static_cast<unsigned long long>(arg1),
                       static_cast<unsigned long long>(arg2));
@@ -22588,7 +22639,7 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
                 : 0;
         try {
             const std::uint64_t result =
-                RunBackendBMappedFunction(handler, {arg0, arg1, arg2}, tcb_base, 0);
+                RunJitMappedFunction(handler, {arg0, arg1, arg2}, tcb_base, 0);
             if (guest_result != nullptr) {
                 *guest_result = result;
             }
@@ -22596,7 +22647,7 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
             if (signal_success_trace_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                 NativeLog(ANDROID_LOG_INFO,
                           "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=run_guest_signal "
-                          "result=backend_b_run_ok handler=%p arg0=0x%llx arg1=0x%llx arg2=0x%llx "
+                          "result=jit_run_ok handler=%p arg0=0x%llx arg1=0x%llx arg2=0x%llx "
                           "guestResult=0x%llx tcb=0x%llx thread=%p",
                           reinterpret_cast<void*>(handler),
                           static_cast<unsigned long long>(arg0),
@@ -22608,11 +22659,11 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
             }
             return 0;
         } catch (const std::exception& e) {
-            RecordBackendBSignalBridgeFailure("mapped_function_exception", handler, arg0, arg1,
+            RecordJitSignalBridgeFailure("mapped_function_exception", handler, arg0, arg1,
                                               arg2, e.what());
             NativeLog(ANDROID_LOG_ERROR,
                       "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=run_guest_signal "
-                      "result=backend_b_exception handler=%p arg0=0x%llx arg1=0x%llx arg2=0x%llx "
+                      "result=jit_exception handler=%p arg0=0x%llx arg1=0x%llx arg2=0x%llx "
                       "what=%s",
                       reinterpret_cast<void*>(handler),
                       static_cast<unsigned long long>(arg0),
@@ -22620,11 +22671,11 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
                       static_cast<unsigned long long>(arg2), e.what());
             return -10;
         } catch (...) {
-            RecordBackendBSignalBridgeFailure("mapped_function_unknown_exception", handler,
+            RecordJitSignalBridgeFailure("mapped_function_unknown_exception", handler,
                                               arg0, arg1, arg2, "unknown");
             NativeLog(ANDROID_LOG_ERROR,
                       "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=run_guest_signal "
-                      "result=backend_b_exception handler=%p arg0=0x%llx arg1=0x%llx arg2=0x%llx "
+                      "result=jit_exception handler=%p arg0=0x%llx arg1=0x%llx arg2=0x%llx "
                       "what=unknown",
                       reinterpret_cast<void*>(handler),
                       static_cast<unsigned long long>(arg0),
@@ -22658,7 +22709,7 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
 // Lightweight synchronous guest-callback bridge for HOT paths (Mono metadata bsearch comparator).
 // Runs a guest int(const void*, const void*) INLINE on the current guest thread with a warm JIT,
 // no per-call thread/mmap/log. Mirrors the run_guest_signal_handler bridge but with the cheap
-// callback ABI. When Backend B is active it routes through the same exception-safe mapped-function
+// callback ABI. When JIT is active it routes through the same exception-safe mapped-function
 // path (2 args) so no throw escapes; otherwise it uses the embed's inline primitive.
 extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_run_guest_comparator(std::uint64_t func, std::uint64_t arg0,
@@ -22666,7 +22717,7 @@ executor_lsx4_android_run_guest_comparator(std::uint64_t func, std::uint64_t arg
     if (result_lo != nullptr) {
         *result_lo = 0;
     }
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         if (func == 0) {
             return -2;
         }
@@ -22677,19 +22728,19 @@ executor_lsx4_android_run_guest_comparator(std::uint64_t func, std::uint64_t arg
                 : 0;
         try {
             const std::uint64_t result =
-                RunBackendBMappedFunction(func, {arg0, arg1, 0}, tcb_base, 0);
+                RunJitMappedFunction(func, {arg0, arg1, 0}, tcb_base, 0);
             if (result_lo != nullptr) {
                 *result_lo = result;
             }
             return 0;
         } catch (const std::exception& e) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_LIVE_CALLBACK_BRIDGE] result=backend_b_exception func=%p what=%s",
+                      "[EXECUTOR_LIVE_CALLBACK_BRIDGE] result=jit_exception func=%p what=%s",
                       reinterpret_cast<void*>(func), e.what());
             return -10;
         } catch (...) {
             NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_LIVE_CALLBACK_BRIDGE] result=backend_b_exception func=%p "
+                      "[EXECUTOR_LIVE_CALLBACK_BRIDGE] result=jit_exception func=%p "
                       "what=unknown",
                       reinterpret_cast<void*>(func));
             return -11;
@@ -22721,17 +22772,17 @@ executor_lsx4_android_get_current_guest_regs(void* out, std::size_t out_size) {
 
 extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_size) {
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         if (regs == nullptr || regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
             return -2;
         }
-        auto* state = Executor::BackendB::CurrentMachineImage();
+        auto* state = Executor::Jit::CurrentMachineImage();
         if (state == nullptr) {
             return -1;
         }
         ExecutorBox64GuestRegsSnapshot snapshot{};
         std::memcpy(&snapshot, regs, sizeof(snapshot));
-        RestoreBackendBStateFromBox64Regs(*state, snapshot);
+        RestoreJitStateFromBox64Regs(*state, snapshot);
         return 0;
     }
     if (!g_box64_set_current_guest_regs) {
@@ -22740,14 +22791,14 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
     return g_box64_set_current_guest_regs(regs, regs_size);
 }
 
-extern "C" void executor_backend_b_dump_thread_states(const char* reason);
+extern "C" void executor_jit_dump_thread_states(const char* reason);
 
 extern "C" __attribute__((visibility("default"), used)) void
 executor_lsx4_android_dump_box64_emu_states(const char* reason) {
-    if (RuntimeGuestBackendBActive()) {
-        executor_backend_b_dump_thread_states(reason ? reason : "<none>");
+    if (RuntimeGuestJitActive()) {
+        executor_jit_dump_thread_states(reason ? reason : "<none>");
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_BACKEND_B_THREAD_DUMP_BRIDGE] reason=%s result=0",
+                  "[EXECUTOR_JIT_THREAD_DUMP_BRIDGE] reason=%s result=0",
                   reason ? reason : "<none>");
         return;
     }
@@ -22944,10 +22995,10 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto mono_workaround_sentinel =
         std::filesystem::path(g_root) / "run-live-mono-workaround";
     if (std::filesystem::exists(mono_workaround_sentinel)) {
-        const bool backend_b_route = RuntimeGuestBackendBRequestedOrActive();
+        const bool jit_route = RuntimeGuestJitRequestedOrActive();
         setenv("MONO_DEBUG", "explicit-null-checks", 1);
         setenv("MONO_THREADS_SUSPEND", "coop", 1);
-        if (backend_b_route) {
+        if (jit_route) {
             unsetenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS");
             unsetenv("EXECUTOR_FEX_PS4_SIGNAL_FRAME");
             unsetenv("EXECUTOR_FEX_SIGUSR1_GUEST_SIGNUM");
@@ -22960,8 +23011,8 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   mono_workaround_sentinel.string().c_str(),
                  std::getenv("MONO_DEBUG") ? std::getenv("MONO_DEBUG") : "",
                  std::getenv("MONO_THREADS_SUSPEND") ? std::getenv("MONO_THREADS_SUSPEND") : "",
-                 backend_b_route ? "backend-b-aarch64-jit" : "box64-fex",
-                 backend_b_route ? "lsx4-backend-b" : "fex-signal-delegator",
+                 jit_route ? "jit-aarch64-jit" : "box64-fex",
+                 jit_route ? "lsx4-jit" : "fex-signal-delegator",
                  std::getenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS")
                      ? std::getenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS")
                      : "");
@@ -23019,12 +23070,12 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto mono_signal_deliver_sentinel =
         std::filesystem::path(g_root) / "run-live-mono-signal-deliver";
     if (std::filesystem::exists(mono_signal_deliver_sentinel)) {
-        const bool backend_b_route = RuntimeGuestBackendBRequestedOrActive();
+        const bool jit_route = RuntimeGuestJitRequestedOrActive();
         unsetenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER");
         unsetenv("EXECUTOR_LIVE_MONO_SAFEPOINT_SIGNAL");
         unsetenv("EXECUTOR_LIVE_MONO_SYNTHETIC_ACK");
         unsetenv("EXECUTOR_FEX_SIGUSR1_GUEST_SIGNUM");
-        if (backend_b_route) {
+        if (jit_route) {
             unsetenv("EXECUTOR_FEX_PS4_SIGNAL_FRAME");
             unsetenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS");
         } else {
@@ -23050,11 +23101,11 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   "postAckResumeEvent=disabled waiterAutoResumeEvent=disabled "
                   "monoThreadsSuspend=preemptive-default bypassesCleared=1 mutexBypass=0",
                   mono_signal_deliver_sentinel.string().c_str(),
-                  backend_b_route ? "backend-b-aarch64-jit" : "box64-fex",
-                  backend_b_route ? "backend-b-guest-signal-queue"
+                  jit_route ? "jit-aarch64-jit" : "box64-fex",
+                  jit_route ? "jit-guest-signal-queue"
                                   : "fex-queued-pause-frame",
-                  backend_b_route ? "backend-b-orbis-ucontext" : "fex-orbis-ucontext",
-                  backend_b_route ? "lsx4-backend-b" : "fex-signal-delegator");
+                  jit_route ? "jit-orbis-ucontext" : "fex-orbis-ucontext",
+                  jit_route ? "lsx4-jit" : "fex-signal-delegator");
     }
     const auto mono_full_coop_probe_sentinel =
         std::filesystem::path(g_root) / "run-live-mono-full-coop-probe";
@@ -23138,7 +23189,7 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         setenv("EXECUTOR_SKIP_FAULTING_STORES", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_SKIP_FAULTING_STORES] source=sentinel path=%s enabled=1 "
-                  "(Backend-B audio-worker bad-store survival)",
+                  "(JIT audio-worker bad-store survival)",
                   skip_faulting_stores_sentinel.string().c_str());
     }
     const auto park_nonrender_sentinel =
@@ -23253,6 +23304,20 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_BISECT_DRAW_MAX] source=sentinel max=%d path=%s", max_draws,
                       bisect_sentinel.string().c_str());
+        }
+    }
+    const auto bisect_draw_limit_file =
+        std::filesystem::path(g_root) / "run-bisect-draw-max";
+    if (std::filesystem::exists(bisect_draw_limit_file)) {
+        std::ifstream limit_stream{bisect_draw_limit_file};
+        u64 max_draws{};
+        if ((limit_stream >> max_draws) && max_draws > 0 && max_draws <= 1'000'000) {
+            const std::string normalized = std::to_string(max_draws);
+            setenv("EXECUTOR_BISECT_DRAW_MAX", normalized.c_str(), 1);
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_BISECT_DRAW_MAX] source=file max=%llu path=%s",
+                      static_cast<unsigned long long>(max_draws),
+                      bisect_draw_limit_file.string().c_str());
         }
     }
     const auto bisect_skip_coro_present_sentinel =
@@ -23564,6 +23629,14 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   "[EXECUTOR_LIVE_HLE_FLIGHT] source=sentinel path=%s enabled=1",
                    live_hle_flight_sentinel.string().c_str());
     }
+    const auto sync_frontier_sentinel =
+        std::filesystem::path(g_root) / "run-sync-frontier";
+    if (std::filesystem::exists(sync_frontier_sentinel)) {
+        setenv("EXECUTOR_SYNC_FRONTIER", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_SYNC_FRONTIER] source=sentinel path=%s enabled=1",
+                  sync_frontier_sentinel.string().c_str());
+    }
     const auto avplayer_fast_forward_intro_sentinel =
         std::filesystem::path(g_root) / "run-avplayer-fast-forward-intro";
     if (std::filesystem::exists(avplayer_fast_forward_intro_sentinel)) {
@@ -23624,10 +23697,22 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     if (std::filesystem::exists(live_stall_thread_dump_sentinel)) {
         setenv("EXECUTOR_LIVE_STALL_THREAD_DUMP", "1", 1);
         setenv("EXECUTOR_TRACE_LIVE_MUTEX_OWNER_DUMP", "1", 1);
+        setenv("EXECUTOR_TRACE_EQUEUE_WAIT", "1", 1);
+        setenv("EXECUTOR_TRACE_LIVE_SYNC", "1", 1);
+        setenv("EXECUTOR_TRACE_LIVE_VIDEOOUT", "1", 1);
+        setenv("EXECUTOR_TRACE_LIVE_WIDE_HOT", "1", 1);
+        setenv("EXECUTOR_VK_JOURNAL", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_LIVE_STALL_THREAD_DUMP] source=sentinel path=%s enabled=1 "
-                  "mutexOwnerDump=1",
-                  live_stall_thread_dump_sentinel.string().c_str());
+                   "[EXECUTOR_LIVE_STALL_THREAD_DUMP] source=sentinel path=%s enabled=1 "
+                   "mutexOwnerDump=1 equeueWait=1 sync=1 videoOut=1",
+                   live_stall_thread_dump_sentinel.string().c_str());
+    }
+    const auto vk_journal_sentinel = std::filesystem::path(g_root) / "run-vk-journal";
+    if (std::filesystem::exists(vk_journal_sentinel)) {
+        setenv("EXECUTOR_VK_JOURNAL", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_VK_JOURNAL] source=sentinel path=%s enabled=1",
+                  vk_journal_sentinel.string().c_str());
     }
     const auto live_mutex_owner_dump_sentinel =
         std::filesystem::path(g_root) / "run-live-mutex-owner-dump";
@@ -23806,8 +23891,8 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         if (std::filesystem::exists(std::filesystem::path(g_root) / "run-live-mono-synthetic-ack")) {
             setenv("EXECUTOR_LIVE_MONO_SYNTHETIC_ACK", "1", 1);
         }
-        const bool backend_b_route = RuntimeGuestBackendBRequestedOrActive();
-        if (backend_b_route) {
+        const bool jit_route = RuntimeGuestJitRequestedOrActive();
+        if (jit_route) {
             unsetenv("EXECUTOR_FEX_PS4_SIGNAL_FRAME");
             unsetenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS");
         } else {
@@ -23844,11 +23929,11 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   std::getenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER")
                       ? std::getenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER")
                       : "",
-                  backend_b_route ? "backend-b-aarch64-jit" : "box64-fex",
-                  backend_b_route ? "backend-b-guest-signal-queue"
+                  jit_route ? "jit-aarch64-jit" : "box64-fex",
+                  jit_route ? "jit-guest-signal-queue"
                                   : "fex-queued-pause-frame",
-                  backend_b_route ? "backend-b-orbis-ucontext" : "fex-orbis-ucontext",
-                  backend_b_route ? "lsx4-backend-b" : "fex-signal-delegator",
+                  jit_route ? "jit-orbis-ucontext" : "fex-orbis-ucontext",
+                  jit_route ? "lsx4-jit" : "fex-signal-delegator",
                   std::getenv("EXECUTOR_LIVE_UNITY_PRELOAD_HELPER_SIGUSR1")
                       ? std::getenv("EXECUTOR_LIVE_UNITY_PRELOAD_HELPER_SIGUSR1")
                       : "",
@@ -24377,13 +24462,13 @@ extern "C" const char* executor_lsx4_runtime_status() {
     return g_status.c_str();
 }
 
-extern "C" const char* executor_lsx4_runtime_backend_b_status() {
+extern "C" const char* executor_lsx4_runtime_jit_status() {
     static std::string status;
-    status = Executor::BackendB::LsxEngineStatusJson();
+    status = Executor::Jit::LsxEngineStatusJson();
     return status.c_str();
 }
 
-extern "C" int executor_backend_b_guest_range_selftest() {
+extern "C" int executor_jit_guest_range_selftest() {
 #ifdef __ANDROID__
     alignas(4096) static std::array<std::uint8_t, 4096> storage{};
     static std::once_flag register_once;
@@ -24394,17 +24479,17 @@ extern "C" int executor_backend_b_guest_range_selftest() {
             storage[Offset + index] = static_cast<std::uint8_t>(index + 1);
         }
         RegisterBox64GuestReadableRange(storage.data() + Offset, Size,
-                                        "backend_b_guest_range_selftest");
+                                        "jit_guest_range_selftest");
     });
     const std::uint64_t address =
         reinterpret_cast<std::uint64_t>(storage.data() + Offset);
-    const bool range_ok = ExecutorBackendBIsReadableGuestRange(address, Size) &&
-                          ExecutorBackendBIsReadableGuestRange(address + Size - 1, 1) &&
-                          !ExecutorBackendBIsReadableGuestRange(address - 1, 1) &&
-                          !ExecutorBackendBIsReadableGuestRange(address, Size + 1) &&
-                          !ExecutorBackendBIsReadableGuestRange(0, 1) &&
-                          !ExecutorBackendBIsReadableGuestRange(address, 0) &&
-                          !ExecutorBackendBIsReadableGuestRange(
+    const bool range_ok = ExecutorJitIsReadableGuestRange(address, Size) &&
+                          ExecutorJitIsReadableGuestRange(address + Size - 1, 1) &&
+                          !ExecutorJitIsReadableGuestRange(address - 1, 1) &&
+                          !ExecutorJitIsReadableGuestRange(address, Size + 1) &&
+                          !ExecutorJitIsReadableGuestRange(0, 1) &&
+                          !ExecutorJitIsReadableGuestRange(address, 0) &&
+                          !ExecutorJitIsReadableGuestRange(
                               std::numeric_limits<std::uint64_t>::max() - 1, 4);
     return range_ok && ExecutorAeroLibGuestPageReaderSelfTest(address, Size) ? 1 : 0;
 #else
@@ -24414,9 +24499,9 @@ extern "C" int executor_backend_b_guest_range_selftest() {
 
 // Fixed-layout, allocation-free snapshot for MainActivity's one-Hz HUD.  Returning integers keeps
 // this path independent of the large diagnostic JSON and, importantly, out of logcat.
-// [0..4] Backend-B: decoded/native/helper/unsupported/native-cache-hits
+// [0..4] JIT: decoded/native/helper/unsupported/native-cache-hits
 // [5..10] GNM: builder-total/actual-vulkan-draw/shader/submit/submit-done/present-request
-// [11..17] persistent Backend-B cache: enabled/loaded/IR-hits/native-hits/native-captured/
+// [11..17] persistent JIT cache: enabled/loaded/IR-hits/native-hits/native-captured/
 //          IR-written/native-written
 extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
                                                    std::size_t value_count) {
@@ -24425,7 +24510,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
         return -1;
     }
 
-    const auto cpu = Executor::BackendB::GetRuntimeStatsSnapshot();
+    const auto cpu = Executor::Jit::GetRuntimeStatsSnapshot();
     const auto gpu = Libraries::GnmDriver::ExecutorGetGnmHudStats();
     values[0] = cpu.decoded_blocks;
     values[1] = cpu.native_blocks;
@@ -24448,10 +24533,10 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     return static_cast<int>(kValueCount);
 }
 
-extern "C" const char* executor_lsx4_runtime_backend_b_selftest() {
+extern "C" const char* executor_lsx4_runtime_jit_selftest() {
     static std::string status;
-    status = Executor::BackendB::LsxEngineSelfTestJson();
-    const bool guest_range_ok = executor_backend_b_guest_range_selftest() != 0;
+    status = Executor::Jit::LsxEngineSelfTestJson();
+    const bool guest_range_ok = executor_jit_guest_range_selftest() != 0;
     if (!status.empty() && status.back() == '}') {
         status.pop_back();
         status += R"(,"guestReadableRangeOk":)";
@@ -24466,12 +24551,12 @@ extern "C" const char* executor_lsx4_runtime_backend_b_selftest() {
     return status.c_str();
 }
 
-// Device-callable conformance probe for the real scalar-FP HLE bridge used by Backend B.  It
-// intentionally crosses ExecutorBackendBHleBridgeCallback instead of calling host math directly,
+// Device-callable conformance probe for the real scalar-FP HLE bridge used by JIT.  It
+// intentionally crosses ExecutorJitHleBridgeCallback instead of calling host math directly,
 // so wrong XMM input decoding, integer fallback dispatch, result classification, or raw result
 // transport all fail the gate.  The final calculation is stb_vorbis' exact lookup1_values
 // frontier (entries=6561, dimensions=8).
-extern "C" int executor_backend_b_hle_fp_bridge_selftest() {
+extern "C" int executor_jit_hle_fp_bridge_selftest() {
     constexpr int entries = 6561;
     constexpr int dimensions = 8;
 
@@ -24486,12 +24571,12 @@ extern "C" int executor_backend_b_hle_fp_bridge_selftest() {
         return value;
     };
     const auto invoke_unary = [&](const std::uint64_t target, const double value) {
-        return ExecutorBackendBHleBridgeCallback(target, 0, 0, 0, 0, 0, 0, 0,
+        return ExecutorJitHleBridgeCallback(target, 0, 0, 0, 0, 0, 0, 0,
                                                   to_raw(value), 0, 0, 0);
     };
     const auto invoke_binary = [&](const std::uint64_t target, const double lhs,
                                    const double rhs) {
-        return ExecutorBackendBHleBridgeCallback(target, 0, 0, 0, 0, 0, 0, 0,
+        return ExecutorJitHleBridgeCallback(target, 0, 0, 0, 0, 0, 0, 0,
                                                   to_raw(lhs), to_raw(rhs), 0, 0);
     };
 
@@ -24499,8 +24584,8 @@ extern "C" int executor_backend_b_hle_fp_bridge_selftest() {
         HOST_CALL(Libraries::LibcInternal::internal_exp));
     const auto pow_target = reinterpret_cast<std::uint64_t>(
         HOST_CALL(Libraries::LibcInternal::internal_pow));
-    if (executor_backend_b_hle_fp_result_kind(exp_target) != 2 ||
-        executor_backend_b_hle_fp_result_kind(pow_target) != 2) {
+    if (executor_jit_hle_fp_result_kind(exp_target) != 2 ||
+        executor_jit_hle_fp_result_kind(pow_target) != 2) {
         return 0;
     }
 
@@ -24565,10 +24650,10 @@ extern "C" int executor_lsx4_runtime_scan_game(const char* path) {
 extern "C" int executor_lsx4_runtime_launch_game(const char* path);
 extern "C" int executor_lsx4_runtime_relocate_imports();
 extern "C" int executor_lsx4_runtime_run_embedded_box64_mapped_entry();
-extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry();
-extern "C" void executor_lsx4_install_backend_b_signal_handlers();
+extern "C" int executor_lsx4_runtime_run_jit_mapped_entry();
+extern "C" void executor_lsx4_install_jit_signal_handlers();
 
-extern "C" int executor_lsx4_runtime_launch_game_backend_b(const char* path) {
+extern "C" int executor_lsx4_runtime_launch_game_jit(const char* path) {
     const int load_result = executor_lsx4_runtime_launch_game(path);
     if (load_result < 0) {
         return load_result;
@@ -24577,14 +24662,14 @@ extern "C" int executor_lsx4_runtime_launch_game_backend_b(const char* path) {
     if (relocate_result < 0) {
         return relocate_result;
     }
-    g_backend_b_launch_entry_requested.store(true, std::memory_order_release);
-    return executor_lsx4_runtime_run_backend_b_mapped_entry();
+    g_jit_launch_entry_requested.store(true, std::memory_order_release);
+    return executor_lsx4_runtime_run_jit_mapped_entry();
 }
 
 extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
     std::lock_guard lock(g_lock);
     g_runtime_guest_backend.store(1, std::memory_order_release);
-    executor_lsx4_install_backend_b_signal_handlers();
+    executor_lsx4_install_jit_signal_handlers();
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_RUNTIME_GUEST_BACKEND] launch route=%s",
               RuntimeGuestBackendName());
@@ -24599,7 +24684,7 @@ extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
         LoadAndroidGameSpecificConfig(direct_launch_title);
         const auto direct_app0 = std::filesystem::path(g_root) / "runtime-fs" / "user" /
                                  "app" / direct_launch_title;
-        ConfigureBackendBPersistentCacheForLaunch(
+        ConfigureJitPersistentCacheForLaunch(
             true, direct_app0, direct_app0 / "eboot.bin");
         return DirectLaunchInstalledTitleLocked(direct_launch_title);
     }
@@ -24669,7 +24754,7 @@ extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
                   "[EXECUTOR_LIBC_ALLOCATOR_POLICY] owner=%s available=%d path=%s",
                   has_guest_libc ? "guest-libc" : "executor-hle", has_guest_libc ? 1 : 0,
                   guest_libc_path.string().c_str());
-        ConfigureBackendBPersistentCacheForLaunch(true, app0_path, launch_path);
+        ConfigureJitPersistentCacheForLaunch(true, app0_path, launch_path);
         const auto managed_path = app0_path / "Media" / "Managed";
         if (std::filesystem::exists(managed_path)) {
             const std::string mono_path =
@@ -25308,23 +25393,23 @@ extern "C" const char* executor_lsx4_runtime_embedded_box64_mapped_entry_info() 
     return g_box64_mapped_entry_info.c_str();
 }
 
-extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
+extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
     std::unique_lock lock(g_lock);
-    if (RuntimeGuestBackendBActive()) {
+    if (RuntimeGuestJitActive()) {
         const bool launch_entry_requested =
-            g_backend_b_launch_entry_requested.exchange(false, std::memory_order_acq_rel);
+            g_jit_launch_entry_requested.exchange(false, std::memory_order_acq_rel);
         const auto foreground_opt_in =
-            std::filesystem::path(g_root) / "run-backendb-foreground-mapped-entry";
+            std::filesystem::path(g_root) / "run-jit-foreground-mapped-entry";
         if (!launch_entry_requested && !std::filesystem::exists(foreground_opt_in)) {
             g_box64_mapped_entry_info =
-                R"({"attempted":false,"skipped":true,"mode":"backend_b_aarch64_jit","reason":"backend_b_uses_launch_game_entry; old Box64/FEX mapped-entry foreground path is disabled unless run-backendb-foreground-mapped-entry exists"})";
+                R"({"attempted":false,"skipped":true,"mode":"jit_aarch64_jit","reason":"jit_uses_launch_game_entry; old Box64/FEX mapped-entry foreground path is disabled unless run-jit-foreground-mapped-entry exists"})";
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_BACKEND_B_ENTRY_RUN] result=skipped reason=foreground_mapped_entry_disabled marker=%s",
+                      "[EXECUTOR_JIT_ENTRY_RUN] result=skipped reason=foreground_mapped_entry_disabled marker=%s",
                       foreground_opt_in.string().c_str());
             return 0;
         }
     }
-    if (!RuntimeGuestBackendBActive() && (!g_box64_embed || !g_box64_run_mapped_entry)) {
+    if (!RuntimeGuestJitActive() && (!g_box64_embed || !g_box64_run_mapped_entry)) {
         g_box64_mapped_entry_info =
             R"({"attempted":false,"error":"embedded Box64 is not loaded"})";
         g_status =
@@ -25371,7 +25456,7 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
             return -4;
         }
 
-        if (RuntimeGuestBackendBActive()) {
+        if (RuntimeGuestJitActive()) {
             // PC Linker::Execute enters bootstrap from an already-created Game:Main.  Building the
             // main request first establishes eboot EntryParams, static TLS and the primary TCB;
             // only then may guest PRX initializers run.  Complete the same bootstrap with the
@@ -25379,19 +25464,19 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
             // executable segments before entering eboot.
             std::string bootstrap_error;
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_BACKEND_B_PROCESS_BOOTSTRAP] stage=begin mode=full");
+                      "[EXECUTOR_JIT_PROCESS_BOOTSTRAP] stage=begin mode=full");
             lock.unlock();
             const bool bootstrap_ok = EnsureMappedEntryProcessBootstrap(bootstrap_error);
             lock.lock();
             NativeLog(bootstrap_ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
-                      "[EXECUTOR_BACKEND_B_PROCESS_BOOTSTRAP] stage=result ok=%d error=%s",
+                      "[EXECUTOR_JIT_PROCESS_BOOTSTRAP] stage=result ok=%d error=%s",
                       bootstrap_ok ? 1 : 0, bootstrap_error.c_str());
             if (!bootstrap_ok) {
                 g_box64_mapped_entry_info =
                     std::string(R"({"attempted":false,"error":"process bootstrap failed: )") +
                     JsonEscape(bootstrap_error) + R"("})";
                 g_status =
-                    std::string(R"({"state":"backend_b_process_bootstrap_failed","core":"lsx4-native","error":")") +
+                    std::string(R"({"state":"jit_process_bootstrap_failed","core":"lsx4-native","error":")") +
                     JsonEscape(bootstrap_error) + R"("})";
                 return -8;
             }
@@ -25407,18 +25492,18 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                 return -4;
             }
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_MAPPED_ENTRY_REQUEST_REFRESH] phase=backend_b_post_bootstrap "
+                      "[EXECUTOR_MAPPED_ENTRY_REQUEST_REFRESH] phase=jit_post_bootstrap "
                       "entry=%p segments=%u tcb=%p",
                       reinterpret_cast<void*>(request.entry), request.segment_count,
                       reinterpret_cast<void*>(request.tcb_base));
         }
 
-        if (RuntimeGuestBackendBActive()) {
+        if (RuntimeGuestJitActive()) {
             std::ostringstream running;
             running << "{"
                     << R"("attempted":true,)"
                     << R"("running":true,)"
-                    << R"("mode":"backend_b_aarch64_jit",)"
+                    << R"("mode":"jit_aarch64_jit",)"
                     << R"("entry":")" << Hex64(request.entry) << R"(",)"
                     << R"("entryParams":")" << Hex64(request.entry_params) << R"(",)"
                     << R"("exitFunc":")" << Hex64(request.exit_func) << R"(",)"
@@ -25429,14 +25514,14 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                     << R"("tlsImageSize":)" << request.tls_image_size << ","
                     << R"("tcbBase":")" << Hex64(request.tcb_base) << R"(",)"
                     << R"("segmentCount":)" << request.segment_count << ","
-                    << R"("next_step":"Backend B is executing the loaded module entry through the reconstructed AArch64 JIT route")"
+                    << R"("next_step":"JIT is executing the loaded module entry through the reconstructed AArch64 JIT route")"
                     << "}";
             g_box64_mapped_entry_info = running.str();
             g_status = std::string(
-                           R"({"state":"backend_b_mapped_entry_running","core":"lsx4-native","guestEntryAttempted":true,"guestEntryCompleted":false,"backendB":)") +
+                           R"({"state":"jit_mapped_entry_running","core":"lsx4-native","guestEntryAttempted":true,"guestEntryCompleted":false,"jit":)") +
                        g_box64_mapped_entry_info + "}";
             WriteTextFile(std::filesystem::path(g_root) / "translator" /
-                              "last-backend-b-entry-run.json",
+                              "last-jit-entry-run.json",
                           g_box64_mapped_entry_info);
 
             int result = 0;
@@ -25449,19 +25534,19 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                         Libraries::Kernel::g_curthread = primary_guest_thread;
                         Common::SetCurrentThreadName(primary_guest_thread->name.c_str());
                         // The primary guest Pthread is allocated while the mapped-entry request is
-                        // prepared, but Backend B executes it on this dedicated native worker.  A
+                        // prepared, but JIT executes it on this dedicated native worker.  A
                         // normal guest pthread binds NativeThread from RunThread(); the primary
                         // path previously skipped that step, leaving GetHandle()==0.  Mono could
                         // then enumerate Game:Main for stop-the-world, but pthread_kill(0, SIGUSR1)
                         // never delivered its suspend handler and the initiator waited forever for
                         // the missing ACK.  Bind the Pthread to the worker that actually owns its
-                        // Backend-B guest state, matching the reference's 1:1 native thread model.
+                        // JIT guest state, matching the reference's 1:1 native thread model.
                         primary_guest_thread->native_thr.Initialize();
                         // std::thread inherits the creator's host signal mask.  The Android launch
                         // thread has SIGURG blocked, so Mono's suspend signal was successfully
                         // queued to Game:Main but remained pending forever.  Upstream Linker::Execute
                         // and every regular RunThread clear the inherited mask before guest entry;
-                        // preserve that exact contract for Backend B's dedicated primary worker.
+                        // preserve that exact contract for JIT's dedicated primary worker.
                         sigset_t empty_signal_mask;
                         sigemptyset(&empty_signal_mask);
                         const int signal_mask_rc =
@@ -25470,7 +25555,7 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                             Core::SetTcbBase(primary_guest_thread->tcb);
                         }
                         NativeLog(ANDROID_LOG_INFO,
-                                  "[EXECUTOR_BACKEND_B_PRIMARY_THREAD] bound thread=%p name=%s "
+                                  "[EXECUTOR_JIT_PRIMARY_THREAD] bound thread=%p name=%s "
                                   "native=0x%zx tcb=%p signalMaskRc=%d",
                                   static_cast<void*>(primary_guest_thread),
                                   primary_guest_thread->name.c_str(),
@@ -25478,14 +25563,14 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                                       primary_guest_thread->native_thr.GetHandle()),
                                   static_cast<void*>(primary_guest_thread->tcb), signal_mask_rc);
                     }
-                    Executor::BackendB::LsxEntryPacket ctx{};
+                    Executor::Jit::LsxEntryPacket ctx{};
                     ctx.args[0] = request.entry_params;
                     ctx.args[1] = request.exit_func;
                     ctx.arg_count = 2;
                     // Main-entry is not a normal ExecuteGuest call. Upstream shadPS4 reaches
                     // eboot through RunMainEntry: RDI=params, RSI=ProgramExitFunc, and the first
                     // two EntryParams qwords are copied to the initial guest stack before a jump
-                    // into the eboot entry. Backend B must reconstruct that process-entry frame;
+                    // into the eboot entry. JIT must reconstruct that process-entry frame;
                     // ordinary HLE/guest calls still use the LsxEntryPacket stack-argument
                     // contract.
                     ctx.stack_args_enabled = 2;
@@ -25493,13 +25578,13 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                     ctx.stack_base = request.stack_base;
                     ctx.stack_size = request.stack_size;
                     // A real process entry should leave via ProgramExitFunc or the eboot exit
-                    // chain, not by a managed helper tail-returning into Backend B's sentinel.
-                    // Keep the sentinel enabled for explicit Backend B helper exits, but the
+                    // chain, not by a managed helper tail-returning into JIT's sentinel.
+                    // Keep the sentinel enabled for explicit JIT helper exits, but the
                     // main-entry stack above prevents ordinary tail-call icalls from becoming a
                     // false mapped-entry completion.
                     ctx.allow_guest_return_sentinel = 1;
                     const std::uint64_t guest_result =
-                        Executor::BackendB::RunArm64Translation(request.entry, ctx);
+                        Executor::Jit::RunArm64Translation(request.entry, ctx);
                     result = static_cast<int>(guest_result);
                 } catch (const std::exception& e) {
                     exception_text = e.what();
@@ -25525,20 +25610,20 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
                  << R"("stackBase":")" << Hex64(request.stack_base) << R"(",)"
                  << R"("stackSize":")" << Hex64(request.stack_size) << R"(",)"
                  << R"("tcbBase":")" << Hex64(request.tcb_base) << R"(",)"
-                 << R"("next_step":"expand Backend B opcode/helper coverage for the reported guest block")"
+                 << R"("next_step":"expand JIT opcode/helper coverage for the reported guest block")"
                  << "}";
             g_box64_mapped_entry_info = info.str();
             WriteTextFile(std::filesystem::path(g_root) / "translator" /
-                              "last-backend-b-entry-run.json",
+                              "last-jit-entry-run.json",
                           g_box64_mapped_entry_info);
             g_status = std::string(
                            R"({"state":")") +
-                       (result >= 0 ? "backend_b_mapped_entry_exited"
-                                    : "backend_b_mapped_entry_failed") +
-                       R"(","core":"lsx4-native","backendB":)" +
+                       (result >= 0 ? "jit_mapped_entry_exited"
+                                    : "jit_mapped_entry_failed") +
+                       R"(","core":"lsx4-native","jit":)" +
                        g_box64_mapped_entry_info + "}";
             NativeLog(ANDROID_LOG_INFO,
-                      "[EXECUTOR_BACKEND_B_ENTRY_RUN] result=%d exception=%s info=%s",
+                      "[EXECUTOR_JIT_ENTRY_RUN] result=%d exception=%s info=%s",
                       result, exception_text.c_str(), g_box64_mapped_entry_info.c_str());
             return result;
         }
@@ -25742,5 +25827,5 @@ extern "C" int executor_lsx4_runtime_run_backend_b_mapped_entry() {
 }
 
 extern "C" int executor_lsx4_runtime_run_embedded_box64_mapped_entry() {
-    return executor_lsx4_runtime_run_backend_b_mapped_entry();
+    return executor_lsx4_runtime_run_jit_mapped_entry();
 }

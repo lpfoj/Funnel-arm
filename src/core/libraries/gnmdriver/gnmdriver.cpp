@@ -68,12 +68,12 @@ extern "C" void executor_live_hle_flight_dump(const char* reason, u64 builder_to
                                               u64 builder_draw, u64 builder_shader,
                                               u64 active_cb, u64 active_dw)
     __attribute__((weak));
-extern "C" void executor_backend_b_dump_thread_states(const char* reason) __attribute__((weak));
-extern "C" void executor_live_dump_unity_thread_rips(const char* reason, int pulse)
-    __attribute__((weak));
+extern "C" void executor_jit_dump_thread_states(const char* reason) __attribute__((weak));
+extern "C" void executor_live_dump_unity_thread_rips(const char* reason, int pulse);
+extern "C" void executor_live_dump_kernel_sem_records(const char* reason) __attribute__((weak));
 extern "C" void executor_live_dump_mutex_wait_ledger(const char* reason, int pulse)
     __attribute__((weak));
-extern "C" int executor_lsx4_android_runtime_backend_b_active() __attribute__((weak));
+extern "C" int executor_lsx4_android_runtime_jit_active() __attribute__((weak));
 
 static bool ExecutorTraceLiveWide() {
     // FPS: this gates ~20 per-submit/per-DCB GPU traces (DCB_SET_SH/CTX, GNM_BUILDER/DWORDS/STAGE,
@@ -220,8 +220,8 @@ static void ExecutorLiveMaybeStartPostShaderWatchdog(const char* api, const char
                 __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
                                     "[EXECUTOR_LIVE_HLE_FLIGHT_DUMP] unavailable=1");
             }
-            if (executor_backend_b_dump_thread_states) {
-                executor_backend_b_dump_thread_states("post-shader-no-draw");
+            if (executor_jit_dump_thread_states) {
+                executor_jit_dump_thread_states("post-shader-no-draw");
             }
             if (executor_lsx4_android_dump_box64_emu_states) {
                 executor_lsx4_android_dump_box64_emu_states("post-shader-no-draw");
@@ -4166,6 +4166,18 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     }
     static std::atomic<u64> submit_done_log_count{0};
     const u64 submit_done_call = ++submit_done_log_count;
+    if (submit_done_call == 64 &&
+        std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") != nullptr) {
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(6));
+            if (executor_jit_dump_thread_states) {
+                executor_jit_dump_thread_states("delayed-submitdone-stall");
+            }
+            if (executor_live_dump_mutex_wait_ledger) {
+                executor_live_dump_mutex_wait_ledger("delayed-submitdone-stall", 64);
+            }
+        }).detach();
+    }
     AmdGpu::ExecutorEopTraceSubmitDonePulse(submit_done_call);
     const bool submit_done_log =
         submit_done_call <= 16 || (submit_done_call & (submit_done_call - 1)) == 0 ||
@@ -4206,9 +4218,48 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     // Guest-RIP pulse for the Unity/Game/mono threads: SubmitDone is the one reliable heartbeat
     // through the whole boot (Thread3 calls it every few seconds even while everything else is
     // stalled), so this exposes the poll sites of a mutual polling standoff with no contention.
-    if (executor_live_dump_unity_thread_rips && (submit_done_call % 4) == 0 &&
+    if (executor_live_dump_unity_thread_rips && submit_done_call >= 12 &&
+        submit_done_call <= 24 && (submit_done_call % 4) == 0 &&
         g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0) {
         executor_live_dump_unity_thread_rips("submitdone", static_cast<int>(submit_done_call));
+    }
+    // One narrow synchronization-frontier sample. Run it from an observer after the tenth
+    // heartbeat because a guest synchronization stall can prevent all subsequent SubmitDone calls.
+    // The flight recorder itself remains opt-in through its runtime marker.
+    static std::atomic<bool> sync_frontier_dump_started{false};
+    if (executor_live_hle_flight_dump && submit_done_call == 10 &&
+        g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0 &&
+        !sync_frontier_dump_started.exchange(true, std::memory_order_relaxed)) {
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            executor_live_hle_flight_dump(
+                "submitdone-sync-frontier",
+                g_live_gnm_builder_total.load(std::memory_order_relaxed),
+                g_live_gnm_builder_draw.load(std::memory_order_relaxed),
+                g_live_gnm_builder_shader.load(std::memory_order_relaxed),
+                reinterpret_cast<u64>(g_live_active_cmdbuf.load(std::memory_order_relaxed)),
+                g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
+            if (executor_live_dump_kernel_sem_records) {
+                executor_live_dump_kernel_sem_records("submitdone-sync-frontier");
+            }
+            if (executor_live_dump_posix_sem_records) {
+                executor_live_dump_posix_sem_records("submitdone-sync-frontier");
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(47));
+            executor_live_hle_flight_dump(
+                "submitdone-late-sync-frontier",
+                g_live_gnm_builder_total.load(std::memory_order_relaxed),
+                g_live_gnm_builder_draw.load(std::memory_order_relaxed),
+                g_live_gnm_builder_shader.load(std::memory_order_relaxed),
+                reinterpret_cast<u64>(g_live_active_cmdbuf.load(std::memory_order_relaxed)),
+                g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
+            if (executor_live_dump_kernel_sem_records) {
+                executor_live_dump_kernel_sem_records("submitdone-late-sync-frontier");
+            }
+            if (executor_live_dump_posix_sem_records) {
+                executor_live_dump_posix_sem_records("submitdone-late-sync-frontier");
+            }
+        }).detach();
     }
     if (std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") != nullptr &&
         executor_live_dump_mutex_wait_ledger != nullptr) {
@@ -4216,7 +4267,7 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
                                              static_cast<int>(submit_done_call));
     }
     if ((std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") || ExecutorTraceLiveWide()) &&
-        executor_backend_b_dump_thread_states &&
+        executor_jit_dump_thread_states &&
         g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0 &&
         ExecutorLiveShouldPulse(submit_done_call)) {
         if (executor_live_hle_flight_dump) {
@@ -4228,7 +4279,7 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
                 reinterpret_cast<u64>(g_live_active_cmdbuf.load(std::memory_order_relaxed)),
                 g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
         }
-        executor_backend_b_dump_thread_states("submitdone-no-workload-draw");
+        executor_jit_dump_thread_states("submitdone-no-workload-draw");
     }
     if (std::getenv("EXECUTOR_TRACE_LIVE_EMU_DUMP") &&
         executor_lsx4_android_dump_box64_emu_states) {
@@ -4288,19 +4339,19 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     // Unity worker can reach SubmitDone with that same active builder DCB already complete but never
     // passed through sceGnmSubmit*. SubmitDone is the guest's ordering boundary, so drain exactly one
     // new active draw DCB here instead of letting it spin forever as an unsubmitted command stream.
-    // Backend B can issue an early init-only explicit submit and then build the first draw DCB in a
+    // JIT can issue an early init-only explicit submit and then build the first draw DCB in a
     // different buffer without passing that buffer through sceGnmSubmit*. A process-wide "any submit"
     // bit incorrectly suppresses the real frame forever. Suppress only an exact DCB that was already
     // submitted (same base, parsed length, and contents). Preserve Backend A's existing global gate.
     const bool guest_used_explicit_submit =
         g_live_submit_calls.load(std::memory_order_relaxed) != 0;
-    const bool backend_b_active = executor_lsx4_android_runtime_backend_b_active &&
-                                  executor_lsx4_android_runtime_backend_b_active() != 0;
+    const bool jit_active = executor_lsx4_android_runtime_jit_active &&
+                                  executor_lsx4_android_runtime_jit_active() != 0;
     const bool active_dcb_already_submitted = ExecutorLiveWasExplicitlySubmitted(active_cb, analysis);
-    // Reference Backend B never turns SubmitDone into an implicit SubmitGfx. Replaying Sonic's
+    // Reference JIT never turns SubmitDone into an implicit SubmitGfx. Replaying Sonic's
     // mutable DCB here queues a second copy which observes the next frame's rewritten WAIT_REG_MEM.
     const bool suppress_active_dcb =
-        backend_b_active || active_dcb_already_submitted || guest_used_explicit_submit;
+        jit_active || active_dcb_already_submitted || guest_used_explicit_submit;
     if (!suppress_active_dcb && active_cb && analysis.draws != 0 &&
         analysis.valid_dwords != 0 && analysis.hash != previous_hash) {
         Core::g_executor_render_tid.store(static_cast<int>(gettid()), std::memory_order_relaxed);
@@ -5050,10 +5101,10 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
     liverpool = std::make_unique<AmdGpu::Liverpool>();
 #if defined(__ANDROID__) && defined(EXECUTOR_ANDROID_NATIVE_CORE_PROBE_NO_DESKTOP_MEDIA_USB)
-    const bool backend_b_active = executor_lsx4_android_runtime_backend_b_active &&
-                                  executor_lsx4_android_runtime_backend_b_active() != 0;
-    if (backend_b_active) {
-        // Backend B executes the guest concurrently with Liverpool's graphics coroutine. Copy
+    const bool jit_active = executor_lsx4_android_runtime_jit_active &&
+                                  executor_lsx4_android_runtime_jit_active() != 0;
+    if (jit_active) {
+        // JIT executes the guest concurrently with Liverpool's graphics coroutine. Copy
         // DCB/CCB bytes at submit time so Unity cannot recycle their guest storage while the GPU
         // thread is still parsing it. Menu-sized submits often hide this lifetime race; the first
         // FlusterCluck gameplay frame reliably exposes it as an Adreno device loss.
@@ -5063,7 +5114,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
         presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
         LOG_INFO(Lib_GnmDriver,
                  "EXECUTOR_VULKAN_WSI phase=presenter_eager result=OK "
-                 "reason=backend_b_reference");
+                 "reason=jit_reference");
     } else {
     // Do NOT create the Vulkan presenter eagerly here. Its Swapchain ctor connects the
     // ANativeWindow to the Vulkan WSI API, which steals the surface from Piglet (the PS4

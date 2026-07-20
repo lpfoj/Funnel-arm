@@ -11,13 +11,18 @@ import android.graphics.BitmapFactory;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.StatFs;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.Menu;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -84,6 +89,9 @@ public final class LauncherUi {
 
     private final Activity activity;
     private final AtomicBoolean workRunning = new AtomicBoolean();
+    private final GameCompatibilityRepository compatibilityRepository;
+    private final Handler holdHandler;
+    private final int touchSlop;
     private LinearLayout gameList;
     private TextView status;
     private ProgressBar progress;
@@ -98,6 +106,9 @@ public final class LauncherUi {
             throw new IllegalArgumentException("activity == null");
         }
         this.activity = activity;
+        compatibilityRepository = new GameCompatibilityRepository(activity);
+        holdHandler = new Handler(Looper.getMainLooper());
+        touchSlop = ViewConfiguration.get(activity).getScaledTouchSlop();
     }
 
     /** Builds the complete portrait launcher view. The caller owns setContentView(). */
@@ -217,10 +228,12 @@ public final class LauncherUi {
     /** Detaches UI references; an already-running atomic import is allowed to finish safely. */
     public void destroy() {
         destroyed = true;
+        holdHandler.removeCallbacksAndMessages(null);
         rootView = null;
         gameList = null;
         status = null;
         progress = null;
+        removeAction = null;
     }
 
     /** Returns true when the result belongs to this launcher. */
@@ -629,13 +642,19 @@ public final class LauncherUi {
         if (gameList == null) {
             return;
         }
-        latestGames = new ArrayList<>(games);
-        if (selectedGame != null && !games.contains(selectedGame)) {
+        List<GameEntry> orderedGames = new ArrayList<>(games);
+        orderedGames.sort(Comparator
+                .comparingInt((GameEntry entry) -> compatibilityRepository
+                        .statusOf(entry.titleId).librarySortPriority())
+                .thenComparing(entry -> entry.title.toLowerCase(Locale.ROOT))
+                .thenComparing(entry -> entry.titleId));
+        latestGames = orderedGames;
+        if (selectedGame != null && !orderedGames.contains(selectedGame)) {
             selectedGame = null;
             updateRemoveAction();
         }
         gameList.removeAllViews();
-        if (games.isEmpty()) {
+        if (orderedGames.isEmpty()) {
             TextView empty = label(activity.getString(R.string.library_empty),
                     14, 0xffc5cbd3);
             empty.setGravity(Gravity.CENTER);
@@ -644,20 +663,30 @@ public final class LauncherUi {
             gameList.addView(empty, matchWrap());
             return;
         }
-        for (GameEntry game : games) {
+        for (GameEntry game : orderedGames) {
             gameList.addView(gameRow(game), matchWrapWithMargins(0, 0, 0, 10));
         }
     }
 
     private View gameRow(GameEntry game) {
-        LinearLayout row = new LinearLayout(activity);
+        AccessibleGameRow row = new AccessibleGameRow(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(12), dp(12), dp(12), dp(12));
         boolean selected = selectedGame == game;
+        GameCompatibilityStatus compatibility = compatibilityRepository.statusOf(game.titleId);
+        int fill = game.launchable ? 0xff1b2026 : 0xff171b20;
+        int stroke = 0xff2a313a;
+        if (compatibility == GameCompatibilityStatus.SUPPORTED) {
+            fill = 0xff192820;
+            stroke = 0xff397352;
+        } else if (compatibility == GameCompatibilityStatus.UNSUPPORTED) {
+            fill = 0xff2b201d;
+            stroke = 0xff8c4f43;
+        }
         row.setBackground(roundedBackground(
-                selected ? 0xff203754 : (game.launchable ? 0xff1b2026 : 0xff171b20),
-                selected ? 0xff6fb4ff : 0xff2a313a, 18));
+                selected ? 0xff203754 : fill,
+                selected ? 0xff6fb4ff : stroke, 18));
         row.setElevation(dp(2));
 
         ImageView icon = new ImageView(activity);
@@ -680,6 +709,23 @@ public final class LauncherUi {
                 android.graphics.Typeface.BOLD);
         textColumn.addView(title);
         textColumn.addView(label(game.titleId, 12, 0xff7f8a97));
+        TextView holdHint = label(activity.getString(R.string.game_hold_waiting),
+                11, 0xff7f8a97);
+        holdHint.setPadding(0, dp(5), 0, 0);
+        textColumn.addView(holdHint);
+        ProgressBar holdProgress = new ProgressBar(
+                activity, null, android.R.attr.progressBarStyleHorizontal);
+        holdProgress.setMax((int) GameHoldAction.MARK_SUPPORTED_MS);
+        holdProgress.setProgress(0);
+        holdProgress.setProgressTintList(
+                android.content.res.ColorStateList.valueOf(0xff6fb4ff));
+        holdProgress.setProgressBackgroundTintList(
+                android.content.res.ColorStateList.valueOf(0xff303741));
+        holdProgress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams holdProgressLp =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(4));
+        holdProgressLp.setMargins(0, dp(5), 0, 0);
+        textColumn.addView(holdProgress, holdProgressLp);
         if (!game.launchable) {
             TextView metadata = label(activity.getString(R.string.metadata_only),
                     11, 0xffffad66);
@@ -689,27 +735,260 @@ public final class LauncherUi {
         row.addView(textColumn, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        if (game.launchable) {
-            row.setClickable(true);
-            row.setFocusable(true);
-            row.setOnClickListener(view -> {
-                if (selectedGame != null) {
-                    selectedGame = game;
-                    updateRemoveAction();
-                    renderGameList(latestGames);
-                } else {
-                    launch(game);
-                }
-            });
+        if (compatibility != GameCompatibilityStatus.UNCLASSIFIED) {
+            TextView compatibilityMark = label(
+                    compatibility == GameCompatibilityStatus.SUPPORTED ? "\u2713" : "\u00d7",
+                    20,
+                    compatibility == GameCompatibilityStatus.SUPPORTED
+                            ? 0xff67d391 : 0xffff806f);
+            compatibilityMark.setGravity(Gravity.CENTER);
+            compatibilityMark.setContentDescription(activity.getString(
+                    compatibility == GameCompatibilityStatus.SUPPORTED
+                            ? R.string.game_status_supported
+                            : R.string.game_status_unsupported));
+            LinearLayout.LayoutParams markLp =
+                    new LinearLayout.LayoutParams(dp(34), dp(34));
+            markLp.setMargins(dp(8), 0, 0, 0);
+            row.addView(compatibilityMark, markLp);
         }
-        row.setLongClickable(true);
-        row.setOnLongClickListener(view -> {
-            selectedGame = selectedGame == game ? null : game;
-            updateRemoveAction();
-            renderGameList(latestGames);
-            return true;
+
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.setOnClickListener(view -> {
+            if (selectedGame != null) {
+                selectedGame = game;
+                updateRemoveAction();
+                renderGameList(latestGames);
+            } else if (game.launchable) {
+                launch(game);
+            }
         });
+        int statusText = compatibility == GameCompatibilityStatus.SUPPORTED
+                ? R.string.game_status_supported
+                : compatibility == GameCompatibilityStatus.UNSUPPORTED
+                ? R.string.game_status_unsupported
+                : R.string.game_status_unclassified;
+        row.setContentDescription(activity.getString(R.string.game_item_accessibility,
+                game.title, game.titleId, activity.getString(statusText)));
+        row.setOnTouchListener(new GameHoldTouchListener(game, holdHint, holdProgress));
         return row;
+    }
+
+    private void handleGameHoldAction(GameEntry game, GameHoldAction action) {
+        if (action == GameHoldAction.TAP) {
+            return;
+        }
+        if (action == GameHoldAction.SELECT_FOR_REMOVAL) {
+            boolean selected = selectedGame != game;
+            selectedGame = selected ? game : null;
+            updateRemoveAction();
+            toast(activity.getString(selected
+                    ? R.string.game_selected_for_removal
+                    : R.string.game_selection_cleared, game.title));
+            renderGameList(latestGames);
+            return;
+        }
+
+        GameCompatibilityStatus status = action == GameHoldAction.MARK_SUPPORTED
+                ? GameCompatibilityStatus.SUPPORTED
+                : GameCompatibilityStatus.UNSUPPORTED;
+        compatibilityRepository.setStatus(game.titleId, status);
+        selectedGame = null;
+        updateRemoveAction();
+        toast(activity.getString(status == GameCompatibilityStatus.SUPPORTED
+                ? R.string.game_marked_supported
+                : R.string.game_marked_unsupported, game.title));
+        renderGameList(latestGames);
+    }
+
+    private final class GameHoldTouchListener implements View.OnTouchListener {
+        private final GameEntry game;
+        private final TextView holdHint;
+        private final ProgressBar holdProgress;
+        private View pressedView;
+        private android.graphics.drawable.Drawable restingBackground;
+        private long downAtMs;
+        private float downX;
+        private float downY;
+        private boolean active;
+        private GameHoldAction reachedAction = GameHoldAction.TAP;
+        private int currentStageText = R.string.game_hold_waiting;
+
+        private final Runnable elapsedTicker = new Runnable() {
+            @Override
+            public void run() {
+                if (!active || pressedView == null) {
+                    return;
+                }
+                long elapsedMs = Math.max(0L,
+                        android.os.SystemClock.uptimeMillis() - downAtMs);
+                holdProgress.setProgress((int) Math.min(
+                        elapsedMs, GameHoldAction.MARK_SUPPORTED_MS));
+                double seconds =
+                        Math.min(elapsedMs, GameHoldAction.MARK_SUPPORTED_MS) / 1000.0;
+                holdHint.setText(activity.getString(R.string.game_hold_elapsed,
+                        seconds, activity.getString(currentStageText)));
+                holdHandler.postDelayed(this, 100L);
+            }
+        };
+
+        private final Runnable selectionCue = () -> showHoldStage(
+                GameHoldAction.SELECT_FOR_REMOVAL, R.string.game_hold_release_remove, 0xff6fb4ff,
+                0xff203754, 0xff6fb4ff, HapticFeedbackConstants.CLOCK_TICK);
+        private final Runnable unsupportedCue = () -> showHoldStage(
+                GameHoldAction.MARK_UNSUPPORTED, R.string.game_hold_release_unsupported, 0xffff806f,
+                0xff2b201d, 0xffb85d50, HapticFeedbackConstants.CLOCK_TICK);
+        private final Runnable supportedCue = () -> showHoldStage(
+                GameHoldAction.MARK_SUPPORTED, R.string.game_hold_release_supported, 0xff67d391,
+                0xff192820, 0xff4f9a6c, HapticFeedbackConstants.LONG_PRESS);
+
+        GameHoldTouchListener(GameEntry game, TextView holdHint,
+                              ProgressBar holdProgress) {
+            this.game = game;
+            this.holdHint = holdHint;
+            this.holdProgress = holdProgress;
+        }
+
+        @Override
+        public boolean onTouch(View view, MotionEvent event) {
+            switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                // A fresh gesture always owns a fresh timer/callback set, even if a platform or
+                // accessibility service starts it without delivering the previous ACTION_CANCEL.
+                cancel();
+                pressedView = view;
+                restingBackground = view.getBackground();
+                downAtMs = android.os.SystemClock.uptimeMillis();
+                downX = event.getX();
+                downY = event.getY();
+                active = true;
+                reachedAction = GameHoldAction.TAP;
+                // The row must own a stationary gesture from its first event. Delaying this call
+                // lets ScrollView synthesize ACTION_CANCEL from tiny touch jitter before any hold
+                // threshold is reached. A deliberate drag relinquishes ownership below.
+                if (view.getParent() != null) {
+                    view.getParent().requestDisallowInterceptTouchEvent(true);
+                }
+                currentStageText = R.string.game_hold_waiting;
+                holdHint.setTypeface(android.graphics.Typeface.DEFAULT,
+                        android.graphics.Typeface.BOLD);
+                holdHint.setTextColor(0xff9aa6b2);
+                holdHint.setPadding(dp(8), dp(6), dp(8), dp(6));
+                holdHint.setBackground(roundedBackground(0xff151a20, 0xff39424d, 10));
+                holdHint.setVisibility(View.VISIBLE);
+                holdProgress.setProgress(0);
+                holdProgress.setProgressTintList(
+                        android.content.res.ColorStateList.valueOf(0xff6fb4ff));
+                holdProgress.setVisibility(View.VISIBLE);
+                elapsedTicker.run();
+                holdHandler.postDelayed(selectionCue,
+                        GameHoldAction.SELECT_FOR_REMOVAL_MS);
+                holdHandler.postDelayed(unsupportedCue,
+                        GameHoldAction.MARK_UNSUPPORTED_MS);
+                holdHandler.postDelayed(supportedCue,
+                        GameHoldAction.MARK_SUPPORTED_MS);
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                long moveElapsedMs = android.os.SystemClock.uptimeMillis() - downAtMs;
+                // A finger naturally drifts during an eight-second hold. Once the first action
+                // threshold is reached the gesture is locked to this row; cancelling it after
+                // that point made 4 s and 8 s indistinguishable in normal use.
+                if (active && moveElapsedMs < GameHoldAction.SELECT_FOR_REMOVAL_MS
+                        && (Math.abs(event.getX() - downX) > touchSlop * 5
+                        || Math.abs(event.getY() - downY) > touchSlop * 5)) {
+                    cancel();
+                }
+                return true;
+            case MotionEvent.ACTION_UP:
+                if (!active) {
+                    cancel();
+                    return true;
+                }
+                long durationMs = Math.max(0L,
+                        android.os.SystemClock.uptimeMillis() - downAtMs);
+                // The release duration is authoritative. Handler callbacks are only visual cues
+                // and can run late on a busy launcher frame; using the last callback here made an
+                // eight-second hold occasionally execute the four-second action.
+                GameHoldAction action = GameHoldAction.fromDuration(durationMs);
+                cancel();
+                if (action == GameHoldAction.TAP) {
+                    view.performClick();
+                } else {
+                    handleGameHoldAction(game, action);
+                }
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                cancel();
+                return true;
+            default:
+                return true;
+            }
+        }
+
+        private void cue(int feedbackConstant) {
+            if (active && pressedView != null) {
+                pressedView.performHapticFeedback(feedbackConstant);
+            }
+        }
+
+        private void showHoldStage(GameHoldAction action, int textResource,
+                                   int textColor, int fillColor,
+                                   int strokeColor, int feedbackConstant) {
+            if (!active || pressedView == null) {
+                return;
+            }
+            reachedAction = action;
+            holdHint.setText(textResource);
+            currentStageText = textResource;
+            holdHint.setTextColor(textColor);
+            holdHint.setVisibility(View.VISIBLE);
+            holdProgress.setProgressTintList(
+                    android.content.res.ColorStateList.valueOf(textColor));
+            pressedView.setBackground(roundedBackground(fillColor, strokeColor, 18));
+            cue(feedbackConstant);
+        }
+
+        private void cancel() {
+            active = false;
+            reachedAction = GameHoldAction.TAP;
+            holdHandler.removeCallbacks(selectionCue);
+            holdHandler.removeCallbacks(unsupportedCue);
+            holdHandler.removeCallbacks(supportedCue);
+            holdHandler.removeCallbacks(elapsedTicker);
+            holdHint.setText(R.string.game_hold_waiting);
+            holdHint.setTypeface(android.graphics.Typeface.DEFAULT,
+                    android.graphics.Typeface.NORMAL);
+            holdHint.setTextColor(0xff7f8a97);
+            holdHint.setPadding(0, dp(5), 0, 0);
+            holdHint.setBackground(null);
+            holdHint.setVisibility(View.VISIBLE);
+            holdProgress.setProgress(0);
+            holdProgress.setVisibility(View.GONE);
+            if (pressedView != null && restingBackground != null) {
+                pressedView.setBackground(restingBackground);
+            }
+            if (pressedView != null && pressedView.getParent() != null) {
+                pressedView.getParent().requestDisallowInterceptTouchEvent(false);
+            }
+            pressedView = null;
+            restingBackground = null;
+        }
+    }
+
+    /**
+     * Keeps the custom hold gesture compatible with accessibility services that invoke a row
+     * through {@link View#performClick()} instead of synthesizing touch input.
+     */
+    private static final class AccessibleGameRow extends LinearLayout {
+        AccessibleGameRow(android.content.Context context) {
+            super(context);
+        }
+
+        @Override
+        public boolean performClick() {
+            return super.performClick();
+        }
     }
 
     private void updateRemoveAction() {
@@ -745,6 +1024,7 @@ public final class LauncherUi {
                                 ? appInstallRoot() : checkedChild(homeDir(), "games");
                         ensureWithin(game.directory, boundary);
                         deleteTreeWithin(game.directory, boundary);
+                        compatibilityRepository.clear(game.titleId);
                         message = activity.getString(R.string.game_removed, game.title);
                     } catch (Exception error) {
                         Log.e(TAG, "Could not remove " + game.titleId, error);

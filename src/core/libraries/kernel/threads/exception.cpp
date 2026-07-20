@@ -11,7 +11,7 @@
 #include "core/libraries/libs.h"
 #include "core/signals.h"
 #ifdef __ANDROID__
-#include "executor/backend_b/lsx_translation_engine.h"
+#include "executor/jit/lsx_translation_engine.h"
 #endif
 
 #include <cerrno>
@@ -56,7 +56,7 @@ extern "C" void executor_live_mono_mark_pending_sigusr1_for_thread(void* guest_t
     __attribute__((weak));
 extern "C" int executor_live_mono_synthetic_suspend_ack(void* guest_thread, const char* reason)
     __attribute__((weak));
-extern "C" bool executor_lsx4_android_backend_b_active() __attribute__((weak));
+extern "C" bool executor_lsx4_android_jit_active() __attribute__((weak));
 
 struct ExecutorBox64GuestRegs {
     std::uint64_t regs[16];
@@ -74,7 +74,7 @@ static std::atomic<int> g_executor_mono_sigsegv_installed{0};
 static thread_local ExecutorBox64GuestRegs g_executor_raise_regs {};
 static thread_local bool g_executor_have_raise_regs = false;
 
-static void RecordBackendBSignalDispatchFailure(const char* stage, s32 orbis_sig,
+static void RecordJitSignalDispatchFailure(const char* stage, s32 orbis_sig,
                                                 s32 native_sig,
                                                 Libraries::Kernel::OrbisKernelExceptionHandler handler,
                                                 int rc,
@@ -90,7 +90,7 @@ static void RecordBackendBSignalDispatchFailure(const char* stage, s32 orbis_sig
             ? Libraries::Kernel::HandlerKinds[orbis_sig]
             : 0);
     const int fd = ::open(
-        "/data/data/app.lsx4.android/files/executor-backend-b-signal-failure.log",
+        "/data/data/app.lsx4.android/files/executor-jit-signal-failure.log",
         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd >= 0) {
         if (length > 0) {
@@ -104,9 +104,9 @@ static void RecordBackendBSignalDispatchFailure(const char* stage, s32 orbis_sig
     }
 }
 
-static bool ExecutorBackendBSignalParityActive() {
-    return executor_lsx4_android_backend_b_active != nullptr &&
-           executor_lsx4_android_backend_b_active();
+static bool ExecutorJitSignalParityActive() {
+    return executor_lsx4_android_jit_active != nullptr &&
+           executor_lsx4_android_jit_active();
 }
 
 static bool ExecutorIsAsyncDeliveredSegv(const siginfo_t* info) {
@@ -421,11 +421,11 @@ static long CurrentKernelTidForSignalTrace() {
 #endif
 }
 
-// Read-only, explicitly armed observer for the isolated Backend-B signal
+// Read-only, explicitly armed observer for the isolated JIT signal
 // delivery regression.  Keeping every field atomic makes the signal-entry
 // write independent from libc locks and lets the harness take a stable
 // snapshot after the handler returns without changing dispatch semantics.
-struct ExecutorBackendBSignalProbeSnapshot {
+struct ExecutorJitSignalProbeSnapshot {
     std::uint64_t sequence;
     std::int64_t linux_tid;
     std::int32_t orbis_signal;
@@ -437,92 +437,92 @@ struct ExecutorBackendBSignalProbeSnapshot {
     std::uintptr_t host_pc;
 };
 
-static std::atomic_bool g_backend_b_signal_probe_armed{false};
-static std::atomic<std::uint64_t> g_backend_b_signal_probe_sequence{0};
-static std::atomic<std::int64_t> g_backend_b_signal_probe_linux_tid{-1};
-static std::atomic<std::int32_t> g_backend_b_signal_probe_orbis_signal{0};
-static std::atomic<std::int32_t> g_backend_b_signal_probe_native_signal{0};
-static std::atomic<std::uint8_t> g_backend_b_signal_probe_handler_kind{0};
-static std::atomic<std::uintptr_t> g_backend_b_signal_probe_guest_state{0};
-static std::atomic<std::uint64_t> g_backend_b_signal_probe_guest_rip{0};
-static std::atomic<std::uintptr_t> g_backend_b_signal_probe_host_pc{0};
+static std::atomic_bool g_jit_signal_probe_armed{false};
+static std::atomic<std::uint64_t> g_jit_signal_probe_sequence{0};
+static std::atomic<std::int64_t> g_jit_signal_probe_linux_tid{-1};
+static std::atomic<std::int32_t> g_jit_signal_probe_orbis_signal{0};
+static std::atomic<std::int32_t> g_jit_signal_probe_native_signal{0};
+static std::atomic<std::uint8_t> g_jit_signal_probe_handler_kind{0};
+static std::atomic<std::uintptr_t> g_jit_signal_probe_guest_state{0};
+static std::atomic<std::uint64_t> g_jit_signal_probe_guest_rip{0};
+static std::atomic<std::uintptr_t> g_jit_signal_probe_host_pc{0};
 
-static void RecordBackendBSignalProbeEntry(const s32 orbis_signal,
+static void RecordJitSignalProbeEntry(const s32 orbis_signal,
                                            const s32 native_signal,
                                            const ucontext_t* raw_context) {
-    if (!g_backend_b_signal_probe_armed.load(std::memory_order_acquire) ||
-        !ExecutorBackendBSignalParityActive()) {
+    if (!g_jit_signal_probe_armed.load(std::memory_order_acquire) ||
+        !ExecutorJitSignalParityActive()) {
         return;
     }
-    auto* state = Executor::BackendB::CurrentMachineImage();
+    auto* state = Executor::Jit::CurrentMachineImage();
     const auto next_sequence =
-        g_backend_b_signal_probe_sequence.load(std::memory_order_relaxed) + 1;
-    g_backend_b_signal_probe_linux_tid.store(CurrentKernelTidForSignalTrace(),
+        g_jit_signal_probe_sequence.load(std::memory_order_relaxed) + 1;
+    g_jit_signal_probe_linux_tid.store(CurrentKernelTidForSignalTrace(),
                                              std::memory_order_relaxed);
-    g_backend_b_signal_probe_orbis_signal.store(orbis_signal, std::memory_order_relaxed);
-    g_backend_b_signal_probe_native_signal.store(native_signal, std::memory_order_relaxed);
-    g_backend_b_signal_probe_handler_kind.store(
+    g_jit_signal_probe_orbis_signal.store(orbis_signal, std::memory_order_relaxed);
+    g_jit_signal_probe_native_signal.store(native_signal, std::memory_order_relaxed);
+    g_jit_signal_probe_handler_kind.store(
         orbis_signal >= 0 && static_cast<std::size_t>(orbis_signal) < HandlerKinds.size()
             ? HandlerKinds[orbis_signal]
             : std::uint8_t{0},
         std::memory_order_relaxed);
-    g_backend_b_signal_probe_guest_state.store(reinterpret_cast<std::uintptr_t>(state),
+    g_jit_signal_probe_guest_state.store(reinterpret_cast<std::uintptr_t>(state),
                                                std::memory_order_relaxed);
-    g_backend_b_signal_probe_guest_rip.store(state != nullptr ? state->rip_or_exit : 0,
+    g_jit_signal_probe_guest_rip.store(state != nullptr ? state->rip_or_exit : 0,
                                              std::memory_order_relaxed);
 #if defined(__aarch64__)
-    g_backend_b_signal_probe_host_pc.store(
+    g_jit_signal_probe_host_pc.store(
         raw_context != nullptr
             ? static_cast<std::uintptr_t>(raw_context->uc_mcontext.pc)
             : 0,
         std::memory_order_relaxed);
 #else
-    g_backend_b_signal_probe_host_pc.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_host_pc.store(0, std::memory_order_relaxed);
 #endif
-    g_backend_b_signal_probe_sequence.store(next_sequence, std::memory_order_release);
+    g_jit_signal_probe_sequence.store(next_sequence, std::memory_order_release);
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
-executor_backend_b_signal_probe_arm(const int armed) {
-    g_backend_b_signal_probe_armed.store(false, std::memory_order_release);
-    g_backend_b_signal_probe_sequence.store(0, std::memory_order_relaxed);
-    g_backend_b_signal_probe_linux_tid.store(-1, std::memory_order_relaxed);
-    g_backend_b_signal_probe_orbis_signal.store(0, std::memory_order_relaxed);
-    g_backend_b_signal_probe_native_signal.store(0, std::memory_order_relaxed);
-    g_backend_b_signal_probe_handler_kind.store(0, std::memory_order_relaxed);
-    g_backend_b_signal_probe_guest_state.store(0, std::memory_order_relaxed);
-    g_backend_b_signal_probe_guest_rip.store(0, std::memory_order_relaxed);
-    g_backend_b_signal_probe_host_pc.store(0, std::memory_order_relaxed);
+executor_jit_signal_probe_arm(const int armed) {
+    g_jit_signal_probe_armed.store(false, std::memory_order_release);
+    g_jit_signal_probe_sequence.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_linux_tid.store(-1, std::memory_order_relaxed);
+    g_jit_signal_probe_orbis_signal.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_native_signal.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_handler_kind.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_guest_state.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_guest_rip.store(0, std::memory_order_relaxed);
+    g_jit_signal_probe_host_pc.store(0, std::memory_order_relaxed);
     if (armed == 0) {
         return 0;
     }
-    if (!ExecutorBackendBSignalParityActive()) {
+    if (!ExecutorJitSignalParityActive()) {
         return -1;
     }
-    g_backend_b_signal_probe_armed.store(true, std::memory_order_release);
+    g_jit_signal_probe_armed.store(true, std::memory_order_release);
     return 0;
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
-executor_backend_b_signal_probe_snapshot(void* out, const std::size_t out_size) {
-    if (out == nullptr || out_size != sizeof(ExecutorBackendBSignalProbeSnapshot)) {
+executor_jit_signal_probe_snapshot(void* out, const std::size_t out_size) {
+    if (out == nullptr || out_size != sizeof(ExecutorJitSignalProbeSnapshot)) {
         return -1;
     }
-    ExecutorBackendBSignalProbeSnapshot snapshot{};
-    snapshot.sequence = g_backend_b_signal_probe_sequence.load(std::memory_order_acquire);
-    snapshot.linux_tid = g_backend_b_signal_probe_linux_tid.load(std::memory_order_relaxed);
+    ExecutorJitSignalProbeSnapshot snapshot{};
+    snapshot.sequence = g_jit_signal_probe_sequence.load(std::memory_order_acquire);
+    snapshot.linux_tid = g_jit_signal_probe_linux_tid.load(std::memory_order_relaxed);
     snapshot.orbis_signal =
-        g_backend_b_signal_probe_orbis_signal.load(std::memory_order_relaxed);
+        g_jit_signal_probe_orbis_signal.load(std::memory_order_relaxed);
     snapshot.native_signal =
-        g_backend_b_signal_probe_native_signal.load(std::memory_order_relaxed);
+        g_jit_signal_probe_native_signal.load(std::memory_order_relaxed);
     snapshot.handler_kind =
-        g_backend_b_signal_probe_handler_kind.load(std::memory_order_relaxed);
+        g_jit_signal_probe_handler_kind.load(std::memory_order_relaxed);
     snapshot.guest_state =
-        g_backend_b_signal_probe_guest_state.load(std::memory_order_relaxed);
+        g_jit_signal_probe_guest_state.load(std::memory_order_relaxed);
     snapshot.guest_rip =
-        g_backend_b_signal_probe_guest_rip.load(std::memory_order_relaxed);
+        g_jit_signal_probe_guest_rip.load(std::memory_order_relaxed);
     snapshot.host_pc =
-        g_backend_b_signal_probe_host_pc.load(std::memory_order_relaxed);
+        g_jit_signal_probe_host_pc.load(std::memory_order_relaxed);
     std::memcpy(out, &snapshot, sizeof(snapshot));
     return 0;
 }
@@ -536,23 +536,23 @@ static void TraceLiveSignal(const char* stage, s32 orbis_sig, s32 native_sig,
     if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
         return;
     }
-    const auto* guest_state = Executor::BackendB::CurrentMachineImage();
+    const auto* guest_state = Executor::Jit::CurrentMachineImage();
     const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
     const std::uint64_t guest_rsp = guest_state != nullptr
-                                        ? Executor::BackendB::GetGpr64(
-                                              *guest_state, Executor::BackendB::LsxGpr::Rsp)
+                                        ? Executor::Jit::GetGpr64(
+                                              *guest_state, Executor::Jit::LsxGpr::Rsp)
                                         : 0;
-    const auto guest_gpr = [guest_state](const Executor::BackendB::LsxGpr reg) {
-        return guest_state != nullptr ? Executor::BackendB::GetGpr64(*guest_state, reg) : 0;
+    const auto guest_gpr = [guest_state](const Executor::Jit::LsxGpr reg) {
+        return guest_state != nullptr ? Executor::Jit::GetGpr64(*guest_state, reg) : 0;
     };
-    const std::uint64_t guest_rdi = guest_gpr(Executor::BackendB::LsxGpr::Rdi);
-    const std::uint64_t guest_rsi = guest_gpr(Executor::BackendB::LsxGpr::Rsi);
-    const std::uint64_t guest_rbp = guest_gpr(Executor::BackendB::LsxGpr::Rbp);
-    const std::uint64_t guest_rax = guest_gpr(Executor::BackendB::LsxGpr::Rax);
-    const std::uint64_t guest_r12 = guest_gpr(Executor::BackendB::LsxGpr::R12);
-    const std::uint64_t guest_r13 = guest_gpr(Executor::BackendB::LsxGpr::R13);
-    const std::uint64_t guest_r14 = guest_gpr(Executor::BackendB::LsxGpr::R14);
-    const std::uint64_t guest_r15 = guest_gpr(Executor::BackendB::LsxGpr::R15);
+    const std::uint64_t guest_rdi = guest_gpr(Executor::Jit::LsxGpr::Rdi);
+    const std::uint64_t guest_rsi = guest_gpr(Executor::Jit::LsxGpr::Rsi);
+    const std::uint64_t guest_rbp = guest_gpr(Executor::Jit::LsxGpr::Rbp);
+    const std::uint64_t guest_rax = guest_gpr(Executor::Jit::LsxGpr::Rax);
+    const std::uint64_t guest_r12 = guest_gpr(Executor::Jit::LsxGpr::R12);
+    const std::uint64_t guest_r13 = guest_gpr(Executor::Jit::LsxGpr::R13);
+    const std::uint64_t guest_r14 = guest_gpr(Executor::Jit::LsxGpr::R14);
+    const std::uint64_t guest_r15 = guest_gpr(Executor::Jit::LsxGpr::R15);
     __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
                         "[EXECUTOR_LIVE_SIGNAL] stage=%s curThread=%s tid=%ld target=%p "
                         "targetName=%s targetNative=0x%zx sig=%d native=%d handler=%p "
@@ -660,13 +660,13 @@ static void TraceLightOracleThreadSnapshot(const char* reason, PthreadT target, 
                         target && target->name == "UnityPreload" ? 1 : 0);
 }
 
-static bool CaptureBackendBGuestUcontext(Ucontext& ctx) {
-    const auto* state = Executor::BackendB::CurrentMachineImage();
+static bool CaptureJitGuestUcontext(Ucontext& ctx) {
+    const auto* state = Executor::Jit::CurrentMachineImage();
     if (state == nullptr) {
         return false;
     }
-    using Executor::BackendB::GetGpr64;
-    using Executor::BackendB::LsxGpr;
+    using Executor::Jit::GetGpr64;
+    using Executor::Jit::LsxGpr;
     ctx.uc_mcontext.mc_rax = GetGpr64(*state, LsxGpr::Rax);
     ctx.uc_mcontext.mc_rcx = GetGpr64(*state, LsxGpr::Rcx);
     ctx.uc_mcontext.mc_rdx = GetGpr64(*state, LsxGpr::Rdx);
@@ -701,8 +701,8 @@ static bool RunGuestSignalHandlerThroughBox64(s32 orbis_sig, s32 native_sig,
         return false;
     }
 
-    const bool backend_b_parity = ExecutorBackendBSignalParityActive();
-    const std::uint8_t kind = backend_b_parity ? HandlerKinds[orbis_sig] :
+    const bool jit_parity = ExecutorJitSignalParityActive();
+    const std::uint8_t kind = jit_parity ? HandlerKinds[orbis_sig] :
         ((HandlerFlags[orbis_sig] & POSIX_SA_SIGINFO) != 0 ? 2u : 1u);
     const bool siginfo_handler = kind == 2;
     const bool kernel_exception_handler = kind == 3;
@@ -725,7 +725,7 @@ static bool RunGuestSignalHandlerThroughBox64(s32 orbis_sig, s32 native_sig,
                     orbis_sig, native_sig, handler, nullptr, rc,
                     static_cast<int>(guest_result), siginfo ? siginfo->_si_addr : nullptr);
     if (rc < 0) {
-        RecordBackendBSignalDispatchFailure("guest_handler_call", orbis_sig, native_sig, handler,
+        RecordJitSignalDispatchFailure("guest_handler_call", orbis_sig, native_sig, handler,
                                             rc, siginfo ? siginfo->_si_addr : nullptr);
         return false;
     }
@@ -735,15 +735,15 @@ static bool RunGuestSignalHandlerThroughBox64(s32 orbis_sig, s32 native_sig,
 static bool ApplyGuestUcontextToBackend(s32 orbis_sig, s32 native_sig,
                                         OrbisKernelExceptionHandler handler,
                                         const Ucontext& ctx, void* fault_addr) {
-    if (ExecutorBackendBSignalParityActive()) {
-        auto* state = Executor::BackendB::CurrentMachineImage();
+    if (ExecutorJitSignalParityActive()) {
+        auto* state = Executor::Jit::CurrentMachineImage();
         if (state == nullptr) {
             TraceLiveSignal("handler_guest_ucontext_apply_no_state", orbis_sig, native_sig,
                             handler, nullptr, -1, 0, fault_addr);
             return false;
         }
-        using Executor::BackendB::SetGpr64;
-        using Executor::BackendB::LsxGpr;
+        using Executor::Jit::SetGpr64;
+        using Executor::Jit::LsxGpr;
         SetGpr64(*state, LsxGpr::Rax, ctx.uc_mcontext.mc_rax);
         SetGpr64(*state, LsxGpr::Rcx, ctx.uc_mcontext.mc_rcx);
         SetGpr64(*state, LsxGpr::Rdx, ctx.uc_mcontext.mc_rdx);
@@ -808,7 +808,7 @@ static bool ApplyGuestUcontextToBackend(s32 orbis_sig, s32 native_sig,
     return rc == 0;
 }
 
-static void ApplyBackendBGuestSignalMask(const Sigset& mask) {
+static void ApplyJitGuestSignalMask(const Sigset& mask) {
     if (g_curthread != nullptr) {
         g_curthread->sigmask = mask.bits[0];
     }
@@ -827,17 +827,17 @@ static void ApplyBackendBGuestSignalMask(const Sigset& mask) {
 #endif
 
 #ifndef _WIN64
-struct BackendBDeferredSignalMetadata {
+struct JitDeferredSignalMetadata {
     u64 guest_rip = 0;
     bool is_write = false;
 };
 
 static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* raw_context,
-                                const BackendBDeferredSignalMetadata* deferred = nullptr) {
+                                const JitDeferredSignalMetadata* deferred = nullptr) {
     const auto orbis_sig = NativeToOrbisSignal(native_signum);
 #ifdef __ANDROID__
-    const bool backend_b_parity = ExecutorBackendBSignalParityActive();
-    RecordBackendBSignalProbeEntry(orbis_sig, native_signum, raw_context);
+    const bool jit_parity = ExecutorJitSignalParityActive();
+    RecordJitSignalProbeEntry(orbis_sig, native_signum, raw_context);
 #endif
     const auto handler = Handlers[orbis_sig];
     if (handler) {
@@ -846,9 +846,9 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
                         HandlerFlags[orbis_sig], inf ? inf->si_addr : nullptr);
 #endif
 #ifdef __ANDROID__
-        // Backend B enters here from an asynchronous host signal. stdio may already be locked by
+        // JIT enters here from an asynchronous host signal. stdio may already be locked by
         // the interrupted thread, so fprintf/fflush can deadlock before guest signal dispatch.
-        if (!backend_b_parity) {
+        if (!jit_parity) {
 #endif
             std::fprintf(
                 stderr,
@@ -861,7 +861,7 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
 #endif
         auto ctx = Ucontext{};
 #ifdef __ANDROID__
-        if (backend_b_parity && g_curthread != nullptr) {
+        if (jit_parity && g_curthread != nullptr) {
             ctx.uc_sigmask.bits[0] = g_curthread->sigmask;
             ctx.uc_sigmask.bits[1] = 0;
         }
@@ -957,11 +957,11 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
             }
         }
         // The legacy Box64 snapshot omits RFLAGS and intentionally exposes only the common GPR
-        // ABI.  Backend B owns a richer architectural state object; capture it directly so a
+        // ABI.  JIT owns a richer architectural state object; capture it directly so a
         // deferred synchronous handler sees the precise fault state and may modify every scalar
         // field represented by Orbis Ucontext.
-        if (backend_b_parity && !CaptureBackendBGuestUcontext(ctx)) {
-            RecordBackendBSignalDispatchFailure("guest_ucontext_capture", orbis_sig,
+        if (jit_parity && !CaptureJitGuestUcontext(ctx)) {
+            RecordJitSignalDispatchFailure("guest_ucontext_capture", orbis_sig,
                                                 native_signum, handler, -1,
                                                 inf ? inf->si_addr : nullptr);
             return false;
@@ -1004,7 +1004,7 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
                             inf ? inf->si_addr : nullptr);
             return false;
         }
-        if (!backend_b_parity && orbis_sig == POSIX_SIGUSR1 &&
+        if (!jit_parity && orbis_sig == POSIX_SIGUSR1 &&
             std::getenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER") != nullptr) {
             TraceLiveSignal("handler_guest_ucontext_preserve_interrupted_frame", orbis_sig,
                             native_signum, handler, nullptr, 0, HandlerFlags[orbis_sig],
@@ -1013,8 +1013,8 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
             const bool applied = ApplyGuestUcontextToBackend(
                 orbis_sig, native_signum, handler, ctx,
                 inf ? inf->si_addr : nullptr);
-            if (backend_b_parity && !applied) {
-                RecordBackendBSignalDispatchFailure(
+            if (jit_parity && !applied) {
+                RecordJitSignalDispatchFailure(
                     "guest_ucontext_apply", orbis_sig, native_signum, handler, -1,
                     inf ? inf->si_addr : nullptr);
                 TraceLiveSignal("handler_guest_ucontext_apply_failed", orbis_sig,
@@ -1024,8 +1024,8 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
                 return false;
             }
         }
-        if (backend_b_parity) {
-            ApplyBackendBGuestSignalMask(ctx.uc_sigmask);
+        if (jit_parity) {
+            ApplyJitGuestSignalMask(ctx.uc_sigmask);
         }
 #else
         if ((HandlerFlags[orbis_sig] & POSIX_SA_SIGINFO) != 0) {
@@ -1040,7 +1040,7 @@ static bool DispatchGuestSignal(int native_signum, siginfo_t* inf, ucontext_t* r
                         HandlerFlags[orbis_sig], inf ? inf->si_addr : nullptr);
 #endif
 #ifdef __ANDROID__
-        if (!backend_b_parity) {
+        if (!jit_parity) {
 #endif
             std::fprintf(stderr,
                          "[EXECUTOR_SIGNAL_HANDLER_RETURNED] sig=%d native=%d handler=%p\n",
@@ -1069,8 +1069,21 @@ executor_lsx4_android_dispatch_deferred_guest_signal(
     const std::int32_t si_errno, const std::int32_t source_pid,
     const std::uint32_t source_uid, const std::uint64_t fault_addr,
     const std::uint64_t guest_rip, const std::int32_t is_write) {
-    if (!ExecutorBackendBSignalParityActive() || guest_rip == 0) {
+    if (!ExecutorJitSignalParityActive() || guest_rip == 0) {
         return 0;
+    }
+    const auto orbis_sig = NativeToOrbisSignal(native_sig);
+    static std::atomic<u32> deferred_trace_count{0};
+    const u32 trace_index = deferred_trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_index < 32) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[LSX4_DEFERRED_SIGNAL] phase=enter native=%d orbis=%d handler=%p flags=0x%x "
+            "kind=%u guestRip=0x%llx fault=0x%llx",
+            native_sig, orbis_sig, reinterpret_cast<void*>(Handlers[orbis_sig]),
+            HandlerFlags[orbis_sig], static_cast<unsigned>(HandlerKinds[orbis_sig]),
+            static_cast<unsigned long long>(guest_rip),
+            static_cast<unsigned long long>(fault_addr));
     }
     siginfo_t info{};
     info.si_signo = native_sig;
@@ -1085,8 +1098,17 @@ executor_lsx4_android_dispatch_deferred_guest_signal(
     // remains by design, and DispatchGuestSignal replaces this with the exact LsxMachineImage image.
     raw_context.uc_mcontext.pc = guest_rip;
 #endif
-    const BackendBDeferredSignalMetadata deferred{guest_rip, is_write != 0};
-    return DispatchGuestSignal(native_sig, &info, &raw_context, &deferred) ? 1 : -1;
+    const JitDeferredSignalMetadata deferred{guest_rip, is_write != 0};
+    const bool dispatched = DispatchGuestSignal(native_sig, &info, &raw_context, &deferred);
+    if (trace_index < 32) {
+        __android_log_print(
+            dispatched ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, "LSX4Native",
+            "[LSX4_DEFERRED_SIGNAL] phase=return native=%d orbis=%d dispatched=%d "
+            "handler=%p",
+            native_sig, orbis_sig, dispatched ? 1 : 0,
+            reinterpret_cast<void*>(Handlers[orbis_sig]));
+    }
+    return dispatched ? 1 : -1;
 }
 #endif
 
@@ -1174,7 +1196,7 @@ s32 PS4_SYSV_ABI posix_sigaction(s32 sig, Sigaction* act, Sigaction* oact) {
     }
 #ifdef __ANDROID__
     const s32 native_sig = OrbisToNativeSignal(sig);
-    if (ExecutorBackendBSignalParityActive()) {
+    if (ExecutorJitSignalParityActive()) {
         const auto previous_handler = Handlers[sig];
         const std::uint8_t previous_kind = HandlerKinds[sig];
         if (oact != nullptr) {
@@ -1195,7 +1217,7 @@ s32 PS4_SYSV_ABI posix_sigaction(s32 sig, Sigaction* act, Sigaction* oact) {
             HandlerKinds[sig] =
                 (act->sa_flags & POSIX_SA_SIGINFO) != 0 ? std::uint8_t{2} : std::uint8_t{1};
             HandlerFlags[sig] = act->sa_flags;
-            TraceLiveSignal("backend_b_sigaction_register", sig, native_sig, next_handler,
+            TraceLiveSignal("jit_sigaction_register", sig, native_sig, next_handler,
                             nullptr, 0, HandlerKinds[sig], static_cast<void*>(act));
         }
 
@@ -1242,7 +1264,7 @@ s32 PS4_SYSV_ABI posix_sigaction(s32 sig, Sigaction* act, Sigaction* oact) {
         const int ret = sigaction(native_sig, native_act_ptr,
                                   oact != nullptr ? &native_oact : nullptr);
         const int err = errno;
-        TraceLiveSignal("backend_b_host_sigaction", sig, native_sig, Handlers[sig], nullptr,
+        TraceLiveSignal("jit_host_sigaction", sig, native_sig, Handlers[sig], nullptr,
                         ret, err, nullptr);
         if (ret < 0) {
             *__Error() = ErrnoToSceKernelError(err);
@@ -1445,15 +1467,15 @@ s32 PS4_SYSV_ABI posix_pthread_kill(PthreadT thread, s32 sig) {
     }
     int const native_signum = OrbisToNativeSignal(sig);
 #ifdef __ANDROID__
-    if (ExecutorBackendBSignalParityActive()) {
+    if (ExecutorJitSignalParityActive()) {
         if (thread == nullptr) {
             return POSIX_EINVAL;
         }
         const auto pthr = static_cast<pthread_t>(thread->native_thr.GetHandle());
-        TraceLiveSignal("backend_b_pthread_kill_enter", sig, native_signum, Handlers[sig],
+        TraceLiveSignal("jit_pthread_kill_enter", sig, native_signum, Handlers[sig],
                         thread, 0, HandlerKinds[sig], nullptr);
         const int ret = pthread_kill(pthr, native_signum);
-        TraceLiveSignal("backend_b_pthread_kill_return", sig, native_signum, Handlers[sig],
+        TraceLiveSignal("jit_pthread_kill_return", sig, native_signum, Handlers[sig],
                         thread, ret, errno, nullptr);
         // Preserve ESRCH/EINVAL so sceKernelRaiseException can encode the
         // corresponding Orbis error. BDWGC relies on ESRCH to exclude a dead
@@ -1490,8 +1512,8 @@ s32 PS4_SYSV_ABI posix_pthread_kill(PthreadT thread, s32 sig) {
     }
     const bool allow_synthetic_mono_ack =
         std::getenv("EXECUTOR_LIVE_MONO_SYNTHETIC_ACK") != nullptr &&
-        !(executor_lsx4_android_backend_b_active != nullptr &&
-          executor_lsx4_android_backend_b_active());
+        !(executor_lsx4_android_jit_active != nullptr &&
+          executor_lsx4_android_jit_active());
     if (live_mono_sigusr1 && allow_synthetic_mono_ack && ExecutorIsHleUnsafeMonoThread(thread) &&
         executor_live_mono_synthetic_suspend_ack) {
         const int synth_rc =
@@ -1690,7 +1712,7 @@ int PS4_SYSV_ABI sceKernelInstallExceptionHandler(s32 signum, OrbisKernelExcepti
         return ErrnoToSceKernelError(*__Error());
     }
 #ifdef __ANDROID__
-    if (ExecutorBackendBSignalParityActive()) {
+    if (ExecutorJitSignalParityActive()) {
         HandlerKinds[signum] = 3;
     }
 #endif
@@ -1748,7 +1770,7 @@ int PS4_SYSV_ABI sceKernelRaiseException(PthreadT thread, int signum) {
     }
 #ifdef __ANDROID__
     // BDWGC scans the collector thread's native registers before it stops its peers.  Under
-    // Backend B those AArch64 registers do not contain the emulated x86-64 GPRs, so publish the
+    // JIT those AArch64 registers do not contain the emulated x86-64 GPRs, so publish the
     // initiating thread's guest register image as a conservative root as well.  The target-side
     // signal handler below publishes every suspended peer, but Game:Main (the collector) is never
     // sent its own SIGUSR1 and was therefore the one missing register root.

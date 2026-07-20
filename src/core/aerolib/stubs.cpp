@@ -11,7 +11,7 @@
 #include "core/libraries/libc_internal/libc_internal_io.h"
 #include "core/memory.h"
 #ifdef __ANDROID__
-#include "executor/backend_b/lsx_translation_engine.h"
+#include "executor/jit/lsx_translation_engine.h"
 #endif
 
 #include <algorithm>
@@ -92,14 +92,14 @@ extern "C" int executor_live_get_current_hle_call_site(std::uint64_t* guest_retu
     __attribute__((weak));
 extern "C" int executor_live_get_current_hle_guest_rsp(std::uint64_t* guest_rsp)
     __attribute__((weak));
-extern "C" void executor_backend_b_record_current_thread_state(const char* reason)
+extern "C" void executor_jit_record_current_thread_state(const char* reason)
     __attribute__((weak));
-extern "C" void executor_backend_b_dump_thread_states(const char* reason) __attribute__((weak));
-extern "C" bool ExecutorBackendBReadGuestBytes(std::uint64_t address, void* dst,
+extern "C" void executor_jit_dump_thread_states(const char* reason) __attribute__((weak));
+extern "C" bool ExecutorJitReadGuestBytes(std::uint64_t address, void* dst,
                                                  std::size_t size) __attribute__((weak));
-extern "C" bool ExecutorBackendBWriteGuestBytes(std::uint64_t address, const void* src,
+extern "C" bool ExecutorJitWriteGuestBytes(std::uint64_t address, const void* src,
                                                   std::size_t size) __attribute__((weak));
-extern "C" bool ExecutorBackendBIsReadableGuestRange(std::uint64_t address,
+extern "C" bool ExecutorJitIsReadableGuestRange(std::uint64_t address,
                                                        std::size_t size)
     __attribute__((weak));
 
@@ -154,7 +154,7 @@ static constexpr std::array<u8, 32> ExecutorFexHleThunkHash = {
     0x3a, 0x66, 0x65, 0x78, 0x63, 0x6f, 0x72, 0x65,
     0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x30, 0x31,
 };
-static constexpr std::array<u8, 32> ExecutorBackendBHleThunkHash = {
+static constexpr std::array<u8, 32> ExecutorJitHleThunkHash = {
     0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
     0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
     0x3a, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64,
@@ -175,13 +175,20 @@ static std::unordered_map<u64, u64> g_android_x64_hle_stub_by_native;
 static std::unordered_map<u64, u64> g_android_x64_return_zero_stub_by_native;
 static constexpr u32 AndroidX64FallbackStubSlot = MAX_STUBS - 1;
 static u32 g_android_x64_native_hle_next_slot = AndroidX64FallbackStubSlot;
+// A low stub represents an unresolved semantic import, not one relocation occurrence. PRX
+// relocation can ask for the same NID thousands of times during startup; assigning a fresh slot
+// each time eventually consumed the whole slab and made later, fully resolved HLE imports fall
+// through the zero-return emergency slot. Keep the low allocator independent from the HLE metadata
+// mutex because traceable GPU stubs publish metadata while this lock is held.
+static std::mutex g_android_x64_low_stub_mutex;
+static std::unordered_map<std::string, u64> g_android_x64_low_stub_by_nid;
 
 bool ExecutorRuntimeFlagExists(const char* filename);
 
-bool ExecutorBackendBActiveForStubGeneration() {
+bool ExecutorJitActiveForStubGeneration() {
     using Fn = int (*)();
     static Fn fn = reinterpret_cast<Fn>(
-        dlsym(RTLD_DEFAULT, "executor_lsx4_android_runtime_backend_b_active"));
+        dlsym(RTLD_DEFAULT, "executor_lsx4_android_runtime_jit_active"));
     return fn != nullptr && fn() != 0;
 }
 
@@ -246,7 +253,7 @@ void* EnsureAndroidX64StubSlab() {
         __builtin___clear_cache(reinterpret_cast<char*>(code),
                                 reinterpret_cast<char*>(code + slab_size));
     }
-    if (!ExecutorBackendBActiveForStubGeneration()) {
+    if (!ExecutorJitActiveForStubGeneration()) {
         RegisterAndroidX64StubSlabWithFex();
     }
     return g_android_x64_zero_stub_slab;
@@ -661,7 +668,7 @@ u64 GetAndroidX64HleStub(u32 slot, u64 native_function) {
     code[cursor++] = 0x0f;
     code[cursor++] = 0x3f;
     const auto& hle_hash =
-        ExecutorBackendBActiveForStubGeneration() ? ExecutorBackendBHleThunkHash
+        ExecutorJitActiveForStubGeneration() ? ExecutorJitHleThunkHash
                                                   : ExecutorFexHleThunkHash;
     std::memcpy(code + cursor, hle_hash.data(), hle_hash.size());
     cursor += hle_hash.size();
@@ -799,18 +806,18 @@ u64 GetAndroidX64FastGuestLibcStringStub(const char* name) {
     if (!ExecutorUseFastGuestLibcStrings() || !IsFastGuestLibcStringName(name)) {
         return 0;
     }
-    // Backend B already has a native HLE bridge for these routines. Emitting an x86 byte loop
+    // JIT already has a native HLE bridge for these routines. Emitting an x86 byte loop
     // here is both less correct (unbounded strlen/strcmp can walk across a malformed guest
     // allocation forever) and much slower (one or more JIT blocks per byte). Keep these legacy
-    // stubs available to the old translator path only; Backend B must use ExecutorLibcStrlen /
+    // stubs available to the old translator path only; JIT must use ExecutorLibcStrlen /
     // ExecutorSafeStrcmp and their checked guest-byte reader regardless of a stale fast-string
     // marker left by an earlier diagnostic run.
-    if (ExecutorBackendBActiveForStubGeneration()) {
+    if (ExecutorJitActiveForStubGeneration()) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed)) {
             __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
                                 "[EXECUTOR_FAST_LIBC_STRING_STUB] disabled=1 "
-                                "backend=backend-b route=native-checked-hle");
+                                "backend=jit route=native-checked-hle");
         }
         return 0;
     }
@@ -1128,9 +1135,9 @@ bool ExecutorMspaceFreeReuseEnabled() {
     if (enabled < 0) {
         const bool explicitly_disabled =
             ExecutorRuntimeFlagExists("run-disable-mspace-free-reuse");
-        // The reference libc mspace is reusable.  Keeping Backend B monotonic leaks every Boehm
+        // The reference libc mspace is reusable.  Keeping JIT monotonic leaks every Boehm
         // heap section after a collection and deterministically exhausts the 512-MiB arena during
-        // Unity startup.  The alias sources that originally motivated the Backend-B exception are
+        // Unity startup.  The alias sources that originally motivated the JIT exception are
         // fixed now: global/custom mspaces are isolated, reallocalign follows the PS4 ABI, and an
         // exact live allocation wins over a containing allocation.  Retain an explicit emergency
         // opt-out, and validate every recycled candidate against the live registry below.
@@ -2055,7 +2062,11 @@ bool RememberExecutorAllocation(void* ptr, void* base = nullptr, std::size_t map
     if (!inserted) {
         return false;
     }
-    if (mspace_handle != 0 && live_size != 0) {
+    // Handle 0 is the checked host-allocation fallback used before the lazy guest libc mspace
+    // exists. Keep those extents indexed too: a handful of bootstrap strings/records are passed
+    // back into guest Mono, and the guest libc reader must be able to prove their exact live bounds
+    // without accepting arbitrary readable host memory or linearly scanning every allocation.
+    if (live_size != 0) {
         const bool interval_inserted =
             g_executor_live_mspace_intervals[mspace_handle].emplace(begin, live_size).second;
         if (!interval_inserted) {
@@ -2191,13 +2202,11 @@ bool ForgetExecutorAllocation(void* ptr, ExecutorAllocationInfo* info = nullptr,
     if (info != nullptr) {
         *info = removed;
     }
-    if (removed.mspace_handle != 0) {
-        const auto owner = g_executor_live_mspace_intervals.find(removed.mspace_handle);
-        if (owner != g_executor_live_mspace_intervals.end()) {
-            owner->second.erase(reinterpret_cast<u64>(ptr));
-            if (owner->second.empty()) {
-                g_executor_live_mspace_intervals.erase(owner);
-            }
+    const auto owner = g_executor_live_mspace_intervals.find(removed.mspace_handle);
+    if (owner != g_executor_live_mspace_intervals.end()) {
+        owner->second.erase(reinterpret_cast<u64>(ptr));
+        if (owner->second.empty()) {
+            g_executor_live_mspace_intervals.erase(owner);
         }
     }
     g_executor_allocations.erase(it);
@@ -3931,11 +3940,13 @@ u64 ExecutorLibcFree(u64 ptr) {
 
 #ifdef __ANDROID__
 static bool ExecutorLibcCopyTraceEnabled() {
-    const char* env = std::getenv("EXECUTOR_TRACE_LIBC_COPY");
-    if (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) {
-        return true;
-    }
-    return false;
+    // Diagnostic policy is installed before guest execution. Avoid an environment lookup on
+    // every memcpy/memmove HLE call when tracing is disabled.
+    static const bool enabled = [] {
+        const char* env = std::getenv("EXECUTOR_TRACE_LIBC_COPY");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
 }
 
 static bool ExecutorLooksLikeGuestDataPtr(u64 ptr) {
@@ -4111,7 +4122,7 @@ static bool ExecutorLibcOwnHostImageRange(u64& lo, u64& hi) {
 // A guest libc write (memcpy/memmove/memset/strcpy/…) whose DEST lands inside our own loaded host
 // image is ALWAYS a bug: the guest computed a garbage host-address destination (from a leaked host
 // pointer) and our HLE would overwrite our .so's static mutexes / caches, corrupting the process
-// (shape-shifting FORTIFY/SIGSEGV, Sonic Backend-B). Reject + log the exact dest/size/return-addr so
+// (shape-shifting FORTIFY/SIGSEGV, Sonic JIT). Reject + log the exact dest/size/return-addr so
 // the leak source can be traced, instead of corrupting.
 static bool ExecutorLibcRejectHostImageWrite(const char* op, u64 dest, u64 size) {
     u64 lo = 0, hi = 0;
@@ -4127,7 +4138,7 @@ static bool ExecutorLibcRejectHostImageWrite(const char* op, u64 dest, u64 size)
                   op, dest, size, lo, hi,
                   reinterpret_cast<u64>(__builtin_return_address(0)));
         std::FILE* cf = std::fopen(
-            "/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt", "a");
+            "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a");
         if (cf != nullptr) {
             std::fprintf(cf, "LIBC_WRITE_INTO_HOST_IMAGE op=%s dest=0x%llx size=0x%llx\n", op,
                          static_cast<unsigned long long>(dest), static_cast<unsigned long long>(size));
@@ -4147,7 +4158,7 @@ u64 ExecutorLibcMemcpy(u64 dest, u64 src, u64 size) {
     // anonymous bionic memcpy work.  Real PS4 user copies this large are split by the title/IO
     // layer; a single >= 1 GiB libc copy is also larger than every tracked game allocation used by
     // the Android bridge.  Reject it at the ABI boundary and preserve the exact guest return site
-    // so the producer instruction can be fixed in Backend B.  Spelunky 2 exposed this with
+    // so the producer instruction can be fixed in JIT.  Spelunky 2 exposed this with
     // size=0x800f7073 while serialising a one-byte music-volume value.
     constexpr u64 kMaximumSingleGuestLibcCopy = 1ull << 30;
     if (size >= kMaximumSingleGuestLibcCopy) {
@@ -4499,13 +4510,35 @@ static bool ExecutorHostPageReadable(u64 address) {
     return ExecutorFindHostReadableRange(address, range_begin, range_end);
 }
 
+static std::size_t ExecutorTrackedFallbackReadablePrefix(u64 address, std::size_t requested) {
+    std::scoped_lock lk{g_executor_alloc_mutex};
+    const auto owner = g_executor_live_mspace_intervals.find(0);
+    if (owner == g_executor_live_mspace_intervals.end()) {
+        return 0;
+    }
+    const auto& intervals = owner->second;
+    auto next = intervals.upper_bound(address);
+    if (next == intervals.begin()) {
+        return 0;
+    }
+    const auto allocation = std::prev(next);
+    const u64 begin = allocation->first;
+    const u64 size = allocation->second;
+    if (size == 0 || size > std::numeric_limits<u64>::max() - begin || address < begin ||
+        address >= begin + size) {
+        return 0;
+    }
+    return static_cast<std::size_t>(
+        std::min<u64>(requested, begin + size - address));
+}
+
 // Checked page-at-a-time reader for libc routines. Most PS4 guest mappings are directly
 // host-addressable, so the common path validates the live guest VMA's CpuRead permission before
 // using native memchr/memcmp. MemoryManager's Map/Protect contract installs that VMA at the same
 // canonical host address with matching mmap/mprotect permissions. Addresses outside the guest VMA
 // map (native HLE strings and registered host stacks) are accepted only when a kernel read probe
 // (with procfs as a seccomp fallback) confirms the page. This preserves the fault boundary without
-// turning every byte of a valid C string into a separate mapping query or Backend-B block dispatch.
+// turning every byte of a valid C string into a separate mapping query or JIT block dispatch.
 class ExecutorGuestPageReader {
 public:
     bool ReadSpan(u64 ptr, u64 requested, ExecutorGuestReadSpan& out) {
@@ -4526,14 +4559,14 @@ public:
         bool guest_readable =
             memory != nullptr && memory->IsReadableMapping(ptr, candidate, &guest_managed);
         if (!guest_managed) {
-            // Backend B's synthetic pthread stacks and other explicitly published guest ranges
+            // JIT's synthetic pthread stacks and other explicitly published guest ranges
             // are identity-mapped host memory, but intentionally do not belong to MemoryManager's
-            // VMA tree.  Prove the complete span against Backend B's authoritative range registry
+            // VMA tree.  Prove the complete span against JIT's authoritative range registry
             // before applying the low-40-bit guest-hole rejection below.  When a registered range
             // ends inside this host page, preserve exactly its readable prefix just like the VMA
             // path does below; never infer readability from the first/last byte alone.
-            if (ExecutorBackendBIsReadableGuestRange != nullptr) {
-                if (ExecutorBackendBIsReadableGuestRange(host_ptr, candidate)) {
+            if (ExecutorJitIsReadableGuestRange != nullptr) {
+                if (ExecutorJitIsReadableGuestRange(host_ptr, candidate)) {
                     out = {
                         .data = reinterpret_cast<const unsigned char*>(host_ptr),
                         .size = candidate,
@@ -4542,12 +4575,12 @@ public:
                     return true;
                 }
                 if (candidate > 1 &&
-                    ExecutorBackendBIsReadableGuestRange(host_ptr, 1)) {
+                    ExecutorJitIsReadableGuestRange(host_ptr, 1)) {
                     std::size_t low = 1;
                     std::size_t high = candidate;
                     while (low < high) {
                         const std::size_t mid = low + (high - low + 1) / 2;
-                        if (ExecutorBackendBIsReadableGuestRange(host_ptr, mid)) {
+                        if (ExecutorJitIsReadableGuestRange(host_ptr, mid)) {
                             low = mid;
                         } else {
                             high = mid - 1;
@@ -4560,6 +4593,20 @@ public:
                     };
                     return true;
                 }
+            }
+            // Bootstrap helpers may run before the lazy guest libc mspace is available. Their
+            // fallback allocations remain directly addressable by translated guest code, but can
+            // sit inside the low 40-bit window and therefore look like guest-map holes. Accept only
+            // the exact live prefix proven by the allocator's interval index.
+            const std::size_t tracked_prefix =
+                ExecutorTrackedFallbackReadablePrefix(host_ptr, candidate);
+            if (tracked_prefix != 0) {
+                out = {
+                    .data = reinterpret_cast<const unsigned char*>(host_ptr),
+                    .size = tracked_prefix,
+                    .direct = true,
+                };
+                return true;
             }
             // A PS4 CPU address is 40-bit. An unmanaged address inside that window is a guest-map
             // hole, not an invitation to adopt an unrelated fixed host mmap merely because Linux
@@ -4618,7 +4665,7 @@ public:
     }
 };
 
-// Called by Backend B's existing device self-test wrapper.  The caller registers an exact
+// Called by JIT's existing device self-test wrapper.  The caller registers an exact
 // sub-page range first; requesting one byte past it verifies both direct-span acceptance and the
 // range-end prefix search used by libc scanners.
 extern "C" bool ExecutorAeroLibGuestPageReaderSelfTest(const u64 address,
@@ -5196,36 +5243,36 @@ static bool ExecutorIsMonoCompareInterfaceIds(const u64 compar) {
 
 static bool ExecutorReadMonoInterfaceFastPathBytes(const u64 address, void* out,
                                                    const std::size_t size,
-                                                   const bool use_backend_b_reader) {
-    // Backend B's reader has a process-wide lock-free 64-KiB mapping cache. Restrict it to this
+                                                   const bool use_jit_reader) {
+    // JIT's reader has a process-wide lock-free 64-KiB mapping cache. Restrict it to this
     // exact Mono fast path and preserve ExecutorReadGuestBytes as the authoritative fallback for
     // unmapped, high-host/selfcheck, or symbol-unavailable cases.
-    if (use_backend_b_reader && ExecutorBackendBReadGuestBytes != nullptr &&
-        ExecutorBackendBReadGuestBytes(address, out, size)) {
+    if (use_jit_reader && ExecutorJitReadGuestBytes != nullptr &&
+        ExecutorJitReadGuestBytes(address, out, size)) {
         return true;
     }
     return ExecutorReadGuestBytes(address, out, size);
 }
 
 static bool ExecutorReadMonoClassInterfaceId(const u64 klass, std::uint16_t& interface_id,
-                                             const bool use_backend_b_reader) {
+                                             const bool use_jit_reader) {
     if (klass == 0 ||
         klass > std::numeric_limits<u64>::max() - ExecutorMonoClassInterfaceIdOffset) {
         return false;
     }
     return ExecutorReadMonoInterfaceFastPathBytes(klass + ExecutorMonoClassInterfaceIdOffset,
                                                   &interface_id, sizeof(interface_id),
-                                                  use_backend_b_reader);
+                                                  use_jit_reader);
 }
 
 static bool ExecutorCompareMonoInterfaceIds(const std::uint16_t key_interface_id, const u64 element,
-                                            int& result, const bool use_backend_b_reader) {
+                                            int& result, const bool use_jit_reader) {
     u64 element_class = 0;
     std::uint16_t element_interface_id = 0;
     if (!ExecutorReadMonoInterfaceFastPathBytes(element, &element_class, sizeof(element_class),
-                                                use_backend_b_reader) ||
+                                                use_jit_reader) ||
         !ExecutorReadMonoClassInterfaceId(element_class, element_interface_id,
-                                          use_backend_b_reader)) {
+                                          use_jit_reader)) {
         return false;
     }
     result = static_cast<int>(key_interface_id) - static_cast<int>(element_interface_id);
@@ -5307,11 +5354,11 @@ static bool ExecutorIsMonoIndirectStrcmpComparator(const u64 compar) {
 }
 
 static bool ExecutorCompareMonoIndirectStrcmp(const u64 key, const u64 element, int& result,
-                                              const bool use_backend_b_reader) {
+                                              const bool use_jit_reader) {
     u64 element_string = 0;
     if (!ExecutorReadMonoInterfaceFastPathBytes(element, &element_string,
                                                 sizeof(element_string),
-                                                use_backend_b_reader) ||
+                                                use_jit_reader) ||
         element_string == 0) {
         return false;
     }
@@ -5354,9 +5401,12 @@ static bool ExecutorMonoIndirectStrcmpSelfCheck() {
 // this exact body at mono-ps4.sprx text+0x6bab0 accounts for thousands of bsearch calls and each
 // generic comparison otherwise re-enters the guest to call mono_metadata_decode_value.
 //
-// Recognize the complete 73-byte body, including its relative decode-value call.  All descriptor,
-// key and row accesses below are checked.  Any code drift, malformed layout, failed read or failed
-// hit-store falls back to the original guest comparator for that comparison.
+// Recognize the complete 73-byte body by instruction semantics. Different supported Mono builds
+// may schedule the independent `mov r14, rax` and `mov edx, [rbx+4]` in either order, and the
+// relative displacement of the decode-value call naturally changes at link time. Everything else,
+// including the call opcode and the full compare/writeback suffix, remains exact. All descriptor,
+// key and row accesses below are checked. Any other code drift, malformed layout, failed read or
+// failed hit-store falls back to the original guest comparator for that comparison.
 constexpr auto ExecutorMonoMetadataBsearchComparatorSignature = std::to_array<u8>({
     0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x7b,
     0x08, 0x48, 0x2b, 0x37, 0x0f, 0xb6, 0x4f, 0x0b, 0x48, 0x89, 0xf0, 0x48, 0x99,
@@ -5366,10 +5416,109 @@ constexpr auto ExecutorMonoMetadataBsearchComparatorSignature = std::to_array<u8
     0x0f, 0x42, 0xc1, 0x5b, 0x41, 0x5e, 0x5d, 0xc3,
 });
 
+// Some Mono table columns describe the start of a token interval rather than one exact token.
+// Their bsearch comparator decodes both the selected row and its successor, then accepts the row
+// when current <= wanted < next. It shares the same key/table layout and decode helper as the
+// exact comparator above, but has a distinct 120-byte control-flow shape.
+constexpr auto ExecutorMonoMetadataRangeBsearchComparatorSignature = std::to_array<u8>({
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xfb,
+    0x48, 0x8b, 0x7b, 0x08, 0x48, 0x2b, 0x37, 0x0f, 0xb6, 0x4f, 0x0b, 0x48, 0x89,
+    0xf0, 0x48, 0x99, 0x48, 0xf7, 0xf9, 0x8b, 0x53, 0x04, 0x49, 0x89, 0xc6, 0x44,
+    0x89, 0xf6, 0xe8, 0x42, 0xc4, 0xff, 0xff, 0x41, 0x89, 0xc7, 0xb8, 0xff, 0xff,
+    0xff, 0xff, 0x44, 0x39, 0x3b, 0x72, 0x32, 0x48, 0x8b, 0x7b, 0x08, 0xb8, 0xff,
+    0xff, 0xff, 0x00, 0x41, 0x8d, 0x76, 0x01, 0x23, 0x47, 0x08, 0x39, 0xc6, 0x7d,
+    0x18, 0x8b, 0x53, 0x04, 0xe8, 0x19, 0xc4, 0xff, 0xff, 0x89, 0xc1, 0xb8, 0x01,
+    0x00, 0x00, 0x00, 0x41, 0x39, 0xcf, 0x74, 0x0a, 0x39, 0x0b, 0x73, 0x06, 0x31,
+    0xc0, 0x44, 0x89, 0x73, 0x10, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0x41, 0x5e, 0x41,
+    0x5f, 0x5d, 0xc3,
+});
+
+static bool ExecutorMatchesMonoMetadataBsearchComparatorShape(
+    const std::span<const u8, ExecutorMonoMetadataBsearchComparatorSignature.size()> bytes) {
+    constexpr std::size_t kScheduledPairOffset = 29;
+    constexpr std::size_t kScheduledPairSize = 6;
+    constexpr std::array<u8, kScheduledPairSize> kMoveResultThenColumn = {
+        0x49, 0x89, 0xc6, 0x8b, 0x53, 0x04,
+    };
+    constexpr std::array<u8, kScheduledPairSize> kMoveColumnThenResult = {
+        0x8b, 0x53, 0x04, 0x49, 0x89, 0xc6,
+    };
+    constexpr std::size_t kDecodeCallOpcodeOffset = 38;
+    constexpr std::size_t kDecodeCallDisplacementOffset = kDecodeCallOpcodeOffset + 1;
+    constexpr std::size_t kDecodeCallDisplacementSize = sizeof(std::int32_t);
+    constexpr std::size_t kSuffixOffset =
+        kDecodeCallDisplacementOffset + kDecodeCallDisplacementSize;
+
+    if (!std::equal(bytes.begin(), bytes.begin() + kScheduledPairOffset,
+                    ExecutorMonoMetadataBsearchComparatorSignature.begin())) {
+        return false;
+    }
+    const auto scheduled_pair =
+        bytes.subspan<kScheduledPairOffset, kScheduledPairSize>();
+    if (!std::equal(scheduled_pair.begin(), scheduled_pair.end(),
+                    kMoveResultThenColumn.begin()) &&
+        !std::equal(scheduled_pair.begin(), scheduled_pair.end(),
+                    kMoveColumnThenResult.begin())) {
+        return false;
+    }
+    if (!std::equal(bytes.begin() + kScheduledPairOffset + kScheduledPairSize,
+                    bytes.begin() + kDecodeCallDisplacementOffset,
+                    ExecutorMonoMetadataBsearchComparatorSignature.begin() +
+                        kScheduledPairOffset + kScheduledPairSize)) {
+        return false;
+    }
+    return std::equal(bytes.begin() + kSuffixOffset, bytes.end(),
+                      ExecutorMonoMetadataBsearchComparatorSignature.begin() + kSuffixOffset);
+}
+
 static bool ExecutorHasMonoMetadataBsearchComparatorSignature(const u64 compar) {
     std::array<u8, ExecutorMonoMetadataBsearchComparatorSignature.size()> bytes{};
     return ExecutorReadGuestBytes(compar, bytes.data(), bytes.size()) &&
-           bytes == ExecutorMonoMetadataBsearchComparatorSignature;
+           ExecutorMatchesMonoMetadataBsearchComparatorShape(bytes);
+}
+
+static bool ExecutorMatchesMonoMetadataRangeBsearchComparatorShape(
+    const std::span<const u8,
+                    ExecutorMonoMetadataRangeBsearchComparatorSignature.size()> bytes) {
+    constexpr std::size_t kScheduledPairOffset = 32;
+    constexpr std::size_t kScheduledPairSize = 6;
+    constexpr std::array<u8, kScheduledPairSize> kMoveColumnThenResult = {
+        0x8b, 0x53, 0x04, 0x49, 0x89, 0xc6,
+    };
+    constexpr std::array<u8, kScheduledPairSize> kMoveResultThenColumn = {
+        0x49, 0x89, 0xc6, 0x8b, 0x53, 0x04,
+    };
+    constexpr std::array<std::size_t, 2> kCallOpcodes = {41, 82};
+
+    if (!std::equal(bytes.begin(), bytes.begin() + kScheduledPairOffset,
+                    ExecutorMonoMetadataRangeBsearchComparatorSignature.begin())) {
+        return false;
+    }
+    const auto scheduled_pair =
+        bytes.subspan<kScheduledPairOffset, kScheduledPairSize>();
+    if (!std::equal(scheduled_pair.begin(), scheduled_pair.end(),
+                    kMoveColumnThenResult.begin()) &&
+        !std::equal(scheduled_pair.begin(), scheduled_pair.end(),
+                    kMoveResultThenColumn.begin())) {
+        return false;
+    }
+    std::size_t checked = kScheduledPairOffset + kScheduledPairSize;
+    for (const std::size_t call_opcode : kCallOpcodes) {
+        if (!std::equal(bytes.begin() + checked, bytes.begin() + call_opcode + 1,
+                        ExecutorMonoMetadataRangeBsearchComparatorSignature.begin() + checked) ||
+            bytes[call_opcode] != 0xe8) {
+            return false;
+        }
+        checked = call_opcode + 5;
+    }
+    return std::equal(bytes.begin() + checked, bytes.end(),
+                      ExecutorMonoMetadataRangeBsearchComparatorSignature.begin() + checked);
+}
+
+static bool ExecutorHasMonoMetadataRangeBsearchComparatorSignature(const u64 compar) {
+    std::array<u8, ExecutorMonoMetadataRangeBsearchComparatorSignature.size()> bytes{};
+    return ExecutorReadGuestBytes(compar, bytes.data(), bytes.size()) &&
+           ExecutorMatchesMonoMetadataRangeBsearchComparatorShape(bytes);
 }
 
 static bool ExecutorIsMonoMetadataBsearchComparator(const u64 compar) {
@@ -5391,6 +5540,25 @@ static bool ExecutorIsMonoMetadataBsearchComparator(const u64 compar) {
     return matches;
 }
 
+static bool ExecutorIsMonoMetadataRangeBsearchComparator(const u64 compar) {
+    struct SignatureCache {
+        std::array<u64, 2> addresses{};
+        std::array<bool, 2> matches{};
+        unsigned next = 0;
+    };
+    thread_local SignatureCache cache;
+    for (std::size_t i = 0; i < cache.addresses.size(); ++i) {
+        if (cache.addresses[i] == compar) {
+            return cache.matches[i];
+        }
+    }
+    const bool matches = ExecutorHasMonoMetadataRangeBsearchComparatorSignature(compar);
+    const unsigned slot = cache.next++ % cache.addresses.size();
+    cache.addresses[slot] = compar;
+    cache.matches[slot] = matches;
+    return matches;
+}
+
 struct ExecutorMonoMetadataBsearchDecoded {
     std::uint32_t wanted{};
     std::uint32_t value{};
@@ -5399,7 +5567,7 @@ struct ExecutorMonoMetadataBsearchDecoded {
 
 static bool ExecutorDecodeMonoMetadataBsearchElement(
     const u64 key, const u64 element, ExecutorMonoMetadataBsearchDecoded& decoded,
-    const bool use_backend_b_reader) {
+    const bool use_jit_reader) {
     struct KeyPrefix {
         std::uint32_t wanted;
         std::uint32_t column;
@@ -5412,10 +5580,10 @@ static bool ExecutorDecodeMonoMetadataBsearchElement(
     } table{};
 
     if (!ExecutorReadMonoInterfaceFastPathBytes(key, &key_prefix, sizeof(key_prefix),
-                                                use_backend_b_reader) ||
+                                                use_jit_reader) ||
         key_prefix.table == 0 ||
         !ExecutorReadMonoInterfaceFastPathBytes(key_prefix.table, &table, sizeof(table),
-                                                use_backend_b_reader)) {
+                                                use_jit_reader)) {
         return false;
     }
 
@@ -5465,20 +5633,20 @@ static bool ExecutorDecodeMonoMetadataBsearchElement(
     if (width_code == 0) {
         std::int8_t byte = 0;
         if (!ExecutorReadMonoInterfaceFastPathBytes(value_address, &byte, sizeof(byte),
-                                                    use_backend_b_reader)) {
+                                                    use_jit_reader)) {
             return false;
         }
         value = static_cast<std::uint32_t>(static_cast<std::int32_t>(byte));
     } else if (width_code == 1) {
         std::uint16_t word = 0;
         if (!ExecutorReadMonoInterfaceFastPathBytes(value_address, &word, sizeof(word),
-                                                    use_backend_b_reader)) {
+                                                    use_jit_reader)) {
             return false;
         }
         value = word;
     } else {
         if (!ExecutorReadMonoInterfaceFastPathBytes(value_address, &value, sizeof(value),
-                                                    use_backend_b_reader)) {
+                                                    use_jit_reader)) {
             return false;
         }
     }
@@ -5490,16 +5658,16 @@ static bool ExecutorDecodeMonoMetadataBsearchElement(
 }
 
 static bool ExecutorCompareMonoMetadataBsearch(const u64 key, const u64 element, int& result,
-                                               const bool use_backend_b_reader) {
+                                               const bool use_jit_reader) {
     ExecutorMonoMetadataBsearchDecoded decoded{};
     if (!ExecutorDecodeMonoMetadataBsearchElement(key, element, decoded,
-                                                  use_backend_b_reader)) {
+                                                  use_jit_reader)) {
         return false;
     }
     if (decoded.wanted == decoded.value) {
-        if (!use_backend_b_reader || ExecutorBackendBWriteGuestBytes == nullptr ||
+        if (!use_jit_reader || ExecutorJitWriteGuestBytes == nullptr ||
             key > std::numeric_limits<u64>::max() - 0x10 ||
-            !ExecutorBackendBWriteGuestBytes(key + 0x10, &decoded.row, sizeof(decoded.row))) {
+            !ExecutorJitWriteGuestBytes(key + 0x10, &decoded.row, sizeof(decoded.row))) {
             return false;
         }
         result = 0;
@@ -5509,14 +5677,98 @@ static bool ExecutorCompareMonoMetadataBsearch(const u64 key, const u64 element,
     return true;
 }
 
+static bool ExecutorCompareMonoMetadataRangeBsearch(const u64 key, const u64 element,
+                                                    int& result,
+                                                    const bool use_jit_reader) {
+    ExecutorMonoMetadataBsearchDecoded current{};
+    if (!ExecutorDecodeMonoMetadataBsearchElement(key, element, current,
+                                                  use_jit_reader)) {
+        return false;
+    }
+    if (current.wanted < current.value) {
+        result = -1;
+        return true;
+    }
+
+    struct KeyPrefix {
+        std::uint32_t wanted;
+        std::uint32_t column;
+        u64 table;
+    } key_prefix{};
+    struct TablePrefix {
+        u64 base;
+        std::uint32_t rows_and_stride;
+        std::uint32_t packed_columns;
+    } table{};
+    if (!ExecutorReadMonoInterfaceFastPathBytes(key, &key_prefix, sizeof(key_prefix),
+                                                use_jit_reader) ||
+        key_prefix.table == 0 ||
+        !ExecutorReadMonoInterfaceFastPathBytes(key_prefix.table, &table, sizeof(table),
+                                                use_jit_reader)) {
+        return false;
+    }
+    const std::uint32_t rows = table.rows_and_stride & 0x00ffffffu;
+    const std::uint32_t stride = table.rows_and_stride >> 24;
+    if (stride == 0 || current.row >= rows) {
+        return false;
+    }
+    if (current.row + 1 < rows) {
+        if (element > std::numeric_limits<u64>::max() - stride) {
+            return false;
+        }
+        ExecutorMonoMetadataBsearchDecoded next{};
+        if (!ExecutorDecodeMonoMetadataBsearchElement(key, element + stride, next,
+                                                      use_jit_reader) ||
+            next.row != current.row + 1) {
+            return false;
+        }
+        if (current.value == next.value || current.wanted >= next.value) {
+            result = 1;
+            return true;
+        }
+    }
+    if (!use_jit_reader || ExecutorJitWriteGuestBytes == nullptr ||
+        key > std::numeric_limits<u64>::max() - 0x10 ||
+        !ExecutorJitWriteGuestBytes(key + 0x10, &current.row, sizeof(current.row))) {
+        return false;
+    }
+    result = 0;
+    return true;
+}
+
 static bool ExecutorMonoMetadataBsearchSelfCheck() {
     auto exact_signature = ExecutorMonoMetadataBsearchComparatorSignature;
+    auto rescheduled_signature = exact_signature;
+    constexpr std::array<u8, 6> kMoveColumnThenResult = {
+        0x8b, 0x53, 0x04, 0x49, 0x89, 0xc6,
+    };
+    std::copy(kMoveColumnThenResult.begin(), kMoveColumnThenResult.end(),
+              rescheduled_signature.begin() + 29);
+    // A relative call displacement is a linker result, not part of comparator semantics.
+    rescheduled_signature[39] = 0x05;
+    rescheduled_signature[40] = 0xc0;
+    rescheduled_signature[41] = 0xff;
+    rescheduled_signature[42] = 0xff;
     auto drifted_signature = exact_signature;
     drifted_signature[38] ^= 1;
+    auto range_signature = ExecutorMonoMetadataRangeBsearchComparatorSignature;
+    auto range_relinked_signature = range_signature;
+    range_relinked_signature[42] ^= 0x55;
+    range_relinked_signature[83] ^= 0xaa;
+    auto range_drifted_signature = range_signature;
+    range_drifted_signature[87] ^= 1;
     if (!ExecutorHasMonoMetadataBsearchComparatorSignature(
             reinterpret_cast<u64>(exact_signature.data())) ||
+        !ExecutorHasMonoMetadataBsearchComparatorSignature(
+            reinterpret_cast<u64>(rescheduled_signature.data())) ||
         ExecutorHasMonoMetadataBsearchComparatorSignature(
-            reinterpret_cast<u64>(drifted_signature.data()))) {
+            reinterpret_cast<u64>(drifted_signature.data())) ||
+        !ExecutorHasMonoMetadataRangeBsearchComparatorSignature(
+            reinterpret_cast<u64>(range_signature.data())) ||
+        !ExecutorHasMonoMetadataRangeBsearchComparatorSignature(
+            reinterpret_cast<u64>(range_relinked_signature.data())) ||
+        ExecutorHasMonoMetadataRangeBsearchComparatorSignature(
+            reinterpret_cast<u64>(range_drifted_signature.data()))) {
         return false;
     }
 
@@ -5549,6 +5801,25 @@ static bool ExecutorMonoMetadataBsearchSelfCheck() {
         decoded.wanted != kWanted || decoded.value != kWanted || decoded.row != 2) {
         return false;
     }
+
+    std::uint32_t next_value = kWanted + 7;
+    std::memcpy(rows.data() + 3 * kStride + 6, &next_value, sizeof(next_value));
+    int range_result = 1;
+    key.wanted = kWanted - 1;
+    if (!ExecutorCompareMonoMetadataRangeBsearch(
+            reinterpret_cast<u64>(&key),
+            reinterpret_cast<u64>(rows.data() + 2 * kStride), range_result, false) ||
+        range_result != -1) {
+        return false;
+    }
+    key.wanted = next_value;
+    if (!ExecutorCompareMonoMetadataRangeBsearch(
+            reinterpret_cast<u64>(&key),
+            reinterpret_cast<u64>(rows.data() + 2 * kStride), range_result, false) ||
+        range_result != 1) {
+        return false;
+    }
+    key.wanted = kWanted;
 
     key.column = 3;
     if (ExecutorDecodeMonoMetadataBsearchElement(
@@ -5590,7 +5861,7 @@ u64 ExecutorLibcBsearch(u64 key, u64 base, u64 nmemb, u64 size, u64 compar) {
     // Any other comparator uses the cheap inline-on-active guest-callback primitive (warm JIT,
     // exception-safe), falling back to the heavyweight signal-handler primitive only if the cheap
     // weak symbol is unavailable. Both preserve the old exception-safety contract (a comparator
-    // failure aborts THIS search, never the process; the raw Backend-B JIT std::terminate root is
+    // failure aborts THIS search, never the process; the raw JIT JIT std::terminate root is
     // never reached).
     u64 hle_native_fn = 0;
     const bool compar_is_native_strcmp =
@@ -5628,20 +5899,24 @@ u64 ExecutorLibcBsearch(u64 key, u64 base, u64 nmemb, u64 size, u64 compar) {
         return true;
     }();
     (void)mono_metadata_bsearch_selfcheck_logged;
-    const bool use_backend_b_mono_reader =
-        ExecutorBackendBActiveForStubGeneration() && ExecutorBackendBReadGuestBytes != nullptr;
+    const bool use_jit_mono_reader =
+        ExecutorJitActiveForStubGeneration() && ExecutorJitReadGuestBytes != nullptr;
     std::uint16_t mono_key_interface_id = 0;
     const bool compar_is_mono_interface_ids =
         mono_interface_id_selfcheck_ok && size == sizeof(u64) &&
         ExecutorIsMonoCompareInterfaceIds(compar) &&
-        ExecutorReadMonoClassInterfaceId(key, mono_key_interface_id, use_backend_b_mono_reader);
+        ExecutorReadMonoClassInterfaceId(key, mono_key_interface_id, use_jit_mono_reader);
     const bool compar_is_mono_indirect_strcmp =
         mono_indirect_strcmp_selfcheck_ok && size == sizeof(u64) &&
         ExecutorIsMonoIndirectStrcmpComparator(compar);
     const bool compar_is_mono_metadata_bsearch =
-        mono_metadata_bsearch_selfcheck_ok && use_backend_b_mono_reader &&
-        ExecutorBackendBWriteGuestBytes != nullptr &&
+        mono_metadata_bsearch_selfcheck_ok && use_jit_mono_reader &&
+        ExecutorJitWriteGuestBytes != nullptr &&
         ExecutorIsMonoMetadataBsearchComparator(compar);
+    const bool compar_is_mono_metadata_range_bsearch =
+        mono_metadata_bsearch_selfcheck_ok && use_jit_mono_reader &&
+        ExecutorJitWriteGuestBytes != nullptr &&
+        ExecutorIsMonoMetadataRangeBsearchComparator(compar);
 #endif
     while (low < high) {
         const u64 mid = low + ((high - low) / 2);
@@ -5653,16 +5928,20 @@ u64 ExecutorLibcBsearch(u64 key, u64 base, u64 nmemb, u64 size, u64 compar) {
             cmp = static_cast<int>(ExecutorLibcStrcmp(key, elem));
         } else if (compar_is_mono_indirect_strcmp &&
                    ExecutorCompareMonoIndirectStrcmp(key, elem, cmp,
-                                                     use_backend_b_mono_reader)) {
+                                                     use_jit_mono_reader)) {
             // Exact Mono `strcmp(key, *(const char**)element)` comparator semantics.
         } else if (compar_is_mono_interface_ids &&
                    ExecutorCompareMonoInterfaceIds(mono_key_interface_id, elem, cmp,
-                                                   use_backend_b_mono_reader)) {
+                                                   use_jit_mono_reader)) {
             // Exact mono-ps4.sprx compare_interface_ids semantics, with checked guest reads.
         } else if (compar_is_mono_metadata_bsearch &&
                    ExecutorCompareMonoMetadataBsearch(key, elem, cmp,
-                                                      use_backend_b_mono_reader)) {
+                                                      use_jit_mono_reader)) {
             // Exact mono-ps4.sprx packed metadata-table comparator semantics.
+        } else if (compar_is_mono_metadata_range_bsearch &&
+                   ExecutorCompareMonoMetadataRangeBsearch(
+                       key, elem, cmp, use_jit_mono_reader)) {
+            // Exact Mono packed metadata interval comparator semantics.
         } else {
             // Cheap inline-on-active callback for non-strcmp comparators; keep the exact
             // cb_rc!=0 fallback contract (a failure aborts THIS search, never the process).
@@ -5750,11 +6029,11 @@ s64 ExecutorLibcStrncmp(u64 lhs, u64 rhs, u64 size) {
             executor_live_get_current_hle_call_site(&guest_return, &return_off, nullptr, symbol,
                                                     sizeof(symbol), module, sizeof(module));
         }
-        const bool is_backend_b_fault_search_site =
+        const bool is_jit_fault_search_site =
             std::strcmp(module[0] ? module : "", "mono-ps4.sprx") == 0 &&
             return_off >= 0x10200ULL && return_off < 0x10400ULL;
         static std::atomic<int> s_fault_site_budget{512};
-        if (is_backend_b_fault_search_site &&
+        if (is_jit_fault_search_site &&
             s_fault_site_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
             char la[48]{};
             char rbuf[48]{};
@@ -5847,12 +6126,12 @@ s64 ExecutorLibcStrcmp(u64 lhs, u64 rhs) {
         const bool is_monoscript_cache_site =
             return_off >= 0x19b800ULL && return_off < 0x19c000ULL &&
             std::strcmp(module[0] ? module : "", "eboot.bin") == 0;
-        const bool is_backend_b_fault_search_site =
+        const bool is_jit_fault_search_site =
             std::strcmp(module[0] ? module : "", "mono-ps4.sprx") == 0 &&
             return_off >= 0x10200ULL && return_off < 0x10400ULL;
         static std::atomic<int> s_focused_budget{4096};
         const bool focused =
-            is_unity_preload || is_monoscript_cache_site || is_backend_b_fault_search_site;
+            is_unity_preload || is_monoscript_cache_site || is_jit_fault_search_site;
         const bool should_log =
             ((dn & 0xF) == 0 && dn < 64000ULL) ||
             (focused && s_focused_budget.fetch_sub(1, std::memory_order_relaxed) > 0);
@@ -7868,7 +8147,7 @@ std::filesystem::path ExecutorHostPathFromGuestPath(std::string_view guest_path,
 }
 
 // Desktop shadPS4 can return &g_posix_errno directly because the guest and emulator share one
-// address space.  A native Android TLS address is outside Backend B's guest map, so returning it
+// address space.  A native Android TLS address is outside JIT's guest map, so returning it
 // violates the guest-pointer boundary and faults as soon as guest libc dereferences errno.  Keep
 // only the bookkeeping in host TLS; the ABI-visible s32 lives in the mapped guest libc mspace.
 class ExecutorLibcErrnoTls {
@@ -7957,11 +8236,11 @@ bool ExecutorCopyToGuestFileBuffer(const u64 guest_ptr, const void* source,
         return false;
     }
 #ifdef __ANDROID__
-    // Backend B owns canonical pointer decoding, registered stack ranges and watched-page fault
+    // JIT owns canonical pointer decoding, registered stack ranges and watched-page fault
     // handling. MemoryManager::TryWriteBacking historically accepted partial spans, so it must not
     // be used as an optimistic validator here.
-    if (ExecutorBackendBWriteGuestBytes != nullptr) {
-        return ExecutorBackendBWriteGuestBytes(guest_ptr, source, size);
+    if (ExecutorJitWriteGuestBytes != nullptr) {
+        return ExecutorJitWriteGuestBytes(guest_ptr, source, size);
     }
     if (!ExecutorAddressMapped(guest_ptr, size, true)) {
         return false;
@@ -8586,7 +8865,7 @@ extern "C" u64 ExecutorLibcFflush(u64 file_ptr) {
     return 0;
 }
 
-// EXECUTOR (Sonic Backend-B, cont-14): the game opens data.rsdk via ExecutorLibcFopen (a HOST std::FILE*) and reads it via
+// EXECUTOR (Sonic JIT, cont-14): the game opens data.rsdk via ExecutorLibcFopen (a HOST std::FILE*) and reads it via
 // ExecutorLibcFread, but guest fseek/ftell/rewind/fgetpos/fsetpos were NOT overridden here -- they resolved to the
 // libSceLibcInternal OrbisFILE impls (internal_fseek/ftell), which treat the host FILE* as an OrbisFILE and silently
 // mis-seek. The RSDK archive reader parses the data.rsdk directory, then SEEKS to each asset's offset to read it; with a
@@ -10263,6 +10542,13 @@ u64 GetStub(const char* nid) {
     if (const u64 ft = ResolveExecutorFreeTypeHle(nid)) {
         return GetAndroidX64NativeHleStub(nid, ft, "freetype");
     }
+
+    const std::string semantic_nid = nid ? nid : "";
+    std::scoped_lock low_stub_lock(g_android_x64_low_stub_mutex);
+    if (const auto cached = g_android_x64_low_stub_by_nid.find(semantic_nid);
+        cached != g_android_x64_low_stub_by_nid.end()) {
+        return cached->second;
+    }
 #endif
 
     if (
@@ -10273,7 +10559,7 @@ u64 GetStub(const char* nid) {
 #endif
     ) {
 #ifdef __ANDROID__
-        return GetAndroidX64ZeroStub(MAX_STUBS - 1);
+        return GetAndroidX64ZeroStub(AndroidX64FallbackStubSlot);
 #else
         return (u64)&UnknownStub;
 #endif
@@ -10288,9 +10574,10 @@ u64 GetStub(const char* nid) {
     }
 
 #ifdef __ANDROID__
+    u64 address = 0;
     if (entry && IsExecutorTraceableGpuStubName(entry->name)) {
         const u64 native = reinterpret_cast<u64>(stub_handlers[slot]);
-        const u64 address = GetAndroidX64HleStub(slot, native);
+        address = GetAndroidX64HleStub(slot, native);
         {
             std::scoped_lock lock(g_android_x64_hle_names_mutex);
             g_android_x64_hle_names_by_native[native] = entry->name ? entry->name : "";
@@ -10309,20 +10596,23 @@ u64 GetStub(const char* nid) {
                          entry->nid, entry->name, reinterpret_cast<void*>(address));
             std::fclose(f);
         }
+        g_android_x64_low_stub_by_nid.emplace(semantic_nid, address);
         return address;
     }
+    address = GetAndroidX64ZeroStub(slot);
     std::fprintf(stderr, "[EXECUTOR_AEROLIB_X64_STUB] index=%u nid=%s address=%p\n", slot, nid,
-                 reinterpret_cast<void*>(GetAndroidX64ZeroStub(slot)));
+                 reinterpret_cast<void*>(address));
     std::fflush(stderr);
     // Persist slot->nid to a file so a missing import that the guest then calls can be identified
     // by the stub slab offset (slot = (call_addr - slab_base) / AndroidX64StubSize).
     if (std::FILE* f = std::fopen(
             "/data/data/app.lsx4.android/files/executor-stub-nids.log", "a")) {
         std::fprintf(f, "slot=%u nid=%s addr=%p\n", slot, nid ? nid : "<null>",
-                     reinterpret_cast<void*>(GetAndroidX64ZeroStub(slot)));
+                     reinterpret_cast<void*>(address));
         std::fclose(f);
     }
-    return GetAndroidX64ZeroStub(slot);
+    g_android_x64_low_stub_by_nid.emplace(semantic_nid, address);
+    return address;
 #else
     return (u64)stub_handlers[slot];
 #endif
@@ -10404,11 +10694,11 @@ u64 ExecutorMonoDomainOpenLog(u64 name_ptr) {
                         "[EXECUTOR_MONO_DOMAIN_OPEN] name=0x%llx \"%s\"",
                         static_cast<unsigned long long>(name_ptr), nm);
     if (std::strstr(nm, "SonyVitaSavedGames") != nullptr) {
-        if (executor_backend_b_record_current_thread_state != nullptr) {
-            executor_backend_b_record_current_thread_state("domain-open-SonyVitaSavedGames");
+        if (executor_jit_record_current_thread_state != nullptr) {
+            executor_jit_record_current_thread_state("domain-open-SonyVitaSavedGames");
         }
-        if (executor_backend_b_dump_thread_states != nullptr) {
-            executor_backend_b_dump_thread_states("domain-open-SonyVitaSavedGames");
+        if (executor_jit_dump_thread_states != nullptr) {
+            executor_jit_dump_thread_states("domain-open-SonyVitaSavedGames");
         }
     }
     if (std::FILE* f = std::fopen(

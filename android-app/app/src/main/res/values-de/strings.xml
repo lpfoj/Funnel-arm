@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">LSX4</string><string name="library_scanning">Installierte Spiele werden gesucht…</string><string name="library_found">Gefundene Spiele: %1$d</string><string name="library_empty_status">Keine Spiele gefunden</string><string name="library_empty">Keine Spiele installiert. Mit + einen entpackten Ordner oder ein PKG importieren.</string>
     <string name="menu_import_directory">Ordner importieren</string><string name="menu_import_pkg">PKG importieren</string><string name="menu_settings">Einstellungen</string><string name="menu_add">Spiel hinzufügen</string><string name="menu_remove_game">Ausgewähltes Spiel entfernen</string><string name="game_removing">%1$s wird entfernt…</string><string name="game_removed">%1$s entfernt</string><string name="game_remove_failed">%1$s konnte nicht entfernt werden</string>
+    <string name="game_selected_for_removal">%1$s zum Entfernen ausgewählt</string><string name="game_selection_cleared">Auswahl von %1$s aufgehoben</string><string name="game_marked_unsupported">%1$s zu den nicht unterstützten Spielen hinzugefügt</string><string name="game_marked_supported">%1$s zu den unterstützten Spielen hinzugefügt</string>
+    <string name="game_status_unclassified">Nicht klassifiziert</string><string name="game_status_unsupported">Nicht unterstützt</string><string name="game_status_supported">Unterstützt</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. 2 Sekunden halten, um das Spiel zum Entfernen auszuwählen, 4 Sekunden für nicht unterstützt oder 8 Sekunden für unterstützt.</string>
     <string name="metadata_only">Nur Metadaten · eboot fehlt</string>
     <string name="settings_title">Einstellungen</string><string name="settings_subtitle">Änderungen werden automatisch gespeichert</string><string name="section_general">Allgemein</string><string name="language">App-Sprache</string>
     <string name="category_graphics">Grafik</string><string name="category_graphics_summary">GPU, Auflösung und Patches</string><string name="category_audio">Audio</string><string name="category_audio_summary">Audioausgabe</string><string name="category_controls">Steuerung</string><string name="category_controls_summary">Bildschirmsteuerung</string><string name="category_cache">Caching</string><string name="category_cache_summary">Cache kompilierter Blöcke</string><string name="category_other">Sonstiges</string><string name="category_other_summary">Debug-HUD</string>
@@ -30,4 +33,20 @@
     <string name="controls_gamepad_hint">Wenn ein unterstützter Controller verbunden ist, wird die Bildschirmsteuerung automatisch ausgeblendet. Controller werden unterstützt.</string>
     <string name="resolution_native">Nativ (Gerät)</string>
     <string name="resolution_upscale_150">1,5×-Hochskalierung (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">NGS2-Audiomodul installiert. Es wird beim nächsten Spielstart verwendet.</string>
+    <string name="audio_ngs2_module_missing">Das NGS2-Audiomodul fehlt. Spiele mit NGS2 bleiben stumm.</string>
+    <string name="audio_import_ngs2_module">libSceNgs2.sprx importieren</string>
+    <string name="audio_ngs2_module_hint">Importiere nur ein entschlüsseltes Firmwaremodul von deiner eigenen PlayStation 4. Starte danach nur das Spiel neu; die App muss nicht neu gestartet werden.</string>
+    <string name="audio_ngs2_import_success">NGS2-Audiomodul importiert. Starte das Spiel neu, um den Ton zu aktivieren.</string>
+    <string name="audio_ngs2_import_failed">NGS2-Audiomodul konnte nicht importiert werden: %1$s</string>
+    <string name="audio_ngs2_error_directory">Das Systemmodulverzeichnis konnte nicht erstellt werden</string>
+    <string name="audio_ngs2_error_open">Die ausgewählte Datei konnte nicht geöffnet werden</string>
+    <string name="audio_ngs2_error_size">Das ausgewählte Modul ist zu groß</string>
+    <string name="audio_ngs2_error_name">Wähle das Firmwaremodul mit dem Namen %1$s aus</string>
+    <string name="audio_ngs2_error_format">Die ausgewählte Datei ist kein entschlüsseltes PS4-Modul</string>
+    <string name="game_hold_waiting">Halten: 2 s entfernen · 4 s nicht unterstützt · 8 s unterstützt</string>
+    <string name="game_hold_release_remove">Jetzt loslassen: zum Entfernen auswählen</string>
+    <string name="game_hold_release_unsupported">Jetzt loslassen: als nicht unterstützt markieren</string>
+    <string name="game_hold_release_supported">Jetzt loslassen: als unterstützt markieren</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
 </resources>

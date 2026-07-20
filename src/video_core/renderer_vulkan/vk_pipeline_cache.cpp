@@ -7,6 +7,7 @@
 #include <android/log.h>
 #include <atomic>
 #include <cstdlib>
+#include <unistd.h>
 #endif
 
 #include "common/config.h"
@@ -143,9 +144,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.vs_info.emulate_depth_negative_one_to_one =
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        const auto host_primitive =
+            graphics_primitive_override.value_or(regs.primitive_type);
         info.vs_info.tess_emulated_primitive =
-            regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
-            regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+            host_primitive == AmdGpu::PrimitiveType::RectList ||
+            host_primitive == AmdGpu::PrimitiveType::QuadList;
         info.vs_info.clip_disable = regs.IsClipDisabled();
         if (l_stage == LogicalStage::TessellationEval) {
             info.es_vs_info.tess_type = regs.tess_config.type;
@@ -320,8 +323,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_image_load_store_lod = instance_.IsImageLoadStoreLodSupported(),
         .supports_native_cube_calc = instance_.IsAmdGcnShaderSupported(),
         .supports_trinary_minmax = instance_.IsAmdShaderTrinaryMinMaxSupported(),
-        // TODO: Emitted bounds checks cause problems with phi control flow; needs to be fixed.
-        .supports_robust_buffer_access = true, // instance_.IsRobustBufferAccess2Supported(),
+        // Qualcomm's proprietary driver can hang the GPU on valid, in-range loads from a
+        // robustness2 runtime storage array. Keep the manual-bounds path available for an exact
+        // device A/B; it derives the guest size from Flatbuf and preserves the real buffer data.
+        .supports_robust_buffer_access =
+#ifdef __ANDROID__
+            !(instance.GetDriverID() == vk::DriverId::eQualcommProprietary &&
+              ::access("/data/user/0/app.lsx4.android/files/run-manual-buffer-bounds", F_OK) == 0),
+#else
+            true,
+#endif
         .supports_buffer_fp32_atomic_min_max =
             instance_.IsShaderAtomicFloatBuffer32MinMaxSupported(),
         .supports_image_fp32_atomic_min_max = instance_.IsShaderAtomicFloatImage32MinMaxSupported(),
@@ -926,11 +937,13 @@ const std::optional<Shader::Gcn::FetchShaderData>& PipelineCache::ResolveFetchSh
     return snapshot.parsed;
 }
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
+    std::optional<AmdGpu::PrimitiveType> host_primitive_override) {
     const u64 state_generation = liverpool->GraphicsStateGeneration();
     if (!background_warmup_active.load(std::memory_order_acquire) &&
         last_graphics_pipeline != nullptr &&
-        last_graphics_state_generation == state_generation) {
+        last_graphics_state_generation == state_generation &&
+        last_graphics_primitive_override == host_primitive_override) {
         return last_graphics_pipeline;
     }
 
@@ -942,7 +955,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         }
         background_warmup_foreground_waiters.fetch_sub(1, std::memory_order_acq_rel);
     }
-    const bool refresh_ok = RefreshGraphicsKey();
+    graphics_primitive_override = host_primitive_override;
+    const bool refresh_ok = RefreshGraphicsKey(host_primitive_override);
 #ifdef __ANDROID__
     {
         static std::atomic<int> s_gp{0};
@@ -1003,6 +1017,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     const auto* pipeline = it->second.get();
     last_graphics_pipeline = pipeline && pipeline->IsValid() ? pipeline : nullptr;
     last_graphics_state_generation = state_generation;
+    last_graphics_primitive_override = host_primitive_override;
     return last_graphics_pipeline;
 }
 
@@ -1039,7 +1054,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return pipeline && pipeline->IsValid() ? pipeline : nullptr;
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
+bool PipelineCache::RefreshGraphicsKey(
+    std::optional<AmdGpu::PrimitiveType> host_primitive_override) {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -1061,7 +1077,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
-    key.prim_type = regs.primitive_type;
+    key.prim_type = host_primitive_override.value_or(regs.primitive_type);
     key.polygon_mode = regs.polygon_control.PolyMode();
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
@@ -1098,6 +1114,8 @@ bool PipelineCache::RefreshGraphicsKey() {
     // Second pass to mask out render targets not written by shader and fill remaining info
     u8 color_samples = 0;
     bool all_color_samples_same = true;
+    bool has_active_color_target = false;
+    bool has_rop3_enabled_target = false;
     for (s32 cb = 0; cb < key.num_color_attachments && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
         const u32 target_mask = regs.color_target_mask.GetMask(cb);
@@ -1108,6 +1126,9 @@ bool PipelineCache::RefreshGraphicsKey() {
             std::memset(&key.color_buffers[cb], 0, sizeof(Shader::PsColorBuffer));
             continue;
         }
+
+        has_active_color_target = true;
+        has_rop3_enabled_target |= !regs.blend_control[cb].disable_rop3;
 
         // Fill color blending information.
         if (regs.blend_control[cb].enable && !col_buf.info.blend_bypass) {
@@ -1123,6 +1144,16 @@ bool PipelineCache::RefreshGraphicsKey() {
         all_color_samples_same &= color_samples == prev_color_samples || prev_color_samples == 0;
         key.color_samples[cb] = color_samples;
         key.num_samples = std::max(key.num_samples, color_samples);
+    }
+
+    // CB_BLENDn_CONTROL.DISABLE_ROP3 is per render target on Liverpool. Vulkan exposes one
+    // logic-op enable for the complete pipeline, so the exactly representable common case is to
+    // disable it when every shader-written attachment requests that. Previously the bit was never
+    // consumed and a stale ROP3=SET could turn otherwise valid draws into solid white output.
+    // Mixed enabled/disabled MRTs retain the guest ROP3 because Vulkan cannot express that split
+    // without a destination-reading shader path.
+    if (has_active_color_target && !has_rop3_enabled_target) {
+        key.logic_op = AmdGpu::ColorControl::LogicOp::Copy;
     }
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
@@ -1206,7 +1237,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 
     const auto* fs_info = infos[static_cast<u32>(LogicalStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
-    // EXECUTOR (Sonic Backend-B host-memory corruption root, bisected to the GraphicsPipeline ctor):
+    // EXECUTOR (Sonic JIT host-memory corruption root, bisected to the GraphicsPipeline ctor):
     // num_color_attachments indexes the FIXED 8-element color_formats[] / attachments[] std::arrays in
     // the ctor AND is passed as attachmentCount to vkCreateGraphicsPipelines. A mis-recompiled RSDK
     // fragment shader can emit an mrt_mask with bits above 7, so std::bit_width() yields >8 and the

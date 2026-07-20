@@ -488,7 +488,7 @@ void GraphicsPipeline::GetVertexInputs(
     }
     const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
     for (const auto& attrib : fetch_shader->attributes) {
-        // HARD BOUND (Sonic Backend-B host-memory corruption root): attributes/bindings/guest_buffers
+        // HARD BOUND (Sonic JIT host-memory corruption root): attributes/bindings/guest_buffers
         // are boost::container::static_vector<T, MaxVertexBufferCount=32> with FIXED inline storage,
         // but fetch_shader->attributes is an UNBOUNDED std::vector. A garbage/unrelocated fetch-shader
         // pointer (our S_SETPC_B64 / fetch-shader reloc gap) makes the decoder emit >32 attributes, so

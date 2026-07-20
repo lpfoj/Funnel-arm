@@ -52,12 +52,12 @@ present_test_pattern_fn g_present_test_pattern = nullptr;
 present_homebrew_loader_frame_fn g_present_homebrew_loader_frame = nullptr;
 present_frame_dump_fn g_present_frame_dump = nullptr;
 str_fn g_status = nullptr;
-str_fn g_backend_b_status = nullptr;
+str_fn g_jit_status = nullptr;
 runtime_hud_stats_fn g_runtime_hud_stats = nullptr;
-str_fn g_backend_b_selftest = nullptr;
+str_fn g_jit_selftest = nullptr;
 path_fn g_scan_game = nullptr;
 path_fn g_launch_game = nullptr;
-path_fn g_launch_game_backend_b = nullptr;
+path_fn g_launch_game_jit = nullptr;
 path_fn g_load_embedded_box64 = nullptr;
 path_fn g_translator_install_helper = nullptr;
 path_fn g_translator_run_guest_elf = nullptr;
@@ -428,14 +428,14 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
     g_present_frame_dump =
         resolve_optional<present_frame_dump_fn>("executor_lsx4_runtime_present_frame_dump_file");
     g_status = resolve_optional<str_fn>("executor_lsx4_runtime_status");
-    g_backend_b_status = resolve_optional<str_fn>("executor_lsx4_runtime_backend_b_status");
+    g_jit_status = resolve_optional<str_fn>("executor_lsx4_runtime_jit_status");
     g_runtime_hud_stats =
         resolve_optional<runtime_hud_stats_fn>("executor_lsx4_runtime_hud_stats");
-    g_backend_b_selftest = resolve_optional<str_fn>("executor_lsx4_runtime_backend_b_selftest");
+    g_jit_selftest = resolve_optional<str_fn>("executor_lsx4_runtime_jit_selftest");
     g_scan_game = resolve_optional<path_fn>("executor_lsx4_runtime_scan_game");
     g_launch_game = resolve_optional<path_fn>("executor_lsx4_runtime_launch_game");
-    g_launch_game_backend_b =
-        resolve_optional<path_fn>("executor_lsx4_runtime_launch_game_backend_b");
+    g_launch_game_jit =
+        resolve_optional<path_fn>("executor_lsx4_runtime_launch_game_jit");
     g_load_embedded_box64 =
         resolve_optional<path_fn>("executor_lsx4_runtime_load_embedded_box64");
     g_translator_install_helper =
@@ -1042,9 +1042,9 @@ Java_app_lsx4_android_RuntimeBridge_status(JNIEnv* env, jclass)
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_app_lsx4_android_RuntimeBridge_backendBStatus(JNIEnv* env, jclass)
+Java_app_lsx4_android_RuntimeBridge_jitStatus(JNIEnv* env, jclass)
 {
-    return to_jstring(env, call_or_empty(g_backend_b_status));
+    return to_jstring(env, call_or_empty(g_jit_status));
 }
 
 extern "C" JNIEXPORT jlongArray JNICALL
@@ -1073,9 +1073,9 @@ Java_app_lsx4_android_RuntimeBridge_runtimeHudStats(JNIEnv* env, jclass)
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_app_lsx4_android_RuntimeBridge_backendBSelfTest(JNIEnv* env, jclass)
+Java_app_lsx4_android_RuntimeBridge_jitSelfTest(JNIEnv* env, jclass)
 {
-    return to_jstring(env, call_or_empty(g_backend_b_selftest));
+    return to_jstring(env, call_or_empty(g_jit_selftest));
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1143,15 +1143,15 @@ Java_app_lsx4_android_RuntimeBridge_launchGame(JNIEnv* env, jclass, jstring path
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_app_lsx4_android_RuntimeBridge_launchGameBackendB(JNIEnv* env, jclass, jstring path)
+Java_app_lsx4_android_RuntimeBridge_launchGameJit(JNIEnv* env, jclass, jstring path)
 {
-    if (!g_launch_game_backend_b)
+    if (!g_launch_game_jit)
     {
         return -2;
     }
 
     const char* raw_path = env->GetStringUTFChars(path, nullptr);
-    const int result = g_launch_game_backend_b(raw_path);
+    const int result = g_launch_game_jit(raw_path);
     env->ReleaseStringUTFChars(path, raw_path);
     return result;
 }

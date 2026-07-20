@@ -326,8 +326,27 @@ void VideoOutDriver::Flip(const Request& req) {
     port->prev_ready_tick = req.ready_tick;
     if (release_index != -1) {
         if (release_tick != 0) {
+#ifdef __ANDROID__
+            if (std::getenv("EXECUTOR_TRACE_LIVE_VIDEOOUT") != nullptr) {
+                const auto* semaphore =
+                    presenter->GetRasterizer().GetScheduler().GetMasterSemaphore();
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_VIDEOOUT_RETIRE] stage=queued index=%d tick=%llu current=%llu gpu=%llu",
+                    release_index, static_cast<unsigned long long>(release_tick),
+                    static_cast<unsigned long long>(semaphore->CurrentTick()),
+                    static_cast<unsigned long long>(semaphore->KnownGpuTick()));
+            }
+#endif
             presenter->GetRasterizer().GetScheduler().DeferPriorityOperationAt(
                 release_tick, [port, release_index] {
+#ifdef __ANDROID__
+                    if (std::getenv("EXECUTOR_TRACE_LIVE_VIDEOOUT") != nullptr) {
+                        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                            "[EXECUTOR_VIDEOOUT_RETIRE] stage=callback index=%d",
+                                            release_index);
+                    }
+#endif
                     ExecutorRetireVoLabel(port, release_index);
                 });
         } else {

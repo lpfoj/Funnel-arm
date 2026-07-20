@@ -925,7 +925,14 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         sym_type == Loader::SymbolType::Function &&
         (sr.module == "libc" || sr.module == "libSceLibcInternal" ||
          sr.library == "libc" || sr.library == "libSceLibcInternal");
-    if (is_libc_os_surface) {
+    // A title-supplied libc must resolve calls back into its own exported ABI. Routing those
+    // self-imports through an Executor FILE*/locale/etc. bridge mixes two private libc object
+    // layouts inside one module. The resulting return value may be valid for the HLE contract but
+    // meaningless to the guest implementation (for example, a scalar status subsequently used as
+    // a guest object pointer). External importers keep the existing HLE-first ownership policy.
+    const bool importer_is_guest_libc =
+        m->file.filename() == "libc.prx" || m->file.filename() == "libSceLibcInternal.prx";
+    if (is_libc_os_surface && !importer_is_guest_libc) {
         if (Core::AeroLib::TryGetAndroidX64ExecutorOverride(
                 sr.name.c_str(), &return_info->virtual_address, &return_info->name)) {
             ExecutorAuditLibcFamilyOwner(sr.name.c_str(), m->file.string().c_str(),
@@ -1358,7 +1365,7 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
         ASSERT_MSG(dest != MAP_FAILED, "Unable to allocate Android dynamic PRX TLS");
         if (executor_lsx4_android_register_guest_gc_sideband_range) {
             executor_lsx4_android_register_guest_gc_sideband_range(
-                dest, alloc_size, "backend_b_dynamic_prx_tls");
+                dest, alloc_size, "jit_dynamic_prx_tls");
         }
         __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
                             "[EXECUTOR_TLS_ALLOC] module=%llu offset=0x%llx size=0x%zx "
@@ -1459,8 +1466,8 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
         if (executor_lsx4_android_register_guest_gc_sideband_range) {
             executor_lsx4_android_register_guest_gc_sideband_range(
                 rooted_base, rooted_size,
-                is_primary ? "backend_b_main_static_tls_tcb"
-                           : "backend_b_worker_static_tls_tcb");
+                is_primary ? "jit_main_static_tls_tcb"
+                           : "jit_worker_static_tls_tcb");
         }
         LOG_INFO(Core_Linker,
                  "Android TLS+TCB allocated primary={} tls_base={} tcb={} prefix={:#x} static_tls={:#x} total={:#x}",

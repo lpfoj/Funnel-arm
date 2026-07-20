@@ -13,6 +13,14 @@
     <string name="game_removing">Removing %1$s…</string>
     <string name="game_removed">%1$s removed</string>
     <string name="game_remove_failed">Could not remove %1$s</string>
+    <string name="game_selected_for_removal">%1$s selected for removal</string>
+    <string name="game_selection_cleared">%1$s selection cleared</string>
+    <string name="game_marked_unsupported">%1$s added to unsupported games</string>
+    <string name="game_marked_supported">%1$s added to supported games</string>
+    <string name="game_status_unclassified">Not classified</string>
+    <string name="game_status_unsupported">Unsupported</string>
+    <string name="game_status_supported">Supported</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Hold for 2 seconds to select for removal, 4 seconds to mark unsupported, or 8 seconds to mark supported.</string>
     <string name="metadata_only">Metadata only · eboot is missing</string>
     <string name="settings_title">Settings</string>
     <string name="settings_subtitle">Changes are saved automatically</string>
@@ -99,4 +107,20 @@
     <string name="controls_gamepad_hint">When a supported gamepad is connected, the on-screen overlay hides automatically. Gamepads are supported.</string>
     <string name="resolution_native">Native (device)</string>
     <string name="resolution_upscale_150">1.5× upscale (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">NGS2 audio module installed. It will be used on the next game launch.</string>
+    <string name="audio_ngs2_module_missing">The NGS2 audio module is missing. Games that use NGS2 will be silent.</string>
+    <string name="audio_import_ngs2_module">Import libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">Import only a decrypted firmware module dumped from your own PlayStation 4. Restart the game after importing; the application itself does not need to restart.</string>
+    <string name="audio_ngs2_import_success">NGS2 audio module imported. Restart the game to enable sound.</string>
+    <string name="audio_ngs2_import_failed">Could not import the NGS2 audio module: %1$s</string>
+    <string name="audio_ngs2_error_directory">Could not create the system module directory</string>
+    <string name="audio_ngs2_error_open">Could not open the selected file</string>
+    <string name="audio_ngs2_error_size">The selected module is too large</string>
+    <string name="audio_ngs2_error_name">Select the firmware module named %1$s</string>
+    <string name="audio_ngs2_error_format">The selected file is not a decrypted PS4 module</string>
+    <string name="game_hold_waiting">Hold: 2s remove · 4s unsupported · 8s supported</string>
+    <string name="game_hold_release_remove">Release now: select for removal</string>
+    <string name="game_hold_release_unsupported">Release now: mark unsupported</string>
+    <string name="game_hold_release_supported">Release now: mark supported</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
 </resources>

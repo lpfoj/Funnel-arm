@@ -433,6 +433,25 @@ static bool ExecutorEnvFlag(const char* name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+struct EventFlagTraceConfig {
+    bool light_oracle = false;
+    bool live_wide = false;
+    bool live_sync = false;
+    bool render_thread_only = false;
+};
+
+static const EventFlagTraceConfig& GetEventFlagTraceConfig() {
+    // Trace policy is fixed before the first guest event flag is touched. Keeping the four
+    // answers together removes repeated getenv walks from every production wait/set operation.
+    static const EventFlagTraceConfig config{
+        .light_oracle = ExecutorEnvFlag("EXECUTOR_LIGHT_ORACLE"),
+        .live_wide = ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_WIDE"),
+        .live_sync = ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_SYNC"),
+        .render_thread_only = ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_RENDER_THREAD_ONLY"),
+    };
+    return config;
+}
+
 static bool IsWatchedEventFlag(OrbisKernelEventFlag ef, bool mark);
 
 static bool IsLiveRenderThreadName(const std::string& name) {
@@ -443,7 +462,7 @@ static bool IsLiveRenderThreadName(const std::string& name) {
 }
 
 static bool IsLiveInterestingThreadName(const std::string& name) {
-    if (ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_RENDER_THREAD_ONLY")) {
+    if (GetEventFlagTraceConfig().render_thread_only) {
         return IsLiveRenderThreadName(name);
     }
     return IsLiveRenderThreadName(name) || name.find("mono") != std::string::npos ||
@@ -467,7 +486,7 @@ static bool IsEventFlagFlowOp(const char* op) {
 }
 
 static bool ShouldTraceTargetedEventFlag(const char* op, OrbisKernelEventFlag ef) {
-    if (!ExecutorEnvFlag("EXECUTOR_LIGHT_ORACLE") || !g_curthread || !IsEventFlagFlowOp(op)) {
+    if (!GetEventFlagTraceConfig().light_oracle || !g_curthread || !IsEventFlagFlowOp(op)) {
         return false;
     }
     if (IsMonoSuspendThreadName(g_curthread->name)) {
@@ -477,8 +496,8 @@ static bool ShouldTraceTargetedEventFlag(const char* op, OrbisKernelEventFlag ef
 }
 
 static bool ShouldTraceLiveEventFlag() {
-    return ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_WIDE") ||
-           ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_SYNC");
+    const auto& config = GetEventFlagTraceConfig();
+    return config.live_wide || config.live_sync;
 }
 
 static bool IsCurrentLiveInterestingThread() {

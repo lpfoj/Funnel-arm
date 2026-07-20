@@ -1,9 +1,11 @@
 package app.lsx4.android;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.database.Cursor;
 import android.graphics.Canvas;
 import android.graphics.ColorFilter;
 import android.graphics.Paint;
@@ -12,7 +14,9 @@ import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.net.Uri;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -24,13 +28,25 @@ import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 
 /** Categorised settings shell. Every displayed control maps to an applied runtime preference. */
 public final class SettingsActivity extends Activity {
     public static final String PREFS = "lsx4_settings";
     private static final String EXTRA_SCREEN = "settings_screen";
+    private static final int REQUEST_IMPORT_NGS2_MODULE = 4301;
+    private static final String NGS2_MODULE_NAME = "libSceNgs2.sprx";
+    private static final long MAX_SYSTEM_MODULE_BYTES = 128L * 1024L * 1024L;
 
     public static final String K_RES_MODE = "res_mode";
     public static final String K_GPU_BACKEND = "gpu_backend";
@@ -42,7 +58,7 @@ public final class SettingsActivity extends Activity {
     public static final String K_AUTO_LAUNCH_STORE = "auto_launch_store";
     public static final String K_PERSISTENT_JIT_CACHE = "persistent_jit_cache";
     private static final String K_LEGACY_PERSISTENT_JIT_CACHE =
-            "backend_b_persistent_jit_cache";
+            "jit_persistent_jit_cache";
     public static final String K_DISABLE_DYNAMIC_SHADOWS = "disable_dynamic_shadows";
     public static final String K_DISABLE_SSAO = "disable_ssao";
     public static final String K_DISABLE_MOTION_BLUR = "disable_motion_blur";
@@ -292,6 +308,157 @@ public final class SettingsActivity extends Activity {
 
     private void buildAudio(LinearLayout root) {
         root.addView(preferenceCheck(R.string.audio_enable, K_AUDIO, true));
+
+        TextView moduleStatus = hint(getString(isNgs2ModuleInstalled()
+                ? R.string.audio_ngs2_module_ready
+                : R.string.audio_ngs2_module_missing));
+        moduleStatus.setPadding(dp(2), dp(14), dp(2), dp(8));
+        root.addView(moduleStatus);
+
+        TextView importModule = label(
+                getString(R.string.audio_import_ngs2_module), 15, 0xffe3e8ef);
+        importModule.setGravity(Gravity.CENTER_VERTICAL);
+        importModule.setMinHeight(dp(58));
+        importModule.setPadding(dp(18), dp(12), dp(16), dp(12));
+        importModule.setBackground(cardBackground(0xff1b2026, 0xff2d3640, 14));
+        importModule.setClickable(true);
+        importModule.setFocusable(true);
+        importModule.setOnClickListener(view -> pickNgs2Module());
+        root.addView(importModule, cardMargins());
+
+        TextView legalHint = hint(getString(R.string.audio_ngs2_module_hint));
+        legalHint.setPadding(dp(2), dp(8), dp(2), 0);
+        root.addView(legalHint);
+    }
+
+    private void pickNgs2Module() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQUEST_IMPORT_NGS2_MODULE);
+        } catch (ActivityNotFoundException error) {
+            Toast.makeText(this, R.string.file_picker_unavailable, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_IMPORT_NGS2_MODULE
+                || resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        Uri source = data.getData();
+        Thread importer = new Thread(() -> {
+            try {
+                importNgs2Module(source);
+                runOnUiThread(() -> {
+                    Toast.makeText(this, R.string.audio_ngs2_import_success,
+                            Toast.LENGTH_LONG).show();
+                    recreate();
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        getString(R.string.audio_ngs2_import_failed,
+                                error.getMessage() == null
+                                        ? error.getClass().getSimpleName()
+                                        : error.getMessage()),
+                        Toast.LENGTH_LONG).show());
+            }
+        }, "lsx4-ngs2-import");
+        importer.setDaemon(true);
+        importer.start();
+    }
+
+    private boolean isNgs2ModuleInstalled() {
+        File module = new File(new File(new File(getFilesDir(), "lsx4-home"),
+                "sys_modules"), NGS2_MODULE_NAME);
+        if (!module.isFile() || module.length() < 64) {
+            return false;
+        }
+        try {
+            return hasSupportedModuleMagic(module);
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private void importNgs2Module(Uri source) throws IOException {
+        String displayName = selectedFileName(source);
+        if (displayName == null || !NGS2_MODULE_NAME.equalsIgnoreCase(displayName.trim())) {
+            throw new IOException(getString(R.string.audio_ngs2_error_name, NGS2_MODULE_NAME));
+        }
+        File modules = new File(new File(getFilesDir(), "lsx4-home"), "sys_modules");
+        if (!modules.isDirectory() && !modules.mkdirs()) {
+            throw new IOException(getString(R.string.audio_ngs2_error_directory));
+        }
+        File temporary = new File(modules, "." + NGS2_MODULE_NAME + ".importing");
+        File destination = new File(modules, NGS2_MODULE_NAME);
+        long copied = 0;
+        try (InputStream input = getContentResolver().openInputStream(source);
+             FileOutputStream output = new FileOutputStream(temporary)) {
+            if (input == null) {
+                throw new IOException(getString(R.string.audio_ngs2_error_open));
+            }
+            byte[] buffer = new byte[256 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                if (count == 0) {
+                    continue;
+                }
+                if (copied > MAX_SYSTEM_MODULE_BYTES - count) {
+                    throw new IOException(getString(R.string.audio_ngs2_error_size));
+                }
+                output.write(buffer, 0, count);
+                copied += count;
+            }
+            output.getFD().sync();
+        } catch (IOException error) {
+            //noinspection ResultOfMethodCallIgnored
+            temporary.delete();
+            throw error;
+        }
+        if (copied < 64 || !hasSupportedModuleMagic(temporary)) {
+            //noinspection ResultOfMethodCallIgnored
+            temporary.delete();
+            throw new IOException(getString(R.string.audio_ngs2_error_format));
+        }
+        try {
+            Files.move(temporary.toPath(), destination.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(temporary.toPath(), destination.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private String selectedFileName(Uri source) {
+        try (Cursor cursor = getContentResolver().query(source,
+                new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) {
+                return cursor.getString(0);
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return source.getLastPathSegment();
+    }
+
+    private static boolean hasSupportedModuleMagic(File module) throws IOException {
+        byte[] magic = new byte[4];
+        try (FileInputStream input = new FileInputStream(module)) {
+            if (input.read(magic) != magic.length) {
+                return false;
+            }
+        }
+        boolean elf = (magic[0] & 0xff) == 0x7f
+                && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+        boolean ps4Self = (magic[0] & 0xff) == 0x4f
+                && (magic[1] & 0xff) == 0x15
+                && (magic[2] & 0xff) == 0x3d
+                && (magic[3] & 0xff) == 0x1d;
+        return elf || ps4Self;
     }
 
     private void buildControls(LinearLayout root) {

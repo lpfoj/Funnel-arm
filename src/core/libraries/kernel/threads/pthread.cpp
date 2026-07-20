@@ -74,7 +74,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                                                            void* arg,
                                                            const char* name)
     __attribute__((weak));
-extern "C" int executor_lsx4_android_runtime_backend_b_active() __attribute__((weak));
+extern "C" int executor_lsx4_android_runtime_jit_active() __attribute__((weak));
 extern "C" void executor_live_note_unity_gfx_worker(void* worker) __attribute__((weak));
 extern "C" bool executor_lsx4_android_should_suppress_guest_once(void* once_control,
                                                                      void* init_routine)
@@ -100,9 +100,9 @@ static bool ExecutorLightOraclePthreadTrace() {
     return std::getenv("EXECUTOR_LIGHT_ORACLE") != nullptr;
 }
 
-static bool ExecutorAndroidBackendBActive() {
-    return executor_lsx4_android_runtime_backend_b_active != nullptr &&
-           executor_lsx4_android_runtime_backend_b_active() == 1;
+static bool ExecutorAndroidJitActive() {
+    return executor_lsx4_android_runtime_jit_active != nullptr &&
+           executor_lsx4_android_runtime_jit_active() == 1;
 }
 
 static const char* ExecutorThreadNameOrUnknown(Libraries::Kernel::Pthread* thread) {
@@ -1337,11 +1337,11 @@ static void RunThread(void* arg) {
 #ifdef __ANDROID__
 static void RunAndroidMappedGuestThread(void* arg) {
     auto* curthread = static_cast<Pthread*>(arg);
-    const bool backend_b = ExecutorAndroidBackendBActive();
+    const bool jit = ExecutorAndroidJitActive();
     static std::atomic_uint32_t mapped_thread_log_count{0};
     const bool trace_guest_thread =
         mapped_thread_log_count.fetch_add(1, std::memory_order_relaxed) < 4;
-    const char* runner_name = backend_b ? "RunBackendBGuestThread" : "RunBox64GuestThread";
+    const char* runner_name = jit ? "RunJitGuestThread" : "RunBox64GuestThread";
     g_curthread = curthread;
     std::atomic_thread_fence(std::memory_order_acquire);
     ExecutorTracePthreadLifecycle("mapped_begin", curthread, nullptr,
@@ -1384,7 +1384,7 @@ static void RunAndroidMappedGuestThread(void* arg) {
                                     "[EXECUTOR_GUEST_THREAD_STACK] clear_mapped_partial backend=%s "
                                     "thread=%p name=%s stack=%p size=0x%zx lowGuard=0x%zx "
                                     "topPreserve=0x%zx clearBase=%p clearSize=0x%zx",
-                                    backend_b ? "backend-b-aarch64-jit" : "box64-fex",
+                                    jit ? "jit-aarch64-jit" : "box64-fex",
                                     curthread, curthread->name.c_str(),
                                     curthread->attr.stackaddr_attr, stack_size, LowGuardBytes,
                                     TopBootstrapPreserveBytes,
@@ -1396,7 +1396,7 @@ static void RunAndroidMappedGuestThread(void* arg) {
                                     "[EXECUTOR_GUEST_THREAD_STACK] clear_mapped_skip_small backend=%s "
                                     "thread=%p name=%s stack=%p size=0x%zx lowGuard=0x%zx "
                                     "topPreserve=0x%zx",
-                                    backend_b ? "backend-b-aarch64-jit" : "box64-fex",
+                                    jit ? "jit-aarch64-jit" : "box64-fex",
                                     curthread, curthread->name.c_str(),
                                     curthread->attr.stackaddr_attr, stack_size, LowGuardBytes,
                                     TopBootstrapPreserveBytes);
@@ -1471,7 +1471,7 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
     static int TidCounter = 1;
     new_thread->tid = ++TidCounter;
 
-    const bool backend_b = ExecutorAndroidBackendBActive();
+    const bool jit = ExecutorAndroidJitActive();
     const bool force_unique_android_mapped_guest_stack =
 #ifdef __ANDROID__
         true;
@@ -1497,13 +1497,13 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
         if (trace_mapped_stack) {
             LOG_INFO(Kernel_Pthread,
                      "Android mapped guest thread forcing unique stack, backend={}, old attr stack={}, size={:#x}, flags={:#x}",
-                     backend_b ? "backend-b-aarch64-jit" : "box64-fex",
+                     jit ? "jit-aarch64-jit" : "box64-fex",
                      new_thread->attr.stackaddr_attr, new_thread->attr.stacksize_attr,
                      static_cast<u32>(new_thread->attr.flags));
             __android_log_print(ANDROID_LOG_INFO, ExecutorAndroidLogTag,
                                 "[EXECUTOR_PTHREAD_STACK_FORCE] backend=%s old_stack=%p "
                                 "old_size=0x%zx flags=0x%x",
-                                backend_b ? "backend-b-aarch64-jit" : "box64-fex",
+                                jit ? "jit-aarch64-jit" : "box64-fex",
                                 new_thread->attr.stackaddr_attr, new_thread->attr.stacksize_attr,
                                 static_cast<unsigned>(new_thread->attr.flags));
         }
@@ -1538,13 +1538,13 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
         if (trace_mapped_stack) {
             LOG_INFO(Kernel_Pthread,
                      "Android mapped guest thread stack ready backend={}, stack={}, size={:#x}, guard={:#x}, flags={:#x}",
-                     backend_b ? "backend-b-aarch64-jit" : "box64-fex",
+                     jit ? "jit-aarch64-jit" : "box64-fex",
                      new_thread->attr.stackaddr_attr, new_thread->attr.stacksize_attr,
                      new_thread->attr.guardsize_attr, static_cast<u32>(new_thread->attr.flags));
             __android_log_print(ANDROID_LOG_INFO, ExecutorAndroidLogTag,
                                 "[EXECUTOR_PTHREAD_STACK_READY] backend=%s stack=%p size=0x%zx "
                                 "guard=0x%zx flags=0x%x",
-                                backend_b ? "backend-b-aarch64-jit" : "box64-fex",
+                                jit ? "jit-aarch64-jit" : "box64-fex",
                                 new_thread->attr.stackaddr_attr, new_thread->attr.stacksize_attr,
                                 new_thread->attr.guardsize_attr,
                                 static_cast<unsigned>(new_thread->attr.flags));

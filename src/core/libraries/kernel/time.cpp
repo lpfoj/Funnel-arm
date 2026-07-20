@@ -53,9 +53,13 @@ static std::mutex clock_mutex;
 
 #ifdef __ANDROID__
 static bool ShouldTraceLiveSleep() {
-    if (std::getenv("EXECUTOR_TRACE_LIVE_WIDE") == nullptr &&
-        std::getenv("EXECUTOR_TRACE_LIVE_SYNC") == nullptr &&
-        std::getenv("EXECUTOR_LIGHT_ORACLE") == nullptr) {
+    // These diagnostic switches are established before guest execution. Querying libc's
+    // environment three times on every Unity usleep showed up directly in the loading profile.
+    static const bool enabled =
+        std::getenv("EXECUTOR_TRACE_LIVE_WIDE") != nullptr ||
+        std::getenv("EXECUTOR_TRACE_LIVE_SYNC") != nullptr ||
+        std::getenv("EXECUTOR_LIGHT_ORACLE") != nullptr;
+    if (!enabled) {
         return false;
     }
     if (!g_curthread) {

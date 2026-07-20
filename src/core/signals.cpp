@@ -75,45 +75,45 @@ static struct sigaction g_previous_sigill {};
 static struct sigaction g_previous_sigurg {};
 static struct sigaction g_previous_sigvtalrm {};
 static bool g_fault_signal_handlers_installed = false;
-static bool g_backend_b_signal_handlers_installed = false;
+static bool g_jit_signal_handlers_installed = false;
 
-extern "C" int executor_lsx4_android_runtime_backend_b_active() __attribute__((weak));
-extern "C" int executor_backend_b_has_synchronous_guest_fault_frame() __attribute__((weak));
-extern "C" int executor_backend_b_defer_synchronous_guest_fault(
+extern "C" int executor_lsx4_android_runtime_jit_active() __attribute__((weak));
+extern "C" int executor_jit_has_synchronous_guest_fault_frame() __attribute__((weak));
+extern "C" int executor_jit_defer_synchronous_guest_fault(
     s32 native_sig, s32 si_code, s32 si_errno, s32 source_pid, u32 source_uid, u64 fault_addr,
     s32 is_write) __attribute__((weak));
-extern "C" u64 executor_backend_b_current_fault_guest_rip() __attribute__((weak));
-extern "C" u64 executor_backend_b_current_fault_active_block_rip() __attribute__((weak));
-extern "C" u64 executor_backend_b_current_fault_instruction() __attribute__((weak));
-extern "C" u32 executor_backend_b_current_fault_instruction_meta() __attribute__((weak));
-extern "C" u64 executor_backend_b_current_fault_gpr(u32 index) __attribute__((weak));
-extern "C" u32 executor_backend_b_current_fault_recent_rips(u64* out, u32 capacity)
+extern "C" u64 executor_jit_current_fault_guest_rip() __attribute__((weak));
+extern "C" u64 executor_jit_current_fault_active_block_rip() __attribute__((weak));
+extern "C" u64 executor_jit_current_fault_instruction() __attribute__((weak));
+extern "C" u32 executor_jit_current_fault_instruction_meta() __attribute__((weak));
+extern "C" u64 executor_jit_current_fault_gpr(u32 index) __attribute__((weak));
+extern "C" u32 executor_jit_current_fault_recent_rips(u64* out, u32 capacity)
     __attribute__((weak));
-extern "C" u32 executor_backend_b_current_fault_active_block_bytes(u8* out, u32 capacity)
+extern "C" u32 executor_jit_current_fault_active_block_bytes(u8* out, u32 capacity)
     __attribute__((weak));
-extern "C" u32 executor_backend_b_current_fault_recent_block(u32 newest_index, u64* rip_out,
+extern "C" u32 executor_jit_current_fault_recent_block(u32 newest_index, u64* rip_out,
                                                                u8* bytes_out, u32 capacity)
     __attribute__((weak));
 
-static bool AndroidBackendBActive() {
-    return executor_lsx4_android_runtime_backend_b_active != nullptr &&
-           executor_lsx4_android_runtime_backend_b_active() != 0;
+static bool AndroidJitActive() {
+    return executor_lsx4_android_runtime_jit_active != nullptr &&
+           executor_lsx4_android_runtime_jit_active() != 0;
 }
 
-static bool BackendBSynchronousGuestFaultCanResume() {
-    return executor_backend_b_has_synchronous_guest_fault_frame != nullptr &&
-           executor_backend_b_has_synchronous_guest_fault_frame() != 0;
+static bool JitSynchronousGuestFaultCanResume() {
+    return executor_jit_has_synchronous_guest_fault_frame != nullptr &&
+           executor_jit_has_synchronous_guest_fault_frame() != 0;
 }
 
-static bool DeferBackendBSynchronousGuestFault(int sig, const siginfo_t* info,
+static bool DeferJitSynchronousGuestFault(int sig, const siginfo_t* info,
                                                bool is_write) {
-    if (executor_backend_b_defer_synchronous_guest_fault == nullptr) {
+    if (executor_jit_defer_synchronous_guest_fault == nullptr) {
         return false;
     }
-    // This is the only Backend-B action permitted while the POSIX signal frame is live.  The
+    // This is the only JIT action permitted while the POSIX signal frame is live.  The
     // callee copies these scalars into the armed frame and siglongjmps out of emitted AArch64.
     // Guest code, logging, allocation and ucontext writeback all happen later in Execute().
-    return executor_backend_b_defer_synchronous_guest_fault(
+    return executor_jit_defer_synchronous_guest_fault(
                sig, info ? info->si_code : 0, info ? info->si_errno : 0,
                info ? info->si_pid : 0, info ? info->si_uid : 0,
                reinterpret_cast<u64>(info ? info->si_addr : nullptr), is_write ? 1 : 0) != 0;
@@ -285,7 +285,7 @@ static bool TryFixupMisalignedReleaseAcquire(int sig, siginfo_t* info, void* raw
 #endif
 
 #ifdef __ANDROID__
-// Survival escape hatch: a Backend-B reconstruction gap in the RSDK audio worker (Thread2) computes
+// Survival escape hatch: a JIT reconstruction gap in the RSDK audio worker (Thread2) computes
 // a corrupted store target (e.g. a host-lib address 0x77xx) and the native JIT block's STR SIGSEGVs,
 // taking the WHOLE process down (killing the render main thread too). When
 // EXECUTOR_SKIP_FAULTING_STORES is set, discard a faulting guest STORE (the value is lost but the
@@ -336,7 +336,7 @@ std::atomic<int> g_executor_render_tid{0};
 
 // boost::container::static_vector / small_vector bounds preconditions use BOOST_ASSERT, a no-op under
 // NDEBUG (silent UB on overflow). BOOST_ENABLE_ASSERT_HANDLER (defined for the GPU-path TUs) routes
-// them here. The Sonic Backend-B corruption is a suspected static_vector overflow scribbling a
+// them here. The Sonic JIT corruption is a suspected static_vector overflow scribbling a
 // std::mutex; log the EXACT expr/file:line to the persistent checkfail file so it can be pinned, then
 // return (do not abort) so we can also see whether the render survives.
 namespace boost {
@@ -351,7 +351,7 @@ void assertion_failed(char const* expr, char const* function, char const* file, 
     char buf[512];
     const int n = std::snprintf(buf, sizeof(buf), "BOOST_ASSERT expr='%s' fn='%s' %s:%ld\n",
                                 expr ? expr : "?", function ? function : "?", file ? file : "?", line);
-    const int fd = ::open("/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt",
+    const int fd = ::open("/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt",
                           O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd >= 0) {
         (void)::write(fd, buf, static_cast<size_t>(n > 0 ? n : 0));
@@ -370,7 +370,7 @@ namespace Core {
 // Capture the calling thread's backtrace (async-signal-safe-ish via _Unwind_Backtrace) to the
 // persistent checkfail file on an abort. With libc++ hardening on, a silent std::vector::operator[]
 // OOB aborts AT THE WRITE SITE (before it can corrupt a mutex), so this backtrace pins the exact
-// offending frame — the Sonic Backend-B host-memory corruptor. Offsets are resolved later with
+// offending frame — the Sonic JIT host-memory corruptor. Offsets are resolved later with
 // llvm-addr2line against the full-probe .so.
 struct BtState {
     void** pcs;
@@ -398,7 +398,7 @@ static void CaptureAbortBacktrace(int sig) {
     _Unwind_Backtrace(&BtTrace, &st);
     Dl_info info{};
     char line[256];
-    const int fd = ::open("/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt",
+    const int fd = ::open("/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt",
                           O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0) {
         return;
@@ -419,11 +419,11 @@ static void CaptureAbortBacktrace(int sig) {
     }
     ::close(fd);
     __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
-                        "[EXECUTOR_ABORT_BACKTRACE] sig=%d tid=%d frames=%d (see backendb-checkfail.txt)",
+                        "[EXECUTOR_ABORT_BACKTRACE] sig=%d tid=%d frames=%d (see jit-checkfail.txt)",
                         sig, static_cast<int>(gettid()), st.count);
 }
 
-// Last-resort survival: a native Backend-B codegen bug on a WORKER thread (e.g. the RSDK audio
+// Last-resort survival: a native JIT codegen bug on a WORKER thread (e.g. the RSDK audio
 // worker) corrupts host memory and faults, taking the whole process — and the render thread that is
 // mid-present — down with it. When EXECUTOR_PARK_NONRENDER_ON_FAULT is set and an unrecoverable
 // fault lands on a non-render, non-main thread, park that thread forever instead of aborting the
@@ -468,8 +468,8 @@ static bool TryParkNonRenderThreadOnFault(int sig, void* code_address, siginfo_t
 void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     const auto* signals = Signals::Instance();
 #ifdef __ANDROID__
-    const bool backend_b_parity = AndroidBackendBActive();
-    if (!backend_b_parity) {
+    const bool jit_parity = AndroidJitActive();
+    if (!jit_parity) {
         if (TryFixupMisalignedReleaseAcquire(sig, info, raw_context)) {
             return;
         }
@@ -482,7 +482,7 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     if (sig == SIGABRT) {
         CaptureAbortBacktrace(sig);
     }
-    // A FORTIFY abort (SIGABRT) from a Backend-B worker's corrupted-mutex lock would take the whole
+    // A FORTIFY abort (SIGABRT) from a JIT worker's corrupted-mutex lock would take the whole
     // process down; park the worker instead so the render thread survives to present.
     if (sig == SIGABRT && TryParkNonRenderThreadOnFault(sig, Common::GetRip(raw_context), info)) {
         return;
@@ -496,17 +496,17 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     case SIGBUS: {
         const bool is_write = Common::IsWriteError(raw_context);
 #ifdef __ANDROID__
-        if (backend_b_parity && BackendBSynchronousGuestFaultCanResume()) {
+        if (jit_parity && JitSynchronousGuestFaultCanResume()) {
             // HLE memory tracking gets first refusal.  Every remaining fault raised by an armed
-            // Backend-B Arm64BlockEntry belongs to guest execution, including an unhandled guest
+            // JIT Arm64BlockEntry belongs to guest execution, including an unhandled guest
             // fault.  Defer both cases: a registered guest handler resumes normally, while a
             // missing handler becomes a controlled mapped-entry error in Execute().  Falling
             // through to UNREACHABLE here used to turn an ordinary unhandled guest stack fault
             // into a process-wide host SIGTRAP.
             if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
-                (void)DeferBackendBSynchronousGuestFault(sig, info, is_write);
+                (void)DeferJitSynchronousGuestFault(sig, info, is_write);
                 UNREACHABLE_MSG(
-                    "Backend B synchronous guest access fault could not be deferred");
+                    "JIT synchronous guest access fault could not be deferred");
             }
             break;
         }
@@ -518,34 +518,34 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
             static std::atomic<int> budget{12};
             if (budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                 const auto gh = Libraries::Kernel::Handlers[Libraries::Kernel::NativeToOrbisSignal(sig)];
-                const u64 guest_rip = executor_backend_b_current_fault_guest_rip != nullptr
-                                          ? executor_backend_b_current_fault_guest_rip()
+                const u64 guest_rip = executor_jit_current_fault_guest_rip != nullptr
+                                          ? executor_jit_current_fault_guest_rip()
                                           : 0;
                 const u64 active_rip =
-                    executor_backend_b_current_fault_active_block_rip != nullptr
-                        ? executor_backend_b_current_fault_active_block_rip()
+                    executor_jit_current_fault_active_block_rip != nullptr
+                        ? executor_jit_current_fault_active_block_rip()
                         : 0;
-                const u64 instruction = executor_backend_b_current_fault_instruction != nullptr
-                                            ? executor_backend_b_current_fault_instruction()
+                const u64 instruction = executor_jit_current_fault_instruction != nullptr
+                                            ? executor_jit_current_fault_instruction()
                                             : 0;
                 const u32 instruction_meta =
-                    executor_backend_b_current_fault_instruction_meta != nullptr
-                        ? executor_backend_b_current_fault_instruction_meta()
+                    executor_jit_current_fault_instruction_meta != nullptr
+                        ? executor_jit_current_fault_instruction_meta()
                         : 0;
                 const auto fault_gpr = [](const u32 index) -> u64 {
-                    return executor_backend_b_current_fault_gpr != nullptr
-                               ? executor_backend_b_current_fault_gpr(index)
+                    return executor_jit_current_fault_gpr != nullptr
+                               ? executor_jit_current_fault_gpr(index)
                                : 0;
                 };
                 u64 recent_rips[16]{};
-                const u32 recent_count = executor_backend_b_current_fault_recent_rips != nullptr
-                                             ? executor_backend_b_current_fault_recent_rips(
+                const u32 recent_count = executor_jit_current_fault_recent_rips != nullptr
+                                             ? executor_jit_current_fault_recent_rips(
                                                    recent_rips, 16u)
                                              : 0;
                 u8 active_bytes[64]{};
                 const u32 active_bytes_count =
-                    executor_backend_b_current_fault_active_block_bytes != nullptr
-                        ? executor_backend_b_current_fault_active_block_bytes(
+                    executor_jit_current_fault_active_block_bytes != nullptr
+                        ? executor_jit_current_fault_active_block_bytes(
                               active_bytes, 64u)
                         : 0;
                 char line[768];
@@ -594,11 +594,11 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                                 O_WRONLY | O_CREAT | O_APPEND, 0600);
                 if (fd >= 0) {
                     (void)::write(fd, line, static_cast<size_t>(n > 0 ? n : 0));
-                    if (executor_backend_b_current_fault_recent_block != nullptr) {
+                    if (executor_jit_current_fault_recent_block != nullptr) {
                         for (u32 recent_index = 0; recent_index < 12; ++recent_index) {
                             u64 recent_rip = 0;
                             u8 recent_bytes[128]{};
-                            const u32 recent_size = executor_backend_b_current_fault_recent_block(
+                            const u32 recent_size = executor_jit_current_fault_recent_block(
                                 recent_index, &recent_rip, recent_bytes, 128u);
                             if (recent_size == 0) {
                                 break;
@@ -632,23 +632,23 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
 #endif
         if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
 #ifdef __ANDROID__
-            if (backend_b_parity) {
+            if (jit_parity) {
                 const s32 guest_sig = Libraries::Kernel::NativeToOrbisSignal(sig);
                 if (Libraries::Kernel::HasSignalHandler(guest_sig) &&
-                    BackendBSynchronousGuestFaultCanResume()) {
-                    (void)DeferBackendBSynchronousGuestFault(sig, info, is_write);
+                    JitSynchronousGuestFaultCanResume()) {
+                    (void)DeferJitSynchronousGuestFault(sig, info, is_write);
                     UNREACHABLE_MSG(
-                        "Backend B synchronous guest access fault could not be deferred");
+                        "JIT synchronous guest access fault could not be deferred");
                 }
                 // A process-wide SIGSEGV/SIGBUS owner also observes faults from ART, libc and
-                // vendor libraries.  They are host faults whenever Backend B has no armed
+                // vendor libraries.  They are host faults whenever JIT has no armed
                 // Arm64BlockEntry frame; let the pre-existing Android handler finish its probe.
-                if (!BackendBSynchronousGuestFaultCanResume() &&
+                if (!JitSynchronousGuestFaultCanResume() &&
                     ChainPreviousSignalHandler(sig, info, raw_context,
-                                               "backend_b_host_access_no_resume")) {
+                                               "jit_host_access_no_resume")) {
                     return;
                 }
-                UNREACHABLE_MSG("Unhandled Backend B access violation at code address {}: {} address {}",
+                UNREACHABLE_MSG("Unhandled JIT access violation at code address {}: {} address {}",
                                 fmt::ptr(code_address), is_write ? "Write to" : "Read from",
                                 fmt::ptr(info->si_addr));
             }
@@ -699,24 +699,24 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     case SIGILL:
         if (!signals->DispatchIllegalInstruction(raw_context)) {
 #ifdef __ANDROID__
-            if (backend_b_parity) {
+            if (jit_parity) {
                 const s32 guest_sig = Libraries::Kernel::NativeToOrbisSignal(sig);
                 if (Libraries::Kernel::HasSignalHandler(guest_sig) &&
-                    BackendBSynchronousGuestFaultCanResume()) {
-                    (void)DeferBackendBSynchronousGuestFault(sig, info, false);
+                    JitSynchronousGuestFaultCanResume()) {
+                    (void)DeferJitSynchronousGuestFault(sig, info, false);
                     UNREACHABLE_MSG(
-                        "Backend B synchronous guest illegal instruction could not be deferred");
+                        "JIT synchronous guest illegal instruction could not be deferred");
                 }
                 // Android and native libraries legitimately use SIGILL for host feature probes.
-                // Backend B owns SIGILL process-wide, but those probes are not guest faults when
+                // JIT owns SIGILL process-wide, but those probes are not guest faults when
                 // no Arm64BlockEntry resume frame is armed.  Preserve the handler that was installed
-                // before Backend B instead of routing a host probe through the PS4 SIGILL table.
-                if (!BackendBSynchronousGuestFaultCanResume() &&
+                // before JIT instead of routing a host probe through the PS4 SIGILL table.
+                if (!JitSynchronousGuestFaultCanResume() &&
                     ChainPreviousSignalHandler(sig, info, raw_context,
-                                               "backend_b_host_ill_no_resume")) {
+                                               "jit_host_ill_no_resume")) {
                     return;
                 }
-                UNREACHABLE_MSG("Unhandled Backend B illegal instruction at code address {}: {}",
+                UNREACHABLE_MSG("Unhandled JIT illegal instruction at code address {}: {}",
                                 fmt::ptr(code_address), DisassembleInstruction(code_address));
             }
             if (AddressIsInNamedMap(code_address, "FEXMem") &&
@@ -791,8 +791,8 @@ extern "C" void executor_lsx4_reinstall_bus_handler() {
     });
 }
 
-extern "C" void executor_lsx4_install_backend_b_signal_handlers() {
-    if (!AndroidBackendBActive() || g_backend_b_signal_handlers_installed) {
+extern "C" void executor_lsx4_install_jit_signal_handlers() {
+    if (!AndroidJitActive() || g_jit_signal_handlers_installed) {
         return;
     }
     struct sigaction action{};
@@ -800,19 +800,19 @@ extern "C" void executor_lsx4_install_backend_b_signal_handlers() {
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     ASSERT_MSG(sigaction(SIGSEGV, &action, &g_previous_sigsegv) == 0,
-               "Failed to register Backend B SIGSEGV handler.");
+               "Failed to register JIT SIGSEGV handler.");
     ASSERT_MSG(sigaction(SIGBUS, &action, &g_previous_sigbus) == 0,
-               "Failed to register Backend B SIGBUS handler.");
+               "Failed to register JIT SIGBUS handler.");
     ASSERT_MSG(sigaction(SIGILL, &action, &g_previous_sigill) == 0,
-               "Failed to register Backend B SIGILL handler.");
+               "Failed to register JIT SIGILL handler.");
     ASSERT_MSG(sigaction(SIGURG, &action, &g_previous_sigurg) == 0,
-               "Failed to register Backend B SIGURG handler.");
+               "Failed to register JIT SIGURG handler.");
     ASSERT_MSG(sigaction(SIGVTALRM, &action, &g_previous_sigvtalrm) == 0,
-               "Failed to register Backend B SIGVTALRM handler.");
+               "Failed to register JIT SIGVTALRM handler.");
     g_fault_signal_handlers_installed = true;
-    g_backend_b_signal_handlers_installed = true;
+    g_jit_signal_handlers_installed = true;
     __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
-                        "[EXECUTOR_BACKEND_B_SIGNAL_OWNER] "
+                        "[EXECUTOR_JIT_SIGNAL_OWNER] "
                         "signals=SIGSEGV,SIGBUS,SIGILL,SIGURG,SIGVTALRM");
 }
 #endif
@@ -828,9 +828,9 @@ SignalDispatch::SignalDispatch() {
     sigemptyset(&action.sa_mask);
 
 #ifdef __ANDROID__
-    const bool backend_b_active = AndroidBackendBActive();
-    if (backend_b_active) {
-        executor_lsx4_install_backend_b_signal_handlers();
+    const bool jit_active = AndroidJitActive();
+    if (jit_active) {
+        executor_lsx4_install_jit_signal_handlers();
     } else if (std::getenv("EXECUTOR_FEX_OWNS_FAULT_SIGNALS") != nullptr) {
         g_fault_signal_handlers_installed = false;
         __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
@@ -844,7 +844,7 @@ SignalDispatch::SignalDispatch() {
         ASSERT_MSG(sigaction(SIGBUS, &action, &g_previous_sigbus) == 0,
                    "Failed to register bus error signal handler.");
         // Own SIGABRT only when the worker-park survival aid is enabled, so a FORTIFY abort (a
-        // corrupted-mutex pthread_mutex_lock from a Backend-B worker) parks that worker instead of
+        // corrupted-mutex pthread_mutex_lock from a JIT worker) parks that worker instead of
         // taking the whole process — and the render thread — down.
         if (const char* pv = std::getenv("EXECUTOR_PARK_NONRENDER_ON_FAULT");
             pv != nullptr && pv[0] != '\0' && std::strcmp(pv, "0") != 0) {
@@ -859,16 +859,16 @@ SignalDispatch::SignalDispatch() {
         g_fault_signal_handlers_installed = true;
         __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
                             "[EXECUTOR_FEX_SIGNAL_MODE] owner=%s "
-                            "shadps4=SIGSEGV,SIGBUS fex=SIGILL backendB=%d",
-                            backend_b_active ? "backend-b" : "split",
-                            backend_b_active ? 1 : 0);
+                            "shadps4=SIGSEGV,SIGBUS fex=SIGILL jit=%d",
+                            jit_active ? "jit" : "split",
+                            jit_active ? 1 : 0);
     }
 #else
     ASSERT_MSG(sigaction(SIGILL, &action, nullptr) == 0,
                "Failed to register illegal instruction signal handler.");
 #endif
 #ifdef __ANDROID__
-    if (!backend_b_active) {
+    if (!jit_active) {
         ASSERT_MSG(sigaction(SIGSLEEP, &action, nullptr) == 0,
                    "Failed to register sleep signal handler.");
     }
@@ -892,7 +892,7 @@ SignalDispatch::~SignalDispatch() {
     if (g_fault_signal_handlers_installed) {
         ASSERT_MSG(sigaction(SIGSEGV, &g_previous_sigsegv, nullptr) == 0,
                    "Failed to restore access violation signal handler.");
-        if (g_backend_b_signal_handlers_installed) {
+        if (g_jit_signal_handlers_installed) {
             ASSERT_MSG(sigaction(SIGBUS, &g_previous_sigbus, nullptr) == 0,
                        "Failed to restore bus signal handler.");
             ASSERT_MSG(sigaction(SIGILL, &g_previous_sigill, nullptr) == 0,
@@ -901,7 +901,7 @@ SignalDispatch::~SignalDispatch() {
                        "Failed to restore urgent signal handler.");
             ASSERT_MSG(sigaction(SIGVTALRM, &g_previous_sigvtalrm, nullptr) == 0,
                        "Failed to restore virtual-alarm signal handler.");
-            g_backend_b_signal_handlers_installed = false;
+            g_jit_signal_handlers_installed = false;
         }
         g_fault_signal_handlers_installed = false;
     }

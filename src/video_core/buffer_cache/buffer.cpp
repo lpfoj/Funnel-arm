@@ -235,6 +235,28 @@ void StreamBuffer::Commit() {
     watch.tick = scheduler->CurrentTick();
 }
 
+void StreamBuffer::RetainCurrentAllocation() {
+    if (offset == 0) {
+        return;
+    }
+
+    const u64 current_tick = scheduler->CurrentTick();
+    if (current_watch_cursor != 0 &&
+        current_watches[current_watch_cursor - 1].tick == current_tick) {
+        current_watches[current_watch_cursor - 1].upper_bound =
+            std::max(current_watches[current_watch_cursor - 1].upper_bound, offset);
+        return;
+    }
+
+    if (current_watch_cursor + 1 >= current_watches.size()) {
+        ReserveWatches(current_watches, WATCHES_RESERVE_CHUNK);
+    }
+
+    auto& watch = current_watches[current_watch_cursor++];
+    watch.upper_bound = offset;
+    watch.tick = current_tick;
+}
+
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
     watches.resize(watches.size() + grow_size);
 }

@@ -751,10 +751,10 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 }
 
 #ifdef __ANDROID__
-// Sonic Backend-B corruption hunt (path B): flag a GPU buffer/image descriptor whose guest address or
+// Sonic JIT corruption hunt (path B): flag a GPU buffer/image descriptor whose guest address or
 // size is CLEARLY garbage — a legit PS4 GPU VA is < 2^40 (0x2xx direct / 0x8xx module, all < 64GB) and
 // sizes are modest. A base >= 0x1000000000 (into the host lib/heap band ~0x77xx) or a > 256MB size
-// means Backend B produced a bad V#/T# (the user's thesis: our JIT emits a subtly-wrong sharp), which
+// means JIT produced a bad V#/T# (the user's thesis: our JIT emits a subtly-wrong sharp), which
 // then drives the shared GPU code's unvalidated raw write into our .so/heap. Log the exact value so we
 // can trace which draw/stage/shader-resource it came from.
 static void ExecutorFlagSuspectGpuDescriptor(const char* site, VAddr addr, u64 size) {
@@ -772,11 +772,11 @@ static void ExecutorFlagSuspectGpuDescriptor(const char* site, VAddr addr, u64 s
     }
     __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
                         "[EXECUTOR_SUSPECT_GPU_DESCRIPTOR] site=%s addr=0x%llx size=0x%llx "
-                        "badAddr=%d badSize=%d (Backend-B garbage sharp)",
+                        "badAddr=%d badSize=%d (JIT garbage sharp)",
                         site, static_cast<unsigned long long>(addr),
                         static_cast<unsigned long long>(size), bad_addr ? 1 : 0, bad_size ? 1 : 0);
     if (std::FILE* cf = std::fopen(
-            "/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt", "a")) {
+            "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a")) {
         std::fprintf(cf, "SUSPECT_GPU_DESCRIPTOR site=%s addr=0x%llx size=0x%llx\n", site,
                      static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
         std::fclose(cf);

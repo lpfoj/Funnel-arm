@@ -1169,20 +1169,20 @@ set(LSX4_NATIVE_CORE_SOURCES
 add_library(lsx4_executor_android SHARED
     ${LSX4_NATIVE_CORE_SOURCES}
     src/executor/native_runtime_api.cpp
-    src/executor/backend_b/lsx_translation_engine.cpp
-    src/executor/backend_b/backend_b_ir_cache.cpp
-    src/executor/backend_b/machine_code_lens.cpp
+    src/executor/jit/lsx_translation_engine.cpp
+    src/executor/jit/jit_ir_cache.cpp
+    src/executor/jit/machine_code_lens.cpp
     src/executor/runtime_death_catcher.cpp
 )
 
-# Persistent Backend-B native blocks contain generated AArch64, so their compatibility key must
+# Persistent JIT native blocks contain generated AArch64, so their compatibility key must
 # follow the lowering ABI rather than the build-id of the whole shadps4 shared object.  Hash every
 # source/header which can change decoded IR or emitted bytes. CONFIGURE_DEPENDS makes an edit to
 # any input regenerate the header and rebuild only translation units which include it; unrelated
 # shader/HLE edits leave the key stable and can safely reuse native blocks.
-file(GLOB_RECURSE EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUTS CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/backend_b/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/backend_b/*.h"
+file(GLOB_RECURSE EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/jit/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/jit/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/externals/xbyak_aarch64/xbyak_aarch64/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_decoder.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_decoder.h"
@@ -1197,12 +1197,12 @@ file(GLOB_RECURSE EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUTS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/core/aerolib/stubs.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/core/memory.h"
 )
-list(APPEND EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUTS ${LSX_ICED_UPSTREAM_SOURCES})
-list(SORT EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUTS)
+list(APPEND EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS ${LSX_ICED_UPSTREAM_SOURCES})
+list(SORT EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUTS})
-string(TOUPPER "${CMAKE_BUILD_TYPE}" EXECUTOR_BACKEND_B_BUILD_TYPE_UPPER)
-set(EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_MATERIAL
+    ${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS})
+string(TOUPPER "${CMAKE_BUILD_TYPE}" EXECUTOR_JIT_BUILD_TYPE_UPPER)
+set(EXECUTOR_JIT_NATIVE_CACHE_ABI_MATERIAL
     "compiler=${CMAKE_CXX_COMPILER_ID}:${CMAKE_CXX_COMPILER_VERSION};"
     "compilerPath=${CMAKE_CXX_COMPILER};system=${CMAKE_SYSTEM_NAME}:${CMAKE_SYSTEM_PROCESSOR};"
     "android=${ANDROID_ABI}:${ANDROID_PLATFORM}:${CMAKE_ANDROID_NDK_VERSION};"
@@ -1210,31 +1210,31 @@ set(EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_MATERIAL
     "probe=${EXECUTOR_ANDROID_NATIVE_CORE_PROBE_NO_DESKTOP_MEDIA_USB}:"
     "${EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER};"
     "flags=${CMAKE_CXX_FLAGS}:"
-    "${CMAKE_CXX_FLAGS_${EXECUTOR_BACKEND_B_BUILD_TYPE_UPPER}};")
-foreach(EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT
-        IN LISTS EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUTS)
-    file(SHA256 "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT}"
-         EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT_HASH)
-    file(RELATIVE_PATH EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT_NAME
-         "${CMAKE_CURRENT_SOURCE_DIR}" "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT}")
-    string(APPEND EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_MATERIAL
-           "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT_NAME}="
-           "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INPUT_HASH};")
+    "${CMAKE_CXX_FLAGS_${EXECUTOR_JIT_BUILD_TYPE_UPPER}};")
+foreach(EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT
+        IN LISTS EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS)
+    file(SHA256 "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT}"
+         EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_HASH)
+    file(RELATIVE_PATH EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_NAME
+         "${CMAKE_CURRENT_SOURCE_DIR}" "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT}")
+    string(APPEND EXECUTOR_JIT_NATIVE_CACHE_ABI_MATERIAL
+           "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_NAME}="
+           "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_HASH};")
 endforeach()
-string(SHA256 EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_HASH
-       "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_MATERIAL}")
-string(SUBSTRING "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_HASH}" 0 16
-       EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_HASH_64)
-set(EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INCLUDE_DIR
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/executor/backend_b")
-file(MAKE_DIRECTORY "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INCLUDE_DIR}")
+string(SHA256 EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH
+       "${EXECUTOR_JIT_NATIVE_CACHE_ABI_MATERIAL}")
+string(SUBSTRING "${EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH}" 0 16
+       EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64)
+set(EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/executor/jit")
+file(MAKE_DIRECTORY "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}")
 configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/backend_b/backend_b_native_cache_abi.h.in"
-    "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INCLUDE_DIR}/backend_b_native_cache_abi.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/jit/jit_native_cache_abi.h.in"
+    "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}/jit_native_cache_abi.h"
     @ONLY
 )
 target_include_directories(lsx4_executor_android PRIVATE
-    "${EXECUTOR_BACKEND_B_NATIVE_CACHE_ABI_INCLUDE_DIR}")
+    "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}")
 set_target_properties(lsx4_executor_android PROPERTIES
     OUTPUT_NAME lsx4_executor_android
 )
@@ -1276,7 +1276,7 @@ endif()
 target_compile_definitions(lsx4_executor_android PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 
-# DIAGNOSTIC (Sonic Backend-B host-memory corruption), OPT-IN via -DEXECUTOR_GPU_CORRUPTION_DIAG=ON:
+# DIAGNOSTIC (Sonic JIT host-memory corruption), OPT-IN via -DEXECUTOR_GPU_CORRUPTION_DIAG=ON:
 # libc++ DEBUG hardening (std::vector/array::operator[] bounds) + BOOST_ENABLE_ASSERT_HANDLER
 # (boost::container::static_vector bounds) on the GPU draw-path TUs so a silent container OOB aborts AT
 # the write site (caught by the SIGABRT _Unwind backtrace / boost::assertion_failed in signals.cpp).
@@ -1287,7 +1287,7 @@ if (ANDROID AND EXECUTOR_GPU_CORRUPTION_DIAG)
         PROPERTIES COMPILE_DEFINITIONS "_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG;BOOST_ENABLE_ASSERT_HANDLER")
 endif()
 
-# DIAGNOSTIC (Sonic Backend-B raw-pointer OOB corruptor), OPT-IN via -DEXECUTOR_GPU_CORRUPTION_ASAN=ON:
+# DIAGNOSTIC (Sonic JIT raw-pointer OOB corruptor), OPT-IN via -DEXECUTOR_GPU_CORRUPTION_ASAN=ON:
 # instrument the GPU draw-path TUs with AddressSanitizer and link the ASAN runtime as a DT_NEEDED
 # (-shared-libasan) so its malloc/memcpy interceptors + inline shadow checks catch the raw OOB write
 # scribbling a heap std::mutex, with an exact abort stack. Off by default (heavy; may not boot).

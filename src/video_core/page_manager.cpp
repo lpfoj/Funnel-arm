@@ -39,6 +39,8 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
+
+extern "C" std::uint64_t executor_jit_current_fault_guest_rip();
 #endif
 #if !defined(__linux__) || !defined(PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP)
 #include "common/spin_lock.h"
@@ -69,7 +71,7 @@ std::atomic<u64> executor_readback_write_fault_count{0};
 } // namespace
 #endif
 
-constexpr size_t PAGE_BYTES = 4_KB;
+constexpr size_t PAGE_SIZE = 4_KB;
 constexpr size_t PAGE_BITS = 12;
 
 struct PageManager::Impl {
@@ -227,7 +229,7 @@ struct PageManager::Impl {
                 ANDROID_LOG_INFO, "LSX4Native",
                 "[EXECUTOR_READBACK_CONTRACT_INIT] mode=%d hostPageSize=%zu trackerPageSize=%zu",
                 Config::getReadbacksMode(), static_cast<size_t>(::sysconf(_SC_PAGESIZE)),
-                PAGE_BYTES);
+                PAGE_SIZE);
         }
 #endif
     }
@@ -282,14 +284,16 @@ struct PageManager::Impl {
                     .fetch_add(1, std::memory_order_relaxed) +
                 1;
             if (ExecutorShouldLogReadbackOrdinal(ordinal)) {
+                const u64 guest_rip = executor_jit_current_fault_guest_rip();
                 __android_log_print(
                     ANDROID_LOG_INFO, "LSX4Native",
                     "[EXECUTOR_READBACK_FAULT] n=%llu typed=%llu addr=0x%llx isWrite=%u "
-                    "handled=%u reads=%llu writes=%llu",
+                    "handled=%u guestRip=0x%llx reads=%llu writes=%llu",
                     static_cast<unsigned long long>(ordinal),
                     static_cast<unsigned long long>(typed_ordinal),
                     static_cast<unsigned long long>(addr), is_write ? 1u : 0u,
                     handled ? 1u : 0u,
+                    static_cast<unsigned long long>(guest_rip),
                     static_cast<unsigned long long>(
                         executor_readback_read_fault_count.load(std::memory_order_relaxed)),
                     static_cast<unsigned long long>(
@@ -306,7 +310,7 @@ struct PageManager::Impl {
         RENDERER_TRACE;
 
         size_t page = addr >> PAGE_BITS;
-        const u64 page_end = Common::DivCeil(addr + size, PAGE_BYTES);
+        const u64 page_end = Common::DivCeil(addr + size, PAGE_SIZE);
 
         // Acquire locks for the range of pages
         const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
@@ -349,7 +353,7 @@ struct PageManager::Impl {
                 perms = new_perms;
             } else if (range_bytes != 0) {
                 // If the protection did not change, extend the potential range
-                potential_range_bytes += PAGE_BYTES;
+                potential_range_bytes += PAGE_SIZE;
             }
 
             // Only start a new range if the page must be (un)protected
@@ -357,7 +361,7 @@ struct PageManager::Impl {
                 if (range_bytes == 0) {
                     // Start a new potential range
                     range_begin = page;
-                    potential_range_bytes = PAGE_BYTES;
+                    potential_range_bytes = PAGE_SIZE;
                 }
                 // Extend current range up to potential range
                 range_bytes = potential_range_bytes;
@@ -414,7 +418,7 @@ struct PageManager::Impl {
                 perms = new_perms;
             } else if (range_bytes != 0) {
                 // If the protection did not change, extend the potential range
-                potential_range_bytes += PAGE_BYTES;
+                potential_range_bytes += PAGE_SIZE;
             }
 
             // If the page is not being updated, skip it
@@ -427,7 +431,7 @@ struct PageManager::Impl {
                 if (range_bytes == 0) {
                     // Start a new potential range
                     range_begin = base_page + page;
-                    potential_range_bytes = PAGE_BYTES;
+                    potential_range_bytes = PAGE_SIZE;
                 }
                 // Extend current rango up to potential range
                 range_bytes = potential_range_bytes;

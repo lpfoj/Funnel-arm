@@ -1,10 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2026 LSX4 Project
+// SPDX-FileCopyrightText: Copyright 2026 Executor Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "executor/backend_b/lsx_translation_engine.h"
-#include "executor/backend_b/backend_b_ir_cache.h"
-#include "executor/backend_b/machine_code_lens.h"
-#include "backend_b_native_cache_abi.h"
+#include "executor/jit/lsx_translation_engine.h"
+#include "executor/jit/jit_ir_cache.h"
+#include "executor/jit/machine_code_lens.h"
+#include "jit_native_cache_abi.h"
 #include "common/content_fingerprint.h"
 #include "core/aerolib/stubs.h"
 #include "core/memory.h"
@@ -71,7 +71,7 @@ extern "C" std::uint64_t ExecutorBox64HleBridgeCallback(std::uint64_t native_fun
                                                         std::uint64_t xmm1,
                                                         std::uint64_t xmm2,
                                                         std::uint64_t xmm3);
-extern "C" std::uint64_t ExecutorBackendBHleBridgeCallback(std::uint64_t native_function,
+extern "C" std::uint64_t ExecutorJitHleBridgeCallback(std::uint64_t native_function,
                                                            std::uint64_t arg0,
                                                            std::uint64_t arg1,
                                                            std::uint64_t arg2,
@@ -83,25 +83,25 @@ extern "C" std::uint64_t ExecutorBackendBHleBridgeCallback(std::uint64_t native_
                                                            std::uint64_t xmm1,
                                                            std::uint64_t xmm2,
                                                            std::uint64_t xmm3);
-extern "C" std::uint64_t ExecutorBackendBResolvedLeafHleCallback(
+extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
     std::uint64_t native_function, std::uint64_t arg0, std::uint64_t arg1,
     std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4,
     std::uint64_t arg5, std::uint64_t guest_rsp);
-extern "C" Executor::BackendB::BackendBLeafHleCallResult
-ExecutorBackendBTryLeafHleThunkCallback(
+extern "C" Executor::Jit::JitLeafHleCallResult
+ExecutorJitTryLeafHleThunkCallback(
     std::uint64_t thunk, std::uint64_t arg0, std::uint64_t arg1,
     std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4,
     std::uint64_t arg5, std::uint64_t guest_rsp);
-extern "C" int executor_backend_b_lookup_hle_thunk(std::uint64_t thunk,
+extern "C" int executor_jit_lookup_hle_thunk(std::uint64_t thunk,
                                                     std::uint64_t* native_function);
-extern "C" int executor_backend_b_lookup_leaf_hle_thunk(std::uint64_t thunk,
+extern "C" int executor_jit_lookup_leaf_hle_thunk(std::uint64_t thunk,
                                                          std::uint64_t* native_function);
-extern "C" int executor_backend_b_hle_thunk_returns_zero(std::uint64_t thunk);
-extern "C" int executor_backend_b_classify_hle_thunk(std::uint64_t thunk);
-extern "C" int executor_backend_b_resolve_hle_thunk(std::uint64_t thunk,
+extern "C" int executor_jit_hle_thunk_returns_zero(std::uint64_t thunk);
+extern "C" int executor_jit_classify_hle_thunk(std::uint64_t thunk);
+extern "C" int executor_jit_resolve_hle_thunk(std::uint64_t thunk,
                                                       std::uint64_t* native_function);
-extern "C" int executor_backend_b_hle_fp_result_kind(std::uint64_t native_function);
-extern "C" int executor_backend_b_hle_fp_bridge_selftest();
+extern "C" int executor_jit_hle_fp_result_kind(std::uint64_t native_function);
+extern "C" int executor_jit_hle_fp_bridge_selftest();
 
 extern "C" void executor_lsx4_android_register_guest_readable_range(const void* base,
                                                                          std::size_t size,
@@ -110,10 +110,12 @@ extern "C" void executor_lsx4_android_register_guest_stack_range(const void* bas
                                                                       std::size_t size,
                                                                       const char* label);
 
-extern "C" bool ExecutorBackendBReadGuestBytes(std::uint64_t address, void* dst, std::size_t size);
-extern "C" bool ExecutorBackendBWriteGuestBytes(std::uint64_t address, const void* src,
+extern "C" bool ExecutorJitReadGuestBytes(std::uint64_t address, void* dst, std::size_t size);
+extern "C" bool ExecutorJitReadGuestBytesStable(std::uint64_t address, void* dst,
+                                                      std::size_t size);
+extern "C" bool ExecutorJitWriteGuestBytes(std::uint64_t address, const void* src,
                                                 std::size_t size);
-extern "C" bool ExecutorBackendBIsReadableGuestRange(std::uint64_t address, std::size_t size);
+extern "C" bool ExecutorJitIsReadableGuestRange(std::uint64_t address, std::size_t size);
 #ifdef __ANDROID__
 extern "C" int executor_lsx4_android_dispatch_deferred_guest_signal(
     std::int32_t native_sig, std::int32_t si_code, std::int32_t si_errno,
@@ -121,8 +123,10 @@ extern "C" int executor_lsx4_android_dispatch_deferred_guest_signal(
     std::uint64_t guest_rip, std::int32_t is_write);
 #endif
 
-namespace Executor::BackendB {
+namespace Executor::Jit {
 namespace {
+
+thread_local bool g_jit_stable_guest_reads = false;
 
 // Keep every guest-visible TSC source in the same architectural counter domain used by
 // Common::NativeClock on AArch64 (CNTVCT_EL0).  RDTSC is intentionally not a load fence; RDTSCP
@@ -143,7 +147,7 @@ std::uint64_t ReadGuestTsc(const bool prior_loads_visible) {
     }
     return value;
 #else
-    // Backend B is an AArch64 backend, but retain a monotonic fallback for host-side tests.
+    // JIT is an AArch64 backend, but retain a monotonic fallback for host-side tests.
     return static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
 #endif
@@ -187,7 +191,7 @@ std::int64_t SignedMemoryDisplacement(const LsxOperandRecord& operand) {
     return std::bit_cast<std::int64_t>(extended);
 }
 
-bool IsBackendBScalarFloatAddSubMulMnemonic(const X86Mnemonic mnemonic) {
+bool IsJitScalarFloatAddSubMulMnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_ADDSS:
     case X86_MNEMONIC_SUBSS:
@@ -201,14 +205,14 @@ bool IsBackendBScalarFloatAddSubMulMnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesScalarFloatAddSubMul(const LsxDecodedRegion& block) {
+bool JitBlockUsesScalarFloatAddSubMul(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBScalarFloatAddSubMulMnemonic(
+        return IsJitScalarFloatAddSubMulMnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBScalarFloatDirectV2Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitScalarFloatDirectV2Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_COMISS:
     case X86_MNEMONIC_VCOMISS:
@@ -224,14 +228,14 @@ bool IsBackendBScalarFloatDirectV2Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesScalarFloatDirectV2(const LsxDecodedRegion& block) {
+bool JitBlockUsesScalarFloatDirectV2(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBScalarFloatDirectV2Mnemonic(
+        return IsJitScalarFloatDirectV2Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBPackedFloatDirectV3Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitPackedFloatDirectV3Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_ADDPS:
     case X86_MNEMONIC_ADDPD:
@@ -261,14 +265,14 @@ bool IsBackendBPackedFloatDirectV3Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesPackedFloatDirectV3(const LsxDecodedRegion& block) {
+bool JitBlockUsesPackedFloatDirectV3(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBPackedFloatDirectV3Mnemonic(
+        return IsJitPackedFloatDirectV3Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBMixedHotDirectV4Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitMixedHotDirectV4Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_CBW:
     case X86_MNEMONIC_CWDE:
@@ -302,14 +306,14 @@ bool IsBackendBMixedHotDirectV4Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesMixedHotDirectV4(const LsxDecodedRegion& block) {
+bool JitBlockUsesMixedHotDirectV4(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBMixedHotDirectV4Mnemonic(
+        return IsJitMixedHotDirectV4Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBWideHotDirectV5Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitWideHotDirectV5Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_LZCNT:
     case X86_MNEMONIC_TZCNT:
@@ -394,14 +398,14 @@ bool IsBackendBWideHotDirectV5Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesWideHotDirectV5(const LsxDecodedRegion& block) {
+bool JitBlockUsesWideHotDirectV5(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBWideHotDirectV5Mnemonic(
+        return IsJitWideHotDirectV5Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBPostLoadDirectV6Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitPostLoadDirectV6Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_PMULLD:
     case X86_MNEMONIC_PMULDQ:
@@ -447,14 +451,14 @@ bool IsBackendBPostLoadDirectV6Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesPostLoadDirectV6(const LsxDecodedRegion& block) {
+bool JitBlockUsesPostLoadDirectV6(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBPostLoadDirectV6Mnemonic(
+        return IsJitPostLoadDirectV6Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBPostLoadDirectV7Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitPostLoadDirectV7Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_PSHUFB:
     case X86_MNEMONIC_VPSHUFB:
@@ -473,14 +477,14 @@ bool IsBackendBPostLoadDirectV7Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesPostLoadDirectV7(const LsxDecodedRegion& block) {
+bool JitBlockUsesPostLoadDirectV7(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBPostLoadDirectV7Mnemonic(
+        return IsJitPostLoadDirectV7Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool IsBackendBPostLoadDirectV8Mnemonic(const X86Mnemonic mnemonic) {
+bool IsJitPostLoadDirectV8Mnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_PAUSE:
     case X86_MNEMONIC_LFENCE:
@@ -496,20 +500,20 @@ bool IsBackendBPostLoadDirectV8Mnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
-bool BackendBBlockUsesPostLoadDirectV8(const LsxDecodedRegion& block) {
+bool JitBlockUsesPostLoadDirectV8(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
-        return IsBackendBPostLoadDirectV8Mnemonic(
+        return IsJitPostLoadDirectV8Mnemonic(
             static_cast<X86Mnemonic>(ir.mnemonic));
     });
 }
 
-bool BackendBBlockUsesPostLoadDirectV9(const LsxDecodedRegion& block) {
+bool JitBlockUsesPostLoadDirectV9(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
         return static_cast<X86Mnemonic>(ir.mnemonic) == X86_MNEMONIC_CMPXCHG;
     });
 }
 
-bool BackendBHostHasLseAtomics() {
+bool JitHostHasLseAtomics() {
 #if defined(__ANDROID__) && defined(__aarch64__) && defined(HWCAP_ATOMICS)
     static const bool supported = (getauxval(AT_HWCAP) & HWCAP_ATOMICS) != 0;
     return supported;
@@ -518,7 +522,7 @@ bool BackendBHostHasLseAtomics() {
 #endif
 }
 
-bool BackendBBlockUsesDirectFaultSlotV10(const LsxDecodedRegion& block) {
+bool JitBlockUsesDirectFaultSlotV10(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
         if (mnemonic != X86_MNEMONIC_LEA) {
@@ -567,8 +571,8 @@ bool BackendBBlockUsesDirectFaultSlotV10(const LsxDecodedRegion& block) {
     });
 }
 
-bool BackendBBlockUsesInlineLseXchgV11(const LsxDecodedRegion& block) {
-    return BackendBHostHasLseAtomics() &&
+bool JitBlockUsesInlineLseXchgV11(const LsxDecodedRegion& block) {
+    return JitHostHasLseAtomics() &&
            std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
                if (static_cast<X86Mnemonic>(ir.mnemonic) != X86_MNEMONIC_XCHG ||
                    ir.operand_count != 2) {
@@ -584,11 +588,11 @@ bool BackendBBlockUsesInlineLseXchgV11(const LsxDecodedRegion& block) {
            });
 }
 
-bool BackendBBlockUsesDirectLseXchgV12(const LsxDecodedRegion& block) {
-    return BackendBBlockUsesInlineLseXchgV11(block);
+bool JitBlockUsesDirectLseXchgV12(const LsxDecodedRegion& block) {
+    return JitBlockUsesInlineLseXchgV11(block);
 }
 
-bool BackendBBlockUsesScalarLogicDirectV14(const LsxDecodedRegion& block) {
+bool JitBlockUsesScalarLogicDirectV14(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
         if (mnemonic == X86_MNEMONIC_ANDN) {
@@ -607,7 +611,7 @@ bool BackendBBlockUsesScalarLogicDirectV14(const LsxDecodedRegion& block) {
     });
 }
 
-bool IsBackendBVpslldImmDirectV15Instruction(const LsxDecodedOp& ir) {
+bool IsJitVpslldImmDirectV15Instruction(const LsxDecodedOp& ir) {
     if (static_cast<X86Mnemonic>(ir.mnemonic) != X86_MNEMONIC_VPSLLD ||
         ir.decoded.encoding != X86_INSTRUCTION_ENCODING_VEX ||
         (ir.decoded.attributes &
@@ -643,12 +647,12 @@ bool IsBackendBVpslldImmDirectV15Instruction(const LsxDecodedOp& ir) {
     return vector_register_width(ir.operands[1]) == width;
 }
 
-bool BackendBBlockUsesVpslldImmDirectV15(const LsxDecodedRegion& block) {
+bool JitBlockUsesVpslldImmDirectV15(const LsxDecodedRegion& block) {
     return std::ranges::any_of(block.instructions,
-                               IsBackendBVpslldImmDirectV15Instruction);
+                               IsJitVpslldImmDirectV15Instruction);
 }
 
-void BackendBLog(const char* fmt, ...) {
+void JitLog(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
 #ifdef __ANDROID__
@@ -665,41 +669,121 @@ void BackendBLog(const char* fmt, ...) {
 // 64 global atomic operations for every previously unseen helper RIP after its 32-slot table
 // filled, which made the profiler itself dominate helper-heavy games. Resolve the marker once
 // before emitting each helper stub so a clean run calls the interpreter executor directly.
-bool BackendBHotHelperProfileEnabled() {
+bool JitHotHelperProfileEnabled() {
 #ifdef __ANDROID__
     static std::atomic<int> enabled{-1};
     int cached = enabled.load(std::memory_order_relaxed);
     if (cached < 0) {
         cached = access("/data/data/app.lsx4.android/files/lsx4-home/"
-                        "diag-backend-b-hot-helper-profile",
+                        "diag-jit-hot-helper-profile",
                         F_OK) == 0 ? 1 : 0;
         enabled.store(cached, std::memory_order_relaxed);
     }
     return cached != 0;
 #else
-    return std::getenv("EXECUTOR_BACKEND_B_HOT_HELPER_PROFILE") != nullptr;
+    return std::getenv("EXECUTOR_JIT_HOT_HELPER_PROFILE") != nullptr;
 #endif
 }
 
-bool BackendBHelperPerfMapEnabled() {
+bool JitHelperPerfMapEnabled() {
 #ifdef __ANDROID__
     static std::atomic<int> enabled{-1};
     int cached = enabled.load(std::memory_order_relaxed);
     if (cached < 0) {
         cached = access("/data/data/app.lsx4.android/files/lsx4-home/"
-                        "diag-backend-b-helper-perf-map",
+                        "diag-jit-helper-perf-map",
                         F_OK) == 0 ? 1 : 0;
         enabled.store(cached, std::memory_order_relaxed);
     }
     return cached != 0;
 #else
-    return std::getenv("EXECUTOR_BACKEND_B_HELPER_PERF_MAP") != nullptr;
+    return std::getenv("EXECUTOR_JIT_HELPER_PERF_MAP") != nullptr;
 #endif
 }
 
-void RegisterBackendBHelperPerfSymbol(const void* entry, const std::size_t code_size,
+void JitThreadName(char* out, std::size_t size);
+
+bool JitGuestHotSamplerEnabled() {
+#ifdef __ANDROID__
+    static const bool enabled =
+        access("/data/data/app.lsx4.android/files/lsx4-home/"
+               "diag-jit-guest-hot-sampler",
+               F_OK) == 0;
+    return enabled;
+#else
+    return std::getenv("EXECUTOR_JIT_GUEST_HOT_SAMPLER") != nullptr;
+#endif
+}
+
+struct JitGuestHotSample {
+    std::uint64_t rip = 0;
+    std::uint32_t count = 0;
+};
+
+struct JitGuestHotSampler {
+    static constexpr std::size_t kSlots = 256;
+    static constexpr std::uint32_t kSamplesPerReport = 4096;
+
+    std::array<JitGuestHotSample, kSlots> slots{};
+    std::uint32_t samples = 0;
+};
+
+thread_local JitGuestHotSampler g_jit_guest_hot_sampler;
+
+void SampleJitGuestRip(const std::uint64_t rip) {
+    if (!JitGuestHotSamplerEnabled() || rip == 0) {
+        return;
+    }
+
+    auto& sampler = g_jit_guest_hot_sampler;
+    const std::size_t index =
+        static_cast<std::size_t>(((rip >> 4) ^ (rip >> 17) ^ (rip >> 31)) &
+                                 (JitGuestHotSampler::kSlots - 1));
+    auto& slot = sampler.slots[index];
+    if (slot.rip == rip) {
+        ++slot.count;
+    } else if (slot.count == 0) {
+        slot = {.rip = rip, .count = 1};
+    } else {
+        // Direct-mapped lossy counting is deliberate: sampling must never lock or allocate in
+        // the dispatcher. Age colliding entries so a recurring hot RIP eventually owns the slot.
+        --slot.count;
+        if (slot.count == 0) {
+            slot.rip = rip;
+        }
+    }
+
+    if (++sampler.samples < JitGuestHotSampler::kSamplesPerReport) {
+        return;
+    }
+
+    auto ranked = sampler.slots;
+    std::partial_sort(ranked.begin(), ranked.begin() + 8, ranked.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          return lhs.count > rhs.count;
+                      });
+    char thread_name[32]{};
+    JitThreadName(thread_name, sizeof(thread_name));
+    JitLog(
+        "[EXECUTOR_JIT_GUEST_HOT] thread=\"%s\" samples=%u "
+        "r0=0x%llx:%u r1=0x%llx:%u r2=0x%llx:%u r3=0x%llx:%u "
+        "r4=0x%llx:%u r5=0x%llx:%u r6=0x%llx:%u r7=0x%llx:%u",
+        thread_name[0] ? thread_name : "<unnamed>", sampler.samples,
+        static_cast<unsigned long long>(ranked[0].rip), ranked[0].count,
+        static_cast<unsigned long long>(ranked[1].rip), ranked[1].count,
+        static_cast<unsigned long long>(ranked[2].rip), ranked[2].count,
+        static_cast<unsigned long long>(ranked[3].rip), ranked[3].count,
+        static_cast<unsigned long long>(ranked[4].rip), ranked[4].count,
+        static_cast<unsigned long long>(ranked[5].rip), ranked[5].count,
+        static_cast<unsigned long long>(ranked[6].rip), ranked[6].count,
+        static_cast<unsigned long long>(ranked[7].rip), ranked[7].count);
+    sampler.slots = {};
+    sampler.samples = 0;
+}
+
+void RegisterJitHelperPerfSymbol(const void* entry, const std::size_t code_size,
                                       const LsxDecodedRegion& block) {
-    if (!BackendBHelperPerfMapEnabled() || entry == nullptr || code_size == 0) {
+    if (!JitHelperPerfMapEnabled() || entry == nullptr || code_size == 0) {
         return;
     }
 
@@ -738,13 +822,13 @@ void RegisterBackendBHelperPerfSymbol(const void* entry, const std::size_t code_
 // entirely so EVERY block falls back to the interpreter helper (interpreter). If a Sonic/RSDK boot
 // divergence disappears with this on, the fault is in a mis-reconstructed native handler; if it
 // persists, the fault is in the interpreter helper / arg-passing / HLE. Marker-gated, opt-in.
-bool BackendBForceHelperEnabled() {
+bool JitForceHelperEnabled() {
 #ifdef __ANDROID__
     static std::atomic<int> enabled{-1};
     int cached = enabled.load(std::memory_order_relaxed);
     if (cached < 0) {
         cached = access("/data/data/app.lsx4.android/files/lsx4-home/"
-                        "run-backend-b-force-helper",
+                        "run-jit-force-helper",
                         F_OK) == 0 ? 1 : 0;
         enabled.store(cached, std::memory_order_relaxed);
     }
@@ -759,13 +843,13 @@ bool BackendBForceHelperEnabled() {
 // mismatch (with a NATIVE_CHECK_FAIL log naming the block). If a Sonic/RSDK divergence disappears
 // with this on, the fault was a native codegen bug that only shows on later operands (post-trust);
 // if it persists, the fault is in the semantic interpreter itself. Marker-gated, opt-in.
-bool BackendBAlwaysCheckEnabled() {
+bool JitAlwaysCheckEnabled() {
 #ifdef __ANDROID__
     static std::atomic<int> enabled{-1};
     int cached = enabled.load(std::memory_order_relaxed);
     if (cached < 0) {
         cached = access("/data/data/app.lsx4.android/files/lsx4-home/"
-                        "run-backend-b-always-check",
+                        "run-jit-always-check",
                         F_OK) == 0 ? 1 : 0;
         enabled.store(cached, std::memory_order_relaxed);
     }
@@ -777,13 +861,13 @@ bool BackendBAlwaysCheckEnabled() {
 
 // Same as above but a NON-run-* marker path (run-* markers trip a patch-scanner that breaks app
 // launch). Use this file to enable the eboot-range native-vs-interpreter validation on demand.
-bool BackendBDiagAlwaysCheckEnabled() {
+bool JitDiagAlwaysCheckEnabled() {
 #ifdef __ANDROID__
     static std::atomic<int> enabled{-1};
     int cached = enabled.load(std::memory_order_relaxed);
     if (cached < 0) {
         cached = access("/data/data/app.lsx4.android/files/lsx4-home/"
-                        "diag-backend-b-always-check",
+                        "diag-jit-always-check",
                         F_OK) == 0 ? 1 : 0;
         enabled.store(cached, std::memory_order_relaxed);
     }
@@ -794,7 +878,7 @@ bool BackendBDiagAlwaysCheckEnabled() {
 }
 
 // The native-vs-interpreter comparator is an interpreter, not part of the production execution
-// contract.  PC shadPS4 enters guest x86 directly, and the reconstructed Backend B has already
+// contract.  PC shadPS4 enters guest x86 directly, and the reconstructed JIT has already
 // been validated by the offline differential suite.  Replaying every cold native block through
 // the semantic interpreter until it earns 16 matches made Mono/Unity startup pay that cost
 // in the game's critical path.
@@ -802,83 +886,138 @@ bool BackendBDiagAlwaysCheckEnabled() {
 // Keep the live comparator available behind the existing explicit diagnostic knobs.  The
 // thread-local override is used only by LsxEngineSelfTestJson so its publication/trust checks stay
 // deterministic without imposing the live interpreter on a normal game run.
-thread_local bool g_backendb_selftest_differential_active = false;
+thread_local bool g_jit_selftest_differential_active = false;
 // A focused direct-link gate nests inside the differential self-test. It must compile the exact
 // production tail-link epilogue while the surrounding interpreter continues to request checked-native
 // wrappers. This override is thread-local and never participates in a game run.
-thread_local bool g_backendb_selftest_production_direct_active = false;
+thread_local bool g_jit_selftest_production_direct_active = false;
 // Structural gate for indirect-control lowering.  It is touched only while the headless
 // differential self-test is active, so production guest execution pays no counter traffic.  A
 // low 40-bit native JMP/CALL test snapshots it after the semantic fallback and requires the emitted
 // entry to leave it unchanged; the high HLE test requires exactly one semantic entry instead.
-thread_local std::uint64_t g_backendb_selftest_dynamic_control_semantic_calls = 0;
+thread_local std::uint64_t g_jit_selftest_dynamic_control_semantic_calls = 0;
 // Compile-time structural witnesses for the focused dead-status-flags gates. They count emitted
 // flag publication paths, not guest executions, and are touched only inside the self-test scope.
-thread_local std::uint64_t g_backendb_selftest_shift_flag_path_emissions = 0;
+thread_local std::uint64_t g_jit_selftest_shift_flag_path_emissions = 0;
 // Generic scalar arithmetic/logic must publish live x86 status flags without crossing the C++
 // ABI.  These compile-time witnesses let focused gates prove that every exercised live path used
 // the in-block materializer and that none fell back to the retired UpdateFlags* BLR path.
-thread_local std::uint64_t g_backendb_selftest_scalar_flag_helper_emissions = 0;
-thread_local std::uint64_t g_backendb_selftest_scalar_flag_inline_emissions = 0;
-thread_local std::uint64_t g_backendb_selftest_scalar_flag_post_memory_write_emissions = 0;
+thread_local std::uint64_t g_jit_selftest_scalar_flag_helper_emissions = 0;
+thread_local std::uint64_t g_jit_selftest_scalar_flag_inline_emissions = 0;
+thread_local std::uint64_t g_jit_selftest_scalar_flag_post_memory_write_emissions = 0;
 
-class ScopedBackendBSelfTestDifferential {
+class ScopedJitSelfTestDifferential {
 public:
-    ScopedBackendBSelfTestDifferential()
-        : previous_(g_backendb_selftest_differential_active) {
-        g_backendb_selftest_differential_active = true;
+    ScopedJitSelfTestDifferential()
+        : previous_(g_jit_selftest_differential_active) {
+        g_jit_selftest_differential_active = true;
     }
 
-    ~ScopedBackendBSelfTestDifferential() {
-        g_backendb_selftest_differential_active = previous_;
+    ~ScopedJitSelfTestDifferential() {
+        g_jit_selftest_differential_active = previous_;
     }
 
-    ScopedBackendBSelfTestDifferential(const ScopedBackendBSelfTestDifferential&) = delete;
-    ScopedBackendBSelfTestDifferential& operator=(
-        const ScopedBackendBSelfTestDifferential&) = delete;
+    ScopedJitSelfTestDifferential(const ScopedJitSelfTestDifferential&) = delete;
+    ScopedJitSelfTestDifferential& operator=(
+        const ScopedJitSelfTestDifferential&) = delete;
 
 private:
     bool previous_{};
 };
 
-class ScopedBackendBSelfTestProductionDirect {
+class ScopedJitSelfTestProductionDirect {
 public:
-    ScopedBackendBSelfTestProductionDirect()
-        : previous_(g_backendb_selftest_production_direct_active) {
-        g_backendb_selftest_production_direct_active = true;
+    ScopedJitSelfTestProductionDirect()
+        : previous_(g_jit_selftest_production_direct_active) {
+        g_jit_selftest_production_direct_active = true;
     }
 
-    ~ScopedBackendBSelfTestProductionDirect() {
-        g_backendb_selftest_production_direct_active = previous_;
+    ~ScopedJitSelfTestProductionDirect() {
+        g_jit_selftest_production_direct_active = previous_;
     }
 
-    ScopedBackendBSelfTestProductionDirect(
-        const ScopedBackendBSelfTestProductionDirect&) = delete;
-    ScopedBackendBSelfTestProductionDirect& operator=(
-        const ScopedBackendBSelfTestProductionDirect&) = delete;
+    ScopedJitSelfTestProductionDirect(
+        const ScopedJitSelfTestProductionDirect&) = delete;
+    ScopedJitSelfTestProductionDirect& operator=(
+        const ScopedJitSelfTestProductionDirect&) = delete;
 
 private:
     bool previous_{};
 };
 
-bool BackendBLiveCheckedNativeEnabled() {
+bool JitLiveCheckedNativeEnabled() {
     // Marker state is fixed before guest launch. Cache the production decision while retaining the
     // per-thread self-test override above.
     static const bool explicitly_enabled =
-        BackendBAlwaysCheckEnabled() || BackendBDiagAlwaysCheckEnabled();
-    if (g_backendb_selftest_production_direct_active) {
+        JitAlwaysCheckEnabled() || JitDiagAlwaysCheckEnabled();
+    if (g_jit_selftest_production_direct_active) {
         return false;
     }
-    return g_backendb_selftest_differential_active || explicitly_enabled;
+    return g_jit_selftest_differential_active || explicitly_enabled;
+}
+
+struct JitStoreWatchRange {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+
+    [[nodiscard]] bool Enabled() const noexcept {
+        return hi > lo;
+    }
+};
+
+const JitStoreWatchRange& JitDiagnosticStoreWatchRange() {
+    static const JitStoreWatchRange range = [] {
+        JitStoreWatchRange result;
+#ifdef __ANDROID__
+        const char* lo = std::getenv("EXECUTOR_DIAG_STORE_WATCH_LO");
+        const char* hi = std::getenv("EXECUTOR_DIAG_STORE_WATCH_HI");
+        if (lo != nullptr && hi != nullptr) {
+            result.lo = std::strtoull(lo, nullptr, 0);
+            result.hi = std::strtoull(hi, nullptr, 0);
+        }
+#endif
+        return result;
+    }();
+    return range;
+}
+
+void JitReportWatchedStore(const std::uint64_t guest_rip, const std::uint64_t address,
+                                const std::uint64_t size_bytes) {
+#ifdef __ANDROID__
+    static std::atomic<std::uint64_t> ordinal{0};
+    const std::uint64_t current = ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::array<std::uint8_t, 16> bytes{};
+    const std::size_t copied =
+        std::min<std::size_t>(bytes.size(), static_cast<std::size_t>(size_bytes));
+    if (copied != 0) {
+        std::memcpy(bytes.data(), reinterpret_cast<const void*>(address), copied);
+    }
+    std::uint64_t low = 0;
+    std::uint64_t high = 0;
+    std::memcpy(&low, bytes.data(), sizeof(low));
+    std::memcpy(&high, bytes.data() + sizeof(low), sizeof(high));
+    JitLog("[EXECUTOR_JIT_STORE_WATCH] n=%llu rip=0x%llx addr=0x%llx bytes=%llu "
+                "valueLo=0x%016llx valueHi=0x%016llx",
+                static_cast<unsigned long long>(current),
+                static_cast<unsigned long long>(guest_rip),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(size_bytes),
+                static_cast<unsigned long long>(low),
+                static_cast<unsigned long long>(high));
+#else
+    (void)guest_rip;
+    (void)address;
+    (void)size_bytes;
+#endif
 }
 
 // Force a guest RIP range onto the semantic interpreter (never native). The interpreter routes its
-// stores through ExecutorBackendBWriteGuestBytes, which rejects+logs any store landing in our host
+// stores through ExecutorJitWriteGuestBytes, which rejects+logs any store landing in our host
 // image — so forcing the RSDK audio worker's hot block range here both PREVENTS the shape-shifting
 // host-memory corruption AND pins the guest PC of the offending store (GUEST_STORE_INTO_HOST_IMAGE),
 // while letting the render main thread keep native codegen. Range from EXECUTOR_FORCE_INTERPRET_LO/HI
 // (hex), evaluated once.
-bool BackendBForceInterpretRip(std::uint64_t rip) {
+bool JitForceInterpretRip(std::uint64_t rip) {
 #ifdef __ANDROID__
     struct Range {
         std::uint64_t lo = 0;
@@ -977,7 +1116,7 @@ std::uint64_t FingerprintCodeSpan(const std::uint64_t guest_va,
             remaining < bytes.size() ? remaining : static_cast<std::uint32_t>(bytes.size());
         if (!ReadGuestBytesChecked(guest_va + offset, bytes.data(), chunk)) {
             std::ostringstream error;
-            error << "Backend B FingerprintCodeSpan unreadable guest range va=0x" << std::hex
+            error << "JIT FingerprintCodeSpan unreadable guest range va=0x" << std::hex
                   << guest_va << " size=0x" << size_bytes << " offset=0x" << offset;
             throw std::runtime_error(error.str());
         }
@@ -990,10 +1129,10 @@ std::uint64_t FingerprintCodeSpan(const std::uint64_t guest_va,
 void Cmps(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
           bool repeat_not_equal);
 
-static bool BackendBOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi);
+static bool JitOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi);
 
 namespace {
-constexpr std::uint32_t kBackendBMaxInstructionsPerBlock = 128;
+constexpr std::uint32_t kJitMaxInstructionsPerBlock = 128;
 
 std::uint64_t InterpretDecodedInstruction(LsxMachineImage* state, const LsxDecodedOp* ir);
 std::uint64_t InterpretDecodedInstructionScoped(LsxMachineImage* state,
@@ -1013,12 +1152,12 @@ bool IsSetccMnemonic(X86Mnemonic mnemonic);
 bool TryResolveBranchTarget(const LsxDecodedOp& ir, std::uint64_t& target);
 bool TryEvaluateCountedBranch(LsxMachineImage& state, const LsxDecodedOp& ir,
                               bool& should_branch);
-bool IsBackendBHleBridgeMarkerAt(std::uint64_t rip);
-bool IsBackendBHleBridgeMarkerInstruction(const LsxDecodedOp& ir);
-std::uint64_t ExecuteBackendBHleBridgeMarker(LsxMachineImage& state, std::uint64_t marker_rip);
-bool TryExecuteBackendBDirectHleCall(LsxMachineImage& state, std::uint64_t thunk,
+bool IsJitHleBridgeMarkerAt(std::uint64_t rip);
+bool IsJitHleBridgeMarkerInstruction(const LsxDecodedOp& ir);
+std::uint64_t ExecuteJitHleBridgeMarker(LsxMachineImage& state, std::uint64_t marker_rip);
+bool TryExecuteJitDirectHleCall(LsxMachineImage& state, std::uint64_t thunk,
                                      std::uint64_t next_rip);
-bool TryExecuteBackendBDirectHleTail(LsxMachineImage& state, std::uint64_t thunk);
+bool TryExecuteJitDirectHleTail(LsxMachineImage& state, std::uint64_t thunk);
 bool IsStringCmpsInstruction(const LsxDecodedOp& ir);
 std::string HexBytesAt(std::uint64_t address, std::size_t size);
 bool IsTraceReadableAddress(std::uint64_t address, std::uint64_t bytes);
@@ -1091,14 +1230,14 @@ std::int64_t LoadElementSigned(const std::uint8_t* ptr, std::size_t element_size
 void StoreElement(std::uint8_t* ptr, std::uint64_t value, std::size_t element_size);
 void VPackSaturating(void* dst, const void* lhs, const void* rhs, std::size_t total_size,
                      std::size_t source_element_bytes, bool unsigned_destination);
-void RecordBackendBThreadSnapshot(const char* phase, std::uint64_t executed_blocks,
+void RecordJitThreadSnapshot(const char* phase, std::uint64_t executed_blocks,
                                   std::uint64_t rip, std::uint64_t next_rip,
                                   std::uint64_t result, const LsxMachineImage& state);
 std::string DescribeInvalidGuestMemoryAccess(const char* op, std::uint64_t guest_va,
                                              std::uint32_t size_bytes);
 
 constexpr std::uint64_t kGuestExitSentinel = ~std::uint64_t{1};
-// This value is internal to the Backend-B dispatcher and must never be exposed as a return
+// This value is internal to the JIT dispatcher and must never be exposed as a return
 // program counter in the x86 guest stack.  Mono/libunwind walks through mapped guest entries
 // while reporting managed exceptions; when -2 occupied the synthetic return slot, libc's
 // access_mem callback treated it as a real RIP and faulted at address -2.  A null return address
@@ -1122,7 +1261,7 @@ thread_local std::uint64_t g_pending_stack_reservoir_size = 0;
 // Signal-safe payload captured from the host POSIX handler.  Keep this trivially-copyable and
 // pointer-free: the originating siginfo_t/ucontext_t cease to exist as soon as siglongjmp leaves
 // the faulting emitted block.
-struct BackendBDeferredGuestFault {
+struct JitDeferredGuestFault {
     std::uint32_t valid = 0;
     std::int32_t native_sig = 0;
     std::int32_t si_code = 0;
@@ -1133,7 +1272,7 @@ struct BackendBDeferredGuestFault {
     std::uint64_t guest_rip = 0;
     std::int32_t is_write = 0;
 };
-static_assert(std::is_trivially_copyable_v<BackendBDeferredGuestFault>);
+static_assert(std::is_trivially_copyable_v<JitDeferredGuestFault>);
 
 // Generic native blocks publish their current guest instruction immediately before every
 // faultable guest-memory load/store.  Resolving the dynamic TLS descriptors once at block entry
@@ -1153,28 +1292,28 @@ const LsxDecodedOp** PrepareGenericNativeMemoryFaultContext(
 // strictly thread-local escape point around the current block entry instead.
 // The state object is owned by Execute(), outside this frame, so the guest
 // handler's ucontext writeback survives the jump.
-struct BackendBSynchronousFaultResumeFrame {
+struct JitSynchronousFaultResumeFrame {
     sigjmp_buf environment{};
-    BackendBSynchronousFaultResumeFrame* previous = nullptr;
+    JitSynchronousFaultResumeFrame* previous = nullptr;
     LsxMachineImage* state = nullptr;
     volatile sig_atomic_t armed = 0;
 };
 
-thread_local BackendBSynchronousFaultResumeFrame* g_backend_b_fault_resume_frame = nullptr;
+thread_local JitSynchronousFaultResumeFrame* g_jit_fault_resume_frame = nullptr;
 // Do not place the payload inside the automatic setjmp frame: C/C++ makes non-volatile automatic
 // objects modified between setjmp and longjmp indeterminate.  TLS survives the jump and is copied
 // into an ordinary local only after control has returned to Execute().
-thread_local BackendBDeferredGuestFault g_backend_b_deferred_guest_fault{};
+thread_local JitDeferredGuestFault g_jit_deferred_guest_fault{};
 #endif
 
 bool ExecuteHostBlockWithSynchronousFaultResume(Arm64BlockEntry entry, LsxMachineImage* state,
                                                  std::uint64_t& result,
-                                                 BackendBDeferredGuestFault* deferred_fault
+                                                 JitDeferredGuestFault* deferred_fault
 #if defined(__ANDROID__) && defined(__aarch64__)
                                                  ,
-                                                 BackendBSynchronousFaultResumeFrame**
+                                                 JitSynchronousFaultResumeFrame**
                                                      fault_resume_frame_slot,
-                                                 BackendBDeferredGuestFault*
+                                                 JitDeferredGuestFault*
                                                      deferred_guest_fault_slot
 #endif
 ) {
@@ -1185,7 +1324,7 @@ bool ExecuteHostBlockWithSynchronousFaultResume(Arm64BlockEntry entry, LsxMachin
         *deferred_fault = {};
     }
 #if defined(__ANDROID__) && defined(__aarch64__)
-    BackendBSynchronousFaultResumeFrame frame{};
+    JitSynchronousFaultResumeFrame frame{};
     *deferred_guest_fault_slot = {};
     frame.previous = *fault_resume_frame_slot;
     frame.state = state;
@@ -1234,7 +1373,7 @@ bool ExecuteHostBlockWithSynchronousFaultResume(Arm64BlockEntry entry, LsxMachin
 bool BlockNeedsSynchronousFaultResume(const LsxDecodedRegion& block) {
     for (const LsxDecodedOp& ir : block.instructions) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
-        if (IsBackendBHleBridgeMarkerInstruction(ir) || mnemonic == X86_MNEMONIC_UD2) {
+        if (IsJitHleBridgeMarkerInstruction(ir) || mnemonic == X86_MNEMONIC_UD2) {
             return true;
         }
         // These forms touch guest stack/string memory even when X86 doesn't expose the
@@ -1287,7 +1426,7 @@ bool BlockNeedsSynchronousFaultResume(const LsxDecodedRegion& block) {
 bool BlockRequiresDispatcherBoundary(const LsxDecodedRegion& block) {
     for (const LsxDecodedOp& ir : block.instructions) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
-        if (IsBackendBHleBridgeMarkerInstruction(ir) ||
+        if (IsJitHleBridgeMarkerInstruction(ir) ||
             mnemonic == X86_MNEMONIC_UD2 ||
             mnemonic == X86_MNEMONIC_RET) {
             // RET consumes a guest return address.  A block containing it may execute natively
@@ -1325,7 +1464,7 @@ bool IsIndirectPicTerminator(const LsxDecodedOp& ir) {
     return target.type == X86_OPERAND_TYPE_MEMORY && target.size == 64;
 }
 
-struct BackendBThreadSnapshot {
+struct JitThreadSnapshot {
     bool valid = false;
     std::uint64_t seq = 0;
     std::uint64_t blocks = 0;
@@ -1350,43 +1489,43 @@ struct BackendBThreadSnapshot {
     char thread[32]{};
 };
 
-std::mutex g_backendb_thread_snapshot_mutex;
-std::array<BackendBThreadSnapshot, 64> g_backendb_thread_snapshots{};
-std::atomic<std::uint64_t> g_backendb_thread_snapshot_seq{0};
+std::mutex g_jit_thread_snapshot_mutex;
+std::array<JitThreadSnapshot, 64> g_jit_thread_snapshots{};
+std::atomic<std::uint64_t> g_jit_thread_snapshot_seq{0};
 
 std::atomic<std::uint32_t> g_allocator_trace_count{0};
-std::atomic<std::uint32_t> g_backendb_block_probe_count{0};
-std::atomic<std::uint64_t> g_backendb_blocks_decoded{0};
-std::atomic<std::uint64_t> g_backendb_blocks_native{0};
-std::atomic<std::uint64_t> g_backendb_blocks_helper{0};
-std::atomic<std::uint64_t> g_backendb_blocks_unsupported{0};
-std::atomic<std::uint64_t> g_backendb_cache_hash_hits{0};
-std::atomic<std::uint64_t> g_backendb_cache_hash_misses{0};
-std::atomic<std::uint64_t> g_backendb_checked_native_hits{0};
-std::atomic<std::uint64_t> g_backendb_checked_native_trusted{0};
-std::atomic<std::uint64_t> g_backendb_checked_native_fallback{0};
-std::atomic<std::uint64_t> g_backendb_persistent_ir_hits{0};
-std::atomic<std::uint64_t> g_backendb_persistent_ir_misses{0};
-std::atomic<std::uint64_t> g_backendb_persistent_ir_records_loaded{0};
-std::atomic<std::uint64_t> g_backendb_persistent_ir_records_written{0};
-std::atomic<std::uint64_t> g_backendb_persistent_ir_corrupt_shards{0};
-std::atomic<std::uint64_t> g_backendb_persistent_native_hits{0};
-std::atomic<std::uint64_t> g_backendb_persistent_native_segments_restored{0};
-std::atomic<std::uint64_t> g_backendb_persistent_native_records_captured{0};
-std::atomic<std::uint64_t> g_backendb_persistent_native_records_written{0};
-std::atomic<std::uint64_t> g_backendb_persistent_native_restore_fallbacks{0};
-std::atomic<std::uint64_t> g_backendb_persistent_native_capture_rejected{0};
-std::atomic<bool> g_backendb_persistent_ir_enabled{false};
+std::atomic<std::uint32_t> g_jit_block_probe_count{0};
+std::atomic<std::uint64_t> g_jit_blocks_decoded{0};
+std::atomic<std::uint64_t> g_jit_blocks_native{0};
+std::atomic<std::uint64_t> g_jit_blocks_helper{0};
+std::atomic<std::uint64_t> g_jit_blocks_unsupported{0};
+std::atomic<std::uint64_t> g_jit_cache_hash_hits{0};
+std::atomic<std::uint64_t> g_jit_cache_hash_misses{0};
+std::atomic<std::uint64_t> g_jit_checked_native_hits{0};
+std::atomic<std::uint64_t> g_jit_checked_native_trusted{0};
+std::atomic<std::uint64_t> g_jit_checked_native_fallback{0};
+std::atomic<std::uint64_t> g_jit_persistent_ir_hits{0};
+std::atomic<std::uint64_t> g_jit_persistent_ir_misses{0};
+std::atomic<std::uint64_t> g_jit_persistent_ir_records_loaded{0};
+std::atomic<std::uint64_t> g_jit_persistent_ir_records_written{0};
+std::atomic<std::uint64_t> g_jit_persistent_ir_corrupt_shards{0};
+std::atomic<std::uint64_t> g_jit_persistent_native_hits{0};
+std::atomic<std::uint64_t> g_jit_persistent_native_segments_restored{0};
+std::atomic<std::uint64_t> g_jit_persistent_native_records_captured{0};
+std::atomic<std::uint64_t> g_jit_persistent_native_records_written{0};
+std::atomic<std::uint64_t> g_jit_persistent_native_restore_fallbacks{0};
+std::atomic<std::uint64_t> g_jit_persistent_native_capture_rejected{0};
+std::atomic<bool> g_jit_persistent_ir_enabled{false};
 // This is a diagnostic coverage counter, not execution state.  A global fetch_add for every
 // trusted block made all busy guest threads contend on the same cache line (tens of millions of
 // RMWs during Mono bootstrap).  Keep the public counter approximately live while paying the
 // global atomic cost only once per local batch.
-thread_local std::uint32_t g_backendb_checked_native_hits_pending = 0;
-inline void RecordBackendBCheckedNativeHit() {
+thread_local std::uint32_t g_jit_checked_native_hits_pending = 0;
+inline void RecordJitCheckedNativeHit() {
     constexpr std::uint32_t kFlushBatch = 4096;
-    if (++g_backendb_checked_native_hits_pending == kFlushBatch) {
-        g_backendb_checked_native_hits.fetch_add(kFlushBatch, std::memory_order_relaxed);
-        g_backendb_checked_native_hits_pending = 0;
+    if (++g_jit_checked_native_hits_pending == kFlushBatch) {
+        g_jit_checked_native_hits.fetch_add(kFlushBatch, std::memory_order_relaxed);
+        g_jit_checked_native_hits_pending = 0;
     }
 }
 // Compile-time coverage counters for the structural SIMD path.  They count unique decoded
@@ -1394,62 +1533,62 @@ inline void RecordBackendBCheckedNativeHit() {
 // atomic tax).  "fast" is direct NEON, while "semantic" is the narrow one-instruction thunk
 // used only where host FP/MXCSR or shuffle corner cases need the already differential-tested
 // semantic implementation.  Neither counter includes a fallback block helper.
-std::atomic<std::uint64_t> g_backendb_native_simd_fast_instructions{0};
-std::atomic<std::uint64_t> g_backendb_native_simd_semantic_instructions{0};
-std::atomic<std::uint64_t> g_backendb_native_simd_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_simd_fast_instructions{0};
+std::atomic<std::uint64_t> g_jit_native_simd_semantic_instructions{0};
+std::atomic<std::uint64_t> g_jit_native_simd_blocks{0};
 // Compile-time coverage for blocks which keep written SIMD state in q16-q23 across ordinary
 // guest-memory operations. This is not a dynamic hot-path counter.
-std::atomic<std::uint64_t> g_backendb_native_simd_faultable_writeback_blocks{0};
-std::atomic<std::uint64_t> g_backendb_native_scalar_direct_instructions{0};
-std::atomic<std::uint64_t> g_backendb_native_scalar_semantic_instructions{0};
-std::atomic<std::uint64_t> g_backendb_native_scalar_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_simd_faultable_writeback_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_direct_instructions{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_semantic_instructions{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_blocks{0};
 // Dynamic semantic-leaf profiler.  A block classified as "native" may still BLR into one of the
 // instruction-local scalar/SIMD semantic leaves.  That distinction matters on AArch64: a single
 // hot x86 opcode hidden inside otherwise-native blocks can dominate an FMOD or render worker.
 // Keep this diagnostic behind the existing hot-helper marker and aggregate in fixed lock-free
 // counters.  The reporting path runs only once per 2^22 semantic calls and resets the interval,
 // so it identifies the CURRENT phase (level/cutscene/gameplay) instead of being swamped by boot.
-constexpr std::size_t kBackendBSemanticMnemonicCount =
+constexpr std::size_t kJitSemanticMnemonicCount =
     static_cast<std::size_t>(X86_MNEMONIC_MAX_VALUE) + 1;
-std::array<std::atomic<std::uint64_t>, kBackendBSemanticMnemonicCount>
-    g_backendb_scalar_semantic_exec{};
-std::array<std::atomic<std::uint64_t>, kBackendBSemanticMnemonicCount>
-    g_backendb_simd_semantic_exec{};
-std::atomic<std::uint64_t> g_backendb_semantic_exec_total{0};
+std::array<std::atomic<std::uint64_t>, kJitSemanticMnemonicCount>
+    g_jit_scalar_semantic_exec{};
+std::array<std::atomic<std::uint64_t>, kJitSemanticMnemonicCount>
+    g_jit_simd_semantic_exec{};
+std::atomic<std::uint64_t> g_jit_semantic_exec_total{0};
 // Dynamic REP-string counters.  These count one semantic instruction, not every copied lane, so
 // their relaxed updates are negligible compared with the former per-lane guest-range validation.
-std::atomic<std::uint64_t> g_backendb_rep_movs_bulk_calls{0};
-std::atomic<std::uint64_t> g_backendb_rep_movs_bulk_bytes{0};
-std::atomic<std::uint64_t> g_backendb_rep_stos_bulk_calls{0};
-std::atomic<std::uint64_t> g_backendb_rep_stos_bulk_bytes{0};
-std::atomic<std::uint64_t> g_backendb_leaf_hle_fused_blocks{0};
+std::atomic<std::uint64_t> g_jit_rep_movs_bulk_calls{0};
+std::atomic<std::uint64_t> g_jit_rep_movs_bulk_bytes{0};
+std::atomic<std::uint64_t> g_jit_rep_stos_bulk_calls{0};
+std::atomic<std::uint64_t> g_jit_rep_stos_bulk_bytes{0};
+std::atomic<std::uint64_t> g_jit_leaf_hle_fused_blocks{0};
 // Compile-time structural sentinels for codec-critical scalar lowering. Selftests compare
 // before/after counts, so replacing either direct emitter with a BLR semantic thunk fails the
 // headless gate without requiring a game regression run.
-std::atomic<std::uint64_t> g_backendb_native_scalar_shift_inline_instructions{0};
-std::atomic<std::uint64_t> g_backendb_native_scalar_imul_inline_instructions{0};
-std::atomic<std::uint64_t> g_backendb_native_scalar_dead_flag_elisions{0};
-std::atomic<std::uint64_t> g_backendb_native_control_semantic_terminators{0};
-std::atomic<std::uint64_t> g_backendb_execution_cache_identity{1};
-std::atomic<std::uint32_t> g_backendb_control_jmp_miss_log_count{0};
-std::atomic<std::uint32_t> g_backendb_control_call_miss_log_count{0};
-std::atomic<std::uint32_t> g_backendb_control_ret_miss_log_count{0};
-std::atomic<std::uint32_t> g_backendb_control_ret_emit_log_count{0};
-std::atomic<std::uint32_t> g_backendb_control_initial_skip_log_count{0};
-std::atomic<std::uint32_t> g_backendb_control_helper_publish_log_count{0};
-std::atomic<std::uint32_t> g_backendb_helper_publish_log_count{0};
-constexpr std::size_t kBackendBHotHelperSlots = 32;
-struct BackendBHotHelperSlot {
+std::atomic<std::uint64_t> g_jit_native_scalar_shift_inline_instructions{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_imul_inline_instructions{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_dead_flag_elisions{0};
+std::atomic<std::uint64_t> g_jit_native_control_semantic_terminators{0};
+std::atomic<std::uint64_t> g_jit_execution_cache_identity{1};
+std::atomic<std::uint32_t> g_jit_control_jmp_miss_log_count{0};
+std::atomic<std::uint32_t> g_jit_control_call_miss_log_count{0};
+std::atomic<std::uint32_t> g_jit_control_ret_miss_log_count{0};
+std::atomic<std::uint32_t> g_jit_control_ret_emit_log_count{0};
+std::atomic<std::uint32_t> g_jit_control_initial_skip_log_count{0};
+std::atomic<std::uint32_t> g_jit_control_helper_publish_log_count{0};
+std::atomic<std::uint32_t> g_jit_helper_publish_log_count{0};
+constexpr std::size_t kJitHotHelperSlots = 32;
+struct JitHotHelperSlot {
     std::atomic<std::uint64_t> rip{0};
     std::atomic<std::uint64_t> count{0};
     std::atomic<std::uint32_t> insn_count{0};
     std::atomic<std::uint32_t> first_mnemonic{0};
 };
-std::array<BackendBHotHelperSlot, kBackendBHotHelperSlots> g_backendb_hot_helper_slots{};
+std::array<JitHotHelperSlot, kJitHotHelperSlots> g_jit_hot_helper_slots{};
 // The indirect PIC calls C++ only on a cold way miss.  Counting that cold edge is useful for the
 // focused structural gate and does not put atomic traffic on the generated hit path.
-std::atomic<std::uint64_t> g_backendb_indirect_pic_bind_calls{0};
-std::atomic<std::uint64_t> g_backendb_indirect_pic_native_blocks{0};
+std::atomic<std::uint64_t> g_jit_indirect_pic_bind_calls{0};
+std::atomic<std::uint64_t> g_jit_indirect_pic_native_blocks{0};
 
 struct CheckedNativeBlockContext {
     const LsxDecodedRegion* block = nullptr;
@@ -1470,25 +1609,25 @@ std::uint64_t ExecuteProfiledInterpreterBridge(LsxMachineImage* state, const Lsx
 struct StableDecodedBlock {
     std::unique_ptr<LsxDecodedRegion> block;
     std::uint64_t guest_hash = 0;
-    std::vector<BackendBNativeSegment> native_segments{};
-    std::uint32_t entry_segment_index = kBackendBNativeNoSegment;
-    std::uint32_t direct_segment_index = kBackendBNativeNoSegment;
+    std::vector<JitNativeSegment> native_segments{};
+    std::uint32_t entry_segment_index = kJitNativeNoSegment;
+    std::uint32_t direct_segment_index = kJitNativeNoSegment;
     std::uint32_t native_flags = 0;
     bool loaded_ir_validated = false;
     bool needs_identity_migration = false;
 
     [[nodiscard]] bool HasNativeCode() const noexcept {
-        return (native_flags & kBackendBNativeFlagValid) != 0 &&
+        return (native_flags & kJitNativeFlagValid) != 0 &&
                !native_segments.empty() && entry_segment_index < native_segments.size() &&
-               (direct_segment_index == kBackendBNativeNoSegment ||
+               (direct_segment_index == kJitNativeNoSegment ||
                 direct_segment_index < native_segments.size());
     }
 };
 
 bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_out) noexcept;
-bool ClassifyBackendBStableExternal(std::uint64_t value,
-                                    BackendBNativeRelocation& relocation) noexcept;
-bool ResolveBackendBStableExternal(std::uint32_t target_index,
+bool ClassifyJitStableExternal(std::uint64_t value,
+                                    JitNativeRelocation& relocation) noexcept;
+bool ResolveJitStableExternal(std::uint32_t target_index,
                                    std::uint64_t& target) noexcept;
 
 class PersistentIrBlockCache {
@@ -1509,32 +1648,32 @@ public:
             pending_native_hot_rips_.clear();
         }
         directory_.clear();
-        g_backendb_persistent_ir_enabled.store(false, std::memory_order_release);
-        g_backendb_persistent_ir_hits.store(0, std::memory_order_relaxed);
-        g_backendb_persistent_ir_misses.store(0, std::memory_order_relaxed);
-        g_backendb_persistent_ir_records_loaded.store(0, std::memory_order_relaxed);
-        g_backendb_persistent_ir_records_written.store(0, std::memory_order_relaxed);
-        g_backendb_persistent_ir_corrupt_shards.store(0, std::memory_order_relaxed);
-        g_backendb_persistent_native_hits.store(0, std::memory_order_relaxed);
-        g_backendb_persistent_native_segments_restored.store(0,
+        g_jit_persistent_ir_enabled.store(false, std::memory_order_release);
+        g_jit_persistent_ir_hits.store(0, std::memory_order_relaxed);
+        g_jit_persistent_ir_misses.store(0, std::memory_order_relaxed);
+        g_jit_persistent_ir_records_loaded.store(0, std::memory_order_relaxed);
+        g_jit_persistent_ir_records_written.store(0, std::memory_order_relaxed);
+        g_jit_persistent_ir_corrupt_shards.store(0, std::memory_order_relaxed);
+        g_jit_persistent_native_hits.store(0, std::memory_order_relaxed);
+        g_jit_persistent_native_segments_restored.store(0,
                                                              std::memory_order_relaxed);
-        g_backendb_persistent_native_records_captured.store(0,
+        g_jit_persistent_native_records_captured.store(0,
                                                             std::memory_order_relaxed);
-        g_backendb_persistent_native_records_written.store(0,
+        g_jit_persistent_native_records_written.store(0,
                                                            std::memory_order_relaxed);
-        g_backendb_persistent_native_restore_fallbacks.store(0,
+        g_jit_persistent_native_restore_fallbacks.store(0,
                                                              std::memory_order_relaxed);
-        g_backendb_persistent_native_capture_rejected.store(0,
+        g_jit_persistent_native_capture_rejected.store(0,
                                                             std::memory_order_relaxed);
 
         if (!enabled || root_dir.empty() || title_id.empty() || executable_fingerprint == 0) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE] enabled=0");
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=0");
             return;
         }
 
         const std::string safe_title = SanitizePathComponent(title_id);
         if (safe_title.empty()) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE] enabled=0 reason=bad_title");
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=0 reason=bad_title");
             return;
         }
 
@@ -1544,24 +1683,24 @@ public:
         // Native blocks already cross source hashes below when the semantic epoch is unchanged:
         // all embedded process pointers are represented by validated logical relocations. Keep
         // one directory for that same compatibility contract instead of creating a new 0.5-1 GB
-        // tree after every Backend-B diagnostic/performance edit. A lowering/relocation semantic
+        // tree after every JIT diagnostic/performance edit. A lowering/relocation semantic
         // change must bump this explicit epoch together with kPersistentIrAbiVersion.
         const std::uint64_t native_abi_id = kPersistentNativeSemanticAbiVersion;
         if (native_abi_id == 0) {
             // Generated native records may only cross shared-object builds when CMake supplied
-            // the digest of the exact Backend-B lowering/helper ABI.
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE] enabled=0 "
+            // the digest of the exact JIT lowering/helper ABI.
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=0 "
                         "reason=native_abi_id_missing");
             return;
         }
         std::ostringstream abi_name;
-        abi_name << "v" << kBackendBIrCacheFormatVersion << "-" << std::hex
+        abi_name << "v" << kJitIrCacheFormatVersion << "-" << std::hex
                  << kPersistentIrAbiVersion << "-" << std::setw(16) << std::setfill('0')
                  << native_abi_id;
-        directory_ = std::filesystem::path(root_dir) / "cache" / "backend-b" /
+        directory_ = std::filesystem::path(root_dir) / "cache" / "jit" /
                      safe_title / fingerprint_name.str() / abi_name.str();
         identity_ = BuildIdentity(safe_title, executable_fingerprint, native_abi_id);
-        limits_.max_instructions_per_block = kBackendBMaxInstructionsPerBlock;
+        limits_.max_instructions_per_block = kJitMaxInstructionsPerBlock;
         // Bloodborne currently retains more than 350k immutable basic blocks. Reserving the
         // actual production class up front avoids three whole-table rehashes while reading the
         // cache and does not allocate record nodes before they are needed.
@@ -1570,7 +1709,7 @@ public:
         std::error_code error;
         std::filesystem::create_directories(directory_, error);
         if (error) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE] enabled=0 reason=mkdir_failed "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=0 reason=mkdir_failed "
                         "path=%s error=%s",
                         directory_.string().c_str(), error.message().c_str());
             directory_.clear();
@@ -1578,9 +1717,9 @@ public:
         }
         LoadNativeWarmProfile();
 
-        // IR is tied to guest bytes and the Backend-B IR ABI. Native payloads additionally use
+        // IR is tied to guest bytes and the JIT IR ABI. Native payloads additionally use
         // the generated source/toolchain ABI digest and stable logical helper relocations, so an
-        // unrelated HLE/GPU relink keeps this directory while a Backend-B change selects another.
+        // unrelated HLE/GPU relink keeps this directory while a JIT change selects another.
         // kPersistentIrAbiVersion is the explicit semantic compatibility epoch. Native payloads
         // contain only position-independent instructions plus validated logical relocations, so
         // a source digest change inside the same epoch is not by itself an incompatibility. This
@@ -1605,7 +1744,7 @@ public:
                     BuildIdentity(safe_title, executable_fingerprint, compatible_abi_id), true,
                     true);
                 loaded_records += source_loaded;
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_IR_REUSE] source=%s "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_IR_REUSE] source=%s "
                             "sourceAbi=0x%llx targetAbi=0x%llx loaded=%llu "
                             "native=relocatable-same-semantic-epoch migration=scheduled",
                             compatible_directory.string().c_str(),
@@ -1615,26 +1754,26 @@ public:
             }
         }
         PrepareLoadedRecordsParallel();
-        g_backendb_persistent_ir_records_loaded.store(loaded_records,
+        g_jit_persistent_ir_records_loaded.store(loaded_records,
                                                        std::memory_order_relaxed);
         enabled_ = true;
-        g_backendb_persistent_ir_enabled.store(true, std::memory_order_release);
+        g_jit_persistent_ir_enabled.store(true, std::memory_order_release);
         try {
             writer_ = std::thread([this]() { WriterMain(); });
         } catch (const std::exception& exception) {
             // Read hits remain useful even if the device cannot create the low-priority writer.
             writer_available_.store(false, std::memory_order_release);
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE] writer=disabled error=%s",
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] writer=disabled error=%s",
                         exception.what());
         }
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE] enabled=1 path=%s loaded=%llu "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=1 path=%s loaded=%llu "
                     "writer=%d nativeAbi=0x%llx sourceHash=0x%llx migrated=%d",
                     directory_.string().c_str(),
                     static_cast<unsigned long long>(
-                        g_backendb_persistent_ir_records_loaded.load(std::memory_order_relaxed)),
+                        g_jit_persistent_ir_records_loaded.load(std::memory_order_relaxed)),
                     writer_available_.load(std::memory_order_acquire) ? 1 : 0,
                     static_cast<unsigned long long>(native_abi_id),
-                    static_cast<unsigned long long>(kBackendBNativeCacheSourceAbiHash),
+                    static_cast<unsigned long long>(kJitNativeCacheSourceAbiHash),
                     migration_complete ? 1 : 0);
     }
 
@@ -1644,13 +1783,13 @@ public:
         }
         auto records_it = records_by_rip_.find(guest_rip);
         if (records_it == records_by_rip_.end()) {
-            g_backendb_persistent_ir_misses.fetch_add(1, std::memory_order_relaxed);
+            g_jit_persistent_ir_misses.fetch_add(1, std::memory_order_relaxed);
             return {};
         }
 
         auto& candidates = records_it->second;
         for (std::size_t index = candidates.size(); index != 0; --index) {
-            BackendBIrCacheRecord& candidate = candidates[index - 1];
+            JitIrCacheRecord& candidate = candidates[index - 1];
             const LsxDecodedRegion& block = candidate.block;
             if (block.start_rip != guest_rip || block.end_rip < block.start_rip ||
                 block.end_rip - block.start_rip >
@@ -1676,12 +1815,12 @@ public:
                   !HashDecodedBlockBytes(*decoded, decoded_hash) ||
                   decoded_hash != candidate.guest_hash))) {
                 candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(index - 1));
-                g_backendb_persistent_ir_corrupt_shards.fetch_add(1,
+                g_jit_persistent_ir_corrupt_shards.fetch_add(1,
                                                                   std::memory_order_relaxed);
                 continue;
             }
             const std::uint64_t stored_hash = candidate.guest_hash;
-            std::vector<BackendBNativeSegment> native_segments =
+            std::vector<JitNativeSegment> native_segments =
                 std::move(candidate.native_segments);
             const std::uint32_t entry_segment_index = candidate.entry_segment_index;
             const std::uint32_t direct_segment_index = candidate.direct_segment_index;
@@ -1692,9 +1831,9 @@ public:
                 records_by_rip_.erase(records_it);
             }
             const std::uint64_t hits =
-                g_backendb_persistent_ir_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+                g_jit_persistent_ir_hits.fetch_add(1, std::memory_order_relaxed) + 1;
             if ((hits & 0xfffull) == 1) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_HIT] hits=%llu rip=0x%llx "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_HIT] hits=%llu rip=0x%llx "
                             "size=0x%x",
                             static_cast<unsigned long long>(hits),
                             static_cast<unsigned long long>(guest_rip), guest_size);
@@ -1704,7 +1843,7 @@ public:
                     needs_identity_migration};
         }
 
-        g_backendb_persistent_ir_misses.fetch_add(1, std::memory_order_relaxed);
+        g_jit_persistent_ir_misses.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
 
@@ -1729,9 +1868,9 @@ public:
         selections.reserve(std::min(max_records, records_by_rip_.size()));
         for (auto& [guest_rip, versions] : records_by_rip_) {
             for (std::size_t index = versions.size(); index != 0; --index) {
-                BackendBIrCacheRecord& candidate = versions[index - 1];
+                JitIrCacheRecord& candidate = versions[index - 1];
                 if (!candidate.loaded_ir_validated ||
-                    (candidate.native_flags & kBackendBNativeFlagValid) == 0 ||
+                    (candidate.native_flags & kJitNativeFlagValid) == 0 ||
                     candidate.native_segments.empty()) {
                     continue;
                 }
@@ -1784,7 +1923,7 @@ public:
             }
             auto& versions = records_it->second;
             const auto selected_it = std::find_if(
-                versions.begin(), versions.end(), [&](const BackendBIrCacheRecord& record) {
+                versions.begin(), versions.end(), [&](const JitIrCacheRecord& record) {
                     return record.guest_hash == selection.guest_hash &&
                            record.block.end_rip == selection.end_rip &&
                            record.loaded_order == selection.loaded_order;
@@ -1792,7 +1931,7 @@ public:
             if (selected_it == versions.end()) {
                 continue;
             }
-            BackendBIrCacheRecord selected = std::move(*selected_it);
+            JitIrCacheRecord selected = std::move(*selected_it);
             versions.erase(selected_it);
             if (versions.empty()) {
                 records_by_rip_.erase(records_it);
@@ -1810,7 +1949,7 @@ public:
         if (!stable.block) {
             return;
         }
-        BackendBIrCacheRecord record{};
+        JitIrCacheRecord record{};
         record.guest_rip = stable.block->start_rip;
         record.guest_hash = stable.guest_hash;
         record.block = std::move(*stable.block);
@@ -1825,15 +1964,15 @@ public:
     }
 
     void Remember(const LsxDecodedRegion& block, const std::uint64_t guest_hash,
-                  std::vector<BackendBNativeSegment> native_segments = {},
-                  const std::uint32_t entry_segment_index = kBackendBNativeNoSegment,
-                  const std::uint32_t direct_segment_index = kBackendBNativeNoSegment,
+                  std::vector<JitNativeSegment> native_segments = {},
+                  const std::uint32_t entry_segment_index = kJitNativeNoSegment,
+                  const std::uint32_t direct_segment_index = kJitNativeNoSegment,
                   const std::uint32_t native_flags = 0) {
         if (!enabled_ || !writer_available_.load(std::memory_order_acquire) ||
             block.instructions.empty()) {
             return;
         }
-        BackendBIrCacheRecord record{};
+        JitIrCacheRecord record{};
         record.guest_rip = block.start_rip;
         record.guest_hash = guest_hash;
         record.block = block;
@@ -1856,7 +1995,7 @@ public:
         }
     }
 
-    void PersistMigratedNativeRecords(std::vector<BackendBIrCacheRecord> records,
+    void PersistMigratedNativeRecords(std::vector<JitIrCacheRecord> records,
                                       const std::size_t expected_records) noexcept {
         if (!enabled_ || records.empty() || HasNativeMigrationMarker()) {
             return;
@@ -1866,7 +2005,7 @@ public:
             expected_records != 0 && records.size() >= (expected_records * 9u) / 10u;
         const std::uint64_t generation = static_cast<std::uint64_t>(
             std::chrono::system_clock::now().time_since_epoch().count());
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION_START] records=%zu "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION_START] records=%zu "
                     "shardRecords=%zu",
                     records.size(), kMigrationShardRecords);
 
@@ -1881,11 +2020,11 @@ public:
                  << generation << "-" << std::setw(4) << part << ".bbir";
             const auto path = directory_ / name.str();
             std::string save_error;
-            if (!SaveBackendBIrCacheFileAtomic(
+            if (!SaveJitIrCacheFileAtomic(
                     path, identity_,
-                    std::span<const BackendBIrCacheRecord>{records.data() + offset, count},
+                    std::span<const JitIrCacheRecord>{records.data() + offset, count},
                     save_error, limits_)) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION_FAIL] "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION_FAIL] "
                             "written=%zu records=%zu part=%zu error=%s",
                             written, records.size(), part, save_error.c_str());
                 return;
@@ -1901,7 +2040,7 @@ public:
         }
 
         if (!coverage_complete) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION_PARTIAL] "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION_PARTIAL] "
                         "records=%zu expected=%zu coveragePct=%.1f marker=deferred",
                         written, expected_records,
                         expected_records == 0
@@ -1918,7 +2057,7 @@ public:
         {
             std::ofstream output{temp_marker, std::ios::binary | std::ios::trunc};
             if (!output) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION_FAIL] "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION_FAIL] "
                             "written=%zu records=%zu error=marker_open",
                             written, records.size());
                 return;
@@ -1927,7 +2066,7 @@ public:
                    << kPersistentNativeSemanticAbiVersion << "\n";
             output.flush();
             if (!output) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION_FAIL] "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION_FAIL] "
                             "written=%zu records=%zu error=marker_write",
                             written, records.size());
                 return;
@@ -1938,7 +2077,7 @@ public:
         if (rename_error) {
             std::error_code cleanup_error;
             std::filesystem::remove(temp_marker, cleanup_error);
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION_FAIL] "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION_FAIL] "
                         "written=%zu records=%zu error=marker_rename:%s",
                         written, records.size(), rename_error.message().c_str());
             return;
@@ -1946,7 +2085,7 @@ public:
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - started)
                                     .count();
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_MIGRATION] records=%zu parts=%zu "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_MIGRATION] records=%zu parts=%zu "
                     "elapsedMs=%lld semanticAbi=0x%llx",
                     written, part, static_cast<long long>(elapsed_ms),
                     static_cast<unsigned long long>(kPersistentNativeSemanticAbiVersion));
@@ -2006,7 +2145,7 @@ public:
         {
             std::ofstream output{temporary, std::ios::binary | std::ios::trunc};
             if (!output) {
-                BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] saved=0 reason=open");
+                JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] saved=0 reason=open");
                 return;
             }
             output.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
@@ -2019,7 +2158,7 @@ public:
             if (!output) {
                 std::error_code cleanup_error;
                 std::filesystem::remove(temporary, cleanup_error);
-                BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] saved=0 reason=write");
+                JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] saved=0 reason=write");
                 return;
             }
         }
@@ -2028,13 +2167,13 @@ public:
         if (rename_error) {
             std::error_code cleanup_error;
             std::filesystem::remove(temporary, cleanup_error);
-            BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] saved=0 reason=rename:%s",
+            JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] saved=0 reason=rename:%s",
                         rename_error.message().c_str());
             return;
         }
         native_hot_rips_ = std::move(merged);
         pending_native_hot_rips_.clear();
-        BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] saved=1 records=%u",
+        JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] saved=1 records=%u",
                     count);
     }
 
@@ -2065,24 +2204,24 @@ private:
         input.read(reinterpret_cast<char*>(&checksum), sizeof(checksum));
         if (!input || magic != kNativeHotProfileMagic || version != kNativeHotProfileVersion ||
             count > kMaxNativeHotProfileRecords) {
-            BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] loaded=0 reason=header");
+            JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] loaded=0 reason=header");
             return;
         }
         std::vector<std::uint64_t> loaded(count);
         input.read(reinterpret_cast<char*>(loaded.data()),
                    static_cast<std::streamsize>(loaded.size() * sizeof(std::uint64_t)));
         if (!input || HashNativeHotProfile(loaded) != checksum) {
-            BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] loaded=0 reason=payload");
+            JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] loaded=0 reason=payload");
             return;
         }
         std::lock_guard hot_lock{native_hot_profile_mutex_};
         native_hot_rips_ = std::move(loaded);
-        BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_HOT_PROFILE] loaded=1 records=%zu",
+        JitLog("[EXECUTOR_JIT_NATIVE_HOT_PROFILE] loaded=1 records=%zu",
                     native_hot_rips_.size());
     }
 
     void PrepareLoadedRecordsParallel() {
-        std::vector<BackendBIrCacheRecord*> records;
+        std::vector<JitIrCacheRecord*> records;
         records.reserve(records_by_rip_.size());
         for (auto& [rip, versions] : records_by_rip_) {
             (void)rip;
@@ -2107,7 +2246,7 @@ private:
                 if (index >= records.size()) {
                     break;
                 }
-                BackendBIrCacheRecord& record = *records[index];
+                JitIrCacheRecord& record = *records[index];
                 std::uint64_t decoded_hash = 0;
                 record.loaded_ir_validated =
                     CanonicalizeLoadedIrDerivedMetadata(record.block) &&
@@ -2133,7 +2272,7 @@ private:
             for (auto it = records_by_rip_.begin(); it != records_by_rip_.end();) {
                 auto& versions = it->second;
                 versions.erase(std::remove_if(versions.begin(), versions.end(),
-                                               [](const BackendBIrCacheRecord& record) {
+                                               [](const JitIrCacheRecord& record) {
                                                    return !record.loaded_ir_validated;
                                                }),
                                versions.end());
@@ -2143,12 +2282,12 @@ private:
                     ++it;
                 }
             }
-            g_backendb_persistent_ir_corrupt_shards.fetch_add(rejected_count,
+            g_jit_persistent_ir_corrupt_shards.fetch_add(rejected_count,
                                                                std::memory_order_relaxed);
         }
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_PREPARED] records=%zu "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_PREPARED] records=%zu "
                     "workers=%u rejected=%llu elapsedMs=%lld",
                     records.size(), worker_count,
                     static_cast<unsigned long long>(rejected_count),
@@ -2164,11 +2303,10 @@ private:
     // iced-x86's implicit [R/E]DI destination. Cached IR from the prior epoch
     // contains three operands and must not cross this semantic boundary.
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    // v4: eligible faultable SIMD blocks may retain dirty architectural YMM halves in q16-q23.
-    // They publish those halves immediately before every guest-memory access and at every existing
-    // cache/epilogue boundary. Older native payloads must therefore be re-emitted; decoded IR
-    // remains reusable, so this does not discard the expensive guest decode cache.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607180003ull;
+    // v7: direct chains use a bounded signal/exit/SMC safepoint cadence instead of a nearly
+    // unbounded 4096-block run. The generated tail embeds that cadence, so old native payloads
+    // must be re-emitted. Decoded IR remains reusable.
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x20260719000dull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -2194,10 +2332,10 @@ private:
         return result;
     }
 
-    static BackendBIrCacheIdentity BuildIdentity(const std::string& title,
+    static JitIrCacheIdentity BuildIdentity(const std::string& title,
                                                   const std::uint64_t fingerprint,
                                                   const std::uint64_t native_abi_id) {
-        BackendBIrCacheIdentity identity{};
+        JitIrCacheIdentity identity{};
         identity.jit_abi_version = kPersistentIrAbiVersion;
         for (std::size_t lane = 0; lane < 4; ++lane) {
             Common::ContentFingerprint64 lane_fingerprint{
@@ -2228,7 +2366,7 @@ private:
             std::filesystem::file_time_type time{};
         };
         std::ostringstream prefix_stream;
-        prefix_stream << "v" << kBackendBIrCacheFormatVersion << "-" << std::hex
+        prefix_stream << "v" << kJitIrCacheFormatVersion << "-" << std::hex
                       << kPersistentIrAbiVersion << "-";
         const std::string prefix = prefix_stream.str();
         std::vector<Candidate> candidates;
@@ -2283,7 +2421,7 @@ private:
     }
 
     std::uint64_t LoadExistingShards(const std::filesystem::path& source_directory,
-                                     const BackendBIrCacheIdentity& source_identity,
+                                     const JitIrCacheIdentity& source_identity,
                                      const bool restore_native,
                                      const bool needs_identity_migration) {
         std::vector<std::filesystem::path> shards;
@@ -2340,7 +2478,7 @@ private:
                 }
             }
             if (!checkpoint_shards.empty()) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_CHECKPOINT_SELECT] "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_CHECKPOINT_SELECT] "
                             "allShards=%zu selected=%zu generation=%s",
                             shards.size(), checkpoint_shards.size(),
                             newest_migration_generation.c_str());
@@ -2360,7 +2498,7 @@ private:
         // concurrently, then merge strictly in filename order below so duplicate/SMC precedence
         // and first-touch ranking remain byte-for-byte deterministic.
         const auto load_started = std::chrono::steady_clock::now();
-        std::vector<BackendBIrCacheLoadResult> shard_results(shards.size());
+        std::vector<JitIrCacheLoadResult> shard_results(shards.size());
         const unsigned available = std::max(1u, std::thread::hardware_concurrency());
         const unsigned worker_count = std::min<unsigned>(
             8u, std::min<unsigned>(available, static_cast<unsigned>(shards.size())));
@@ -2372,7 +2510,7 @@ private:
                     break;
                 }
                 shard_results[index] =
-                    LoadBackendBIrCacheFile(shards[index], source_identity, limits_);
+                    LoadJitIrCacheFile(shards[index], source_identity, limits_);
             }
         };
         std::vector<std::thread> load_workers;
@@ -2386,7 +2524,7 @@ private:
         }
         const auto load_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - load_started).count();
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_SHARDS_LOADED] shards=%zu "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_SHARDS_LOADED] shards=%zu "
                     "workers=%u elapsedMs=%lld",
                     shards.size(), worker_count, static_cast<long long>(load_elapsed_ms));
 
@@ -2399,34 +2537,34 @@ private:
         bool aggregate_limit_reached = false;
         for (std::size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
             const auto& shard = shards[shard_index];
-            BackendBIrCacheLoadResult& result = shard_results[shard_index];
+            JitIrCacheLoadResult& result = shard_results[shard_index];
             if (!result.ok()) {
-                g_backendb_persistent_ir_corrupt_shards.fetch_add(1,
+                g_jit_persistent_ir_corrupt_shards.fetch_add(1,
                                                                   std::memory_order_relaxed);
                 if (bad_log_budget != 0) {
                     --bad_log_budget;
-                    BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_SHARD_SKIP] path=%s "
+                    JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_SHARD_SKIP] path=%s "
                                 "status=%u detail=%s",
                                 shard.string().c_str(), static_cast<unsigned>(result.status),
                                 result.detail.c_str());
                 }
                 continue;
             }
-            for (BackendBIrCacheRecord& record : result.records) {
+            for (JitIrCacheRecord& record : result.records) {
                 record.needs_identity_migration = needs_identity_migration;
                 record.loaded_order = next_loaded_order_++;
                 if (!restore_native) {
-                    // A different Backend-B source/toolchain ABI may have changed instruction
+                    // A different JIT source/toolchain ABI may have changed instruction
                     // selection or semantic leaves even though its decoded IR remains valid.
                     // Cross-ABI reuse is therefore decoded-IR-only.
                     record.native_segments.clear();
-                    record.entry_segment_index = kBackendBNativeNoSegment;
-                    record.direct_segment_index = kBackendBNativeNoSegment;
+                    record.entry_segment_index = kJitNativeNoSegment;
+                    record.direct_segment_index = kJitNativeNoSegment;
                     record.native_flags = 0;
                 }
                 std::uint64_t record_native_bytes = 0;
                 std::uint64_t record_native_relocations = 0;
-                for (const BackendBNativeSegment& segment : record.native_segments) {
+                for (const JitNativeSegment& segment : record.native_segments) {
                     record_native_bytes += segment.bytes.size();
                     record_native_relocations += segment.relocs.size();
                 }
@@ -2446,7 +2584,7 @@ private:
 
                 auto& versions = records_by_rip_[record.guest_rip];
                 const auto duplicate = std::find_if(
-                    versions.begin(), versions.end(), [&](const BackendBIrCacheRecord& existing) {
+                    versions.begin(), versions.end(), [&](const JitIrCacheRecord& existing) {
                         return existing.guest_hash == record.guest_hash &&
                                existing.block.end_rip == record.block.end_rip;
                     });
@@ -2455,7 +2593,7 @@ private:
                     // earlier IR-only record for the same immutable guest bytes; otherwise one
                     // diagnostic/capture-rejected launch would mask native code forever.
                     const bool incoming_native =
-                        (record.native_flags & kBackendBNativeFlagValid) != 0;
+                        (record.native_flags & kJitNativeFlagValid) != 0;
                     if (incoming_native) {
                         // A later shard can contain the same immutable guest block rebuilt by a
                         // newer capture path in this exact JIT/build identity.  Prefer it even
@@ -2480,7 +2618,7 @@ private:
                 }
             }
             if (aggregate_limit_reached) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_LOAD_LIMIT] records=%llu "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_LOAD_LIMIT] records=%llu "
                             "instructions=%llu nativeBytes=%llu nativeRelocs=%llu",
                             static_cast<unsigned long long>(candidate_records),
                             static_cast<unsigned long long>(total_instructions),
@@ -2509,10 +2647,10 @@ private:
     void WriterMain() noexcept {
         try {
 #ifdef __ANDROID__
-            pthread_setname_np(pthread_self(), "BackendB:Cache");
+            pthread_setname_np(pthread_self(), "Jit:Cache");
 #endif
             for (;;) {
-                std::vector<BackendBIrCacheRecord> batch;
+                std::vector<JitIrCacheRecord> batch;
                 {
                     std::unique_lock lock{writer_mutex_};
                     writer_cv_.wait_for(lock, std::chrono::seconds(2), [&]() {
@@ -2535,23 +2673,23 @@ private:
                 std::string save_error;
                 const auto shard = NextShardPath();
                 const std::size_t native_records = static_cast<std::size_t>(std::count_if(
-                    batch.begin(), batch.end(), [](const BackendBIrCacheRecord& record) {
-                        return (record.native_flags & kBackendBNativeFlagValid) != 0;
+                    batch.begin(), batch.end(), [](const JitIrCacheRecord& record) {
+                        return (record.native_flags & kJitNativeFlagValid) != 0;
                     }));
-                if (SaveBackendBIrCacheFileAtomic(shard, identity_, batch, save_error, limits_)) {
+                if (SaveJitIrCacheFileAtomic(shard, identity_, batch, save_error, limits_)) {
                     const std::uint64_t written =
-                        g_backendb_persistent_ir_records_written.fetch_add(
+                        g_jit_persistent_ir_records_written.fetch_add(
                             batch.size(), std::memory_order_relaxed) +
                         batch.size();
                     const std::uint64_t native_written =
-                        g_backendb_persistent_native_records_written.fetch_add(
+                        g_jit_persistent_native_records_written.fetch_add(
                             native_records, std::memory_order_relaxed) +
                         native_records;
                     constexpr std::uint64_t kWriteLogInterval = 8192;
                     const std::uint64_t previous_written = written - batch.size();
                     if (previous_written == 0 ||
                         previous_written / kWriteLogInterval != written / kWriteLogInterval) {
-                        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_WRITE] records=%zu "
+                        JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_WRITE] records=%zu "
                                     "written=%llu nativeRecords=%zu nativeWritten=%llu path=%s",
                                     batch.size(), static_cast<unsigned long long>(written),
                                     native_records,
@@ -2559,7 +2697,7 @@ private:
                                     shard.string().c_str());
                     }
                 } else {
-                    BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_WRITE_FAIL] records=%zu "
+                    JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_WRITE_FAIL] records=%zu "
                                 "path=%s error=%s",
                                 batch.size(), shard.string().c_str(), save_error.c_str());
                     // A storage failure is not an execution failure. Disable persistence for this
@@ -2572,11 +2710,11 @@ private:
             }
         } catch (const std::exception& exception) {
             writer_available_.store(false, std::memory_order_release);
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_WRITER_EXIT] error=%s",
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_WRITER_EXIT] error=%s",
                         exception.what());
         } catch (...) {
             writer_available_.store(false, std::memory_order_release);
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_CACHE_WRITER_EXIT] error=unknown");
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_WRITER_EXIT] error=unknown");
         }
     }
 
@@ -2597,16 +2735,16 @@ private:
 
     bool enabled_ = false;
     std::atomic_bool writer_available_{true};
-    BackendBIrCacheIdentity identity_{};
-    BackendBIrCacheLimits limits_{};
+    JitIrCacheIdentity identity_{};
+    JitIrCacheLimits limits_{};
     std::filesystem::path directory_{};
-    std::unordered_map<std::uint64_t, std::vector<BackendBIrCacheRecord>> records_by_rip_{};
+    std::unordered_map<std::uint64_t, std::vector<JitIrCacheRecord>> records_by_rip_{};
     std::mutex native_hot_profile_mutex_{};
     std::vector<std::uint64_t> native_hot_rips_{};
     std::vector<std::uint64_t> pending_native_hot_rips_{};
     std::mutex writer_mutex_{};
     std::condition_variable writer_cv_{};
-    std::deque<BackendBIrCacheRecord> pending_records_{};
+    std::deque<JitIrCacheRecord> pending_records_{};
     bool stop_writer_ = false;
     std::thread writer_{};
     std::uint64_t shard_sequence_ = static_cast<std::uint64_t>(
@@ -2619,19 +2757,26 @@ struct JitExecutionLookup {
     const LsxDecodedRegion* decoded = nullptr;
 };
 
-// Fast-cache geometry used by the LSX translation engine:
-// 4096 buckets selected from RIP * golden ratio, two 0x30-byte ways, and an alternating
-// replacement byte at bucket +0x60. Keeping this at 480 KiB per thread is important on mobile:
-// doubling the uniformly indexed array nearly doubles its hot DTLB footprint while the profiled
-// authoritative miss path accounts for less than one percent of process cycles.
-constexpr std::size_t kBackendBExecutionCacheBucketCount = 4096;
-constexpr std::uint32_t kBackendBExecutionCacheRefreshMask = 0x7ffffu;
-constexpr std::uint64_t kBackendBExecutionCacheHashMultiplier = 0x9e3779b97f4a7c15ull;
-static_assert(std::has_single_bit(kBackendBExecutionCacheBucketCount));
-constexpr unsigned kBackendBExecutionCacheBucketBits =
-    std::countr_zero(kBackendBExecutionCacheBucketCount);
+struct CachedTranslationRecord {
+    TranslationRecord block{};
+    const LsxDecodedRegion* decoded = nullptr;
+};
 
-struct BackendBExecutionCacheWay {
+// Fast-cache geometry used by the LSX translation engine:
+// two 0x30-byte ways selected from RIP * golden ratio, with alternating replacement. The original
+// 4096 buckets covered short startup loops, but a large Unity title reaches a 164k-block resident
+// set before its first scene. A device profile at that frontier put 25.5% of Game:Main in the
+// authoritative unordered-map lookup. 16384 buckets keep a 32k-block per-thread working window;
+// dynamic Android TLS allocates it only for translated guest threads, while avoiding the two
+// pointer-chasing hash-table walks that otherwise dominate scene loading.
+constexpr std::size_t kJitExecutionCacheBucketCount = 16384;
+constexpr std::uint32_t kJitExecutionCacheRefreshMask = 0x7ffffu;
+constexpr std::uint64_t kJitExecutionCacheHashMultiplier = 0x9e3779b97f4a7c15ull;
+static_assert(std::has_single_bit(kJitExecutionCacheBucketCount));
+constexpr unsigned kJitExecutionCacheBucketBits =
+    std::countr_zero(kJitExecutionCacheBucketCount);
+
+struct JitExecutionCacheWay {
     std::uint64_t guest_rip = 0;
     Arm64BlockEntry entry = nullptr;
     std::uint32_t guest_size = 0;
@@ -2667,29 +2812,29 @@ struct BackendBExecutionCacheWay {
     }
 };
 
-static_assert(offsetof(BackendBExecutionCacheWay, entry) == 0x08);
-static_assert(offsetof(BackendBExecutionCacheWay, guest_size) == 0x10);
-static_assert(offsetof(BackendBExecutionCacheWay, guest_hash) == 0x18);
-static_assert(offsetof(BackendBExecutionCacheWay, flags) == 0x20);
-static_assert(offsetof(BackendBExecutionCacheWay, refresh_counter) == 0x28);
-static_assert(offsetof(BackendBExecutionCacheWay, special_type) == 0x2c);
-static_assert(offsetof(BackendBExecutionCacheWay, valid) == 0x2d);
-static_assert(sizeof(BackendBExecutionCacheWay) == 0x30);
+static_assert(offsetof(JitExecutionCacheWay, entry) == 0x08);
+static_assert(offsetof(JitExecutionCacheWay, guest_size) == 0x10);
+static_assert(offsetof(JitExecutionCacheWay, guest_hash) == 0x18);
+static_assert(offsetof(JitExecutionCacheWay, flags) == 0x20);
+static_assert(offsetof(JitExecutionCacheWay, refresh_counter) == 0x28);
+static_assert(offsetof(JitExecutionCacheWay, special_type) == 0x2c);
+static_assert(offsetof(JitExecutionCacheWay, valid) == 0x2d);
+static_assert(sizeof(JitExecutionCacheWay) == 0x30);
 
-struct BackendBExecutionCacheBucket {
-    std::array<BackendBExecutionCacheWay, 2> ways{};
+struct JitExecutionCacheBucket {
+    std::array<JitExecutionCacheWay, 2> ways{};
     std::uint8_t replacement = 0;
     std::array<std::uint8_t, 7> reserved{};
 };
 
-static_assert(offsetof(BackendBExecutionCacheBucket, replacement) == 0x60);
-static_assert(sizeof(BackendBExecutionCacheBucket) == 0x68);
+static_assert(offsetof(JitExecutionCacheBucket, replacement) == 0x60);
+static_assert(sizeof(JitExecutionCacheBucket) == 0x68);
 
-struct alignas(64) BackendBThreadExecutionCache {
+struct alignas(64) JitThreadExecutionCache {
     std::uint64_t backend_identity = 0;
     std::uint64_t epoch = 0;
-    std::array<BackendBExecutionCacheBucket, kBackendBExecutionCacheBucketCount> buckets{};
-    std::array<std::array<const LsxDecodedRegion*, 2>, kBackendBExecutionCacheBucketCount>
+    std::array<JitExecutionCacheBucket, kJitExecutionCacheBucketCount> buckets{};
+    std::array<std::array<const LsxDecodedRegion*, 2>, kJitExecutionCacheBucketCount>
         decoded_sidecar{};
 
     void Reset(const std::uint64_t identity, const std::uint64_t new_epoch) {
@@ -2706,9 +2851,9 @@ struct alignas(64) BackendBThreadExecutionCache {
     }
 };
 
-static_assert(std::is_trivially_copyable_v<BackendBExecutionCacheBucket>);
+static_assert(std::is_trivially_copyable_v<JitExecutionCacheBucket>);
 
-thread_local BackendBThreadExecutionCache g_backendb_thread_execution_cache{};
+thread_local JitThreadExecutionCache g_jit_thread_execution_cache{};
 
 struct alignas(16) ChainPatchCell {
     ChainPatchCell(const std::uint64_t rip, std::atomic<std::uint64_t>* cache_epoch)
@@ -2728,7 +2873,7 @@ struct alignas(16) ChainPatchCell {
     // the first observed use, then only every 2^19 tail links re-hashes guest
     // bytes. This occupies the padding that already preceded the epoch pointer,
     // so emitted consumers still see the same target-at-offset-zero ABI.
-    std::atomic<std::uint32_t> refresh_counter{kBackendBExecutionCacheRefreshMask};
+    std::atomic<std::uint32_t> refresh_counter{kJitExecutionCacheRefreshMask};
     std::atomic<std::uint64_t>* const execution_cache_epoch = nullptr;
 };
 
@@ -2747,22 +2892,22 @@ static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
 // epoch captured under chain_patch_mutex_.  Backend identity prevents a stale TLS pointer from
 // being reused after an LsxTranslationEngine is destroyed and another is created at the same
 // address.
-constexpr std::size_t kBackendBChainPatchTlsSetCount = 128;
-constexpr std::size_t kBackendBChainPatchTlsWayCount = 2;
+constexpr std::size_t kJitChainPatchTlsSetCount = 128;
+constexpr std::size_t kJitChainPatchTlsWayCount = 2;
 
-struct BackendBThreadChainPatchCacheWay {
+struct JitThreadChainPatchCacheWay {
     std::uint64_t guest_target = 0;
     ChainPatchCell* slot = nullptr;
 };
 
-struct alignas(64) BackendBThreadChainPatchCache {
+struct alignas(64) JitThreadChainPatchCache {
     std::uint64_t backend_identity = 0;
     std::uint64_t slot_map_epoch = 0;
-    std::array<std::array<BackendBThreadChainPatchCacheWay,
-                          kBackendBChainPatchTlsWayCount>,
-               kBackendBChainPatchTlsSetCount>
+    std::array<std::array<JitThreadChainPatchCacheWay,
+                          kJitChainPatchTlsWayCount>,
+               kJitChainPatchTlsSetCount>
         sets{};
-    std::array<std::uint8_t, kBackendBChainPatchTlsSetCount> replacement{};
+    std::array<std::uint8_t, kJitChainPatchTlsSetCount> replacement{};
     // TLS-local counters make the focused contract test observable without adding atomics to the
     // production miss path.
     std::uint64_t hits = 0;
@@ -2785,8 +2930,8 @@ struct alignas(64) BackendBThreadChainPatchCache {
 
     static std::size_t SetIndex(const std::uint64_t guest_target) noexcept {
         return static_cast<std::size_t>(
-            (guest_target * kBackendBExecutionCacheHashMultiplier) >>
-            (64u - std::countr_zero(kBackendBChainPatchTlsSetCount)));
+            (guest_target * kJitExecutionCacheHashMultiplier) >>
+            (64u - std::countr_zero(kJitChainPatchTlsSetCount)));
     }
 
     ChainPatchCell* Lookup(const std::uint64_t guest_target) noexcept {
@@ -2820,16 +2965,16 @@ struct alignas(64) BackendBThreadChainPatchCache {
             }
         }
         const std::size_t way_index =
-            replacement[set_index]++ & (kBackendBChainPatchTlsWayCount - 1u);
+            replacement[set_index]++ & (kJitChainPatchTlsWayCount - 1u);
         set[way_index] = {guest_target, slot};
     }
 };
 
-static_assert(std::has_single_bit(kBackendBChainPatchTlsSetCount));
-static_assert(std::has_single_bit(kBackendBChainPatchTlsWayCount));
-static_assert(std::is_trivially_copyable_v<BackendBThreadChainPatchCacheWay>);
+static_assert(std::has_single_bit(kJitChainPatchTlsSetCount));
+static_assert(std::has_single_bit(kJitChainPatchTlsWayCount));
+static_assert(std::is_trivially_copyable_v<JitThreadChainPatchCacheWay>);
 
-thread_local BackendBThreadChainPatchCache g_backendb_thread_chain_patch_cache{};
+thread_local JitThreadChainPatchCache g_jit_thread_chain_patch_cache{};
 
 class LsxTranslationEngine;
 
@@ -3016,8 +3161,8 @@ bool IsMonoScriptCacheTreeStrcmpTail(const std::uint64_t tail_rip,
     std::uint64_t hle_thunk = 0;
     std::uint64_t native_function = 0;
     return ReadGuestBytesChecked(got_slot, &hle_thunk, sizeof(hle_thunk)) &&
-           executor_backend_b_classify_hle_thunk(hle_thunk) != 0 &&
-           executor_backend_b_lookup_hle_thunk(hle_thunk, &native_function) != 0 &&
+           executor_jit_classify_hle_thunk(hle_thunk) != 0 &&
+           executor_jit_lookup_hle_thunk(hle_thunk, &native_function) != 0 &&
            native_function ==
                reinterpret_cast<std::uint64_t>(&Core::AeroLib::ExecutorLibcStrcmp);
 }
@@ -3026,11 +3171,11 @@ bool IsMonoScriptCacheTreeStrcmpTail(const std::uint64_t tail_rip,
 bool IsDirectHleBoundary(const std::uint64_t guest_rip) {
     // A direct link must never cross the dispatcher-owned HLE boundary.  In particular, a
     // module-local `jmp strcmp@plt` can otherwise link to an already-published PLT block and run
-    // the imported tail call without TryExecuteBackendBDirectHleTail translating the mapped
+    // the imported tail call without TryExecuteJitDirectHleTail translating the mapped
     // frame's null return.  Compilation order then decides whether zero is seen as completion or
     // fallthrough into data.  Deny both exact HLE stubs and the canonical x86-64 PLT shape whose
     // GOT slot currently resolves to one of those stubs.
-    if (executor_backend_b_classify_hle_thunk(guest_rip) != 0) {
+    if (executor_jit_classify_hle_thunk(guest_rip) != 0) {
         return true;
     }
 
@@ -3051,17 +3196,17 @@ bool IsDirectHleBoundary(const std::uint64_t guest_rip) {
                                sizeof(resolved))) {
         return false;
     }
-    return executor_backend_b_classify_hle_thunk(resolved) != 0;
+    return executor_jit_classify_hle_thunk(resolved) != 0;
 }
 
-struct BackendBLeafHlePltTarget {
+struct JitLeafHlePltTarget {
     std::uint64_t got_slot = 0;
     std::uint64_t expected_thunk = 0;
     std::uint64_t native_function = 0;
 };
 
-bool TryResolveBackendBLeafHlePlt(const std::uint64_t plt_rip,
-                                  BackendBLeafHlePltTarget& target) {
+bool TryResolveJitLeafHlePlt(const std::uint64_t plt_rip,
+                                  JitLeafHlePltTarget& target) {
     target = {};
     std::array<std::uint8_t, 6> plt{};
     if (plt_rip > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) -
@@ -3081,7 +3226,7 @@ bool TryResolveBackendBLeafHlePlt(const std::uint64_t plt_rip,
     if (!ReadGuestBytesChecked(target.got_slot, &target.expected_thunk,
                                sizeof(target.expected_thunk)) ||
         target.expected_thunk == 0 ||
-        executor_backend_b_lookup_leaf_hle_thunk(target.expected_thunk,
+        executor_jit_lookup_leaf_hle_thunk(target.expected_thunk,
                                                   &target.native_function) == 0 ||
         target.native_function == 0) {
         target = {};
@@ -3099,14 +3244,14 @@ bool IsChainPatchDenied(const std::uint64_t guest_rip) {
            GuestBytesMatch(guest_rip, kChainPatchDenySignature5);
 }
 
-constexpr std::array<std::uint8_t, 32> kBackendBHleThunkHash = {
+constexpr std::array<std::uint8_t, 32> kJitHleThunkHash = {
     0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
     0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
     0x3a, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64,
     0x62, 0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x31,
 };
-constexpr std::uint8_t kBackendBHleMarkerLength =
-    static_cast<std::uint8_t>(2 + kBackendBHleThunkHash.size());
+constexpr std::uint8_t kJitHleMarkerLength =
+    static_cast<std::uint8_t>(2 + kJitHleThunkHash.size());
 
 bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_out) noexcept {
     // Hash the exact instruction bytes consumed by X86.  A decoded basic block is contiguous;
@@ -3119,14 +3264,14 @@ bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_ou
             expected_rip > std::numeric_limits<std::uint64_t>::max() - instruction.length) {
             return false;
         }
-        if (IsBackendBHleBridgeMarkerInstruction(instruction)) {
+        if (IsJitHleBridgeMarkerInstruction(instruction)) {
             // The synthetic marker is 34 bytes while ordinary x86 instructions need at most the
             // 15-byte architectural buffer retained in IR.  Its full payload was already matched
-            // by IsBackendBHleBridgeMarkerAt during decode, so reconstruct those constexpr bytes
+            // by IsJitHleBridgeMarkerAt during decode, so reconstruct those constexpr bytes
             // here instead of overflowing/growing every LsxDecodedOp for this one sentinel.
             constexpr std::array marker_prefix{std::uint8_t{0x0f}, std::uint8_t{0x3f}};
             fingerprint.Update(marker_prefix);
-            fingerprint.Update(kBackendBHleThunkHash);
+            fingerprint.Update(kJitHleThunkHash);
         } else {
             if (instruction.length > instruction.bytes.size()) {
                 return false;
@@ -3147,12 +3292,12 @@ bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_ou
 // mov(XReg, imm64) chooses between MOVZ, MOVN, ORR and a variable number of MOVK instructions,
 // which makes an ASLR relocation change both the bytes and the instruction count. Four fixed
 // instructions keep every process-local pointer patchable in place on a later launch.
-constexpr std::size_t kBackendBNativePointerPatchBytes = 16;
+constexpr std::size_t kJitNativePointerPatchBytes = 16;
 constexpr std::uint32_t kAarch64MovWideOpcodeMask = 0xff800000u;
 constexpr std::uint32_t kAarch64MovzXOpcode = 0xd2800000u;
 constexpr std::uint32_t kAarch64MovkXOpcode = 0xf2800000u;
 
-void EmitBackendBRelocatablePointer(Xbyak_aarch64::CodeGenerator& code,
+void EmitJitRelocatablePointer(Xbyak_aarch64::CodeGenerator& code,
                                     const XReg& destination,
                                     const std::uint64_t value) {
     code.movz(destination, static_cast<std::uint16_t>(value), 0);
@@ -3161,17 +3306,17 @@ void EmitBackendBRelocatablePointer(Xbyak_aarch64::CodeGenerator& code,
     code.movk(destination, static_cast<std::uint16_t>(value >> 48u), 48);
 }
 
-bool DecodeBackendBRelocatablePointer(const std::span<const std::uint8_t> bytes,
+bool DecodeJitRelocatablePointer(const std::span<const std::uint8_t> bytes,
                                       const std::size_t offset,
                                       std::uint8_t& register_index,
                                       std::uint64_t& value) noexcept {
     if ((offset & 3u) != 0 || offset > bytes.size() ||
-        bytes.size() - offset < kBackendBNativePointerPatchBytes) {
+        bytes.size() - offset < kJitNativePointerPatchBytes) {
         return false;
     }
     std::array<std::uint32_t, 4> instructions{};
     std::memcpy(instructions.data(), bytes.data() + offset,
-                kBackendBNativePointerPatchBytes);
+                kJitNativePointerPatchBytes);
     if ((instructions[0] & kAarch64MovWideOpcodeMask) != kAarch64MovzXOpcode) {
         return false;
     }
@@ -3194,14 +3339,14 @@ bool DecodeBackendBRelocatablePointer(const std::span<const std::uint8_t> bytes,
     return true;
 }
 
-bool PatchBackendBRelocatablePointer(const std::span<std::uint8_t> bytes,
+bool PatchJitRelocatablePointer(const std::span<std::uint8_t> bytes,
                                      const std::size_t offset,
                                      const std::uint8_t register_index,
                                      const std::uint64_t value) noexcept {
     std::uint8_t observed_register = 0;
     std::uint64_t ignored_value = 0;
     if (register_index >= 31 ||
-        !DecodeBackendBRelocatablePointer(
+        !DecodeJitRelocatablePointer(
             std::span<const std::uint8_t>{bytes.data(), bytes.size()}, offset,
             observed_register, ignored_value) ||
         observed_register != register_index) {
@@ -3219,17 +3364,17 @@ bool PatchBackendBRelocatablePointer(const std::span<std::uint8_t> bytes,
                               register_index;
     }
     std::memcpy(bytes.data() + offset, instructions.data(),
-                kBackendBNativePointerPatchBytes);
+                kJitNativePointerPatchBytes);
     return true;
 }
 
-std::uint64_t BackendBModuleBaseForNativeCache() noexcept {
+std::uint64_t JitModuleBaseForNativeCache() noexcept {
 #ifdef __ANDROID__
     // A shared object's load bias is immutable for its process lifetime. Persistent restore used
     // to call dladdr once per guest block (hundreds of thousands of dynamic-loader walks).
     static const std::uint64_t module_base = []() noexcept {
         Dl_info information{};
-        if (dladdr(reinterpret_cast<const void*>(&BackendBLog), &information) != 0 &&
+        if (dladdr(reinterpret_cast<const void*>(&JitLog), &information) != 0 &&
             information.dli_fbase != nullptr) {
             return reinterpret_cast<std::uint64_t>(information.dli_fbase);
         }
@@ -3240,7 +3385,7 @@ std::uint64_t BackendBModuleBaseForNativeCache() noexcept {
     return 0;
 }
 
-bool BackendBAddressInOwnLoadSegment(const std::uint64_t address,
+bool JitAddressInOwnLoadSegment(const std::uint64_t address,
                                      const std::uint64_t module_base) noexcept {
 #ifdef __ANDROID__
     if (address == 0 || module_base == 0) {
@@ -3256,7 +3401,7 @@ bool BackendBAddressInOwnLoadSegment(const std::uint64_t address,
     // validation to a bounded range check while preserving the same trust boundary.
     static const ModuleSegments own_segments = []() noexcept {
         ModuleSegments segments{};
-        segments.module_base = BackendBModuleBaseForNativeCache();
+        segments.module_base = JitModuleBaseForNativeCache();
         if (segments.module_base == 0) {
             return segments;
         }
@@ -3302,7 +3447,7 @@ bool BackendBAddressInOwnLoadSegment(const std::uint64_t address,
 #endif
 }
 
-bool AddBackendBNativeRelocationAddend(const std::uint64_t base,
+bool AddJitNativeRelocationAddend(const std::uint64_t base,
                                        const std::int64_t addend,
                                        std::uint64_t& result) noexcept {
     if (addend >= 0) {
@@ -3336,7 +3481,7 @@ StableDecodedBlock DecodeStableBlock(const std::uint64_t guest_rip,
         if (decoded->start_rip != guest_rip || decoded->end_rip < decoded->start_rip ||
             decoded->end_rip - decoded->start_rip >
                 std::numeric_limits<std::uint32_t>::max()) {
-            throw std::runtime_error("Backend B decoder returned an inverted guest span");
+            throw std::runtime_error("JIT decoder returned an inverted guest span");
         }
         std::uint64_t decoded_hash = 0;
         if (!HashDecodedBlockBytes(*decoded, decoded_hash)) {
@@ -3350,7 +3495,7 @@ StableDecodedBlock DecodeStableBlock(const std::uint64_t guest_rip,
         }
     }
     std::ostringstream error;
-    error << "Backend B guest block changed repeatedly while decoding rip=0x" << std::hex
+    error << "JIT guest block changed repeatedly while decoding rip=0x" << std::hex
           << guest_rip;
     throw std::runtime_error(error.str());
 }
@@ -3382,10 +3527,10 @@ public:
                                        ChainPatchCell* outgoing_direct_slot,
                                        ChainPatchCell* alternate_direct_slot,
                                        PolymorphicChainSite* inchain_patch_site,
-                                       std::vector<BackendBNativeSegment>& segments,
+                                       std::vector<JitNativeSegment>& segments,
                                        std::uint32_t& entry_segment_index,
                                        std::uint32_t& direct_segment_index) const;
-    bool RestorePersistentNativeBlock(const std::vector<BackendBNativeSegment>& segments,
+    bool RestorePersistentNativeBlock(const std::vector<JitNativeSegment>& segments,
                                       std::uint32_t entry_segment_index,
                                        std::uint32_t direct_segment_index,
                                        const LsxDecodedRegion& block,
@@ -3436,7 +3581,7 @@ class LsxTranslationEngine final {
 public:
     LsxTranslationEngine()
         : execution_cache_identity_(
-              g_backendb_execution_cache_identity.fetch_add(1, std::memory_order_relaxed)) {
+              g_jit_execution_cache_identity.fetch_add(1, std::memory_order_relaxed)) {
         // AAA executables currently discover roughly 330k unique blocks before gameplay.
         // Pre-sizing above that production class removes repeated synchronous rehash walks from
         // the cache-miss/compile critical section. This reserves only bucket arrays; nodes and IR
@@ -3452,7 +3597,7 @@ public:
     }
 
     const char* Name() const {
-        return "backend-b-aarch64-jit-reconstruction";
+        return "jit-aarch64-jit-reconstruction";
     }
 
     bool IsExecutable() const {
@@ -3497,9 +3642,9 @@ public:
         // dynamic TLS descriptor resolutions out of that path while keeping the signal bridge on
         // the exact same thread-local storage and preserving nested resume-frame chaining.
         auto** const synchronous_fault_resume_frame_slot =
-            &g_backend_b_fault_resume_frame;
+            &g_jit_fault_resume_frame;
         auto* const deferred_guest_fault_slot =
-            &g_backend_b_deferred_guest_fault;
+            &g_jit_deferred_guest_fault;
 #endif
         auto* previous_state = SwapDiagnosticMachineImage(&state);
         const LsxDecodedRegion* previous_active_block = *active_block_slot;
@@ -3535,7 +3680,7 @@ public:
             ctx.segment_base != 0 ? kMaxMappedEntryBlocks : kMaxHelperBlocks;
         // RunMainEntry passes ProgramExitFunc in RSI.  It is a synthetic x86 stub owned by the
         // host runner (`mov eax, guest-exit-syscall; syscall; int3`), not guest program code.
-        // FEX/Box64 intercepts that syscall before translation; Backend B must terminate at the
+        // FEX/Box64 intercepts that syscall before translation; JIT must terminate at the
         // same boundary instead of trying to JIT the host-owned stub and reporting -70.  The
         // stack_args_enabled==2 shape is unique to the process-entry contract, so ordinary guest
         // calls whose second argument happens to equal an executable address are unaffected.
@@ -3544,6 +3689,12 @@ public:
                 ? ctx.args[1]
                 : 0;
         std::uint64_t executed_blocks = 0;
+        std::uint64_t prior_dispatch_rip = 0;
+        std::uint64_t prior_dispatch_result = 0;
+        std::uint64_t prior_dispatch_state_rip = 0;
+        std::uint64_t prior_dispatch_next_rip = 0;
+        std::uint32_t prior_dispatch_size = 0;
+        const LsxDecodedRegion* prior_dispatch_block = nullptr;
         for (; max_executed_blocks == 0 || executed_blocks < max_executed_blocks;
              ++executed_blocks) {
             if (process_exit_rip != 0 && rip == process_exit_rip) {
@@ -3554,9 +3705,19 @@ public:
             // Imported HLE stubs are synthetic executor code, not guest program code. Native
             // control-flow blocks can legitimately land on the thunk entry after a PLT tail jump;
             // handle that boundary before decoding the generated x86 sideband thunk body.
-            if (TryExecuteBackendBDirectHleTail(state, rip)) {
+            if (TryExecuteJitDirectHleTail(state, rip)) {
                 result = state.rip_or_exit;
                 rip = state.rip_or_exit;
+                // A mapped root is allowed to end in a tail-call to an imported HLE function.
+                // TryExecuteJitDirectHleTail translates its null synthetic return to the
+                // dispatcher's private sentinel; consume it here rather than continuing directly
+                // into executable lookup with RIP=-2.
+                if (rip == kGuestExitSentinel || IsGuestExitRequested()) {
+                    result = IsGuestExitRequested() ? GetGuestExitResult()
+                                                    : GetGpr64(state, LsxGpr::Rax);
+                    cleanup();
+                    return result;
+                }
                 if (rip == 0) {
                     result = GetGpr64(state, LsxGpr::Rax);
                     cleanup();
@@ -3568,13 +3729,13 @@ public:
             const TranslationRecord& block = execution.block;
             const LsxDecodedRegion* decoded_block = execution.decoded;
             if (block.entry == nullptr) {
-                RecordBackendBThreadSnapshot("decode_fail", executed_blocks, rip, 0, block.flags,
+                RecordJitThreadSnapshot("decode_fail", executed_blocks, rip, 0, block.flags,
                                              state);
                 const std::uint64_t rsp = GetGpr64(state, LsxGpr::Rsp);
                 const std::uint64_t rbp = GetGpr64(state, LsxGpr::Rbp);
                 const std::uint64_t rdi = GetGpr64(state, LsxGpr::Rdi);
                 std::ostringstream error;
-                error << "Backend B unsupported or unpublished block rip=0x" << std::hex << rip
+                error << "JIT unsupported or unpublished block rip=0x" << std::hex << rip
                       << " flags=0x" << block.flags << " size=0x" << block.guest_size
                       << " rax=0x" << GetGpr64(state, LsxGpr::Rax)
                       << " rbx=0x" << GetGpr64(state, LsxGpr::Rbx)
@@ -3601,6 +3762,11 @@ public:
             *active_block_rip_slot = rip;
             *active_block_slot = decoded_block;
             helper_fault_message_slot->clear();
+            // One sample per 4096 dispatcher returns keeps diagnostic cost negligible while
+            // exposing legal guest busy-loops that neither throw nor block in an HLE wait.
+            if ((executed_blocks & 0xfffu) == 0) {
+                SampleJitGuestRip(rip);
+            }
             // Native and helper entries both observe the exact guest block RIP.
             // This is also the source of truth used to build the guest ucontext
             // when a synchronous host fault is raised inside emitted code.
@@ -3610,7 +3776,7 @@ public:
                 // register-only. Keep one recovery frame around every dispatched chain so all
                 // linked memory accesses retain exact guest-fault delivery without forcing every
                 // basic block back through this C++ loop.
-                BackendBDeferredGuestFault deferred_fault{};
+                JitDeferredGuestFault deferred_fault{};
                 const bool synchronous_fault_resumed = ExecuteHostBlockWithSynchronousFaultResume(
                     block.entry, &state, result, &deferred_fault
 #if defined(__ANDROID__) && defined(__aarch64__)
@@ -3621,7 +3787,7 @@ public:
                 if (synchronous_fault_resumed) {
                     if (deferred_fault.valid == 0 || deferred_fault.guest_rip == 0) {
                         throw std::runtime_error(
-                            "Backend B synchronous guest fault resumed without an exact deferred "
+                            "JIT synchronous guest fault resumed without an exact deferred "
                             "fault payload");
                     }
                     // Resume the architectural fault at the exact IR instruction published before
@@ -3657,8 +3823,8 @@ public:
                             GetGpr64(fault_state, LsxGpr::Rsp);
                         const std::uint64_t fault_rbp =
                             GetGpr64(fault_state, LsxGpr::Rbp);
-                        BackendBLog(
-                            "[EXECUTOR_BACKEND_B_FAULT_CONTEXT] rip=0x%llx fault=0x%llx "
+                        JitLog(
+                            "[EXECUTOR_JIT_FAULT_CONTEXT] rip=0x%llx fault=0x%llx "
                             "rflags=0x%llx rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
                             "rsi=0x%llx rdi=0x%llx rsp=0x%llx rbp=0x%llx",
                             static_cast<unsigned long long>(deferred_fault.guest_rip),
@@ -3672,8 +3838,8 @@ public:
                             static_cast<unsigned long long>(GetGpr64(fault_state, LsxGpr::Rdi)),
                             static_cast<unsigned long long>(fault_rsp),
                             static_cast<unsigned long long>(fault_rbp));
-                        BackendBLog(
-                            "[EXECUTOR_BACKEND_B_FAULT_CONTEXT] r8=0x%llx r9=0x%llx "
+                        JitLog(
+                            "[EXECUTOR_JIT_FAULT_CONTEXT] r8=0x%llx r9=0x%llx "
                             "r10=0x%llx r11=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx "
                             "r15=0x%llx fs=0x%llx gs=0x%llx",
                             static_cast<unsigned long long>(GetGpr64(fault_state, LsxGpr::R8)),
@@ -3690,8 +3856,8 @@ public:
                             for (std::int64_t offset = -0x40; offset <= 0x40; offset += 0x20) {
                                 const std::uint64_t address = static_cast<std::uint64_t>(
                                     static_cast<std::int64_t>(fault_rbp) + offset);
-                                BackendBLog(
-                                    "[EXECUTOR_BACKEND_B_FAULT_FRAME] rbp%+lld=0x%llx "
+                                JitLog(
+                                    "[EXECUTOR_JIT_FAULT_FRAME] rbp%+lld=0x%llx "
                                     "q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx",
                                     static_cast<long long>(offset),
                                     static_cast<unsigned long long>(address),
@@ -3703,8 +3869,8 @@ public:
                         }
                         for (std::uint64_t offset = 0; offset < 0x80; offset += 0x20) {
                             const std::uint64_t address = fault_rsp + offset;
-                            BackendBLog(
-                                "[EXECUTOR_BACKEND_B_FAULT_STACK] rsp+0x%llx=0x%llx "
+                            JitLog(
+                                "[EXECUTOR_JIT_FAULT_STACK] rsp+0x%llx=0x%llx "
                                 "q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx",
                                 static_cast<unsigned long long>(offset),
                                 static_cast<unsigned long long>(address),
@@ -3714,7 +3880,7 @@ public:
                                 static_cast<unsigned long long>(TraceQwordOrZero(address + 24)));
                         }
                         std::ostringstream error;
-                        error << "Backend B deferred guest signal handler failed rc=" << dispatch_rc
+                        error << "JIT deferred guest signal handler failed rc=" << dispatch_rc
                               << " nativeSig=" << deferred_fault.native_sig << " fault=0x"
                               << std::hex << deferred_fault.fault_addr << " guestRip=0x"
                               << deferred_fault.guest_rip << " rsp=0x" << fault_rsp
@@ -3725,7 +3891,7 @@ public:
                     }
 #else
                     throw std::runtime_error(
-                        "Backend B deferred guest signal dispatch is unavailable on this host");
+                        "JIT deferred guest signal dispatch is unavailable on this host");
 #endif
                     // Make the handler-selected RIP explicit even when the faulting instruction
                     // is the first instruction of the block.  Leaving result at zero would make
@@ -3736,7 +3902,7 @@ public:
                     const std::uint32_t n =
                         s_fault_resume_budget.fetch_add(1, std::memory_order_relaxed);
                     if (n < 64) {
-                        BackendBLog("[EXECUTOR_BACKEND_B_SYNC_FAULT_RESUME] n=%u "
+                        JitLog("[EXECUTOR_JIT_SYNC_FAULT_RESUME] n=%u "
                                     "faultRip=0x%llx recoveryRip=0x%llx",
                                     n, static_cast<unsigned long long>(rip),
                                     static_cast<unsigned long long>(state.rip_or_exit));
@@ -3746,7 +3912,16 @@ public:
                 std::ostringstream error;
                 error << e.what() << " activeRip=0x" << std::hex << rip
                       << " activeSize=0x" << block.guest_size
-                      << " activeFlags=0x" << block.flags;
+                      << " activeFlags=0x" << block.flags
+                      << " activeBytes=" << HexBytesAt(rip, 16)
+                      << " priorRip=0x" << prior_dispatch_rip
+                      << " priorSize=0x" << prior_dispatch_size
+                      << " priorResult=0x" << prior_dispatch_result
+                      << " priorStateRip=0x" << prior_dispatch_state_rip
+                      << " priorNext=0x" << prior_dispatch_next_rip;
+                AppendDecodedBlockDump(error, decoded_block);
+                error << " prior";
+                AppendDecodedBlockDump(error, prior_dispatch_block);
                 cleanup();
                 throw std::runtime_error(error.str());
             }
@@ -3775,7 +3950,7 @@ public:
                 const std::uint32_t n =
                     s_zero_ret_budget.fetch_add(1, std::memory_order_relaxed);
                 if (n < 64) {
-                    BackendBLog("[EXECUTOR_BACKEND_B_ZERO_RET_EXIT] n=%u rip=0x%llx "
+                    JitLog("[EXECUTOR_JIT_ZERO_RET_EXIT] n=%u rip=0x%llx "
                                 "size=0x%x flags=0x%x rax=0x%llx rsp=0x%llx rbp=0x%llx",
                                 n,
                                 static_cast<unsigned long long>(rip),
@@ -3788,9 +3963,15 @@ public:
                 result = kGuestExitSentinel;
                 state.rip_or_exit = kGuestExitSentinel;
             }
-            if (result == kGuestExitSentinel || IsGuestExitRequested()) {
+            // Native direct-link chains may publish the synthetic mapped-call return through
+            // LsxMachineImage while returning zero from the outer chain entry.  Test both
+            // channels before selecting next_rip; otherwise the private -2 sentinel escapes into
+            // executable-region lookup and a perfectly valid nested callback is reported as an
+            // undecodable guest block at 0xfffffffffffffffe.
+            if (result == kGuestExitSentinel || state.rip_or_exit == kGuestExitSentinel ||
+                IsGuestExitRequested()) {
                 if (ctx.segment_base != 0 && ctx.allow_guest_return_sentinel == 0) {
-                    RecordBackendBThreadSnapshot("exit_choke", executed_blocks, rip, 0, result,
+                    RecordJitThreadSnapshot("exit_choke", executed_blocks, rip, 0, result,
                                                  state);
                     const bool exit_requested = IsGuestExitRequested();
                     const std::string active_bytes = HexBytesAt(rip, 32);
@@ -3800,7 +3981,7 @@ public:
                         AppendDecodedBlockDump(block_dump, decoded_block);
                         static std::atomic<int> s_exit_choke_detail_budget{16};
                         if (s_exit_choke_detail_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
-                            BackendBLog("[EXECUTOR_BACKEND_B_EXIT_CHOKE_BLOCK] blocks=%llu "
+                            JitLog("[EXECUTOR_JIT_EXIT_CHOKE_BLOCK] blocks=%llu "
                                         "rip=0x%llx result=0x%llx exitRequested=%d size=0x%x "
                                         "flags=0x%x bytes=%s %s%s",
                                         static_cast<unsigned long long>(executed_blocks),
@@ -3815,7 +3996,7 @@ public:
                         }
                     }
                     std::ostringstream error;
-                    error << "Backend B mapped entry exit chokepoint rip=0x" << std::hex << rip
+                    error << "JIT mapped entry exit chokepoint rip=0x" << std::hex << rip
                           << " blockResult=0x" << result
                           << " exitRequested=" << (exit_requested ? 1 : 0)
                           << " exitResult=0x" << (exit_requested ? GetGuestExitResult() : 0)
@@ -3845,6 +4026,12 @@ public:
                             : (state_next_rip != 0 && state_next_rip != rip
                                    ? state_next_rip
                                    : implicit_next_rip);
+            prior_dispatch_rip = rip;
+            prior_dispatch_result = result;
+            prior_dispatch_state_rip = state_next_rip;
+            prior_dispatch_next_rip = next_rip;
+            prior_dispatch_size = block.guest_size;
+            prior_dispatch_block = decoded_block;
             rip = next_rip;
             if (rip == 0) {
                 result = GetGpr64(state, LsxGpr::Rax);
@@ -3852,11 +4039,11 @@ public:
                 return result;
             }
         }
-        RecordBackendBThreadSnapshot("exhausted", executed_blocks, rip, 0, result, state);
+        RecordJitThreadSnapshot("exhausted", executed_blocks, rip, 0, result, state);
         cleanup();
         {
             std::ostringstream error;
-            error << "Backend B execute loop exhausted blocks=" << std::dec
+            error << "JIT execute loop exhausted blocks=" << std::dec
                   << executed_blocks << " max=" << max_executed_blocks
                   << " lastRip=0x" << std::hex << rip
                   << " lastResult=0x" << result
@@ -3911,7 +4098,7 @@ public:
                                              std::memory_order_release);
                     slot->guest_size.store(0, std::memory_order_relaxed);
                     slot->guest_hash.store(0, std::memory_order_relaxed);
-                    slot->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+                    slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                                 std::memory_order_relaxed);
                 }
             }
@@ -3950,19 +4137,22 @@ public:
         return;
 #else
         const bool production_native_mode =
-            !BackendBForceHelperEnabled() &&
-            !BackendBLiveCheckedNativeEnabled() &&
+            !JitForceHelperEnabled() &&
+            !JitLiveCheckedNativeEnabled() &&
             std::getenv("EXECUTOR_FORCE_INTERPRET_LO") == nullptr;
         if (!production_native_mode) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM] enabled=0 "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
                         "reason=diagnostic_or_interpreter_mode");
             return;
         }
 
-        // Restore the measured hot working set, not an entire mature title. The full 300k+ sweep
-        // occupied a host core well into gameplay and caused sustained thermal throttling. Records
-        // beyond this bound remain indexed and restore lazily on first guest use.
-        constexpr std::size_t kNativeWarmRecordLimit = 64u * 1024u;
+        // A 64k cap left medium Unity titles restoring another ~100k already-valid native records
+        // serially on Game:Main.  That is observable as a multi-minute animated title/loading
+        // screen even though persistent-cache hit rate is above 97%.  The publisher below is now
+        // parallel, low-priority and bounded in 16k batches, so cover a complete medium working
+        // set while retaining a finite ceiling for mature 300k+ titles.  Records beyond the
+        // ceiling remain indexed and restore lazily on first guest use.
+        constexpr std::size_t kNativeWarmRecordLimit = 192u * 1024u;
         const auto started = std::chrono::steady_clock::now();
         // Loaded records were already structurally validated in parallel. Do not serially hash
         // 300k+ tiny guest spans before the first instruction: the background publisher checks
@@ -3972,13 +4162,13 @@ public:
         std::vector<StableDecodedBlock> warm_set =
             persistent_ir_cache_.TakeNativeWarmSet(kNativeWarmRecordLimit, false);
         if (warm_set.empty()) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM] enabled=1 records=0");
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 records=0");
             return;
         }
 
         const auto extracted_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM_START] requested=%zu "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_START] requested=%zu "
                     "extractMs=%lld mode=background-live-validated",
                     warm_set.size(), static_cast<long long>(extracted_ms));
 
@@ -4008,7 +4198,7 @@ public:
                                          std::stop_token{}, false);
             const auto hot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - hot_started).count();
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM_HOT] requested=%zu "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_HOT] requested=%zu "
                         "elapsedMs=%lld remaining=%zu",
                         kSynchronousHotRecords, static_cast<long long>(hot_ms),
                         background_set.size());
@@ -4063,14 +4253,14 @@ public:
                     const auto elapsed_ms =
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - background_started).count();
-                    BackendBLog(
-                        "[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM_BATCHED_DONE] "
+                    JitLog(
+                        "[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_BATCHED_DONE] "
                         "requested=%zu elapsedMs=%lld stopped=%u",
                         total_records, static_cast<long long>(elapsed_ms),
                         stop_token.stop_requested() ? 1u : 0u);
                 });
         } catch (const std::exception& exception) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM] enabled=0 "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
                         "reason=background_start_failed error=%s",
                         exception.what());
         }
@@ -4088,6 +4278,14 @@ public:
         (void)background;
         return;
 #else
+        struct StableGuestReadScope {
+            StableGuestReadScope() {
+                g_jit_stable_guest_reads = true;
+            }
+            ~StableGuestReadScope() {
+                g_jit_stable_guest_reads = false;
+            }
+        } stable_guest_read_scope;
 
         struct WarmPlan {
             bool eligible = false;
@@ -4118,79 +4316,79 @@ public:
                 continue;
             }
             LsxDecodedRegion& decoded = *stable.block;
-            if (BackendBBlockUsesScalarFloatAddSubMul(decoded) &&
+            if (JitBlockUsesScalarFloatAddSubMul(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagScalarFloatDirectV1) == 0) {
+                 kJitNativeFlagScalarFloatDirectV1) == 0) {
                 // Do not publish an old semantic-thunk body during background prewarm. The
                 // first live lookup will re-emit just this block with direct scalar FP code and
                 // persist the upgraded payload; the other ~350k records remain warm.
                 continue;
             }
-            if (BackendBBlockUsesScalarFloatDirectV2(decoded) &&
+            if (JitBlockUsesScalarFloatDirectV2(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagScalarFloatDirectV2) == 0) {
+                 kJitNativeFlagScalarFloatDirectV2) == 0) {
                 // The cached body still crosses into the per-instruction semantic leaf for a
                 // measured hot scalar/SIMD operation. Rebuild only this block on first use.
                 continue;
             }
-            if (BackendBBlockUsesPackedFloatDirectV3(decoded) &&
+            if (JitBlockUsesPackedFloatDirectV3(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagPackedFloatDirectV3) == 0) {
+                 kJitNativeFlagPackedFloatDirectV3) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesMixedHotDirectV4(decoded) &&
+            if (JitBlockUsesMixedHotDirectV4(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagMixedHotDirectV4) == 0) {
+                 kJitNativeFlagMixedHotDirectV4) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesWideHotDirectV5(decoded) &&
+            if (JitBlockUsesWideHotDirectV5(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagWideHotDirectV5) == 0) {
+                 kJitNativeFlagWideHotDirectV5) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesPostLoadDirectV6(decoded) &&
+            if (JitBlockUsesPostLoadDirectV6(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagPostLoadDirectV6) == 0) {
+                 kJitNativeFlagPostLoadDirectV6) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesPostLoadDirectV7(decoded) &&
+            if (JitBlockUsesPostLoadDirectV7(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagPostLoadDirectV7) == 0) {
+                 kJitNativeFlagPostLoadDirectV7) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesPostLoadDirectV8(decoded) &&
+            if (JitBlockUsesPostLoadDirectV8(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagPostLoadDirectV8) == 0) {
+                 kJitNativeFlagPostLoadDirectV8) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesPostLoadDirectV9(decoded) &&
+            if (JitBlockUsesPostLoadDirectV9(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagPostLoadDirectV9) == 0) {
+                 kJitNativeFlagPostLoadDirectV9) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesDirectFaultSlotV10(decoded) &&
+            if (JitBlockUsesDirectFaultSlotV10(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagDirectFaultSlotV10) == 0) {
+                 kJitNativeFlagDirectFaultSlotV10) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesInlineLseXchgV11(decoded) &&
+            if (JitBlockUsesInlineLseXchgV11(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagInlineLseXchgV11) == 0) {
+                 kJitNativeFlagInlineLseXchgV11) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesDirectLseXchgV12(decoded) &&
+            if (JitBlockUsesDirectLseXchgV12(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagDirectLseXchgV12) == 0) {
+                 kJitNativeFlagDirectLseXchgV12) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesScalarLogicDirectV14(decoded) &&
+            if (JitBlockUsesScalarLogicDirectV14(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagScalarLogicDirectV14) == 0) {
+                 kJitNativeFlagScalarLogicDirectV14) == 0) {
                 continue;
             }
-            if (BackendBBlockUsesVpslldImmDirectV15(decoded) &&
+            if (JitBlockUsesVpslldImmDirectV15(decoded) &&
                 (stable.native_flags &
-                 kBackendBNativeFlagVpslldImmDirectV15) == 0) {
+                 kJitNativeFlagVpslldImmDirectV15) == 0) {
                 continue;
             }
             const LsxDecodedOp& terminator = decoded.instructions.back();
@@ -4199,15 +4397,15 @@ public:
             WarmPlan& plan = plans[index];
             plan.chain_abi =
                 (stable.native_flags &
-                 kBackendBNativeFlagSharedChainAbiV13) != 0;
+                 kJitNativeFlagSharedChainAbiV13) != 0;
             plan.eligible = true;
             plan.guest_rip = decoded.start_rip;
             const bool requires_inchain_patch_site = std::ranges::any_of(
-                stable.native_segments, [](const BackendBNativeSegment& segment) {
+                stable.native_segments, [](const JitNativeSegment& segment) {
                     return std::ranges::any_of(
-                        segment.relocs, [](const BackendBNativeRelocation& relocation) {
+                        segment.relocs, [](const JitNativeRelocation& relocation) {
                             return relocation.kind ==
-                                   BackendBNativeRelocationKind::PolymorphicChainSite;
+                                   JitNativeRelocationKind::PolymorphicChainSite;
                         });
                 });
             if (requires_inchain_patch_site) {
@@ -4223,9 +4421,9 @@ public:
                 TryResolveBranchTarget(terminator, static_target)) {
                 plan.outgoing_rip = static_target;
                 if (mnemonic == X86_MNEMONIC_CALL) {
-                    BackendBLeafHlePltTarget leaf_target{};
-                    if (TryResolveBackendBLeafHlePlt(static_target, leaf_target) &&
-                        (stable.native_flags & kBackendBNativeFlagLeafHleFused) == 0) {
+                    JitLeafHlePltTarget leaf_target{};
+                    if (TryResolveJitLeafHlePlt(static_target, leaf_target) &&
+                        (stable.native_flags & kJitNativeFlagLeafHleFused) == 0) {
                         // This cached body predates the fused HLE lowering and must be re-emitted.
                         plan.eligible = false;
                     }
@@ -4346,7 +4544,7 @@ public:
         }
 
         if (stop_token.stop_requested()) {
-            BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM] enabled=1 "
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 "
                         "requested=%zu stopped=1",
                         warm_set.size());
             return;
@@ -4358,7 +4556,7 @@ public:
         std::uint64_t stale_blocks = 0;
         std::vector<std::uint64_t> duplicate_guest_rips;
         duplicate_guest_rips.reserve(std::min<std::size_t>(warm_set.size(), 4096u));
-        std::vector<BackendBIrCacheRecord> migrated_records;
+        std::vector<JitIrCacheRecord> migrated_records;
         migrated_records.reserve(std::count_if(
             warm_set.begin(), warm_set.end(), [](const StableDecodedBlock& stable) {
                 return stable.needs_identity_migration;
@@ -4402,7 +4600,7 @@ public:
                     }
                     restored_segments += stable.native_segments.size();
                     if (stable.needs_identity_migration) {
-                        BackendBIrCacheRecord migrated{};
+                        JitIrCacheRecord migrated{};
                         migrated.guest_rip = guest_rip;
                         migrated.guest_hash = stable.guest_hash;
                         migrated.block = *stable.block;
@@ -4419,8 +4617,9 @@ public:
                         inchain_patch_site_storage_.push_back(
                             std::move(plan.inchain_patch_site));
                     }
+                    const LsxDecodedRegion* const decoded_ptr = stable.block.get();
                     decoded_blocks_[guest_rip] = std::move(stable.block);
-                    block_results_[guest_rip] = plan.result;
+                    block_results_[guest_rip] = {plan.result, decoded_ptr};
                     plan.published = true;
                     ++restored;
                 }
@@ -4447,7 +4646,7 @@ public:
                                            std::memory_order_relaxed);
                     slot->guest_hash.store(plan.result.guest_hash,
                                            std::memory_order_relaxed);
-                    slot->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+                    slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                                 std::memory_order_relaxed);
                     slot->chain_target.store(
                         plan.chain_abi ? plan.direct : nullptr,
@@ -4463,15 +4662,15 @@ public:
         }
         persistent_ir_cache_.RecordNativeWarmDuplicates(duplicate_guest_rips);
 
-        g_backendb_blocks_decoded.fetch_add(restored, std::memory_order_relaxed);
-        g_backendb_blocks_native.fetch_add(restored, std::memory_order_relaxed);
-        g_backendb_persistent_ir_hits.fetch_add(restored, std::memory_order_relaxed);
-        g_backendb_persistent_native_hits.fetch_add(restored, std::memory_order_relaxed);
-        g_backendb_persistent_native_segments_restored.fetch_add(
+        g_jit_blocks_decoded.fetch_add(restored, std::memory_order_relaxed);
+        g_jit_blocks_native.fetch_add(restored, std::memory_order_relaxed);
+        g_jit_persistent_ir_hits.fetch_add(restored, std::memory_order_relaxed);
+        g_jit_persistent_native_hits.fetch_add(restored, std::memory_order_relaxed);
+        g_jit_persistent_native_segments_restored.fetch_add(
             restored_segments, std::memory_order_relaxed);
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
-        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_PREWARM] enabled=1 "
+        JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 "
                     "requested=%zu restored=%llu duplicate=%llu stale=%llu workers=%u "
                     "segments=%llu elapsedMs=%lld background=%u",
                     warm_set.size(), static_cast<unsigned long long>(restored),
@@ -4495,15 +4694,15 @@ public:
     }
 
     JitExecutionLookup ResolveExecutableRegionCached(const std::uint64_t guest_rip) {
-        auto& cache = g_backendb_thread_execution_cache;
+        auto& cache = g_jit_thread_execution_cache;
         std::uint64_t epoch = execution_cache_epoch_.load(std::memory_order_acquire);
         if (cache.backend_identity != execution_cache_identity_ || cache.epoch != epoch) {
             cache.Reset(execution_cache_identity_, epoch);
         }
 
         const std::size_t bucket_index = static_cast<std::size_t>(
-            (guest_rip * kBackendBExecutionCacheHashMultiplier) >>
-            (64u - kBackendBExecutionCacheBucketBits));
+            (guest_rip * kJitExecutionCacheHashMultiplier) >>
+            (64u - kJitExecutionCacheBucketBits));
         auto& bucket = cache.buckets[bucket_index];
         for (std::size_t way_index = 0; way_index < bucket.ways.size(); ++way_index) {
             auto& way = bucket.ways[way_index];
@@ -4513,7 +4712,7 @@ public:
 
             const std::uint32_t next_counter = way.refresh_counter + 1;
             way.refresh_counter = next_counter;
-            if ((next_counter & kBackendBExecutionCacheRefreshMask) != 0) {
+            if ((next_counter & kJitExecutionCacheRefreshMask) != 0) {
                 return way.Lookup(cache.decoded_sidecar[bucket_index][way_index]);
             }
 
@@ -4569,7 +4768,7 @@ public:
             fill_way_index = fill_bucket.replacement++ & 1u;
         }
         fill_bucket.ways[fill_way_index].Store(
-            guest_rip, execution, kBackendBExecutionCacheRefreshMask);
+            guest_rip, execution, kJitExecutionCacheRefreshMask);
         cache.decoded_sidecar[bucket_index][fill_way_index] = execution.decoded;
         return execution;
     }
@@ -4579,34 +4778,30 @@ public:
         auto result_it = block_results_.find(guest_rip);
         if (result_it != block_results_.end()) {
             const std::uint64_t live_hash =
-                FingerprintCodeSpan(guest_rip, result_it->second.guest_size);
-            if (result_it->second.guest_hash == live_hash) {
-                g_backendb_cache_hash_hits.fetch_add(1, std::memory_order_relaxed);
-                if ((result_it->second.flags & (0x20u | 8u)) == (0x20u | 8u)) {
+                FingerprintCodeSpan(guest_rip, result_it->second.block.guest_size);
+            if (result_it->second.block.guest_hash == live_hash) {
+                g_jit_cache_hash_hits.fetch_add(1, std::memory_order_relaxed);
+                if ((result_it->second.block.flags & (0x20u | 8u)) == (0x20u | 8u)) {
                     // Raw direct entries bypass ExecuteHostBlockWithSynchronousFaultResume.
                     // Heal an explicitly published legacy/in-flight result once. New unsafe
                     // results never set bit 8, so normal flags&0x10 cache hits stay lock-free.
                     RetireChainPatchTarget(guest_rip);
-                    result_it->second.flags &= ~8u;
+                    result_it->second.block.flags &= ~8u;
                 }
-                const auto decoded_it = decoded_blocks_.find(guest_rip);
-                return {
-                    result_it->second,
-                    decoded_it != decoded_blocks_.end() ? decoded_it->second.get() : nullptr,
-                };
+                return {result_it->second.block, result_it->second.decoded};
             }
 
             // The interpreter re-reads guest bytes before reusing a cached block.
             // Retire every RIP-keyed view together so neither the normal cache
             // nor an already-created direct-link slot can execute stale code.
-            const std::uint64_t old_hash = result_it->second.guest_hash;
+            const std::uint64_t old_hash = result_it->second.block.guest_hash;
             execution_cache_epoch_.fetch_add(1, std::memory_order_release);
-            g_backendb_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
+            g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
             RetirePolymorphicChainSite(guest_rip);
-            BackendBLog("[EXECUTOR_BACKEND_B_SMC_INVALIDATE] rip=0x%llx size=0x%x "
+            JitLog("[EXECUTOR_JIT_SMC_INVALIDATE] rip=0x%llx size=0x%x "
                         "oldHash=0x%llx newHash=0x%llx",
                         static_cast<unsigned long long>(guest_rip),
-                        result_it->second.guest_size,
+                        result_it->second.block.guest_size,
                         static_cast<unsigned long long>(old_hash),
                         static_cast<unsigned long long>(live_hash));
             {
@@ -4616,7 +4811,7 @@ public:
                     slot_it != chain_patch_slots_.end() && slot_it->second) {
                     slot_it->second->target.store(nullptr, std::memory_order_release);
                     slot_it->second->refresh_counter.store(
-                        kBackendBExecutionCacheRefreshMask,
+                        kJitExecutionCacheRefreshMask,
                         std::memory_order_relaxed);
                 }
             }
@@ -4634,11 +4829,11 @@ public:
         StableDecodedBlock stable = persistent_ir_cache_.TryLoad(guest_rip);
         const bool decoded_from_persistent_cache = stable.block != nullptr;
         if (!decoded_from_persistent_cache) {
-            stable = DecodeStableBlock(guest_rip, kBackendBMaxInstructionsPerBlock);
+            stable = DecodeStableBlock(guest_rip, kJitMaxInstructionsPerBlock);
         }
         auto decoded = std::move(stable.block);
         const std::uint64_t decoded_count =
-            g_backendb_blocks_decoded.fetch_add(1, std::memory_order_relaxed) + 1;
+            g_jit_blocks_decoded.fetch_add(1, std::memory_order_relaxed) + 1;
         Arm64BlockEntry compiled_entry = nullptr;
         // The interpreter compiler returns a distinct execution entry and direct
         // target. Helper/checked wrappers are not valid direct targets. Keep
@@ -4651,8 +4846,8 @@ public:
         // worker code is normally private to that worker, so its audio/decode blocks can retain
         // interpreter semantics without charging Game:Main a thread-name check on every block.
         // This also prevents persistent-native restoration for the selected block.
-        const bool force_helper = BackendBForceHelperEnabled() ||
-                                  BackendBForceInterpretRip(guest_rip);
+        const bool force_helper = JitForceHelperEnabled() ||
+                                  JitForceInterpretRip(guest_rip);
         ChainPatchCell* outgoing_direct_slot = nullptr;
         ChainPatchCell* alternate_direct_slot = nullptr;
         std::unique_ptr<PolymorphicChainSite> pending_inchain_patch_site;
@@ -4662,90 +4857,90 @@ public:
         bool persistent_native_uses_indirect_pic = false;
         bool leaf_hle_requires_reemit = false;
         const bool scalar_float_direct_candidate =
-            BackendBBlockUsesScalarFloatAddSubMul(*decoded);
+            JitBlockUsesScalarFloatAddSubMul(*decoded);
         const bool scalar_float_direct_requires_reemit =
             scalar_float_direct_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagScalarFloatDirectV1) == 0;
+             kJitNativeFlagScalarFloatDirectV1) == 0;
         const bool scalar_float_direct_v2_candidate =
-            BackendBBlockUsesScalarFloatDirectV2(*decoded);
+            JitBlockUsesScalarFloatDirectV2(*decoded);
         const bool scalar_float_direct_v2_requires_reemit =
             scalar_float_direct_v2_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagScalarFloatDirectV2) == 0;
+             kJitNativeFlagScalarFloatDirectV2) == 0;
         const bool packed_float_direct_v3_candidate =
-            BackendBBlockUsesPackedFloatDirectV3(*decoded);
+            JitBlockUsesPackedFloatDirectV3(*decoded);
         const bool packed_float_direct_v3_requires_reemit =
             packed_float_direct_v3_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagPackedFloatDirectV3) == 0;
+             kJitNativeFlagPackedFloatDirectV3) == 0;
         const bool mixed_hot_direct_v4_candidate =
-            BackendBBlockUsesMixedHotDirectV4(*decoded);
+            JitBlockUsesMixedHotDirectV4(*decoded);
         const bool mixed_hot_direct_v4_requires_reemit =
             mixed_hot_direct_v4_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagMixedHotDirectV4) == 0;
+             kJitNativeFlagMixedHotDirectV4) == 0;
         const bool wide_hot_direct_v5_candidate =
-            BackendBBlockUsesWideHotDirectV5(*decoded);
+            JitBlockUsesWideHotDirectV5(*decoded);
         const bool wide_hot_direct_v5_requires_reemit =
             wide_hot_direct_v5_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagWideHotDirectV5) == 0;
+             kJitNativeFlagWideHotDirectV5) == 0;
         const bool post_load_direct_v6_candidate =
-            BackendBBlockUsesPostLoadDirectV6(*decoded);
+            JitBlockUsesPostLoadDirectV6(*decoded);
         const bool post_load_direct_v6_requires_reemit =
             post_load_direct_v6_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagPostLoadDirectV6) == 0;
+             kJitNativeFlagPostLoadDirectV6) == 0;
         const bool post_load_direct_v7_candidate =
-            BackendBBlockUsesPostLoadDirectV7(*decoded);
+            JitBlockUsesPostLoadDirectV7(*decoded);
         const bool post_load_direct_v7_requires_reemit =
             post_load_direct_v7_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagPostLoadDirectV7) == 0;
+             kJitNativeFlagPostLoadDirectV7) == 0;
         const bool post_load_direct_v8_candidate =
-            BackendBBlockUsesPostLoadDirectV8(*decoded);
+            JitBlockUsesPostLoadDirectV8(*decoded);
         const bool post_load_direct_v8_requires_reemit =
             post_load_direct_v8_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagPostLoadDirectV8) == 0;
+             kJitNativeFlagPostLoadDirectV8) == 0;
         const bool post_load_direct_v9_candidate =
-            BackendBBlockUsesPostLoadDirectV9(*decoded);
+            JitBlockUsesPostLoadDirectV9(*decoded);
         const bool post_load_direct_v9_requires_reemit =
             post_load_direct_v9_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagPostLoadDirectV9) == 0;
+             kJitNativeFlagPostLoadDirectV9) == 0;
         const bool direct_fault_slot_v10_candidate =
-            BackendBBlockUsesDirectFaultSlotV10(*decoded);
+            JitBlockUsesDirectFaultSlotV10(*decoded);
         const bool direct_fault_slot_v10_requires_reemit =
             direct_fault_slot_v10_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagDirectFaultSlotV10) == 0;
+             kJitNativeFlagDirectFaultSlotV10) == 0;
         const bool inline_lse_xchg_v11_candidate =
-            BackendBBlockUsesInlineLseXchgV11(*decoded);
+            JitBlockUsesInlineLseXchgV11(*decoded);
         const bool inline_lse_xchg_v11_requires_reemit =
             inline_lse_xchg_v11_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagInlineLseXchgV11) == 0;
+             kJitNativeFlagInlineLseXchgV11) == 0;
         const bool direct_lse_xchg_v12_candidate =
-            BackendBBlockUsesDirectLseXchgV12(*decoded);
+            JitBlockUsesDirectLseXchgV12(*decoded);
         const bool direct_lse_xchg_v12_requires_reemit =
             direct_lse_xchg_v12_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagDirectLseXchgV12) == 0;
+             kJitNativeFlagDirectLseXchgV12) == 0;
         const bool scalar_logic_direct_v14_candidate =
-            BackendBBlockUsesScalarLogicDirectV14(*decoded);
+            JitBlockUsesScalarLogicDirectV14(*decoded);
         const bool scalar_logic_direct_v14_requires_reemit =
             scalar_logic_direct_v14_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagScalarLogicDirectV14) == 0;
+             kJitNativeFlagScalarLogicDirectV14) == 0;
         const bool vpslld_imm_direct_v15_candidate =
-            BackendBBlockUsesVpslldImmDirectV15(*decoded);
+            JitBlockUsesVpslldImmDirectV15(*decoded);
         const bool vpslld_imm_direct_v15_requires_reemit =
             vpslld_imm_direct_v15_candidate &&
             (stable.native_flags &
-             kBackendBNativeFlagVpslldImmDirectV15) == 0;
-        const bool persistent_native_mode = !BackendBLiveCheckedNativeEnabled();
+             kJitNativeFlagVpslldImmDirectV15) == 0;
+        const bool persistent_native_mode = !JitLiveCheckedNativeEnabled();
         bool restored_persistent_native = false;
         if (decoded->can_jit_initial && !force_helper) {
             if (!decoded->instructions.empty()) {
@@ -4755,16 +4950,16 @@ public:
                 // ordinary function call back through Execute's C++ lookup loop.
                 const LsxDecodedOp& terminator = decoded->instructions.back();
                 const auto mnemonic = static_cast<X86Mnemonic>(terminator.mnemonic);
-                indirect_pic_candidate = !BackendBLiveCheckedNativeEnabled() &&
+                indirect_pic_candidate = !JitLiveCheckedNativeEnabled() &&
                                          IsIndirectPicTerminator(terminator);
                 persistent_native_uses_indirect_pic = stable.HasNativeCode() &&
                     std::ranges::any_of(
-                        stable.native_segments, [](const BackendBNativeSegment& segment) {
+                        stable.native_segments, [](const JitNativeSegment& segment) {
                             return std::ranges::any_of(
                                 segment.relocs,
-                                [](const BackendBNativeRelocation& relocation) {
+                                [](const JitNativeRelocation& relocation) {
                                     return relocation.kind ==
-                                           BackendBNativeRelocationKind::PolymorphicChainSite;
+                                           JitNativeRelocationKind::PolymorphicChainSite;
                                 });
                         });
                 if (indirect_pic_candidate) {
@@ -4779,9 +4974,9 @@ public:
                     TryResolveBranchTarget(terminator, static_target)) {
                     outgoing_direct_slot = AcquireChainPatchCell(static_target);
                     if (mnemonic == X86_MNEMONIC_CALL) {
-                        BackendBLeafHlePltTarget leaf_target{};
+                        JitLeafHlePltTarget leaf_target{};
                         leaf_hle_requires_reemit =
-                            TryResolveBackendBLeafHlePlt(static_target, leaf_target);
+                            TryResolveJitLeafHlePlt(static_target, leaf_target);
                     }
                 } else if (IsConditionalBranchMnemonic(mnemonic) &&
                            TryResolveBranchTarget(terminator, static_target)) {
@@ -4805,7 +5000,7 @@ public:
             if (persistent_native_mode && stable.HasNativeCode() &&
                 (!persistent_native_uses_indirect_pic || indirect_pic_candidate) &&
                 (!leaf_hle_requires_reemit ||
-                 (stable.native_flags & kBackendBNativeFlagLeafHleFused) != 0) &&
+                 (stable.native_flags & kJitNativeFlagLeafHleFused) != 0) &&
                 !scalar_float_direct_requires_reemit &&
                 !scalar_float_direct_v2_requires_reemit &&
                 !packed_float_direct_v3_requires_reemit &&
@@ -4829,26 +5024,26 @@ public:
                 if (restored_persistent_native) {
                     compiled_chain_abi =
                         (stable.native_flags &
-                         kBackendBNativeFlagSharedChainAbiV13) != 0;
+                         kJitNativeFlagSharedChainAbiV13) != 0;
                     if (compiled_chain_abi) {
                         chain_target = direct_target;
                         direct_target = compiled_entry;
                     }
                     indirect_pic_used = persistent_native_uses_indirect_pic;
                     const std::uint64_t hits =
-                        g_backendb_persistent_native_hits.fetch_add(
+                        g_jit_persistent_native_hits.fetch_add(
                             1, std::memory_order_relaxed) + 1;
-                    g_backendb_persistent_native_segments_restored.fetch_add(
+                    g_jit_persistent_native_segments_restored.fetch_add(
                         stable.native_segments.size(), std::memory_order_relaxed);
                     if ((hits & 0xfffull) == 1) {
-                        BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_HIT] hits=%llu "
+                        JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_HIT] hits=%llu "
                                     "rip=0x%llx segments=%zu",
                                     static_cast<unsigned long long>(hits),
                                     static_cast<unsigned long long>(guest_rip),
                                     stable.native_segments.size());
                     }
                 } else {
-                    g_backendb_persistent_native_restore_fallbacks.fetch_add(
+                    g_jit_persistent_native_restore_fallbacks.fetch_add(
                         1, std::memory_order_relaxed);
                 }
             }
@@ -4867,14 +5062,14 @@ public:
                 first_mnemonic == X86_MNEMONIC_CALL ||
                 first_mnemonic == X86_MNEMONIC_RET) {
                 const std::uint32_t n =
-                    g_backendb_control_initial_skip_log_count.fetch_add(
+                    g_jit_control_initial_skip_log_count.fetch_add(
                         1, std::memory_order_relaxed);
                 if (n < 128) {
                     const LsxDecodedOp& first = decoded->instructions.front();
                     const LsxOperandRecord* op =
                         first.operand_count > 0 ? &first.operands[0] : nullptr;
                     const char* mnemonic_name = X86MnemonicGetString(first_mnemonic);
-                    BackendBLog("[EXECUTOR_BACKEND_B_CONTROL_INITIAL_SKIP] n=%u rip=0x%llx "
+                    JitLog("[EXECUTOR_JIT_CONTROL_INITIAL_SKIP] n=%u rip=0x%llx "
                                 "mnemonic=%s blockCanJit=%d firstCanJit=%d category=%u "
                                 "insnCount=%zu decodeFailed=%d operandCount=%u decodedVisible=%u "
                                 "decodedTotal=%u opType=%u opSize=%u bytes=%s diagnostic=%s",
@@ -4903,7 +5098,7 @@ public:
                 // implemented as an opcode/addressing family without a title-specific probe or a
                 // per-execution profiler.  This adds no instructions to the generated helper.
                 const std::uint32_t helper_log_index =
-                    g_backendb_helper_publish_log_count.fetch_add(1, std::memory_order_relaxed);
+                    g_jit_helper_publish_log_count.fetch_add(1, std::memory_order_relaxed);
                 if (helper_log_index < 128) {
                     std::ostringstream sequence;
                     for (std::size_t i = 0; i < decoded->instructions.size(); ++i) {
@@ -4917,7 +5112,7 @@ public:
                                  << "@0x" << std::hex << ir.guest_rip << ':'
                                  << HexBytesAt(ir.guest_rip, ir.length) << std::dec;
                     }
-                    BackendBLog("[EXECUTOR_BACKEND_B_HELPER_PUBLISH] n=%u rip=0x%llx "
+                    JitLog("[EXECUTOR_JIT_HELPER_PUBLISH] n=%u rip=0x%llx "
                                 "insnCount=%zu sequence=%s diagnostic=%s",
                                 helper_log_index,
                                 static_cast<unsigned long long>(decoded->start_rip),
@@ -4931,14 +5126,14 @@ public:
                         first_mnemonic == X86_MNEMONIC_CALL ||
                         first_mnemonic == X86_MNEMONIC_RET) {
                         const std::uint32_t n =
-                            g_backendb_control_helper_publish_log_count.fetch_add(
+                            g_jit_control_helper_publish_log_count.fetch_add(
                                 1, std::memory_order_relaxed);
                         if (n < 128) {
                             const LsxDecodedOp& first = decoded->instructions.front();
                             const LsxOperandRecord* op =
                                 first.operand_count > 0 ? &first.operands[0] : nullptr;
                             const char* mnemonic_name = X86MnemonicGetString(first_mnemonic);
-                            BackendBLog("[EXECUTOR_BACKEND_B_CONTROL_HELPER_PUBLISH] n=%u "
+                            JitLog("[EXECUTOR_JIT_CONTROL_HELPER_PUBLISH] n=%u "
                                         "rip=0x%llx mnemonic=%s blockCanJit=%d firstCanJit=%d "
                                         "canRef=%d category=%u insnCount=%zu operandCount=%u "
                                         "decodedVisible=%u decodedTotal=%u opType=%u opSize=%u "
@@ -4972,16 +5167,16 @@ public:
             }
         }
         if ((decoded_count & 0x3ffull) == 0) {
-            BackendBLog("[EXECUTOR_BACKEND_B_JIT_COVERAGE] decoded=%llu native=%llu helper=%llu "
+            JitLog("[EXECUTOR_JIT_JIT_COVERAGE] decoded=%llu native=%llu helper=%llu "
                         "unsupported=%llu arenaBlocks=%zu lastRip=0x%llx lastNative=%d "
                         "lastCanRef=%d lastInsn=%zu",
                         static_cast<unsigned long long>(decoded_count),
                         static_cast<unsigned long long>(
-                            g_backendb_blocks_native.load(std::memory_order_relaxed)),
+                            g_jit_blocks_native.load(std::memory_order_relaxed)),
                         static_cast<unsigned long long>(
-                            g_backendb_blocks_helper.load(std::memory_order_relaxed)),
+                            g_jit_blocks_helper.load(std::memory_order_relaxed)),
                         static_cast<unsigned long long>(
-                            g_backendb_blocks_unsupported.load(std::memory_order_relaxed)),
+                            g_jit_blocks_unsupported.load(std::memory_order_relaxed)),
                         code_arena_.BlockCount(),
                         static_cast<unsigned long long>(guest_rip),
                         compiled_native ? 1 : 0,
@@ -5003,8 +5198,9 @@ public:
             result.flags |= 0x20u;
         }
         if ((result.flags & 0x20u) != 0) {
-            // HLE marker/UD2 blocks must re-enter the dispatcher. Ordinary memory blocks are safe
-            // direct targets because Execute owns one fault-resume frame for the whole chain.
+            // HLE marker, UD2 and RET blocks must re-enter the dispatcher. Ordinary memory blocks
+            // remain direct targets: every emitted access publishes its exact IR through
+            // state.fault_ir_slot, while Execute owns one sigsetjmp frame for the complete chain.
             direct_target = nullptr;
             RetireChainPatchTarget(guest_rip);
         }
@@ -5014,8 +5210,8 @@ public:
             // The code changed during lowering. The generated host stub may
             // embed the IR pointer, so retain its lifetime but never publish it.
             retired_decoded_blocks_.push_back(std::move(decoded));
-            g_backendb_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
-            BackendBLog("[EXECUTOR_BACKEND_B_SMC_COMPILE_RETRY] rip=0x%llx size=0x%x "
+            g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
+            JitLog("[EXECUTOR_JIT_SMC_COMPILE_RETRY] rip=0x%llx size=0x%x "
                         "decodedHash=0x%llx publishHash=0x%llx",
                         static_cast<unsigned long long>(guest_rip), result.guest_size,
                         static_cast<unsigned long long>(stable.guest_hash),
@@ -5023,9 +5219,9 @@ public:
             lock.unlock();
             return ResolveExecutableRegion(guest_rip);
         }
-        std::vector<BackendBNativeSegment> native_segments_to_remember;
-        std::uint32_t native_entry_segment = kBackendBNativeNoSegment;
-        std::uint32_t native_direct_segment = kBackendBNativeNoSegment;
+        std::vector<JitNativeSegment> native_segments_to_remember;
+        std::uint32_t native_entry_segment = kJitNativeNoSegment;
+        std::uint32_t native_direct_segment = kJitNativeNoSegment;
         const bool should_capture_persistent_native =
             compiled_native && persistent_native_mode && !restored_persistent_native &&
             compiled_entry != nullptr;
@@ -5042,32 +5238,32 @@ public:
                 native_entry_segment, native_direct_segment);
         if (captured_persistent_native) {
             const std::uint64_t captured =
-                g_backendb_persistent_native_records_captured.fetch_add(
+                g_jit_persistent_native_records_captured.fetch_add(
                     1, std::memory_order_relaxed) + 1;
             if ((captured & 0xfffull) == 1) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PERSISTENT_NATIVE_CAPTURE] captured=%llu "
+                JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_CAPTURE] captured=%llu "
                             "rip=0x%llx segments=%zu",
                             static_cast<unsigned long long>(captured),
                             static_cast<unsigned long long>(guest_rip),
                             native_segments_to_remember.size());
             }
         } else if (should_capture_persistent_native) {
-            g_backendb_persistent_native_capture_rejected.fetch_add(
+            g_jit_persistent_native_capture_rejected.fetch_add(
                 1, std::memory_order_relaxed);
         }
         if (!captured_persistent_native) {
             // Capture is transactional. A fail-closed classifier may reject after copying the
             // first segment; never hand that partial payload to the codec as an IR-only record.
             native_segments_to_remember.clear();
-            native_entry_segment = kBackendBNativeNoSegment;
-            native_direct_segment = kBackendBNativeNoSegment;
+            native_entry_segment = kJitNativeNoSegment;
+            native_direct_segment = kJitNativeNoSegment;
         }
         if (compiled_entry == nullptr) {
-            g_backendb_blocks_unsupported.fetch_add(1, std::memory_order_relaxed);
+            g_jit_blocks_unsupported.fetch_add(1, std::memory_order_relaxed);
         } else if (compiled_native) {
-            g_backendb_blocks_native.fetch_add(1, std::memory_order_relaxed);
+            g_jit_blocks_native.fetch_add(1, std::memory_order_relaxed);
         } else {
-            g_backendb_blocks_helper.fetch_add(1, std::memory_order_relaxed);
+            g_jit_blocks_helper.fetch_add(1, std::memory_order_relaxed);
         }
         if (compiled_entry != nullptr) {
             result.flags |= 2u;
@@ -5086,61 +5282,61 @@ public:
                 std::move(pending_inchain_patch_site));
         }
         decoded_blocks_[guest_rip] = std::move(decoded);
-        block_results_[guest_rip] = result;
+        block_results_[guest_rip] = {result, decoded_ptr};
         if (!decoded_from_persistent_cache || captured_persistent_native) {
             persistent_ir_cache_.Remember(
                 *decoded_ptr, result.guest_hash,
                 std::move(native_segments_to_remember), native_entry_segment,
                 native_direct_segment,
                 captured_persistent_native
-                    ? (kBackendBNativeFlagValid |
+                    ? (kJitNativeFlagValid |
                        (leaf_hle_requires_reemit
-                            ? kBackendBNativeFlagLeafHleFused
+                            ? kJitNativeFlagLeafHleFused
                             : 0u) |
                        (scalar_float_direct_candidate
-                            ? kBackendBNativeFlagScalarFloatDirectV1
+                            ? kJitNativeFlagScalarFloatDirectV1
                             : 0u) |
                        (scalar_float_direct_v2_candidate
-                            ? kBackendBNativeFlagScalarFloatDirectV2
+                            ? kJitNativeFlagScalarFloatDirectV2
                             : 0u) |
                        (packed_float_direct_v3_candidate
-                            ? kBackendBNativeFlagPackedFloatDirectV3
+                            ? kJitNativeFlagPackedFloatDirectV3
                             : 0u) |
                        (mixed_hot_direct_v4_candidate
-                            ? kBackendBNativeFlagMixedHotDirectV4
+                            ? kJitNativeFlagMixedHotDirectV4
                             : 0u) |
                        (wide_hot_direct_v5_candidate
-                            ? kBackendBNativeFlagWideHotDirectV5
+                            ? kJitNativeFlagWideHotDirectV5
                             : 0u) |
                        (post_load_direct_v6_candidate
-                            ? kBackendBNativeFlagPostLoadDirectV6
+                            ? kJitNativeFlagPostLoadDirectV6
                             : 0u) |
                        (post_load_direct_v7_candidate
-                            ? kBackendBNativeFlagPostLoadDirectV7
+                            ? kJitNativeFlagPostLoadDirectV7
                             : 0u) |
                        (post_load_direct_v8_candidate
-                            ? kBackendBNativeFlagPostLoadDirectV8
+                            ? kJitNativeFlagPostLoadDirectV8
                             : 0u) |
                         (post_load_direct_v9_candidate
-                             ? kBackendBNativeFlagPostLoadDirectV9
+                             ? kJitNativeFlagPostLoadDirectV9
                              : 0u) |
                         (direct_fault_slot_v10_candidate
-                             ? kBackendBNativeFlagDirectFaultSlotV10
+                             ? kJitNativeFlagDirectFaultSlotV10
                              : 0u) |
                         (inline_lse_xchg_v11_candidate
-                             ? kBackendBNativeFlagInlineLseXchgV11
+                             ? kJitNativeFlagInlineLseXchgV11
                              : 0u) |
                         (direct_lse_xchg_v12_candidate
-                             ? kBackendBNativeFlagDirectLseXchgV12
+                             ? kJitNativeFlagDirectLseXchgV12
                              : 0u) |
                         (compiled_chain_abi
-                             ? kBackendBNativeFlagSharedChainAbiV13
+                             ? kJitNativeFlagSharedChainAbiV13
                              : 0u) |
                         (scalar_logic_direct_v14_candidate
-                             ? kBackendBNativeFlagScalarLogicDirectV14
+                             ? kJitNativeFlagScalarLogicDirectV14
                              : 0u) |
                         (vpslld_imm_direct_v15_candidate
-                             ? kBackendBNativeFlagVpslldImmDirectV15
+                             ? kJitNativeFlagVpslldImmDirectV15
                              : 0u))
                     : 0);
         }
@@ -5163,7 +5359,7 @@ public:
             return nullptr;
         }
 
-        auto& cache = g_backendb_thread_chain_patch_cache;
+        auto& cache = g_jit_thread_chain_patch_cache;
         std::uint64_t slot_map_epoch =
             chain_patch_slot_epoch_.load(std::memory_order_acquire);
         if ((slot_map_epoch & 1u) == 0) {
@@ -5197,7 +5393,7 @@ public:
                                        std::memory_order_relaxed);
                 slot->guest_hash.store(target_it->second.guest_hash,
                                        std::memory_order_relaxed);
-                slot->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+                slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                             std::memory_order_relaxed);
                 slot->chain_target.store(
                     target_it->second.chain_target,
@@ -5231,7 +5427,7 @@ public:
             slot_it->second->chain_target.store(nullptr, std::memory_order_release);
             slot_it->second->guest_size.store(0, std::memory_order_relaxed);
             slot_it->second->guest_hash.store(0, std::memory_order_relaxed);
-            slot_it->second->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+            slot_it->second->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                                    std::memory_order_relaxed);
         }
     }
@@ -5256,7 +5452,7 @@ public:
         }
         slot->guest_size.store(guest_size, std::memory_order_relaxed);
         slot->guest_hash.store(guest_hash, std::memory_order_relaxed);
-        slot->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+        slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                     std::memory_order_relaxed);
         slot->chain_target.store(chain_target, std::memory_order_relaxed);
         slot->target.store(target, std::memory_order_release);
@@ -5278,7 +5474,7 @@ private:
     std::vector<std::unique_ptr<PolymorphicChainSite>> inchain_patch_site_storage_;
     std::unordered_map<std::uint64_t, std::unique_ptr<LsxDecodedRegion>> decoded_blocks_;
     std::vector<std::unique_ptr<LsxDecodedRegion>> retired_decoded_blocks_;
-    std::unordered_map<std::uint64_t, TranslationRecord> block_results_;
+    std::unordered_map<std::uint64_t, CachedTranslationRecord> block_results_;
 #ifdef __ANDROID__
     bool persistent_native_prewarm_pending_ = false;
     std::jthread persistent_native_prewarm_thread_{};
@@ -5288,10 +5484,18 @@ private:
 LsxTranslationEngine g_lsx_translation_engine{};
 thread_local LsxStackReservoir g_lsx_stack_reservoir{};
 thread_local LsxMachineImage* g_current_guest_state = nullptr;
+struct JitLiveThreadState {
+    std::uint32_t host_tid = 0;
+    std::uintptr_t pthread_handle = 0;
+    LsxMachineImage* machine = nullptr;
+};
+std::mutex g_jit_live_thread_mutex;
+std::unordered_map<std::uint32_t, JitLiveThreadState> g_jit_live_threads;
 thread_local std::uint32_t g_lsx_stack_lease_depth = 0;
 thread_local bool g_stack_lease_callback_drop_captured = false;
 thread_local bool g_guest_exit_requested = false;
 thread_local std::uint64_t g_guest_exit_result = 0;
+thread_local bool g_hle_guest_state_override = false;
 std::mutex g_locked_memory_mutex;
 
 ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
@@ -5310,7 +5514,7 @@ ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
         return nullptr;
     }
 
-    g_backendb_indirect_pic_bind_calls.fetch_add(1, std::memory_order_relaxed);
+    g_jit_indirect_pic_bind_calls.fetch_add(1, std::memory_order_relaxed);
     for (std::uint32_t index = 0; index < way_count; ++index) {
         ChainPatchCell* const observed =
             site->ways[index].load(std::memory_order_acquire);
@@ -5354,7 +5558,7 @@ ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
     return resolved;
 }
 
-// The fallback/callback stack is a conservative Boehm root under Backend B. 64 MiB was a forensic
+// The fallback/callback stack is a conservative Boehm root under JIT. 64 MiB was a forensic
 // over-allocation and made every collection scan 8 million qwords; the PS4 pthread/default stacks
 // are 1-2 MiB and nested HLE callbacks use disjoint 0x400-byte gaps, so 8 MiB preserves generous
 // depth while keeping the collector cost bounded.
@@ -5467,12 +5671,12 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
     ChainPatchCell* const outgoing_direct_slot,
     ChainPatchCell* const alternate_direct_slot,
     PolymorphicChainSite* const inchain_patch_site,
-    std::vector<BackendBNativeSegment>& segments,
+    std::vector<JitNativeSegment>& segments,
     std::uint32_t& entry_segment_index,
     std::uint32_t& direct_segment_index) const {
     segments.clear();
-    entry_segment_index = kBackendBNativeNoSegment;
-    direct_segment_index = kBackendBNativeNoSegment;
+    entry_segment_index = kJitNativeNoSegment;
+    direct_segment_index = kJitNativeNoSegment;
     if (entry == nullptr) {
         return false;
     }
@@ -5503,7 +5707,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
         entry_segment_index = 0;
     }
 
-    const std::uint64_t module_base = BackendBModuleBaseForNativeCache();
+    const std::uint64_t module_base = JitModuleBaseForNativeCache();
     if (module_base == 0) {
         return false;
     }
@@ -5521,9 +5725,9 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
         reinterpret_cast<std::uint64_t>(inchain_patch_site);
 
     const auto classify_pointer = [&](const std::uint64_t value,
-                                      BackendBNativeRelocation& relocation) {
+                                      JitNativeRelocation& relocation) {
         if (value == block_address) {
-            relocation.kind = BackendBNativeRelocationKind::IrBlock;
+            relocation.kind = JitNativeRelocationKind::IrBlock;
             relocation.target_index = 0;
             relocation.addend = 0;
             return true;
@@ -5531,7 +5735,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
         if (instruction_base != 0 && value >= instruction_base &&
             value - instruction_base < instruction_bytes) {
             const std::uint64_t delta = value - instruction_base;
-            relocation.kind = BackendBNativeRelocationKind::IrInstruction;
+            relocation.kind = JitNativeRelocationKind::IrInstruction;
             relocation.target_index = static_cast<std::uint32_t>(
                 delta / sizeof(LsxDecodedOp));
             relocation.addend = static_cast<std::int64_t>(
@@ -5539,7 +5743,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
             return true;
         }
         if (inchain_patch_site != nullptr && value == inchain_patch_site_address) {
-            relocation.kind = BackendBNativeRelocationKind::PolymorphicChainSite;
+            relocation.kind = JitNativeRelocationKind::PolymorphicChainSite;
             relocation.target_index = 0;
             relocation.addend = 0;
             return true;
@@ -5552,7 +5756,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
                 reinterpret_cast<std::uint64_t>(direct_slots[index]);
             if (value >= direct_slot_address &&
                 value - direct_slot_address < sizeof(ChainPatchCell)) {
-                relocation.kind = BackendBNativeRelocationKind::ChainPatchCell;
+                relocation.kind = JitNativeRelocationKind::ChainPatchCell;
                 relocation.target_index = static_cast<std::uint32_t>(index);
                 relocation.addend =
                     static_cast<std::int64_t>(value - direct_slot_address);
@@ -5563,40 +5767,40 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
             const std::uint64_t range_base =
                 reinterpret_cast<std::uint64_t>(ranges[index]->base);
             if (value >= range_base && value - range_base < ranges[index]->size) {
-                relocation.kind = BackendBNativeRelocationKind::SegmentAddress;
+                relocation.kind = JitNativeRelocationKind::SegmentAddress;
                 relocation.target_index = static_cast<std::uint32_t>(index);
                 relocation.addend = static_cast<std::int64_t>(value - range_base);
                 return true;
             }
         }
-        if (ClassifyBackendBStableExternal(value, relocation)) {
+        if (ClassifyJitStableExternal(value, relocation)) {
             return true;
         }
         return false;
     };
 
     const auto points_at_process_local_state = [&](const std::uint64_t value) {
-        BackendBNativeRelocation ignored{};
+        JitNativeRelocation ignored{};
         return classify_pointer(value, ignored) ||
-               BackendBAddressInOwnLoadSegment(value, module_base);
+               JitAddressInOwnLoadSegment(value, module_base);
     };
 
     segments.reserve(ranges.size());
     for (const CommittedCodeRange* range : ranges) {
-        BackendBNativeSegment segment{};
+        JitNativeSegment segment{};
         segment.bytes.assign(range->base, range->base + range->size);
         std::vector<bool> relocated_instruction(range->size / 4u, false);
         const std::span<const std::uint8_t> original_bytes{range->base, range->size};
 
         for (std::size_t offset = 0;
-             offset + kBackendBNativePointerPatchBytes <= range->size; offset += 4u) {
+             offset + kJitNativePointerPatchBytes <= range->size; offset += 4u) {
             std::uint8_t register_index = 0;
             std::uint64_t value = 0;
-            if (!DecodeBackendBRelocatablePointer(original_bytes, offset, register_index,
+            if (!DecodeJitRelocatablePointer(original_bytes, offset, register_index,
                                                    value)) {
                 continue;
             }
-            BackendBNativeRelocation relocation{};
+            JitNativeRelocation relocation{};
             relocation.code_offset = static_cast<std::uint32_t>(offset);
             relocation.register_index = register_index;
             if (!classify_pointer(value, relocation)) {
@@ -5605,7 +5809,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
                 // this cache version does not know how to reconstruct.
                 return false;
             }
-            if (!PatchBackendBRelocatablePointer(
+            if (!PatchJitRelocatablePointer(
                     std::span<std::uint8_t>{segment.bytes.data(), segment.bytes.size()},
                     offset, register_index, 0)) {
                 return false;
@@ -5614,12 +5818,12 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
             for (std::size_t index = 0; index < 4; ++index) {
                 relocated_instruction[offset / 4u + index] = true;
             }
-            offset += kBackendBNativePointerPatchBytes - 4u;
+            offset += kJitNativePointerPatchBytes - 4u;
         }
 
         // Fail closed if a legacy variable-width MOVZ/MOVK chain still materializes a pointer
         // into this module, the retained IR, a ChainPatchCell, or another generated segment. This
-        // makes omission of EmitBackendBRelocatablePointer a cache miss rather than stale-ASLR
+        // makes omission of EmitJitRelocatablePointer a cache miss rather than stale-ASLR
         // execution. Ordinary guest immediates and guest virtual addresses do not classify here.
         for (std::size_t offset = 0; offset + 4u <= range->size; offset += 4u) {
             if (relocated_instruction[offset / 4u]) {
@@ -5659,7 +5863,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
 }
 
 bool Aarch64CodeArena::RestorePersistentNativeBlock(
-    const std::vector<BackendBNativeSegment>& segments,
+    const std::vector<JitNativeSegment>& segments,
     const std::uint32_t entry_segment_index,
     const std::uint32_t direct_segment_index, const LsxDecodedRegion& block,
     ChainPatchCell* const outgoing_direct_slot,
@@ -5669,11 +5873,11 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
     entry = nullptr;
     direct = nullptr;
     if (segments.empty() || entry_segment_index >= segments.size() ||
-        (direct_segment_index != kBackendBNativeNoSegment &&
+        (direct_segment_index != kJitNativeNoSegment &&
          direct_segment_index >= segments.size())) {
         return false;
     }
-    const std::uint64_t module_base = BackendBModuleBaseForNativeCache();
+    const std::uint64_t module_base = JitModuleBaseForNativeCache();
     if (module_base == 0) {
         return false;
     }
@@ -5683,15 +5887,15 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
 
     // Validate the complete untrusted record before consuming executable-arena space. Once these
     // checks pass, every relocation target can be resolved without failure after allocation.
-    for (const BackendBNativeSegment& segment : segments) {
+    for (const JitNativeSegment& segment : segments) {
         if (segment.bytes.empty() || (segment.bytes.size() & 3u) != 0) {
             return false;
         }
-        for (const BackendBNativeRelocation& relocation : segment.relocs) {
+        for (const JitNativeRelocation& relocation : segment.relocs) {
             std::uint8_t observed_register = 0;
             std::uint64_t ignored_value = 0;
             if (relocation.register_index >= 31 ||
-                !DecodeBackendBRelocatablePointer(
+                !DecodeJitRelocatablePointer(
                     std::span<const std::uint8_t>{segment.bytes.data(),
                                                   segment.bytes.size()},
                     relocation.code_offset, observed_register, ignored_value) ||
@@ -5699,19 +5903,19 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                 return false;
             }
             switch (relocation.kind) {
-            case BackendBNativeRelocationKind::ModuleRelative:
-            case BackendBNativeRelocationKind::BackendRelative:
+            case JitNativeRelocationKind::ModuleRelative:
+            case JitNativeRelocationKind::BackendRelative:
                 // Legacy whole-module offsets are not safe across relinks. New captures only
                 // serialize logical StableExternal helper ids.
                 return false;
-            case BackendBNativeRelocationKind::IrBlock:
+            case JitNativeRelocationKind::IrBlock:
                 if (relocation.target_index != 0 || relocation.addend < 0 ||
                     static_cast<std::uint64_t>(relocation.addend) >=
                         sizeof(LsxDecodedRegion)) {
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::IrInstruction:
+            case JitNativeRelocationKind::IrInstruction:
                 if (relocation.target_index >= block.instructions.size() ||
                     relocation.addend < 0 ||
                     static_cast<std::uint64_t>(relocation.addend) >=
@@ -5719,7 +5923,7 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::ChainPatchCell:
+            case JitNativeRelocationKind::ChainPatchCell:
                 if (relocation.target_index >= direct_slots.size() ||
                     direct_slots[relocation.target_index] == nullptr ||
                     relocation.addend < 0 ||
@@ -5728,7 +5932,7 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::SegmentAddress:
+            case JitNativeRelocationKind::SegmentAddress:
                 if (relocation.target_index >= segments.size() ||
                     relocation.addend < 0 ||
                     static_cast<std::uint64_t>(relocation.addend) >=
@@ -5736,16 +5940,16 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::StableExternal: {
+            case JitNativeRelocationKind::StableExternal: {
                 std::uint64_t target = 0;
                 if (relocation.addend != 0 ||
-                    !ResolveBackendBStableExternal(relocation.target_index, target) ||
-                    !BackendBAddressInOwnLoadSegment(target, module_base)) {
+                    !ResolveJitStableExternal(relocation.target_index, target) ||
+                    !JitAddressInOwnLoadSegment(target, module_base)) {
                     return false;
                 }
                 break;
             }
-            case BackendBNativeRelocationKind::PolymorphicChainSite:
+            case JitNativeRelocationKind::PolymorphicChainSite:
                 if (inchain_patch_site == nullptr || relocation.target_index != 0 ||
                     relocation.addend != 0) {
                     return false;
@@ -5795,41 +5999,41 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
     }
 
     for (std::size_t segment_index = 0; segment_index < segments.size(); ++segment_index) {
-        const BackendBNativeSegment& segment = segments[segment_index];
+        const JitNativeSegment& segment = segments[segment_index];
         std::span<std::uint8_t> committed_bytes{committed_segments[segment_index],
                                                 segment.bytes.size()};
-        for (const BackendBNativeRelocation& relocation : segment.relocs) {
+        for (const JitNativeRelocation& relocation : segment.relocs) {
             std::uint64_t target = 0;
             switch (relocation.kind) {
-            case BackendBNativeRelocationKind::ModuleRelative:
-            case BackendBNativeRelocationKind::BackendRelative:
+            case JitNativeRelocationKind::ModuleRelative:
+            case JitNativeRelocationKind::BackendRelative:
                 return false;
-            case BackendBNativeRelocationKind::IrBlock:
+            case JitNativeRelocationKind::IrBlock:
                 target = reinterpret_cast<std::uint64_t>(&block);
                 break;
-            case BackendBNativeRelocationKind::IrInstruction:
+            case JitNativeRelocationKind::IrInstruction:
                 target = reinterpret_cast<std::uint64_t>(
                     &block.instructions[relocation.target_index]);
                 break;
-            case BackendBNativeRelocationKind::ChainPatchCell:
+            case JitNativeRelocationKind::ChainPatchCell:
                 target = reinterpret_cast<std::uint64_t>(
                     direct_slots[relocation.target_index]);
                 break;
-            case BackendBNativeRelocationKind::SegmentAddress:
+            case JitNativeRelocationKind::SegmentAddress:
                 target = reinterpret_cast<std::uint64_t>(
                     committed_segments[relocation.target_index]);
                 break;
-            case BackendBNativeRelocationKind::StableExternal:
-                if (!ResolveBackendBStableExternal(relocation.target_index, target)) {
+            case JitNativeRelocationKind::StableExternal:
+                if (!ResolveJitStableExternal(relocation.target_index, target)) {
                     return false;
                 }
                 break;
-            case BackendBNativeRelocationKind::PolymorphicChainSite:
+            case JitNativeRelocationKind::PolymorphicChainSite:
                 target = reinterpret_cast<std::uint64_t>(inchain_patch_site);
                 break;
             }
-            if (!AddBackendBNativeRelocationAddend(target, relocation.addend, target) ||
-                !PatchBackendBRelocatablePointer(committed_bytes,
+            if (!AddJitNativeRelocationAddend(target, relocation.addend, target) ||
+                !PatchJitRelocatablePointer(committed_bytes,
                                                  relocation.code_offset,
                                                  relocation.register_index, target)) {
                 return false;
@@ -5848,7 +6052,7 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
         }
     }
     entry = reinterpret_cast<Arm64BlockEntry>(committed_segments[entry_segment_index]);
-    direct = direct_segment_index == kBackendBNativeNoSegment
+    direct = direct_segment_index == kJitNativeNoSegment
         ? nullptr
         : reinterpret_cast<Arm64BlockEntry>(committed_segments[direct_segment_index]);
     return entry != nullptr;
@@ -5905,7 +6109,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitDistinctExecutionEntry(
         return nullptr;
     }
     auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-    EmitBackendBRelocatablePointer(
+    EmitJitRelocatablePointer(
         *code, code->x16, reinterpret_cast<std::uint64_t>(direct_target));
     code->br(code->x16);
     code->ready();
@@ -5971,7 +6175,7 @@ void RecordHotInterpreterBridge(const LsxDecodedRegion* block) {
     }
 
     const std::uint64_t rip = block->start_rip;
-    for (auto& slot : g_backendb_hot_helper_slots) {
+    for (auto& slot : g_jit_hot_helper_slots) {
         const std::uint64_t slot_rip = slot.rip.load(std::memory_order_acquire);
         if (slot_rip == rip) {
             slot.count.fetch_add(1, std::memory_order_relaxed);
@@ -5979,7 +6183,7 @@ void RecordHotInterpreterBridge(const LsxDecodedRegion* block) {
         }
     }
 
-    for (auto& slot : g_backendb_hot_helper_slots) {
+    for (auto& slot : g_jit_hot_helper_slots) {
         std::uint64_t empty = 0;
         if (slot.rip.compare_exchange_strong(empty, rip, std::memory_order_acq_rel)) {
             slot.insn_count.store(static_cast<std::uint32_t>(block->instructions.size()),
@@ -5998,20 +6202,20 @@ void RecordHotInterpreterBridge(const LsxDecodedRegion* block) {
     }
 }
 
-struct BackendBSemanticTlsBatch {
-    std::array<std::uint32_t, kBackendBSemanticMnemonicCount> scalar{};
-    std::array<std::uint32_t, kBackendBSemanticMnemonicCount> simd{};
+struct JitSemanticTlsBatch {
+    std::array<std::uint32_t, kJitSemanticMnemonicCount> scalar{};
+    std::array<std::uint32_t, kJitSemanticMnemonicCount> simd{};
     std::uint32_t total = 0;
 };
 
-void RecordBackendBSemanticExecution(const LsxDecodedOp& ir, const bool simd) {
-    static const bool enabled = BackendBHotHelperProfileEnabled();
+void RecordJitSemanticExecution(const LsxDecodedOp& ir, const bool simd) {
+    static const bool enabled = JitHotHelperProfileEnabled();
     if (!enabled) {
         return;
     }
 
     const std::size_t mnemonic = static_cast<std::size_t>(ir.mnemonic);
-    if (mnemonic >= kBackendBSemanticMnemonicCount) {
+    if (mnemonic >= kJitSemanticMnemonicCount) {
         return;
     }
 
@@ -6021,27 +6225,27 @@ void RecordBackendBSemanticExecution(const LsxDecodedOp& ir, const bool simd) {
     // being measured.
     constexpr std::uint32_t kLocalBatch = 4096;
     constexpr std::uint64_t kReportInterval = std::uint64_t{1} << 22;
-    thread_local BackendBSemanticTlsBatch batch{};
+    thread_local JitSemanticTlsBatch batch{};
     auto& local = simd ? batch.simd : batch.scalar;
     ++local[mnemonic];
     if (++batch.total < kLocalBatch) {
         return;
     }
 
-    for (std::size_t index = 0; index < kBackendBSemanticMnemonicCount; ++index) {
+    for (std::size_t index = 0; index < kJitSemanticMnemonicCount; ++index) {
         if (batch.scalar[index] != 0) {
-            g_backendb_scalar_semantic_exec[index].fetch_add(
+            g_jit_scalar_semantic_exec[index].fetch_add(
                 batch.scalar[index], std::memory_order_relaxed);
             batch.scalar[index] = 0;
         }
         if (batch.simd[index] != 0) {
-            g_backendb_simd_semantic_exec[index].fetch_add(
+            g_jit_simd_semantic_exec[index].fetch_add(
                 batch.simd[index], std::memory_order_relaxed);
             batch.simd[index] = 0;
         }
     }
     const std::uint64_t previous =
-        g_backendb_semantic_exec_total.fetch_add(batch.total, std::memory_order_relaxed);
+        g_jit_semantic_exec_total.fetch_add(batch.total, std::memory_order_relaxed);
     const std::uint64_t current = previous + batch.total;
     batch.total = 0;
     if (previous / kReportInterval == current / kReportInterval) {
@@ -6056,11 +6260,11 @@ void RecordBackendBSemanticExecution(const LsxDecodedOp& ir, const bool simd) {
     std::vector<HotMnemonic> hot;
     hot.reserve(64);
     std::uint64_t interval_total = 0;
-    for (std::size_t index = 0; index < kBackendBSemanticMnemonicCount; ++index) {
+    for (std::size_t index = 0; index < kJitSemanticMnemonicCount; ++index) {
         const std::uint64_t scalar_count =
-            g_backendb_scalar_semantic_exec[index].exchange(0, std::memory_order_acq_rel);
+            g_jit_scalar_semantic_exec[index].exchange(0, std::memory_order_acq_rel);
         const std::uint64_t simd_count =
-            g_backendb_simd_semantic_exec[index].exchange(0, std::memory_order_acq_rel);
+            g_jit_simd_semantic_exec[index].exchange(0, std::memory_order_acq_rel);
         const std::uint64_t count = scalar_count + simd_count;
         interval_total += count;
         if (count != 0) {
@@ -6083,7 +6287,7 @@ void RecordBackendBSemanticExecution(const LsxDecodedOp& ir, const bool simd) {
         summary << (name != nullptr ? name : "<unknown>")
                 << ":s" << entry.scalar << "/v" << entry.simd;
     }
-    BackendBLog("[EXECUTOR_BACKEND_B_SEMANTIC_HOT] total=%llu interval=%llu "
+    JitLog("[EXECUTOR_JIT_SEMANTIC_HOT] total=%llu interval=%llu "
                 "activeMnemonics=%zu hot=%s",
                 static_cast<unsigned long long>(current),
                 static_cast<unsigned long long>(interval_total), hot.size(),
@@ -6092,35 +6296,35 @@ void RecordBackendBSemanticExecution(const LsxDecodedOp& ir, const bool simd) {
 } // namespace
 
 extern "C" __attribute__((visibility("default"), used)) int
-executor_backend_b_defer_synchronous_guest_fault(
+executor_jit_defer_synchronous_guest_fault(
     const std::int32_t native_sig, const std::int32_t si_code,
     const std::int32_t si_errno, const std::int32_t source_pid,
     const std::uint32_t source_uid, const std::uint64_t fault_addr,
     const std::int32_t is_write) {
 #if defined(__ANDROID__) && defined(__aarch64__)
-    auto* frame = g_backend_b_fault_resume_frame;
+    auto* frame = g_jit_fault_resume_frame;
     if (frame == nullptr || frame->armed == 0 || frame->state == nullptr ||
         frame->state != CurrentMachineImage()) {
         return 0;
     }
 
-    g_backend_b_deferred_guest_fault.valid = 0;
-    g_backend_b_deferred_guest_fault.native_sig = native_sig;
-    g_backend_b_deferred_guest_fault.si_code = si_code;
-    g_backend_b_deferred_guest_fault.si_errno = si_errno;
-    g_backend_b_deferred_guest_fault.source_pid = source_pid;
-    g_backend_b_deferred_guest_fault.source_uid = source_uid;
-    g_backend_b_deferred_guest_fault.fault_addr = fault_addr;
-    g_backend_b_deferred_guest_fault.guest_rip =
+    g_jit_deferred_guest_fault.valid = 0;
+    g_jit_deferred_guest_fault.native_sig = native_sig;
+    g_jit_deferred_guest_fault.si_code = si_code;
+    g_jit_deferred_guest_fault.si_errno = si_errno;
+    g_jit_deferred_guest_fault.source_pid = source_pid;
+    g_jit_deferred_guest_fault.source_uid = source_uid;
+    g_jit_deferred_guest_fault.fault_addr = fault_addr;
+    g_jit_deferred_guest_fault.guest_rip =
         g_current_fault_ir != nullptr ? g_current_fault_ir->guest_rip
                                       : frame->state->rip_or_exit;
-    g_backend_b_deferred_guest_fault.is_write = is_write != 0 ? 1 : 0;
+    g_jit_deferred_guest_fault.is_write = is_write != 0 ? 1 : 0;
 
     // No guest callback, allocator, lock or logger is reachable above this point.  Publish the
     // complete POD with plain scalar stores before disarming the frame and escaping the faulting
     // AArch64 instruction.  valid is the last store observed by the normal Execute path.
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    g_backend_b_deferred_guest_fault.valid = 1;
+    g_jit_deferred_guest_fault.valid = 1;
     std::atomic_signal_fence(std::memory_order_seq_cst);
     frame->armed = 0;
     siglongjmp(frame->environment, 1);
@@ -6129,9 +6333,9 @@ executor_backend_b_defer_synchronous_guest_fault(
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
-executor_backend_b_resume_synchronous_guest_fault() {
+executor_jit_resume_synchronous_guest_fault() {
 #if defined(__ANDROID__) && defined(__aarch64__)
-    auto* frame = g_backend_b_fault_resume_frame;
+    auto* frame = g_jit_fault_resume_frame;
     if (frame == nullptr || frame->armed == 0 || frame->state == nullptr ||
         frame->state != CurrentMachineImage()) {
         return 0;
@@ -6144,9 +6348,9 @@ executor_backend_b_resume_synchronous_guest_fault() {
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
-executor_backend_b_has_synchronous_guest_fault_frame() {
+executor_jit_has_synchronous_guest_fault_frame() {
 #if defined(__ANDROID__) && defined(__aarch64__)
-    const auto* frame = g_backend_b_fault_resume_frame;
+    const auto* frame = g_jit_fault_resume_frame;
     return frame != nullptr && frame->armed != 0 && frame->state != nullptr &&
                    frame->state == CurrentMachineImage()
                ? 1
@@ -6163,7 +6367,7 @@ executor_backend_b_has_synchronous_guest_fault_frame() {
 // allocate, lock, decode, or dereference guest memory and are therefore safe to call from the
 // SIGSEGV/SIGBUS diagnostic path.
 extern "C" __attribute__((visibility("default"), used)) std::uint64_t
-executor_backend_b_current_fault_guest_rip() {
+executor_jit_current_fault_guest_rip() {
     if (g_current_fault_ir != nullptr) {
         return g_current_fault_ir->guest_rip;
     }
@@ -6174,12 +6378,12 @@ executor_backend_b_current_fault_guest_rip() {
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint64_t
-executor_backend_b_current_fault_active_block_rip() {
+executor_jit_current_fault_active_block_rip() {
     return g_active_block_rip;
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint64_t
-executor_backend_b_current_fault_instruction() {
+executor_jit_current_fault_instruction() {
     if (g_current_fault_ir == nullptr) {
         return 0;
     }
@@ -6192,7 +6396,7 @@ executor_backend_b_current_fault_instruction() {
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint32_t
-executor_backend_b_current_fault_instruction_meta() {
+executor_jit_current_fault_instruction_meta() {
     if (g_current_fault_ir == nullptr) {
         return 0;
     }
@@ -6201,14 +6405,14 @@ executor_backend_b_current_fault_instruction_meta() {
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint64_t
-executor_backend_b_current_fault_gpr(const std::uint32_t index) {
+executor_jit_current_fault_gpr(const std::uint32_t index) {
     return g_current_fault_state != nullptr && index < g_current_fault_state->gpr.size()
                ? g_current_fault_state->gpr[index]
                : 0;
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint32_t
-executor_backend_b_current_fault_recent_rips(std::uint64_t* out, const std::uint32_t capacity) {
+executor_jit_current_fault_recent_rips(std::uint64_t* out, const std::uint32_t capacity) {
     if (out == nullptr || capacity == 0) {
         return 0;
     }
@@ -6227,7 +6431,7 @@ executor_backend_b_current_fault_recent_rips(std::uint64_t* out, const std::uint
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint32_t
-executor_backend_b_current_fault_active_block_bytes(std::uint8_t* out,
+executor_jit_current_fault_active_block_bytes(std::uint8_t* out,
                                                      const std::uint32_t capacity) {
     if (out == nullptr || capacity == 0 || g_active_block == nullptr) {
         return 0;
@@ -6247,7 +6451,7 @@ executor_backend_b_current_fault_active_block_bytes(std::uint8_t* out,
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint32_t
-executor_backend_b_current_fault_recent_block(const std::uint32_t newest_index,
+executor_jit_current_fault_recent_block(const std::uint32_t newest_index,
                                               std::uint64_t* rip_out, std::uint8_t* bytes_out,
                                               const std::uint32_t capacity) {
     const std::uint32_t available = std::min<std::uint32_t>(
@@ -6291,7 +6495,7 @@ Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
 
     const std::uint32_t next_counter =
         slot->refresh_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-    if ((next_counter & kBackendBExecutionCacheRefreshMask) != 0) {
+    if ((next_counter & kJitExecutionCacheRefreshMask) != 0) {
         // Retirement publishes nullptr before changing the remaining metadata.
         // Re-read target so a concurrent retire cannot return the stale entry
         // from this no-hash path.
@@ -6320,7 +6524,7 @@ Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
             expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
         if (cleared) {
             slot->chain_target.store(nullptr, std::memory_order_release);
-            slot->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+            slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                         std::memory_order_relaxed);
             if (slot->execution_cache_epoch != nullptr) {
                 // The generated direct consumer falls back to the dispatcher after this store.
@@ -6329,12 +6533,12 @@ Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
                 slot->execution_cache_epoch->fetch_add(1, std::memory_order_release);
             }
         }
-        g_backendb_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
+        g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<std::uint32_t> s_direct_smc_budget{0};
         const std::uint32_t n =
             s_direct_smc_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 64) {
-            BackendBLog("[EXECUTOR_BACKEND_B_DIRECT_SMC_INVALIDATE] n=%u rip=0x%llx "
+            JitLog("[EXECUTOR_JIT_DIRECT_SMC_INVALIDATE] n=%u rip=0x%llx "
                         "size=0x%x expectedHash=0x%llx liveHash=0x%llx",
                         n,
                         static_cast<unsigned long long>(slot->guest_rip),
@@ -6377,18 +6581,18 @@ Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(ChainPatchCell* slot,
                 expected, nullptr, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
             slot->chain_target.store(nullptr, std::memory_order_release);
-            slot->refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+            slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
                                         std::memory_order_relaxed);
             if (slot->execution_cache_epoch != nullptr) {
                 slot->execution_cache_epoch->fetch_add(1, std::memory_order_release);
             }
         }
-        g_backendb_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
+        g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<std::uint32_t> s_direct_safepoint_smc_budget{0};
         const std::uint32_t n =
             s_direct_safepoint_smc_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 64) {
-            BackendBLog("[EXECUTOR_BACKEND_B_DIRECT_SAFEPOINT_SMC_INVALIDATE] n=%u "
+            JitLog("[EXECUTOR_JIT_DIRECT_SAFEPOINT_SMC_INVALIDATE] n=%u "
                         "rip=0x%llx size=0x%x expectedHash=0x%llx liveHash=0x%llx",
                         n,
                         static_cast<unsigned long long>(slot->guest_rip),
@@ -6429,31 +6633,21 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
     }
 
     if (context->disabled.load(std::memory_order_acquire) != 0) {
-        g_backendb_checked_native_fallback.fetch_add(1, std::memory_order_relaxed);
+        g_jit_checked_native_fallback.fetch_add(1, std::memory_order_relaxed);
         return InterpretDecodedRegion(state, context->block);
     }
 
-    if (context->block != nullptr && BackendBForceInterpretRip(context->block->start_rip)) {
-        g_backendb_checked_native_fallback.fetch_add(1, std::memory_order_relaxed);
+    if (context->block != nullptr && JitForceInterpretRip(context->block->start_rip)) {
+        g_jit_checked_native_fallback.fetch_add(1, std::memory_order_relaxed);
         return InterpretDecodedRegion(state, context->block);
     }
 
-    // Scope always-check to RSDK RenderDevice::Init (D) region 0x800201000..0x800204000 so startup
-    // self-test blocks are unaffected (global always-check hangs boot). Forces every D block to be
-    // re-validated vs the semantic interpreter; a NATIVE_CHECK_FAIL here pins a faulty native
-    // handler in D.
-    // Unconditionally (no marker — run-* markers trip a patch-scanner that breaks launch) always
-    // re-validate D-range (RSDK RenderDevice::Init) blocks vs the semantic interpreter. Tiny range,
-    // negligible cost; a NATIVE_CHECK_FAIL here (persisted to backendb-checkfail.txt) pins the
-    // mis-reconstructed native handler in D.
-    // Diagnostic knob (OFF by default; marker deliberately NOT under run-* which trips a launch-
-    // breaking patch-scanner): when present, always re-validate eboot-code blocks vs the interpreter
-    // interpreter to catch a native codegen divergence (persisted to backendb-checkfail.txt).
-    const bool always_check =
-        BackendBDiagAlwaysCheckEnabled() && context->block != nullptr &&
-        context->block->start_rip >= 0x8001e0000ull && context->block->start_rip < 0x801700000ull;
+    // Explicit diagnostic mode validates every translated title block. Keeping the selection
+    // address-free makes this checker useful across executables and avoids silently coupling the
+    // translation contract to one game's layout.
+    const bool always_check = JitDiagAlwaysCheckEnabled();
     if (!always_check && context->trusted.load(std::memory_order_acquire) != 0) {
-        RecordBackendBCheckedNativeHit();
+        RecordJitCheckedNativeHit();
         return context->native(state);
     }
 
@@ -6470,11 +6664,11 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
     if (native_next != interpreter_next ||
         !CheckedNativeStateMatches(native_state, interpreter_state)) {
         context->disabled.store(1, std::memory_order_release);
-        g_backendb_checked_native_fallback.fetch_add(1, std::memory_order_relaxed);
+        g_jit_checked_native_fallback.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<std::uint32_t> s_mismatch_budget{0};
         const std::uint32_t n = s_mismatch_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 64) {
-            BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_CHECK_FAIL] n=%u rip=0x%llx "
+            JitLog("[EXECUTOR_JIT_NATIVE_CHECK_FAIL] n=%u rip=0x%llx "
                         "nativeNext=0x%llx refNext=0x%llx nativeResult=0x%llx "
                         "refResult=0x%llx nativeFlags=0x%llx refFlags=0x%llx",
                         n,
@@ -6488,7 +6682,7 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
             // Persist to a file (survives logcat rotation + app exit on a flaky device) and record
             // exactly WHICH register the native handler mis-computed vs the semantic interpreter.
             std::FILE* cf = std::fopen(
-                "/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt", "a");
+                "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a");
             if (cf != nullptr) {
                 std::fprintf(cf,
                              "rip=0x%llx nNext=0x%llx rNext=0x%llx nRes=0x%llx rRes=0x%llx "
@@ -6507,6 +6701,65 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
                                      static_cast<unsigned long long>(interpreter_state.gpr[i]));
                     }
                 }
+                const auto print_scalar_difference =
+                    [cf](const char* name, const auto native_value,
+                         const auto interpreter_value) {
+                        if (native_value != interpreter_value) {
+                            std::fprintf(
+                                cf, " %s:n=0x%llx,r=0x%llx", name,
+                                static_cast<unsigned long long>(native_value),
+                                static_cast<unsigned long long>(interpreter_value));
+                        }
+                    };
+                print_scalar_difference("fs", native_state.fs_base,
+                                        interpreter_state.fs_base);
+                print_scalar_difference("gs", native_state.gs_base,
+                                        interpreter_state.gs_base);
+                print_scalar_difference("x87cw", native_state.x87_control_word,
+                                        interpreter_state.x87_control_word);
+                print_scalar_difference("x87top", native_state.x87_top,
+                                        interpreter_state.x87_top);
+                print_scalar_difference("x87tag", native_state.x87_tag_word,
+                                        interpreter_state.x87_tag_word);
+                print_scalar_difference("x87status", native_state.x87_status_word,
+                                        interpreter_state.x87_status_word);
+                print_scalar_difference("x87opcode", native_state.x87_last_opcode,
+                                        interpreter_state.x87_last_opcode);
+                print_scalar_difference("x87ip", native_state.x87_instruction_pointer,
+                                        interpreter_state.x87_instruction_pointer);
+                print_scalar_difference("x87dp", native_state.x87_data_pointer,
+                                        interpreter_state.x87_data_pointer);
+                print_scalar_difference("mxcsr", native_state.mxcsr,
+                                        interpreter_state.mxcsr);
+                for (std::size_t i = 0; i < native_state.x87_values.size(); ++i) {
+                    if (native_state.x87_values[i] == interpreter_state.x87_values[i]) {
+                        continue;
+                    }
+                    std::fprintf(cf, " x87[%zu]:n=", i);
+                    for (const std::uint8_t byte : native_state.x87_values[i]) {
+                        std::fprintf(cf, "%02x", static_cast<unsigned int>(byte));
+                    }
+                    std::fprintf(cf, ",r=");
+                    for (const std::uint8_t byte : interpreter_state.x87_values[i]) {
+                        std::fprintf(cf, "%02x", static_cast<unsigned int>(byte));
+                    }
+                }
+                for (std::size_t i = 0; i < native_state.ymm.size(); ++i) {
+                    if (native_state.ymm[i] == interpreter_state.ymm[i]) {
+                        continue;
+                    }
+                    std::fprintf(cf, " ymm[%zu]:n=", i);
+                    for (const std::uint8_t byte : native_state.ymm[i]) {
+                        std::fprintf(cf, "%02x", static_cast<unsigned int>(byte));
+                    }
+                    std::fprintf(cf, ",r=");
+                    for (const std::uint8_t byte : interpreter_state.ymm[i]) {
+                        std::fprintf(cf, "%02x", static_cast<unsigned int>(byte));
+                    }
+                }
+                const std::string block_description =
+                    DescribeBlockForError(context->block);
+                std::fprintf(cf, " block={%s}", block_description.c_str());
                 std::fprintf(cf, "\n");
                 std::fclose(cf);
             }
@@ -6520,18 +6773,18 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
     if (successes >= 16) {
         std::uint32_t expected = 0;
         if (context->trusted.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
-            g_backendb_checked_native_trusted.fetch_add(1, std::memory_order_relaxed);
+            g_jit_checked_native_trusted.fetch_add(1, std::memory_order_relaxed);
             static std::atomic<std::uint32_t> s_trust_budget{0};
             const std::uint32_t n = s_trust_budget.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
-                BackendBLog("[EXECUTOR_BACKEND_B_NATIVE_CHECK_TRUST] n=%u rip=0x%llx successes=%u",
+                JitLog("[EXECUTOR_JIT_NATIVE_CHECK_TRUST] n=%u rip=0x%llx successes=%u",
                             n,
                             static_cast<unsigned long long>(context->block->start_rip),
                             successes);
             }
         }
     }
-    RecordBackendBCheckedNativeHit();
+    RecordJitCheckedNativeHit();
     return native_result;
 }
 
@@ -6555,9 +6808,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitCheckedNativeBlock(const LsxDecodedRegion&
     // may tail-branch straight to the immutable native candidate.  The opt-in eboot always-check
     // mode deliberately retains the old entry so it can continue comparing after trust.  The
     // checked-native threshold and mismatch fallback are otherwise unchanged.
-    const bool diagnostic_always_check =
-        BackendBDiagAlwaysCheckEnabled() && block.start_rip >= 0x8001e0000ull &&
-        block.start_rip < 0x801700000ull;
+    const bool diagnostic_always_check = JitDiagAlwaysCheckEnabled();
     if (!diagnostic_always_check) {
         Xbyak_aarch64::Label slow_path;
         code->add(code->x16, code->x1, offsetof(CheckedNativeBlockContext, disabled));
@@ -6591,7 +6842,7 @@ std::uint64_t ExecuteNativeSimdSemanticInstruction(LsxMachineImage* state,
     if (state == nullptr || ir == nullptr) {
         return kGuestExitSentinel;
     }
-    RecordBackendBSemanticExecution(*ir, true);
+    RecordJitSemanticExecution(*ir, true);
     try {
         state->rip_or_exit = ir->guest_rip;
         if (ir->can_execute_vector) {
@@ -6604,7 +6855,7 @@ std::uint64_t ExecuteNativeSimdSemanticInstruction(LsxMachineImage* state,
         g_helper_fault_message = e.what();
         return kGuestExitSentinel;
     } catch (...) {
-        g_helper_fault_message = "Backend B native SIMD semantic exception";
+        g_helper_fault_message = "JIT native SIMD semantic exception";
         return kGuestExitSentinel;
     }
     return kGuestExitSentinel;
@@ -6617,10 +6868,10 @@ std::uint64_t ExecuteNativeScalarSemanticInstruction(LsxMachineImage* state,
                                                      const LsxDecodedOp* ir) {
     if (state == nullptr || ir == nullptr || ir->terminates_block ||
         ir->can_execute_vector || ir->can_execute_scalar_float ||
-        IsBackendBHleBridgeMarkerInstruction(*ir)) {
+        IsJitHleBridgeMarkerInstruction(*ir)) {
         return kGuestExitSentinel;
     }
-    RecordBackendBSemanticExecution(*ir, false);
+    RecordJitSemanticExecution(*ir, false);
     state->rip_or_exit = ir->guest_rip;
     // Native lowering already installs the mapped entry's fault-state once and carries the exact
     // TLS IR slot address in LsxMachineImage. Publish/restore through that direct pointer instead of
@@ -6689,7 +6940,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     // padding rather than in a shared ChainPatchCell cache line, so threads executing the same
     // guest library code never contend on an atomic increment.
     constexpr std::uint32_t kStateDirectChainBudgetOffset = 0xa8;
-    constexpr std::uint32_t kDirectChainBudget = 4096;
+    constexpr std::uint32_t kDirectChainBudget = 1;
+    // Static direct links retain inline target lookup but enter through the
+    // ordinary block ABI. A fresh host frame per linked block prevents host
+    // frame state from leaking across guest control-flow edges.
+    constexpr bool kUseSharedFrameStaticLinks = false;
     constexpr std::uint32_t kStateFaultIrSlotOffset = 0x340;
     constexpr std::uint32_t kStateRaxOffset = 0x00;
     constexpr std::uint32_t kStateRbxOffset = 0x08;
@@ -6856,7 +7111,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                          mnemonic == X86_MNEMONIC_VSUBSS ||
                          mnemonic == X86_MNEMONIC_VMULSS;
         if (!ir.can_execute_scalar_float ||
-            !IsBackendBScalarFloatAddSubMulMnemonic(mnemonic) ||
+            !IsJitScalarFloatAddSubMulMnemonic(mnemonic) ||
             ir.operand_count != (vex ? 3u : 2u) ||
             !IsXmmOperand(ir.operands[0]) ||
             !IsXmmOperand(ir.operands[vex ? 1u : 0u])) {
@@ -7425,7 +7680,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     };
     const auto is_native_vpslld_imm = [](const LsxDecodedOp& ir) {
         return ir.can_execute_vector &&
-               IsBackendBVpslldImmDirectV15Instruction(ir);
+               IsJitVpslldImmDirectV15Instruction(ir);
     };
     const auto is_native_partial_packed_store = [](const LsxDecodedOp& ir) {
         if (!ir.can_execute_vector || ir.operand_count != 2 ||
@@ -7591,7 +7846,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     };
     const auto is_native_scalar_semantic_instruction = [&](const LsxDecodedOp& ir) {
         return !ir.terminates_block && !is_native_simd_instruction(ir) &&
-               !IsBackendBHleBridgeMarkerInstruction(ir) &&
+               !IsJitHleBridgeMarkerInstruction(ir) &&
                CanInterpretInstruction(ir);
     };
     const auto is_high8_gpr = [](const LsxRegisterCode reg) {
@@ -7692,7 +7947,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         // These service instructions are emitted directly below even when X86 exposes a
         // cache-line memory operand.  Their native lowering is the same architecture-wide
         // contract used by FEX, so never route them back through the scalar C++ thunk.
-        if (IsBackendBPostLoadDirectV8Mnemonic(
+        if (IsJitPostLoadDirectV8Mnemonic(
                 static_cast<X86Mnemonic>(ir.mnemonic))) {
             return false;
         }
@@ -8068,16 +8323,16 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     // it must never be replayed through a checked/interpreter block wrapper.  Lower the marker to
     // one direct native call of the reconstructed bridge semantic.
     if (block.instructions.size() == 1 &&
-        IsBackendBHleBridgeMarkerInstruction(block.instructions.front())) {
+        IsJitHleBridgeMarkerInstruction(block.instructions.front())) {
         const auto marker_rip = block.instructions.front().guest_rip;
         auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
         code->stp(code->x29, code->x30,
                   Xbyak_aarch64::pre_ptr(code->sp, -16));
         code->mov(code->x29, code->sp);
         code->mov(code->x1, marker_rip);
-        EmitBackendBRelocatablePointer(
+        EmitJitRelocatablePointer(
             *code, code->x16,
-            reinterpret_cast<std::uint64_t>(&ExecuteBackendBHleBridgeMarker));
+            reinterpret_cast<std::uint64_t>(&ExecuteJitHleBridgeMarker));
         code->blr(code->x16);
         code->ldp(code->x29, code->x30,
                   Xbyak_aarch64::post_ptr(code->sp, 16));
@@ -8201,7 +8456,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 code->mov(code->x2, rhs);
                 code->mov(code->x3, result);
                 code->mov(code->x4, bits);
-                EmitBackendBRelocatablePointer(
+                EmitJitRelocatablePointer(
                     *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
                 code->blr(code->x16);
             };
@@ -8326,7 +8581,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, code->x10);
             code->mov(code->x3, code->x14);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
 
@@ -8457,7 +8712,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 0x10);
             code->mov(code->x3, code->x13);
             code->mov(code->x4, 8);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
 
@@ -8515,7 +8770,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, code->x12);
             code->mov(code->x3, code->x13);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
 
@@ -8651,7 +8906,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 0x7fff);
             code->mov(code->x3, code->x14);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
 
@@ -8686,7 +8941,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 1);
             code->mov(code->x3, code->x12);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
             code->ldr(code->x9, Xbyak_aarch64::ptr(code->x19, kStateRflagsOffset));
@@ -8802,7 +9057,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 0x141);
             code->mov(code->x3, code->x11);
             code->mov(code->x4, 64);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
             code->ldr(code->x9,
@@ -8936,7 +9191,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x0, code->x19);
             code->mov(code->x1, code->x16);
             code->mov(code->x2, 64);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16,
                 reinterpret_cast<std::uint64_t>(&CommitLogicFlags));
             code->blr(code->x16);
@@ -9067,7 +9322,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 1);
             code->mov(code->x3, code->x11);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitAddFlags));
             code->blr(code->x16);
             code->ldr(code->x9,
@@ -9523,7 +9778,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     }
 
     // Mono's g_str_hash inner loop is on every name-cache lookup and normally re-enters the
-    // Backend-B dispatcher once per byte.  Generic lowering also calls the full IMUL, SUB, INC,
+    // JIT dispatcher once per byte.  Generic lowering also calls the full IMUL, SUB, INC,
     // and TEST flag helpers even though only the final TEST flags survive.  Collapse the exact
     // address-independent basic block into one AArch64 loop:
     //
@@ -9621,7 +9876,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
     // Guest-loop replacements installed by ExecutorInstallMonoLibcStringFastpath.  Fuse the
     // complete leaf semantics so replacing libc does not merely trade an HLE call for one or two
-    // Backend-B dispatcher round trips per byte.  Both entry and loop-target forms are accepted;
+    // JIT dispatcher round trips per byte.  Both entry and loop-target forms are accepted;
     // the latter is needed when a synchronous fault resumes at the first load in the loop.
     static constexpr std::array<std::uint8_t, 8> kMonoStrlenFastEntry = {
         0x31, 0xc0, 0x80, 0x3c, 0x07, 0x00, 0x74, 0x05,
@@ -9868,7 +10123,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
             code->mov(code->x0, code->x9);
             code->mov(code->x1, code->x10);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16,
                 reinterpret_cast<std::uint64_t>(&Core::AeroLib::ExecutorLibcStrcmp));
             code->blr(code->x16);
@@ -9907,7 +10162,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
     // Complete the generic fast-guest-libc contract.  The loader replaces imported strcmp,
     // strncmp, and memcmp with these exact x64 byte loops, but without a whole-loop lowering they
-    // still re-enter Backend B once per compared character.  Match the generated stub bytes (not
+    // still re-enter JIT once per compared character.  Match the generated stub bytes (not
     // a title RIP) and execute each leaf as one native AArch64 loop.  strncmp/memcmp intentionally
     // match at their first memory-reading loop block rather than the preceding TEST RDX,RDX block:
     // this keeps the existing synchronous guest-fault resume guard attached to every fused entry.
@@ -11734,7 +11989,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 0x100);
             code->mov(code->x3, code->x13);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
             code->ldr(code->x9,
@@ -11792,7 +12047,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 0xffff);
             code->mov(code->x3, code->x11);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
             code->ldr(code->x9,
@@ -11996,7 +12251,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->add(code->x3, code->x1, code->x2);
             code->mov(code->x0, code->x19);
             code->mov(code->x4, 64);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitAddFlags));
             code->blr(code->x16);
             emit_return(target);
@@ -12233,7 +12488,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 1);
             code->mov(code->x3, code->x11);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitAddFlags));
             code->blr(code->x16);
             code->ldr(code->x9,
@@ -12334,7 +12589,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->mov(code->x2, 1);
             code->mov(code->x3, code->x13);
             code->mov(code->x4, 32);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16, reinterpret_cast<std::uint64_t>(&CommitSubtractFlags));
             code->blr(code->x16);
             code->ldr(code->x9,
@@ -12618,7 +12873,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 code->mov(code->x17, ir.guest_rip);
                 code->str(code->x17,
                           Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                EmitBackendBRelocatablePointer(
+                EmitJitRelocatablePointer(
                     *code, code->x17, reinterpret_cast<std::uint64_t>(&ir));
                 code->str(code->x17, Xbyak_aarch64::ptr(code->x21));
             };
@@ -12799,7 +13054,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                       Xbyak_aarch64::ptr(code->x19, kStateFaultIrSlotOffset));
             code->cbnz(code->x21, fault_slot_ready);
             code->mov(code->x0, code->x19);
-            EmitBackendBRelocatablePointer(
+            EmitJitRelocatablePointer(
                 *code, code->x16,
                 reinterpret_cast<std::uint64_t>(
                     &PrepareGenericNativeMemoryFaultContext));
@@ -13602,11 +13857,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 const std::uint64_t fallthrough = generic_has_branch_terminator
                     ? terminator.guest_rip + terminator.length
                     : block.end_rip;
-                BackendBLeafHlePltTarget generic_leaf_hle_target{};
+                JitLeafHlePltTarget generic_leaf_hle_target{};
                 const bool generic_has_leaf_hle_call =
                     generic_has_call_terminator &&
                     !generic_has_dynamic_control_terminator &&
-                    TryResolveBackendBLeafHlePlt(branch_target,
+                    TryResolveJitLeafHlePlt(branch_target,
                                                  generic_leaf_hle_target);
                 // Keep the three most reused guest GPRs in caller-saved host registers for the
                 // lifetime of a straight scalar block. The generic emitter otherwise reloads and
@@ -13628,7 +13883,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     !generic_has_dynamic_control_terminator &&
                     !generic_has_call_terminator && !generic_has_ret_terminator &&
                     !generic_has_counted_terminator &&
-                    !BackendBLiveCheckedNativeEnabled();
+                    !JitLiveCheckedNativeEnabled();
                 std::array<std::uint32_t, 16> generic_gpr_access_count{};
                 std::array<bool, 16> generic_gpr_written{};
                 const auto account_cached_gpr = [&](const LsxRegisterCode reg,
@@ -13778,7 +14033,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     !generic_has_dynamic_control_terminator &&
                     !generic_has_call_terminator && !generic_has_ret_terminator &&
                     !generic_has_counted_terminator &&
-                    !BackendBLiveCheckedNativeEnabled();
+                    !JitLiveCheckedNativeEnabled();
                 const auto is_vector_cache_pair_instruction =
                     [&](const LsxDecodedOp& candidate) {
                     const auto mnemonic =
@@ -14031,7 +14286,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 // block boundary.  The chain-wide Execute fault frame already spans those blocks;
                 // use a uniform 48-byte host frame so x21/x22 are also preserved when a chain
                 // crosses between a memory and a register-only block.
-                const bool generic_chain_abi = !BackendBLiveCheckedNativeEnabled();
+                const bool generic_chain_abi = !JitLiveCheckedNativeEnabled();
                 // Direct flag code and instruction-local semantic leaves expand substantially
                 // on a 20-32 instruction block. Grow only those blocks instead of throwing
                 // Xbyak's "code is too big" at runtime; small blocks keep the 8 KiB footprint.
@@ -14206,17 +14461,17 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                alternate_direct_slot->guest_rip == target) {
                         edge_slot = alternate_direct_slot;
                     }
-                    if (BackendBLiveCheckedNativeEnabled() || edge_slot == nullptr) {
+                    if (JitLiveCheckedNativeEnabled() || edge_slot == nullptr) {
                         return false;
                     }
                     Xbyak_aarch64::Label budget_ready;
                     Xbyak_aarch64::Label validate;
                     Xbyak_aarch64::Label chain;
                     Xbyak_aarch64::Label fallback;
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x9,
                         reinterpret_cast<std::uint64_t>(
-                            generic_chain_abi
+                            generic_chain_abi && kUseSharedFrameStaticLinks
                                 ? &edge_slot->chain_target
                                 : &edge_slot->target));
                     code->ldar(code->x16, Xbyak_aarch64::ptr(code->x9));
@@ -14249,23 +14504,25 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // entering the safepoint callback, then restore both caches because all are
                     // intentionally caller-saved under the host ABI.
                     emit_flush_register_caches();
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x0,
                         reinterpret_cast<std::uint64_t>(edge_slot));
                     code->mov(code->x1, code->x16);
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x17,
                         reinterpret_cast<std::uint64_t>(
-                            generic_chain_abi
+                            generic_chain_abi && kUseSharedFrameStaticLinks
                                 ? &ValidateObservedDirectChainTargetAtSafepoint
                                 : &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
                     emit_reload_register_caches();
                     code->mov(code->x16, code->x0);
                     code->cbz(code->x16, fallback);
-                    // The hash-validation cadence doubles as a chain safepoint. Return the exact
-                    // guest target after validating it so signals, exit requests and cache epoch
-                    // changes are observed even in a finite direct-link cycle.
+                    // Validation is also the finite-chain scheduling boundary. Returning through
+                    // Execute here is not optional: it lets the dispatcher service HLE/signal and
+                    // runtime admission work before starting a fresh chain. Treating zero as both
+                    // "uninitialized" and "continue" silently restarted the budget on every edge
+                    // and turned the supposedly bounded chain into an unbounded one.
                     code->b(fallback);
                     code->L(chain);
                     // Raw generated targets use the Arm64BlockEntry ABI (x0 = LsxMachineImage*).
@@ -14276,7 +14533,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->mov(code->x9, target);
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                    if (generic_chain_abi) {
+                    if (generic_chain_abi && kUseSharedFrameStaticLinks) {
                         // The destination chain entry shares this root frame. Publish the
                         // block-local cache but keep x19/x20 and FP/LR live until a later
                         // dispatcher/special boundary owns the single restore.
@@ -14290,13 +14547,13 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     return true;
                 };
                 const auto emit_epilogue_inchain_patch = [&](const XReg& target) {
-                    if (BackendBLiveCheckedNativeEnabled() || inchain_patch_site == nullptr) {
+                    if (JitLiveCheckedNativeEnabled() || inchain_patch_site == nullptr) {
                         return false;
                     }
                     if (indirect_pic_used_out != nullptr) {
                         *indirect_pic_used_out = true;
                     }
-                    g_backendb_indirect_pic_native_blocks.fetch_add(
+                    g_jit_indirect_pic_native_blocks.fetch_add(
                         1, std::memory_order_relaxed);
 
                     Xbyak_aarch64::Label search_way;
@@ -14312,7 +14569,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // every generic native frame. It carries the exact computed guest RIP through
                     // both hit and miss epilogues without writing architectural guest state early.
                     code->mov(code->x20, target);
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x9,
                         reinterpret_cast<std::uint64_t>(inchain_patch_site));
                     code->add(code->x12, code->x9,
@@ -14356,7 +14613,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     emit_flush_register_caches();
                     code->mov(code->x0, code->x9);
                     code->mov(code->x1, code->x20);
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x16,
                         reinterpret_cast<std::uint64_t>(&BindPolymorphicChainSite));
                     code->blr(code->x16);
@@ -14387,7 +14644,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     emit_flush_register_caches();
                     code->mov(code->x0, code->x13);
                     code->mov(code->x1, code->x16);
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x17,
                         reinterpret_cast<std::uint64_t>(
                             &ValidateObservedDirectTargetAtSafepoint));
@@ -14398,7 +14655,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->L(chain);
                     // A source/title retirement and target retirement can race the first acquire
                     // loads. Re-read both publications immediately before the raw tail branch.
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x9,
                         reinterpret_cast<std::uint64_t>(inchain_patch_site));
                     code->add(code->x12, code->x9,
@@ -14539,10 +14796,64 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->mov(code->x9, ir.guest_rip);
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x9, reinterpret_cast<std::uint64_t>(&ir));
                     code->str(code->x9, Xbyak_aarch64::ptr(code->x21));
                 };
+                const auto emit_diagnostic_store_watch =
+                    [&](const LsxDecodedOp& ir, const std::uint32_t size_bytes) {
+                        const auto& watch = JitDiagnosticStoreWatchRange();
+                        if (!watch.Enabled()) {
+                            return;
+                        }
+
+                        Xbyak_aarch64::Label skip;
+                        // Preserve every generic-lowering temporary. This path exists only when a
+                        // data-driven diagnostic range is active; production blocks emit none of it.
+                        code->stp(code->x5, code->x6,
+                                  Xbyak_aarch64::pre_ptr(code->sp, -16));
+                        code->mov(code->x5, watch.lo);
+                        code->cmp(code->x14, code->x5);
+                        code->b(Xbyak_aarch64::LO, skip);
+                        code->mov(code->x6, watch.hi);
+                        code->cmp(code->x14, code->x6);
+                        code->b(Xbyak_aarch64::HS, skip);
+
+                        code->sub(code->sp, code->sp, 80);
+                        code->stp(code->x9, code->x10,
+                                  Xbyak_aarch64::ptr(code->sp, 0));
+                        code->stp(code->x11, code->x12,
+                                  Xbyak_aarch64::ptr(code->sp, 16));
+                        code->stp(code->x13, code->x14,
+                                  Xbyak_aarch64::ptr(code->sp, 32));
+                        code->stp(code->x15, code->x16,
+                                  Xbyak_aarch64::ptr(code->sp, 48));
+                        code->stp(code->x17, code->xzr,
+                                  Xbyak_aarch64::ptr(code->sp, 64));
+                        emit_flush_vector_cache();
+                        code->mov(code->x0, ir.guest_rip);
+                        code->mov(code->x1, code->x14);
+                        code->mov(code->x2, size_bytes);
+                        EmitJitRelocatablePointer(
+                            *code, code->x16,
+                            reinterpret_cast<std::uint64_t>(&JitReportWatchedStore));
+                        code->blr(code->x16);
+                        code->ldp(code->x9, code->x10,
+                                  Xbyak_aarch64::ptr(code->sp, 0));
+                        code->ldp(code->x11, code->x12,
+                                  Xbyak_aarch64::ptr(code->sp, 16));
+                        code->ldp(code->x13, code->x14,
+                                  Xbyak_aarch64::ptr(code->sp, 32));
+                        code->ldp(code->x15, code->x16,
+                                  Xbyak_aarch64::ptr(code->sp, 48));
+                        code->ldp(code->x17, code->xzr,
+                                  Xbyak_aarch64::ptr(code->sp, 64));
+                        code->add(code->sp, code->sp, 80);
+
+                        code->L(skip);
+                        code->ldp(code->x5, code->x6,
+                                  Xbyak_aarch64::post_ptr(code->sp, 16));
+                    };
                 const auto emit_read_operand = [&](const LsxDecodedOp& ir,
                                                    const LsxOperandRecord& operand,
                                                    const XReg& dst) {
@@ -14638,6 +14949,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         } else {
                             code->str(src, Xbyak_aarch64::ptr(code->x14));
                         }
+                        emit_diagnostic_store_watch(ir, operand.size / 8);
                         return true;
                     }
                     return false;
@@ -14788,6 +15100,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     if (width_bytes == 32) {
                         code->str(high, Xbyak_aarch64::ptr(code->x14, 16));
                     }
+                    emit_diagnostic_store_watch(ir, width_bytes);
                     return true;
                 };
                 // Publish x86 CF/PF/AF/ZF/SF/OF directly into LsxMachineImage.  The operands and
@@ -14804,10 +15117,10 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                                           const std::uint32_t size_bits,
                                                           const bool preserve_cf = false,
                                                           const bool post_memory_write = false) {
-                    if (g_backendb_selftest_differential_active) {
-                        ++g_backendb_selftest_scalar_flag_inline_emissions;
+                    if (g_jit_selftest_differential_active) {
+                        ++g_jit_selftest_scalar_flag_inline_emissions;
                         if (post_memory_write) {
-                            ++g_backendb_selftest_scalar_flag_post_memory_write_emissions;
+                            ++g_jit_selftest_scalar_flag_post_memory_write_emissions;
                         }
                     }
 
@@ -14885,10 +15198,10 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 };
                 const auto emit_inline_flags_logic = [&](const std::uint32_t size_bits,
                                                          const bool post_memory_write = false) {
-                    if (g_backendb_selftest_differential_active) {
-                        ++g_backendb_selftest_scalar_flag_inline_emissions;
+                    if (g_jit_selftest_differential_active) {
+                        ++g_jit_selftest_scalar_flag_inline_emissions;
                         if (post_memory_write) {
-                            ++g_backendb_selftest_scalar_flag_post_memory_write_emissions;
+                            ++g_jit_selftest_scalar_flag_post_memory_write_emissions;
                         }
                     }
 
@@ -14930,7 +15243,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 const auto emit_inline_count_flags = [&]() {
                     // x11 is the masked source and x12 is the count result. LZCNT/TZCNT define
                     // CF from a zero source and ZF from a zero result; PF/AF/SF/OF are cleared by
-                    // the established Backend-B interpreter contract.
+                    // the established JIT interpreter contract.
                     code->cmp(code->x11, 0);
                     code->cset(code->x13, Xbyak_aarch64::EQ);
                     code->cmp(code->x12, 0);
@@ -15073,7 +15386,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                                 kStateFaultIrSlotOffset));
                     code->cbnz(code->x21, fault_slot_ready);
                     code->mov(code->x0, code->x19);
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x16,
                         reinterpret_cast<std::uint64_t>(
                             &PrepareGenericNativeMemoryFaultContext));
@@ -15100,9 +15413,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                   Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                     }
                     code->mov(code->x0, code->x19);
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x1, reinterpret_cast<std::uint64_t>(&ir));
-                    EmitBackendBRelocatablePointer(
+                    EmitJitRelocatablePointer(
                         *code, code->x16,
                         reinterpret_cast<std::uint64_t>(
                             &ExecuteNativeScalarSemanticInstruction));
@@ -15196,7 +15509,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x4, src_state_offset);
                             code->mov(code->x5, 0);
                             code->mov(code->x6, ir.operands[0].size);
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     locked_memory ? &CmpxchgLocked : &Cmpxchg));
@@ -15574,7 +15887,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
                         // Match the existing interpreter semantic exactly. It promotes the two
                         // float operands to double, performs the operation, then rounds once to
-                        // float. Keeping that sequence avoids changing established Backend-B
+                        // float. Keeping that sequence avoids changing established JIT
                         // results while removing the C++ call from the hot physics/audio loops.
                         code->fcvt(code->d0, code->s4);
                         code->fcvt(code->d1, code->s2);
@@ -15906,7 +16219,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         };
                         const auto emit_float_lane = [&](const VReg4S& lhs,
                                                          const VReg4S& rhs) {
-                            // The established Backend-B interpreter promotes every float lane to
+                            // The established JIT interpreter promotes every float lane to
                             // double, performs the operation, and narrows once. FCVTL/FCVTN does
                             // the same four lanes without crossing into C++ and preserves the
                             // interpreter's ARM NaN/rounding behaviour byte-for-byte.
@@ -17734,9 +18047,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                       Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                         }
                         code->mov(code->x0, code->x19);
-                        EmitBackendBRelocatablePointer(
+                        EmitJitRelocatablePointer(
                             *code, code->x1, reinterpret_cast<std::uint64_t>(&ir));
-                        EmitBackendBRelocatablePointer(
+                        EmitJitRelocatablePointer(
                             *code, code->x16,
                             reinterpret_cast<std::uint64_t>(
                                 &ExecuteNativeSimdSemanticInstruction));
@@ -17796,7 +18109,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         code->str(code->x12,
                                   Xbyak_aarch64::ptr(code->x19, kStateRdxOffset));
                         if (mnemonic == X86_MNEMONIC_RDTSCP) {
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(&ReadGuestTscAux));
                             code->blr(code->x16);
@@ -17882,7 +18195,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x3, code->x13);
                             code->mov(code->x4, code->x20);
                             code->mov(code->x5, ir.operands[0].size);
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     mnemonic == X86_MNEMONIC_ADC
@@ -18045,13 +18358,13 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                 // Retain the host-image corruption guard and the exact old helper
                                 // as a slow path; other widths keep the helper until their alignment
                                 // and partial-register cases are lowered equivalently.
-                                if (size_bits == 8 && BackendBHostHasLseAtomics()) {
+                                if (size_bits == 8 && JitHostHasLseAtomics()) {
                                     Xbyak_aarch64::Label direct_exchange;
                                     Xbyak_aarch64::Label slow_exchange;
                                     Xbyak_aarch64::Label exchange_done;
                                     std::uint64_t image_lo = 0;
                                     std::uint64_t image_hi = 0;
-                                    if (BackendBOwnHostImageRange(image_lo, image_hi)) {
+                                    if (JitOwnHostImageRange(image_lo, image_hi)) {
                                         code->mov(code->x10, image_lo);
                                         code->cmp(code->x14, code->x10);
                                         code->blo(direct_exchange);
@@ -18078,7 +18391,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                     code->mov(code->x1, code->x14);
                                     code->mov(code->x2, state_offset);
                                     code->mov(code->x3, size_bits);
-                                    EmitBackendBRelocatablePointer(
+                                    EmitJitRelocatablePointer(
                                         *code, code->x16,
                                         reinterpret_cast<std::uint64_t>(
                                             &ExecuteJitXchgMem));
@@ -18089,7 +18402,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                     code->mov(code->x1, code->x14);
                                     code->mov(code->x2, state_offset);
                                     code->mov(code->x3, size_bits);
-                                    EmitBackendBRelocatablePointer(
+                                    EmitJitRelocatablePointer(
                                         *code, code->x16,
                                         reinterpret_cast<std::uint64_t>(
                                             &ExecuteJitXchgMem));
@@ -18145,7 +18458,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                           : 0);
                             code->mov(code->x5, ir.operands[0].size);
                             code->mov(code->x6, static_cast<std::uint64_t>(op));
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(&BitTest));
                             code->blr(code->x16);
@@ -18162,7 +18475,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x2, ir.operands[0].size);
                             code->mov(code->x3,
                                       mnemonic == X86_MNEMONIC_IDIV ? 1 : 0);
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     mnemonic == X86_MNEMONIC_MUL ? &MulOne
@@ -18178,7 +18491,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                 code->mov(code->x1, code->x12);
                                 code->mov(code->x2, ir.operands[0].size);
                                 code->mov(code->x3, 1);
-                                EmitBackendBRelocatablePointer(
+                                EmitJitRelocatablePointer(
                                     *code, code->x16,
                                     reinterpret_cast<std::uint64_t>(&MulOne));
                                 code->blr(code->x16);
@@ -18269,7 +18582,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x2, code->x10);
                             code->mov(code->x3, code->x11);
                             code->mov(code->x4, ir.operands[0].size);
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(&Bextr));
                             code->blr(code->x16);
@@ -18288,7 +18601,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x1, state_offset);
                             code->mov(code->x2, code->x12);
                             code->mov(code->x3, ir.operands[0].size);
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     mnemonic == X86_MNEMONIC_BLSI ? &Blsi
@@ -18415,7 +18728,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         code->mov(code->x2, code->x13);
                         code->mov(code->x3, code->x12);
                         code->mov(code->x4, size_bits);
-                        EmitBackendBRelocatablePointer(
+                        EmitJitRelocatablePointer(
                             *code, code->x16,
                             target_is_memory
                                 ? reinterpret_cast<std::uint64_t>(&ShldMem)
@@ -18550,8 +18863,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             break;
                         }
 
-                        if (g_backendb_selftest_differential_active) {
-                            ++g_backendb_selftest_shift_flag_path_emissions;
+                        if (g_jit_selftest_differential_active) {
+                            ++g_jit_selftest_shift_flag_path_emissions;
                         }
 
                         // Reproduce Shift's deterministic x86 flag contract inline. AF is
@@ -18663,7 +18976,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         code->mov(code->x3,
                                   mnemonic == X86_MNEMONIC_ROR ? 1u : 0u);
                         code->mov(code->x4, size_bits);
-                        EmitBackendBRelocatablePointer(
+                        EmitJitRelocatablePointer(
                             *code, code->x16,
                             target_is_memory
                                 ? reinterpret_cast<std::uint64_t>(&RotateMem)
@@ -18915,10 +19228,10 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x9, terminator.guest_rip);
                             code->str(code->x9,
                                       Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
-                                    &ExecutorBackendBTryLeafHleThunkCallback));
+                                    &ExecutorJitTryLeafHleThunkCallback));
                             code->blr(code->x16);
                             code->cbz(code->x1, dynamic_full_semantic);
                             code->str(code->x0,
@@ -18948,10 +19261,10 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             // tail-HLE return handling, FP ABI results and unknown-high targets
                             // remain byte-identical to the established path.
                             code->mov(code->x0, code->x19);
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x1,
                                 reinterpret_cast<std::uint64_t>(&terminator));
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     &InterpretDecodedInstruction));
@@ -18970,9 +19283,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             // The compiler already resolved and allow-listed this exact immutable
                             // leaf thunk/native pair. Guard the mutable GOT slot against loader
                             // rebinding, then call the AArch64 HLE function directly with the native
-                            // ABI. These leaves cannot throw or enter the managed GC; routing every
-                            // mutex/time/memory call through a C++ bridge, TLS telemetry, GC check
-                            // and two fences made the boundary itself hotter than the leaf.
+                            // ABI. Keep the x86 memory-ordering boundary even on this fused path:
+                            // synchronization leaves publish and consume guest-owned objects, while
+                            // plain AArch64 LDR/STR are weaker than x86 TSO.
                             code->mov(code->x9, generic_leaf_hle_target.got_slot);
                             code->ldr(code->x10, Xbyak_aarch64::ptr(code->x9));
                             code->mov(code->x11,
@@ -18997,10 +19310,12 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->mov(code->x9, terminator.guest_rip);
                             code->str(code->x9,
                                       Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                            EmitBackendBRelocatablePointer(
+                            EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 generic_leaf_hle_target.native_function);
+                            code->dmb(Xbyak_aarch64::ISH);
                             code->blr(code->x16);
+                            code->dmb(Xbyak_aarch64::ISH);
                             code->str(code->x0,
                                       Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
                             if (!emit_epilogue_chain_patch(fallthrough)) {
@@ -19043,16 +19358,20 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 if (emitted) {
                     if (generic_has_conditional_terminator) {
                         code->L(skip);
-                        if (!emit_epilogue_chain_patch(fallthrough)) {
-                            emit_epilogue_return(fallthrough);
-                        }
+                        // Conditional control flow is kept as a dispatcher boundary until the
+                        // linked-list back-edge parity gate covers both memory-derived predicates
+                        // and repeated taken/fallthrough transitions.
+                        emit_epilogue_return(fallthrough);
                         code->L(take);
-                        if (!emit_epilogue_chain_patch(branch_target)) {
-                            emit_epilogue_return(branch_target);
-                        }
+                        emit_epilogue_return(branch_target);
                     } else if (generic_has_jump_terminator ||
                                generic_has_call_terminator) {
-                        if (generic_has_dynamic_control_terminator &&
+                        if (generic_has_call_terminator) {
+                            // Guest CALL establishes a new stack/unwind and HLE admission
+                            // boundary. Publish its architectural target through Execute rather
+                            // than hiding an entire callee inside the caller's raw chain.
+                            emit_epilogue_return_reg(code->x10);
+                        } else if (generic_has_dynamic_control_terminator &&
                             generic_has_jump_terminator &&
                             emit_epilogue_inchain_patch(code->x10)) {
                             // Both the hit and miss paths own a complete terminal epilogue.
@@ -19076,19 +19395,19 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->ready();
                     auto* entry = CommitCode(std::move(code));
                     if (generic_has_leaf_hle_call) {
-                        g_backendb_leaf_hle_fused_blocks.fetch_add(
+                        g_jit_leaf_hle_fused_blocks.fetch_add(
                             1, std::memory_order_relaxed);
                     }
                     if (emitted_simd_fast != 0 || emitted_simd_semantic != 0) {
-                        g_backendb_native_simd_blocks.fetch_add(1, std::memory_order_relaxed);
-                        g_backendb_native_simd_fast_instructions.fetch_add(
+                        g_jit_native_simd_blocks.fetch_add(1, std::memory_order_relaxed);
+                        g_jit_native_simd_fast_instructions.fetch_add(
                             emitted_simd_fast, std::memory_order_relaxed);
-                        g_backendb_native_simd_semantic_instructions.fetch_add(
+                        g_jit_native_simd_semantic_instructions.fetch_add(
                             emitted_simd_semantic, std::memory_order_relaxed);
                         if (generic_has_faultable_memory_access &&
                             generic_vector_writeback_enabled &&
                             generic_vector_cache_written_mask != 0) {
-                            g_backendb_native_simd_faultable_writeback_blocks.fetch_add(
+                            g_jit_native_simd_faultable_writeback_blocks.fetch_add(
                                 1, std::memory_order_relaxed);
                         }
                     }
@@ -19096,21 +19415,21 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         generic_scalar_instruction_count - emitted_simd_fast -
                         emitted_simd_semantic - emitted_scalar_semantic;
                     if (emitted_scalar_direct != 0 || emitted_scalar_semantic != 0) {
-                        g_backendb_native_scalar_blocks.fetch_add(
+                        g_jit_native_scalar_blocks.fetch_add(
                             1, std::memory_order_relaxed);
-                        g_backendb_native_scalar_direct_instructions.fetch_add(
+                        g_jit_native_scalar_direct_instructions.fetch_add(
                             emitted_scalar_direct, std::memory_order_relaxed);
-                        g_backendb_native_scalar_semantic_instructions.fetch_add(
+                        g_jit_native_scalar_semantic_instructions.fetch_add(
                             emitted_scalar_semantic, std::memory_order_relaxed);
                     }
-                    g_backendb_native_scalar_shift_inline_instructions.fetch_add(
+                    g_jit_native_scalar_shift_inline_instructions.fetch_add(
                         emitted_scalar_shift_inline, std::memory_order_relaxed);
-                    g_backendb_native_scalar_imul_inline_instructions.fetch_add(
+                    g_jit_native_scalar_imul_inline_instructions.fetch_add(
                         emitted_scalar_imul_inline, std::memory_order_relaxed);
-                    g_backendb_native_scalar_dead_flag_elisions.fetch_add(
+                    g_jit_native_scalar_dead_flag_elisions.fetch_add(
                         emitted_scalar_dead_flag_elisions, std::memory_order_relaxed);
                     if (generic_has_dynamic_control_terminator) {
-                        g_backendb_native_control_semantic_terminators.fetch_add(
+                        g_jit_native_control_semantic_terminators.fetch_add(
                             1, std::memory_order_relaxed);
                     }
                     // Guest-memory blocks must execute exactly once: even two read-only passes can
@@ -19122,7 +19441,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // native entry immediately, matching the PC/interpreter production contract.
                     const bool use_live_checked_native =
                         !generic_has_faultable_memory_access &&
-                        BackendBLiveCheckedNativeEnabled();
+                        JitLiveCheckedNativeEnabled();
                     if (generic_chain_abi && entry != nullptr) {
                         // The body starts at the shared-frame chain ABI. Emit a tiny ordinary
                         // Arm64BlockEntry wrapper for dispatcher entry; its single frame remains live
@@ -19144,7 +19463,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                                normal_entry_code->sp);
                         normal_entry_code->mov(normal_entry_code->x19,
                                                normal_entry_code->x0);
-                        EmitBackendBRelocatablePointer(
+                        EmitJitRelocatablePointer(
                             *normal_entry_code, normal_entry_code->x16,
                             reinterpret_cast<std::uint64_t>(entry));
                         normal_entry_code->br(normal_entry_code->x16);
@@ -19177,14 +19496,14 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 first_mnemonic == X86_MNEMONIC_CALL ||
                 first_mnemonic == X86_MNEMONIC_RET) {
                 auto& budget = first_mnemonic == X86_MNEMONIC_JMP
-                                   ? g_backendb_control_jmp_miss_log_count
+                                   ? g_jit_control_jmp_miss_log_count
                                    : first_mnemonic == X86_MNEMONIC_CALL
-                                         ? g_backendb_control_call_miss_log_count
-                                         : g_backendb_control_ret_miss_log_count;
+                                         ? g_jit_control_call_miss_log_count
+                                         : g_jit_control_ret_miss_log_count;
                 const std::uint32_t n = budget.fetch_add(1, std::memory_order_relaxed);
                 if (n < 96) {
                     const char* mnemonic_name = X86MnemonicGetString(first_mnemonic);
-                    BackendBLog("[EXECUTOR_BACKEND_B_CONTROL_NATIVE_MISS] n=%u rip=0x%llx "
+                    JitLog("[EXECUTOR_JIT_CONTROL_NATIVE_MISS] n=%u rip=0x%llx "
                                 "mnemonic=%s reason=block_size insnCount=%zu bytes=%s",
                                 n,
                                 static_cast<unsigned long long>(block.start_rip),
@@ -19205,17 +19524,17 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             return;
         }
         auto& budget = mnemonic == X86_MNEMONIC_JMP
-                           ? g_backendb_control_jmp_miss_log_count
+                           ? g_jit_control_jmp_miss_log_count
                            : mnemonic == X86_MNEMONIC_CALL
-                                 ? g_backendb_control_call_miss_log_count
-                                 : g_backendb_control_ret_miss_log_count;
+                                 ? g_jit_control_call_miss_log_count
+                                 : g_jit_control_ret_miss_log_count;
         const std::uint32_t n = budget.fetch_add(1, std::memory_order_relaxed);
         if (n >= 96) {
             return;
         }
         const char* mnemonic_name = X86MnemonicGetString(mnemonic);
         const LsxOperandRecord* op = ir.operand_count > 0 ? &ir.operands[0] : nullptr;
-        BackendBLog("[EXECUTOR_BACKEND_B_CONTROL_NATIVE_MISS] n=%u rip=0x%llx "
+        JitLog("[EXECUTOR_JIT_CONTROL_NATIVE_MISS] n=%u rip=0x%llx "
                     "mnemonic=%s reason=%s operandCount=%u decodedVisible=%u decodedTotal=%u "
                     "opType=%u opSize=%u base=%u index=%u scale=%u dispSize=%u disp=0x%llx "
                     "bytes=%s",
@@ -19434,7 +19753,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             return false;
         }
         Xbyak_aarch64::Label fallback;
-        EmitBackendBRelocatablePointer(
+        EmitJitRelocatablePointer(
             code, code.x9,
             reinterpret_cast<std::uint64_t>(&outgoing_direct_slot->target));
         // Stable slots are published with release stores. Consume them with a
@@ -19447,11 +19766,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         code.mov(code.x29, code.sp);
         code.mov(code.x19, code.x0);
         code.mov(code.x20, code.x16);
-        EmitBackendBRelocatablePointer(
+        EmitJitRelocatablePointer(
             code, code.x0,
             reinterpret_cast<std::uint64_t>(outgoing_direct_slot));
         code.mov(code.x1, code.x20);
-        EmitBackendBRelocatablePointer(
+        EmitJitRelocatablePointer(
             code, code.x17,
             reinterpret_cast<std::uint64_t>(&ValidateObservedDirectTarget));
         code.blr(code.x17);
@@ -19720,7 +20039,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitInterpreterBridge(const LsxDecodedRegion& 
     code->mov(code->x19, code->x0);
     code->mov(code->x0, code->x19);
     code->mov(code->x1, reinterpret_cast<std::uint64_t>(&block));
-    const auto helper_entry = BackendBHotHelperProfileEnabled()
+    const auto helper_entry = JitHotHelperProfileEnabled()
                                   ? &ExecuteProfiledInterpreterBridge
                                   : &InterpretDecodedRegion;
     code->mov(code->x16, reinterpret_cast<std::uint64_t>(helper_entry));
@@ -19731,7 +20050,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitInterpreterBridge(const LsxDecodedRegion& 
     code->ready();
     const std::size_t code_size = code->getSize();
     auto* entry = CommitCode(std::move(code));
-    RegisterBackendBHelperPerfSymbol(reinterpret_cast<const void*>(entry), code_size, block);
+    RegisterJitHelperPerfSymbol(reinterpret_cast<const void*>(entry), code_size, block);
     return entry;
 }
 
@@ -19773,7 +20092,7 @@ std::size_t PhysicalGprIndex(const LsxGpr reg) {
     return 0;
 }
 
-std::uint32_t BackendBHostTid() {
+std::uint32_t JitHostTid() {
 #ifdef __ANDROID__
     return static_cast<std::uint32_t>(syscall(SYS_gettid));
 #else
@@ -19782,7 +20101,7 @@ std::uint32_t BackendBHostTid() {
 #endif
 }
 
-void BackendBThreadName(char* out, const std::size_t size) {
+void JitThreadName(char* out, const std::size_t size) {
     if (out == nullptr || size == 0) {
         return;
     }
@@ -19790,11 +20109,11 @@ void BackendBThreadName(char* out, const std::size_t size) {
 #ifdef __ANDROID__
     pthread_getname_np(pthread_self(), out, size);
 #else
-    std::snprintf(out, size, "%08x", BackendBHostTid());
+    std::snprintf(out, size, "%08x", JitHostTid());
 #endif
 }
 
-std::uint64_t BackendBStateQwordAt(const LsxMachineImage& state, const std::size_t offset) {
+std::uint64_t JitStateQwordAt(const LsxMachineImage& state, const std::size_t offset) {
     std::uint64_t value = 0;
     if (offset + sizeof(value) <= sizeof(state)) {
         std::memcpy(&value, reinterpret_cast<const std::uint8_t*>(&state) + offset,
@@ -19803,12 +20122,12 @@ std::uint64_t BackendBStateQwordAt(const LsxMachineImage& state, const std::size
     return value;
 }
 
-void RecordBackendBThreadSnapshot(const char* phase, const std::uint64_t executed_blocks,
+void RecordJitThreadSnapshot(const char* phase, const std::uint64_t executed_blocks,
                                   const std::uint64_t rip, const std::uint64_t next_rip,
                                   const std::uint64_t result, const LsxMachineImage& state) {
-    BackendBThreadSnapshot snapshot{};
+    JitThreadSnapshot snapshot{};
     snapshot.valid = true;
-    snapshot.seq = g_backendb_thread_snapshot_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    snapshot.seq = g_jit_thread_snapshot_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     snapshot.blocks = executed_blocks;
     snapshot.rip = rip;
     snapshot.next = next_rip;
@@ -19825,13 +20144,13 @@ void RecordBackendBThreadSnapshot(const char* phase, const std::uint64_t execute
     snapshot.r13 = state.gpr[PhysicalGprIndex(LsxGpr::R13)];
     snapshot.r14 = state.gpr[PhysicalGprIndex(LsxGpr::R14)];
     snapshot.r15 = state.gpr[PhysicalGprIndex(LsxGpr::R15)];
-    snapshot.fsbase = BackendBStateQwordAt(state, kFsBaseStateOffset);
-    snapshot.tid = BackendBHostTid();
+    snapshot.fsbase = JitStateQwordAt(state, kFsBaseStateOffset);
+    snapshot.tid = JitHostTid();
     std::snprintf(snapshot.phase, sizeof(snapshot.phase), "%s", phase ? phase : "?");
-    BackendBThreadName(snapshot.thread, sizeof(snapshot.thread));
+    JitThreadName(snapshot.thread, sizeof(snapshot.thread));
 
-    std::lock_guard lock{g_backendb_thread_snapshot_mutex};
-    g_backendb_thread_snapshots[snapshot.tid % g_backendb_thread_snapshots.size()] = snapshot;
+    std::lock_guard lock{g_jit_thread_snapshot_mutex};
+    g_jit_thread_snapshots[snapshot.tid % g_jit_thread_snapshots.size()] = snapshot;
 }
 
 // Native cache relocations must survive a relink of the containing Android shared object.  Never
@@ -19839,7 +20158,7 @@ void RecordBackendBThreadSnapshot(const char* phase, const std::uint64_t execute
 // versioned logical id and is resolved to the current build's function address during restore.
 // Adding a new emitted helper requires adding a new id here; CapturePersistentNativeBlock rejects
 // an unclassified fixed pointer, so omission safely becomes a cache miss.
-enum class BackendBStableNativeTargetId : std::uint32_t {
+enum class JitStableNativeTargetId : std::uint32_t {
     LibcStrcmp = 1,
     HleBridgeMarker = 2,
     InterpreterInstructionEntry = 3,
@@ -19881,80 +20200,80 @@ enum class BackendBStableNativeTargetId : std::uint32_t {
     ResolvedLeafHle = 39,
 };
 
-struct BackendBStableNativeTarget {
-    BackendBStableNativeTargetId id;
+struct JitStableNativeTarget {
+    JitStableNativeTargetId id;
     std::uint64_t address;
 };
 
-std::span<const BackendBStableNativeTarget> BackendBStableNativeTargets() noexcept {
+std::span<const JitStableNativeTarget> JitStableNativeTargets() noexcept {
     static const std::array targets = {
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::LibcStrcmp,
+        JitStableNativeTarget{JitStableNativeTargetId::LibcStrcmp,
             reinterpret_cast<std::uint64_t>(&Core::AeroLib::ExecutorLibcStrcmp)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::HleBridgeMarker,
-            reinterpret_cast<std::uint64_t>(&ExecuteBackendBHleBridgeMarker)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::InterpreterInstructionEntry,
+        JitStableNativeTarget{JitStableNativeTargetId::HleBridgeMarker,
+            reinterpret_cast<std::uint64_t>(&ExecuteJitHleBridgeMarker)},
+        JitStableNativeTarget{JitStableNativeTargetId::InterpreterInstructionEntry,
             reinterpret_cast<std::uint64_t>(&InterpretDecodedInstruction)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::NativeScalarSemanticInstruction,
+        JitStableNativeTarget{JitStableNativeTargetId::NativeScalarSemanticInstruction,
             reinterpret_cast<std::uint64_t>(&ExecuteNativeScalarSemanticInstruction)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::NativeSimdSemanticInstruction,
+        JitStableNativeTarget{JitStableNativeTargetId::NativeSimdSemanticInstruction,
             reinterpret_cast<std::uint64_t>(&ExecuteNativeSimdSemanticInstruction)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::PrepareMemoryFaultContext,
+        JitStableNativeTarget{JitStableNativeTargetId::PrepareMemoryFaultContext,
             reinterpret_cast<std::uint64_t>(&PrepareGenericNativeMemoryFaultContext)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::CommitAddFlags,
+        JitStableNativeTarget{JitStableNativeTargetId::CommitAddFlags,
             reinterpret_cast<std::uint64_t>(&CommitAddFlags)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::CommitSubtractFlags,
+        JitStableNativeTarget{JitStableNativeTargetId::CommitSubtractFlags,
             reinterpret_cast<std::uint64_t>(&CommitSubtractFlags)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::CommitLogicFlags,
+        JitStableNativeTarget{JitStableNativeTargetId::CommitLogicFlags,
             reinterpret_cast<std::uint64_t>(&CommitLogicFlags)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::CommitCarryAddFlags,
+        JitStableNativeTarget{JitStableNativeTargetId::CommitCarryAddFlags,
             reinterpret_cast<std::uint64_t>(&CommitCarryAddFlags)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::CommitBorrowSubtractFlags,
+        JitStableNativeTarget{JitStableNativeTargetId::CommitBorrowSubtractFlags,
             reinterpret_cast<std::uint64_t>(&CommitBorrowSubtractFlags)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::JitXchgMem,
+        JitStableNativeTarget{JitStableNativeTargetId::JitXchgMem,
             reinterpret_cast<std::uint64_t>(&ExecuteJitXchgMem)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::BitTest,
+        JitStableNativeTarget{JitStableNativeTargetId::BitTest,
             reinterpret_cast<std::uint64_t>(&BitTest)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::MulOne,
+        JitStableNativeTarget{JitStableNativeTargetId::MulOne,
             reinterpret_cast<std::uint64_t>(&MulOne)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::DivOne,
+        JitStableNativeTarget{JitStableNativeTargetId::DivOne,
             reinterpret_cast<std::uint64_t>(&DivOne)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::Bextr,
+        JitStableNativeTarget{JitStableNativeTargetId::Bextr,
             reinterpret_cast<std::uint64_t>(&Bextr)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::Blsi,
+        JitStableNativeTarget{JitStableNativeTargetId::Blsi,
             reinterpret_cast<std::uint64_t>(&Blsi)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::Blsr,
+        JitStableNativeTarget{JitStableNativeTargetId::Blsr,
             reinterpret_cast<std::uint64_t>(&Blsr)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::Shld,
+        JitStableNativeTarget{JitStableNativeTargetId::Shld,
             reinterpret_cast<std::uint64_t>(&Shld)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::ShldMem,
+        JitStableNativeTarget{JitStableNativeTargetId::ShldMem,
             reinterpret_cast<std::uint64_t>(&ShldMem)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::Rotate,
+        JitStableNativeTarget{JitStableNativeTargetId::Rotate,
             reinterpret_cast<std::uint64_t>(&Rotate)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::RotateMem,
+        JitStableNativeTarget{JitStableNativeTargetId::RotateMem,
             reinterpret_cast<std::uint64_t>(&RotateMem)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::ValidateDirectTarget,
+        JitStableNativeTarget{JitStableNativeTargetId::ValidateDirectTarget,
             reinterpret_cast<std::uint64_t>(&ValidateObservedDirectTarget)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::ValidateDirectTargetAtSafepoint,
+        JitStableNativeTarget{JitStableNativeTargetId::ValidateDirectTargetAtSafepoint,
             reinterpret_cast<std::uint64_t>(&ValidateObservedDirectTargetAtSafepoint)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::BindPolymorphicChainSite,
+        JitStableNativeTarget{JitStableNativeTargetId::BindPolymorphicChainSite,
             reinterpret_cast<std::uint64_t>(&BindPolymorphicChainSite)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::TryLeafHleThunk,
-            reinterpret_cast<std::uint64_t>(&ExecutorBackendBTryLeafHleThunkCallback)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::Cmpxchg,
+        JitStableNativeTarget{JitStableNativeTargetId::TryLeafHleThunk,
+            reinterpret_cast<std::uint64_t>(&ExecutorJitTryLeafHleThunkCallback)},
+        JitStableNativeTarget{JitStableNativeTargetId::Cmpxchg,
             reinterpret_cast<std::uint64_t>(&Cmpxchg)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::CmpxchgLocked,
+        JitStableNativeTarget{JitStableNativeTargetId::CmpxchgLocked,
             reinterpret_cast<std::uint64_t>(&CmpxchgLocked)},
-        BackendBStableNativeTarget{BackendBStableNativeTargetId::ResolvedLeafHle,
-            reinterpret_cast<std::uint64_t>(&ExecutorBackendBResolvedLeafHleCallback)},
+        JitStableNativeTarget{JitStableNativeTargetId::ResolvedLeafHle,
+            reinterpret_cast<std::uint64_t>(&ExecutorJitResolvedLeafHleCallback)},
     };
     return targets;
 }
 
-bool ClassifyBackendBStableExternal(const std::uint64_t value,
-                                    BackendBNativeRelocation& relocation) noexcept {
-    for (const BackendBStableNativeTarget& target : BackendBStableNativeTargets()) {
+bool ClassifyJitStableExternal(const std::uint64_t value,
+                                    JitNativeRelocation& relocation) noexcept {
+    for (const JitStableNativeTarget& target : JitStableNativeTargets()) {
         if (value == target.address) {
-            relocation.kind = BackendBNativeRelocationKind::StableExternal;
+            relocation.kind = JitNativeRelocationKind::StableExternal;
             relocation.target_index = static_cast<std::uint32_t>(target.id);
             relocation.addend = 0;
             return true;
@@ -19963,9 +20282,9 @@ bool ClassifyBackendBStableExternal(const std::uint64_t value,
     return false;
 }
 
-bool ResolveBackendBStableExternal(const std::uint32_t target_index,
+bool ResolveJitStableExternal(const std::uint32_t target_index,
                                    std::uint64_t& target_out) noexcept {
-    for (const BackendBStableNativeTarget& target : BackendBStableNativeTargets()) {
+    for (const JitStableNativeTarget& target : JitStableNativeTargets()) {
         if (target_index == static_cast<std::uint32_t>(target.id)) {
             target_out = target.address;
             return target_out != 0;
@@ -19976,25 +20295,25 @@ bool ResolveBackendBStableExternal(const std::uint32_t target_index,
 }
 } // namespace
 
-extern "C" void executor_backend_b_dump_thread_states(const char* reason) {
-    std::array<BackendBThreadSnapshot, 64> snapshot{};
+extern "C" void executor_jit_dump_thread_states(const char* reason) {
+    std::array<JitThreadSnapshot, 64> snapshot{};
     std::size_t count = 0;
     {
-        std::lock_guard lock{g_backendb_thread_snapshot_mutex};
-        for (const auto& entry : g_backendb_thread_snapshots) {
+        std::lock_guard lock{g_jit_thread_snapshot_mutex};
+        for (const auto& entry : g_jit_thread_snapshots) {
             if (entry.valid && count < snapshot.size()) {
                 snapshot[count++] = entry;
             }
         }
     }
 
-    BackendBLog("[EXECUTOR_BACKEND_B_THREAD_DUMP] reason=%s count=%zu lastSeq=%llu",
+    JitLog("[EXECUTOR_JIT_THREAD_DUMP] reason=%s count=%zu lastSeq=%llu",
                 reason && reason[0] ? reason : "<none>", count,
                 static_cast<unsigned long long>(
-                    g_backendb_thread_snapshot_seq.load(std::memory_order_relaxed)));
+                    g_jit_thread_snapshot_seq.load(std::memory_order_relaxed)));
     for (std::size_t i = 0; i < count; ++i) {
         const auto& e = snapshot[i];
-        BackendBLog("[EXECUTOR_BACKEND_B_THREAD] seq=%llu tid=%u thread=\"%s\" phase=%s "
+        JitLog("[EXECUTOR_JIT_THREAD] seq=%llu tid=%u thread=\"%s\" phase=%s "
                     "blocks=%llu rip=0x%llx next=0x%llx result=0x%llx "
                     "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
                     "rdi=0x%llx rsi=0x%llx rsp=0x%llx rbp=0x%llx "
@@ -20021,15 +20340,15 @@ extern "C" void executor_backend_b_dump_thread_states(const char* reason) {
     }
 }
 
-extern "C" void executor_backend_b_record_current_thread_state(const char* reason) {
+extern "C" void executor_jit_record_current_thread_state(const char* reason) {
     auto* state = CurrentMachineImage();
     if (state == nullptr) {
-        BackendBLog("[EXECUTOR_BACKEND_B_THREAD_MARK] reason=%s state=0",
+        JitLog("[EXECUTOR_JIT_THREAD_MARK] reason=%s state=0",
                     reason && reason[0] ? reason : "<none>");
         return;
     }
 
-    RecordBackendBThreadSnapshot(reason && reason[0] ? reason : "mark", 0, state->rip_or_exit,
+    RecordJitThreadSnapshot(reason && reason[0] ? reason : "mark", 0, state->rip_or_exit,
                                  state->rip_or_exit, 0, *state);
 }
 
@@ -20343,14 +20662,14 @@ void WriteMemory(const std::uint64_t guest_va, const std::uint64_t value, const 
 // [lo,hi) of our own loaded host image (this .so), from /proc/self/maps (union of all mappings that
 // contain the address of a function known to live in this image). Cached once. A guest store landing
 // in this range is always a codegen bug (garbage host-address base).
-static bool BackendBOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi) {
+static bool JitOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi) {
 #if defined(__ANDROID__) || defined(__linux__)
     static std::uint64_t s_lo = 0;
     static std::uint64_t s_hi = 0;
     static std::once_flag s_once;
     std::call_once(s_once, [] {
         const std::uint64_t self_addr =
-            reinterpret_cast<std::uint64_t>(&BackendBOwnHostImageRange);
+            reinterpret_cast<std::uint64_t>(&JitOwnHostImageRange);
         std::ifstream maps("/proc/self/maps");
         std::string line;
         std::string self_path;
@@ -20414,12 +20733,12 @@ void WriteMemoryBytes(const std::uint64_t guest_va, const void* src, const std::
     // diff). ExecutorOwnHostImageRange caches [.so lo, hi) from /proc/self/maps.
     {
         std::uint64_t img_lo = 0, img_hi = 0;
-        if (BackendBOwnHostImageRange(img_lo, img_hi) && guest_va < img_hi &&
+        if (JitOwnHostImageRange(img_lo, img_hi) && guest_va < img_hi &&
             (guest_va + size_bytes) > img_lo) {
             static std::atomic<std::uint32_t> s_hostimg_budget{0};
             const std::uint32_t n = s_hostimg_budget.fetch_add(1, std::memory_order_relaxed);
             if (n < 128) {
-                BackendBLog("[EXECUTOR_BACKEND_B_STORE_INTO_HOST_IMAGE] n=%u rip=0x%llx activeRip=0x%llx "
+                JitLog("[EXECUTOR_JIT_STORE_INTO_HOST_IMAGE] n=%u rip=0x%llx activeRip=0x%llx "
                             "guest_va=0x%llx size=%u image=[0x%llx,0x%llx)",
                             n,
                             static_cast<unsigned long long>(g_current_fault_ir != nullptr
@@ -20430,7 +20749,7 @@ void WriteMemoryBytes(const std::uint64_t guest_va, const void* src, const std::
                             static_cast<unsigned long long>(img_lo),
                             static_cast<unsigned long long>(img_hi));
                 std::FILE* cf = std::fopen(
-                    "/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt",
+                    "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt",
                     "a");
                 if (cf != nullptr) {
                     std::fprintf(cf,
@@ -20449,13 +20768,13 @@ void WriteMemoryBytes(const std::uint64_t guest_va, const void* src, const std::
     }
     if (!IsSafeGuestMemoryRange(guest_va, size_bytes)) {
         // Iterative diagnostic: on a native game (Sonic/RSDK) an invalid write to a low/unmapped
-        // address should surface a guest fault, not abort the whole Backend B run. Soft-skip the
+        // address should surface a guest fault, not abort the whole JIT run. Soft-skip the
         // write (bounded) and log the site so we can see whether the game continues (skippable /
         // needs guest SIGSEGV) or the address is a real codegen miscalc that cascades.
         static std::atomic<std::uint32_t> s_bad_write_budget{0};
         const std::uint32_t n = s_bad_write_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 128) {
-            BackendBLog("[EXECUTOR_BACKEND_B_BAD_WRITE_SKIP] n=%u rip=0x%llx address=0x%llx size=%u "
+            JitLog("[EXECUTOR_JIT_BAD_WRITE_SKIP] n=%u rip=0x%llx address=0x%llx size=%u "
                         "activeRip=0x%llx",
                         n,
                         static_cast<unsigned long long>(g_current_fault_ir != nullptr
@@ -20490,9 +20809,9 @@ std::uint8_t* AllocateGuestStyleBackendStack() {
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (stack == reinterpret_cast<void*>(base)) {
             executor_lsx4_android_register_guest_stack_range(stack, kGuestStackSize,
-                                                                "backend_b_guest_stack");
+                                                                "jit_guest_stack");
             std::fprintf(stderr,
-                         "[EXECUTOR_BACKEND_B_STACK] source=low_guest base=%p size=0x%llx\n",
+                         "[EXECUTOR_JIT_STACK] source=low_guest base=%p size=0x%llx\n",
                          stack, static_cast<unsigned long long>(kGuestStackSize));
             std::fflush(stderr);
             return static_cast<std::uint8_t*>(stack);
@@ -20507,9 +20826,9 @@ std::uint8_t* AllocateGuestStyleBackendStack() {
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (fallback_stack != MAP_FAILED) {
             executor_lsx4_android_register_guest_stack_range(fallback_stack, kGuestStackSize,
-                                                                "backend_b_guest_stack");
+                                                                "jit_guest_stack");
             std::fprintf(stderr,
-                         "[EXECUTOR_BACKEND_B_STACK] source=host_fallback base=%p size=0x%llx\n",
+                         "[EXECUTOR_JIT_STACK] source=host_fallback base=%p size=0x%llx\n",
                          fallback_stack, static_cast<unsigned long long>(kGuestStackSize));
             std::fflush(stderr);
             return static_cast<std::uint8_t*>(fallback_stack);
@@ -20518,8 +20837,8 @@ std::uint8_t* AllocateGuestStyleBackendStack() {
 #endif
     auto* stack = new std::uint8_t[kGuestStackSize];
     executor_lsx4_android_register_guest_stack_range(stack, kGuestStackSize,
-                                                        "backend_b_guest_stack");
-    std::fprintf(stderr, "[EXECUTOR_BACKEND_B_STACK] source=new base=%p size=0x%llx\n", stack,
+                                                        "jit_guest_stack");
+    std::fprintf(stderr, "[EXECUTOR_JIT_STACK] source=new base=%p size=0x%llx\n", stack,
                  static_cast<unsigned long long>(kGuestStackSize));
     std::fflush(stderr);
     return stack;
@@ -20584,7 +20903,103 @@ LsxMachineImage* CurrentMachineImage() {
 LsxMachineImage* SwapDiagnosticMachineImage(LsxMachineImage* state) {
     auto* previous = g_current_guest_state;
     g_current_guest_state = state;
+#ifdef __ANDROID__
+    const std::uint32_t host_tid = JitHostTid();
+    std::lock_guard lock{g_jit_live_thread_mutex};
+    if (state != nullptr) {
+        g_jit_live_threads[host_tid] = JitLiveThreadState{
+            .host_tid = host_tid,
+            .pthread_handle = static_cast<std::uintptr_t>(pthread_self()),
+            .machine = state,
+        };
+    } else {
+        g_jit_live_threads.erase(host_tid);
+    }
+#endif
     return previous;
+}
+
+namespace {
+
+int CopyJitLiveThreadState(const JitLiveThreadState& live, std::uint64_t* rip,
+                                std::uint64_t* rsp, std::uint64_t* rbp, long* tid,
+                                char* host_name, const std::size_t host_name_size) {
+    if (live.machine == nullptr) {
+        return -1;
+    }
+    if (rip != nullptr) {
+        *rip = live.machine->rip_or_exit;
+    }
+    if (rsp != nullptr) {
+        *rsp = live.machine->gpr[PhysicalGprIndex(LsxGpr::Rsp)];
+    }
+    if (rbp != nullptr) {
+        *rbp = live.machine->gpr[PhysicalGprIndex(LsxGpr::Rbp)];
+    }
+    if (tid != nullptr) {
+        *tid = static_cast<long>(live.host_tid);
+    }
+    if (host_name != nullptr && host_name_size != 0) {
+        host_name[0] = '\0';
+#ifdef __ANDROID__
+        char path[96]{};
+        std::snprintf(path, sizeof(path), "/proc/self/task/%u/comm", live.host_tid);
+        if (FILE* file = std::fopen(path, "r")) {
+            if (std::fgets(host_name, static_cast<int>(host_name_size), file) != nullptr) {
+                host_name[std::strcspn(host_name, "\r\n")] = '\0';
+            }
+            std::fclose(file);
+        }
+#endif
+    }
+    return 0;
+}
+
+} // namespace
+
+extern "C" int executor_jit_get_guest_thread_regs_by_tid(
+    const long host_tid, std::uint64_t* rip, std::uint64_t* rsp, std::uint64_t* rbp, long* tid,
+    char* host_name, const std::size_t host_name_size) {
+    if (host_tid <= 0) {
+        return -1;
+    }
+    std::lock_guard lock{g_jit_live_thread_mutex};
+    const auto it = g_jit_live_threads.find(static_cast<std::uint32_t>(host_tid));
+    return it == g_jit_live_threads.end()
+               ? -1
+               : CopyJitLiveThreadState(it->second, rip, rsp, rbp, tid, host_name,
+                                             host_name_size);
+}
+
+extern "C" int executor_jit_get_guest_thread_regs_by_pthread(
+    const std::uintptr_t pthread_handle, std::uint64_t* rip, std::uint64_t* rsp,
+    std::uint64_t* rbp, long* tid, char* host_name, const std::size_t host_name_size) {
+    if (pthread_handle == 0) {
+        return -1;
+    }
+    std::lock_guard lock{g_jit_live_thread_mutex};
+    for (const auto& [host_tid, live] : g_jit_live_threads) {
+        (void)host_tid;
+        if (live.pthread_handle == pthread_handle) {
+            return CopyJitLiveThreadState(live, rip, rsp, rbp, tid, host_name,
+                                               host_name_size);
+        }
+    }
+    return -1;
+}
+
+bool MarkCurrentGuestStateOverride() {
+    if (g_current_guest_state == nullptr) {
+        return false;
+    }
+    g_hle_guest_state_override = true;
+    return true;
+}
+
+bool ConsumeCurrentGuestStateOverride() {
+    const bool requested = g_hle_guest_state_override;
+    g_hle_guest_state_override = false;
+    return requested;
 }
 
 LsxStackLease PrepareLsxEntry(LsxMachineImage& state, const std::uint64_t guest_rip,
@@ -20646,8 +21061,8 @@ LsxStackLease PrepareLsxEntry(LsxMachineImage& state, const std::uint64_t guest_
         const std::uint64_t arena_top = reinterpret_cast<std::uint64_t>(arena.top);
         if (arena_top > frame.current_sp && arena_top - frame.current_sp > (1ull << 20)) {
             g_stack_lease_callback_drop_captured = true;
-            BackendBLog(
-                "[EXECUTOR_BACKEND_B_CALLBACK_STACK_DROP] callbackRip=0x%llx "
+            JitLog(
+                "[EXECUTOR_JIT_CALLBACK_STACK_DROP] callbackRip=0x%llx "
                 "outerRip=0x%llx outerRsp=0x%llx previous=0x%llx selected=0x%llx "
                 "arenaTop=0x%llx delta=0x%llx depth=%u",
                 static_cast<unsigned long long>(guest_rip),
@@ -20674,7 +21089,7 @@ LsxStackLease PrepareLsxEntry(LsxMachineImage& state, const std::uint64_t guest_
             guest_rsp = aligned_current - 24;
             WriteMemory(guest_rsp, entry_param_q0, 8);
             WriteMemory(guest_rsp + 8, entry_param_q1, 8);
-            BackendBLog("[EXECUTOR_BACKEND_B_MAIN_ENTRY_STACK] params=0x%llx q0=0x%llx "
+            JitLog("[EXECUTOR_JIT_MAIN_ENTRY_STACK] params=0x%llx q0=0x%llx "
                         "q1=0x%llx rsp=0x%llx aligned=0x%llx",
                         static_cast<unsigned long long>(ctx.args[0]),
                         static_cast<unsigned long long>(entry_param_q0),
@@ -20683,7 +21098,7 @@ LsxStackLease PrepareLsxEntry(LsxMachineImage& state, const std::uint64_t guest_
                         static_cast<unsigned long long>(aligned_current));
         } else {
             WriteMemory(guest_rsp, kGuestUnwindStopReturnAddress, 8);
-            BackendBLog("[EXECUTOR_BACKEND_B_MAIN_ENTRY_STACK] params=0x%llx read_failed "
+            JitLog("[EXECUTOR_JIT_MAIN_ENTRY_STACK] params=0x%llx read_failed "
                         "fallback_unwind_stop_rsp=0x%llx",
                         static_cast<unsigned long long>(ctx.args[0]),
                         static_cast<unsigned long long>(guest_rsp));
@@ -21042,7 +21457,7 @@ void AppendRecentDecodedBlockDumps(std::ostringstream& error) {
 std::string DescribeInvalidGuestMemoryAccess(const char* op, const std::uint64_t guest_va,
                                              const std::uint32_t size_bytes) {
     std::ostringstream error;
-    error << "Backend B invalid guest memory " << (op != nullptr ? op : "access")
+    error << "JIT invalid guest memory " << (op != nullptr ? op : "access")
           << " address=0x" << std::hex << guest_va << " size=0x" << size_bytes;
 
     const auto* state = g_current_fault_state;
@@ -21207,7 +21622,7 @@ void StoreOperandValue(LsxMachineImage& state, const DecodeSummary& instruction,
                     }
                     error << "]";
                 };
-                error << "Backend B low guest memory write rip=0x" << std::hex
+                error << "JIT low guest memory write rip=0x" << std::hex
                       << state.rip_or_exit << " address=0x" << address
                       << " size=0x" << OperandSizeBytes(operand)
                       << " mnemonic=" << (mnemonic != nullptr ? mnemonic : "<unknown>")
@@ -21261,7 +21676,7 @@ void StoreOperandValue(LsxMachineImage& state, const DecodeSummary& instruction,
                 const std::uint32_t low_write_n =
                     s_low_write_budget.fetch_add(1, std::memory_order_relaxed);
                 if (low_write_n < 64) {
-                    BackendBLog("[EXECUTOR_BACKEND_B_LOW_WRITE_SKIP] n=%u %s", low_write_n,
+                    JitLog("[EXECUTOR_JIT_LOW_WRITE_SKIP] n=%u %s", low_write_n,
                                 error.str().c_str());
                 }
                 return;
@@ -21319,7 +21734,7 @@ bool TryResolveBranchTarget(const LsxDecodedOp& ir, std::uint64_t& target) {
     const auto& operand = ir.operands[0];
     if (operand.type == X86_OPERAND_TYPE_IMMEDIATE) {
         if (operand.imm.is_relative && operand.imm.is_signed) {
-            // Backend B decodes in LONG_64 mode, where X86CalcAbsoluteAddress performs this
+            // JIT decodes in LONG_64 mode, where X86CalcAbsoluteAddress performs this
             // exact wrapping addition without 16/32-bit compatibility-mode truncation.
             target = ir.guest_rip + ir.decoded.length +
                      static_cast<std::uint64_t>(operand.imm.value.s);
@@ -21435,7 +21850,7 @@ bool IsAllocatorTraceOffset(const std::uint64_t offset) {
     return false;
 }
 
-bool IsBackendBBlockProbeOffset(const std::uint64_t offset) {
+bool IsJitBlockProbeOffset(const std::uint64_t offset) {
     switch (offset) {
     case 0x1b8300:
     case 0x1b8338:
@@ -21621,7 +22036,9 @@ bool ReadGuestBytesChecked(const std::uint64_t address, void* dst, const std::si
         return false;
     }
 #ifdef __ANDROID__
-    return ExecutorBackendBReadGuestBytes(address, dst, size);
+    return g_jit_stable_guest_reads
+               ? ExecutorJitReadGuestBytesStable(address, dst, size)
+               : ExecutorJitReadGuestBytes(address, dst, size);
 #else
     if (!IsTraceReadableAddress(address, size)) {
         return false;
@@ -21648,14 +22065,14 @@ bool WriteGuestBytesChecked(const std::uint64_t address, const void* src, const 
         static std::atomic<unsigned> s_nullw_budget{0};
         const unsigned n = s_nullw_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 64) {
-            BackendBLog("[EXECUTOR_BACKEND_B_NULLPAGE_STORE] addr=0x%llx size=%zu (skipped)",
+            JitLog("[EXECUTOR_JIT_NULLPAGE_STORE] addr=0x%llx size=%zu (skipped)",
                         static_cast<unsigned long long>(address), size);
         }
 #endif
         return false;
     }
 #ifdef __ANDROID__
-    return ExecutorBackendBWriteGuestBytes(address, src, size);
+    return ExecutorJitWriteGuestBytes(address, src, size);
 #else
     if (!IsTraceReadableAddress(address, size)) {
         return false;
@@ -23108,6 +23525,132 @@ bool IsPackedFloatWidthConvertMnemonic(const X86Mnemonic mnemonic) {
 bool PackedFloatWidthConvertToDouble(const X86Mnemonic mnemonic) {
     return mnemonic == X86_MNEMONIC_CVTPS2PD ||
            mnemonic == X86_MNEMONIC_VCVTPS2PD;
+}
+
+bool IsPackedF16ConvertMnemonic(const X86Mnemonic mnemonic) {
+    return mnemonic == X86_MNEMONIC_VCVTPS2PH ||
+           mnemonic == X86_MNEMONIC_VCVTPH2PS;
+}
+
+std::uint16_t Float32BitsToFloat16(const std::uint32_t bits,
+                                   const std::uint32_t rounding_mode) {
+    const std::uint16_t sign = static_cast<std::uint16_t>((bits >> 16u) & 0x8000u);
+    const std::uint32_t exponent = (bits >> 23u) & 0xffu;
+    const std::uint32_t fraction = bits & 0x7fffffu;
+
+    if (exponent == 0xffu) {
+        if (fraction == 0) {
+            return static_cast<std::uint16_t>(sign | 0x7c00u);
+        }
+        // F16C quiets a signalling NaN while retaining as much payload as binary16 can hold.
+        const std::uint16_t payload =
+            static_cast<std::uint16_t>((fraction >> 13u) | 0x0200u);
+        return static_cast<std::uint16_t>(sign | 0x7c00u | payload);
+    }
+
+    const auto round_right = [rounding_mode, sign](const std::uint32_t value,
+                                                   const std::uint32_t shift) {
+        const std::uint32_t truncated = shift < 32u ? value >> shift : 0u;
+        const std::uint32_t remainder =
+            shift == 0 ? 0u
+                       : shift < 32u ? value & ((std::uint32_t{1} << shift) - 1u)
+                                     : value;
+        if (remainder == 0) {
+            return truncated;
+        }
+        bool increment = false;
+        switch (rounding_mode & 3u) {
+        case 0: { // nearest, ties to even
+            const std::uint32_t halfway =
+                shift == 0 ? 0u
+                           : shift < 32u ? std::uint32_t{1} << (shift - 1u)
+                                         : 0x80000000u;
+            increment = remainder > halfway ||
+                        (remainder == halfway && (truncated & 1u) != 0);
+            break;
+        }
+        case 1: // toward -infinity
+            increment = sign != 0;
+            break;
+        case 2: // toward +infinity
+            increment = sign == 0;
+            break;
+        case 3: // toward zero
+            break;
+        }
+        return truncated + static_cast<std::uint32_t>(increment);
+    };
+
+    if (exponent == 0) {
+        // Every non-zero binary32 subnormal is below the smallest binary16 subnormal.
+        const bool directed_away_from_zero =
+            ((rounding_mode & 3u) == 1u && sign != 0) ||
+            ((rounding_mode & 3u) == 2u && sign == 0);
+        return static_cast<std::uint16_t>(sign |
+                                         ((fraction != 0 && directed_away_from_zero) ? 1u : 0u));
+    }
+
+    const std::int32_t half_exponent =
+        static_cast<std::int32_t>(exponent) - 127 + 15;
+    if (half_exponent >= 31) {
+        const bool to_infinity =
+            (rounding_mode & 3u) == 0u ||
+            ((rounding_mode & 3u) == 1u && sign != 0) ||
+            ((rounding_mode & 3u) == 2u && sign == 0);
+        return static_cast<std::uint16_t>(
+            sign | (to_infinity ? 0x7c00u : 0x7bffu));
+    }
+
+    if (half_exponent <= 0) {
+        const std::uint32_t significand = fraction | 0x800000u;
+        const std::uint32_t shift =
+            static_cast<std::uint32_t>(14 - half_exponent);
+        const std::uint32_t rounded = round_right(significand, shift);
+        return static_cast<std::uint16_t>(sign | std::min(rounded, 0x0400u));
+    }
+
+    std::uint32_t rounded_fraction = round_right(fraction, 13u);
+    std::uint32_t rounded_exponent = static_cast<std::uint32_t>(half_exponent);
+    if (rounded_fraction == 0x0400u) {
+        rounded_fraction = 0;
+        ++rounded_exponent;
+        if (rounded_exponent >= 31u) {
+            const bool to_infinity =
+                (rounding_mode & 3u) == 0u ||
+                ((rounding_mode & 3u) == 1u && sign != 0) ||
+                ((rounding_mode & 3u) == 2u && sign == 0);
+            return static_cast<std::uint16_t>(
+                sign | (to_infinity ? 0x7c00u : 0x7bffu));
+        }
+    }
+    return static_cast<std::uint16_t>(
+        sign | (rounded_exponent << 10u) | rounded_fraction);
+}
+
+std::uint32_t Float16BitsToFloat32(const std::uint16_t bits) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16u;
+    std::uint32_t exponent = (bits >> 10u) & 0x1fu;
+    std::uint32_t fraction = bits & 0x03ffu;
+    if (exponent == 0) {
+        if (fraction == 0) {
+            return sign;
+        }
+        std::int32_t unbiased = -14;
+        while ((fraction & 0x0400u) == 0) {
+            fraction <<= 1u;
+            --unbiased;
+        }
+        fraction &= 0x03ffu;
+        return sign |
+               (static_cast<std::uint32_t>(unbiased + 127) << 23u) |
+               (fraction << 13u);
+    }
+    if (exponent == 0x1fu) {
+        return sign | 0x7f800000u | (fraction << 13u) |
+               (fraction != 0 ? 0x00400000u : 0u);
+    }
+    exponent += 127u - 15u;
+    return sign | (exponent << 23u) | (fraction << 13u);
 }
 
 bool IsPackedDqPdConvertMnemonic(const X86Mnemonic mnemonic) {
@@ -25035,6 +25578,26 @@ bool CanExecuteVectorInstruction(const LsxDecodedOp& ir) {
                    (IsXmmOperand(ir.operands[1]) ||
                     ir.operands[1].type == X86_OPERAND_TYPE_MEMORY);
         }
+        if (IsPackedF16ConvertMnemonic(mnemonic)) {
+            if (mnemonic == X86_MNEMONIC_VCVTPS2PH) {
+                if (ir.operand_count != 3 ||
+                    (!IsXmmOperand(ir.operands[0]) &&
+                     ir.operands[0].type != X86_OPERAND_TYPE_MEMORY) ||
+                    !IsXmmOperand(ir.operands[1]) ||
+                    ir.operands[2].type != X86_OPERAND_TYPE_IMMEDIATE) {
+                    return false;
+                }
+                const std::size_t source_bytes = VectorOperandBytes(ir.operands[1]);
+                return source_bytes == 16 || source_bytes == 32;
+            }
+            if (ir.operand_count != 2 || !IsXmmOperand(ir.operands[0]) ||
+                (!IsXmmOperand(ir.operands[1]) &&
+                 ir.operands[1].type != X86_OPERAND_TYPE_MEMORY)) {
+                return false;
+            }
+            const std::size_t destination_bytes = VectorOperandBytes(ir.operands[0]);
+            return destination_bytes == 16 || destination_bytes == 32;
+        }
         if (IsPackedDqPdConvertMnemonic(mnemonic)) {
             return ir.operand_count >= 2 && IsXmmOperand(ir.operands[0]) &&
                    (IsXmmOperand(ir.operands[1]) ||
@@ -25815,6 +26378,41 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
+    if (IsPackedF16ConvertMnemonic(mnemonic)) {
+        lhs.fill(0);
+        result.fill(0);
+        if (!ReadVector128(state, ir.decoded, ir.operands[1], lhs)) {
+            return false;
+        }
+        if (mnemonic == X86_MNEMONIC_VCVTPS2PH) {
+            const std::size_t source_bytes = VectorOperandBytes(ir.operands[1]);
+            const std::size_t lane_count = source_bytes / sizeof(std::uint32_t);
+            const std::uint32_t immediate =
+                static_cast<std::uint32_t>(ir.operands[2].imm.value.u);
+            const std::uint32_t rounding_mode =
+                (immediate & 0x4u) != 0 ? (state.mxcsr >> 13u) & 0x3u
+                                       : immediate & 0x3u;
+            for (std::size_t lane = 0; lane < lane_count; ++lane) {
+                const std::uint32_t value =
+                    LoadUnaligned<std::uint32_t>(lhs.data() + lane * sizeof(std::uint32_t));
+                StoreUnaligned<std::uint16_t>(
+                    result.data() + lane * sizeof(std::uint16_t),
+                    Float32BitsToFloat16(value, rounding_mode));
+            }
+        } else {
+            const std::size_t destination_bytes = VectorOperandBytes(ir.operands[0]);
+            const std::size_t lane_count = destination_bytes / sizeof(std::uint32_t);
+            for (std::size_t lane = 0; lane < lane_count; ++lane) {
+                const std::uint16_t value =
+                    LoadUnaligned<std::uint16_t>(lhs.data() + lane * sizeof(std::uint16_t));
+                StoreUnaligned<std::uint32_t>(
+                    result.data() + lane * sizeof(std::uint32_t),
+                    Float16BitsToFloat32(value));
+            }
+        }
+        return WriteVector128(state, ir.decoded, ir.operands[0], result);
+    }
+
     if (IsPackedDqPdConvertMnemonic(mnemonic)) {
         const auto& source_operand = ir.operands[1];
         lhs.fill(0);
@@ -26209,7 +26807,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 // FXSAVE abridged tag convention (one valid bit per physical register).  Keep each value in the
 // architectural little-endian 80-bit extended encoding in the first ten bytes of its 16-byte
 // physical slot.  Besides making FLD/FSTP m80 byte-exact, this avoids silently losing precision
-// merely because a value passed through the Backend-B state object.
+// merely because a value passed through the JIT state object.
 using X87Extended = std::array<std::uint8_t, 10>;
 
 constexpr std::uint64_t kX87IntegerBit = std::uint64_t{1} << 63u;
@@ -27220,6 +27818,22 @@ bool X87SingleRegisterOperand(const LsxDecodedOp& ir, std::uint8_t& logical) {
            X87DecodeLogicalRegister(ir.operands[0].reg.value, logical);
 }
 
+bool X87ExchangeRegisterOperand(const LsxDecodedOp& ir, std::uint8_t& logical) {
+    if (X87SingleRegisterOperand(ir, logical)) {
+        return true;
+    }
+    // iced-x86 exposes FXCH's implicit ST0 as operand zero and the encoded ST(i) as operand one.
+    // Keep the single-operand form for already persisted legacy IR, while accepting only that exact
+    // two-register architecture shape for newly decoded IR.
+    std::uint8_t implicit_st0 = 0;
+    return ir.operand_count == 2 &&
+           ir.operands[0].type == X86_OPERAND_TYPE_REGISTER &&
+           ir.operands[1].type == X86_OPERAND_TYPE_REGISTER &&
+           X87DecodeLogicalRegister(ir.operands[0].reg.value, implicit_st0) &&
+           implicit_st0 == 0 &&
+           X87DecodeLogicalRegister(ir.operands[1].reg.value, logical);
+}
+
 bool IsX87StateMnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_FWAIT:
@@ -27537,9 +28151,14 @@ bool CanExecuteX87Instruction(const LsxDecodedOp& ir) {
         mnemonic == X86_MNEMONIC_FABS || mnemonic == X86_MNEMONIC_FNOP) {
         return ir.operand_count == 0;
     }
-    if (mnemonic == X86_MNEMONIC_FXCH || mnemonic == X86_MNEMONIC_FFREE ||
-        mnemonic == X86_MNEMONIC_FFREEP || mnemonic == X86_MNEMONIC_FST ||
-        mnemonic == X86_MNEMONIC_FSTP) {
+    if (mnemonic == X86_MNEMONIC_FXCH) {
+        std::uint8_t ignored = 0;
+        if (X87ExchangeRegisterOperand(ir, ignored)) {
+            return true;
+        }
+    }
+    if (mnemonic == X86_MNEMONIC_FFREE || mnemonic == X86_MNEMONIC_FFREEP ||
+        mnemonic == X86_MNEMONIC_FST || mnemonic == X86_MNEMONIC_FSTP) {
         std::uint8_t ignored = 0;
         if (X87SingleRegisterOperand(ir, ignored)) {
             return true;
@@ -27621,7 +28240,11 @@ bool ExecuteX87Instruction(LsxMachineImage& state, const LsxDecodedOp& ir) {
         return true;
     }
     std::uint8_t register_logical = 0;
-    if (X87SingleRegisterOperand(ir, register_logical)) {
+    const bool has_register_operand =
+        mnemonic == X86_MNEMONIC_FXCH
+            ? X87ExchangeRegisterOperand(ir, register_logical)
+            : X87SingleRegisterOperand(ir, register_logical);
+    if (has_register_operand) {
         const std::uint8_t physical = X87PhysicalLogicalRegister(state, register_logical);
         if (mnemonic == X86_MNEMONIC_FXCH) {
             const std::uint8_t st0 = X87PhysicalSt0(state);
@@ -27706,7 +28329,7 @@ bool ExecuteX87Instruction(LsxMachineImage& state, const LsxDecodedOp& ir) {
 }
 
 bool CanInterpretInstruction(const LsxDecodedOp& ir) {
-    if (IsBackendBHleBridgeMarkerInstruction(ir)) {
+    if (IsJitHleBridgeMarkerInstruction(ir)) {
         return true;
     }
     if (CanExecuteVectorInstruction(ir) || CanExecuteScalarFloatInstruction(ir)) {
@@ -28191,36 +28814,36 @@ bool CanInterpretRegion(const LsxDecodedRegion& block) {
     return true;
 }
 
-bool IsBackendBHleBridgeMarkerAt(const std::uint64_t rip) {
+bool IsJitHleBridgeMarkerAt(const std::uint64_t rip) {
     if (rip == 0) {
         return false;
     }
-    std::array<std::uint8_t, kBackendBHleMarkerLength> bytes{};
+    std::array<std::uint8_t, kJitHleMarkerLength> bytes{};
     if (!ReadGuestBytesChecked(rip, bytes.data(), bytes.size())) {
         return false;
     }
     return bytes[0] == 0x0f && bytes[1] == 0x3f &&
-           std::memcmp(bytes.data() + 2, kBackendBHleThunkHash.data(),
-                       kBackendBHleThunkHash.size()) == 0;
+           std::memcmp(bytes.data() + 2, kJitHleThunkHash.data(),
+                       kJitHleThunkHash.size()) == 0;
 }
 
-bool IsBackendBHleBridgeMarkerInstruction(const LsxDecodedOp& ir) {
-    // BuildLsxCodeRegion creates System/INVALID only after IsBackendBHleBridgeMarkerAt matched
+bool IsJitHleBridgeMarkerInstruction(const LsxDecodedOp& ir) {
+    // BuildLsxCodeRegion creates System/INVALID only after IsJitHleBridgeMarkerAt matched
     // the complete 34-byte marker.  Retained instruction storage is intentionally bounded to the
     // architectural 15-byte x86 maximum, so keep only the two marker opcode bytes here; trying to
     // retain/memcmp the 32-byte sideband hash would read past LsxDecodedOp::bytes.
-    return ir.length == kBackendBHleMarkerLength &&
+    return ir.length == kJitHleMarkerLength &&
            ir.category == LsxOpClass::System &&
            ir.mnemonic == static_cast<std::uint32_t>(X86_MNEMONIC_INVALID) &&
            ir.bytes[0] == 0x0f && ir.bytes[1] == 0x3f;
 }
 
-void ApplyBackendBHleFpResult(LsxMachineImage& state, const std::uint64_t native_function,
+void ApplyJitHleFpResult(LsxMachineImage& state, const std::uint64_t native_function,
                               const std::uint64_t raw_result) {
     // Integer and SSE register banks are independent in the x86-64 SysV ABI. The bridge's
     // transport word carries raw FP result bits; restore them to the architectural return lane.
     // Only the scalar lane is defined, so preserve the upper XMM/YMM bytes.
-    switch (executor_backend_b_hle_fp_result_kind(native_function)) {
+    switch (executor_jit_hle_fp_result_kind(native_function)) {
     case 1: {
         const auto low = static_cast<std::uint32_t>(raw_result);
         std::memcpy(state.ymm[0].data(), &low, sizeof(low));
@@ -28234,7 +28857,7 @@ void ApplyBackendBHleFpResult(LsxMachineImage& state, const std::uint64_t native
     }
 }
 
-std::uint64_t ExecuteBackendBHleBridgeMarker(LsxMachineImage& state, const std::uint64_t marker_rip) {
+std::uint64_t ExecuteJitHleBridgeMarker(LsxMachineImage& state, const std::uint64_t marker_rip) {
     const std::uint64_t call_rsp = GetGpr64(state, LsxGpr::Rsp);
     const std::uint64_t return_rip = ReadMemory(call_rsp, 8);
     std::uint64_t sideband = GetGpr64(state, LsxGpr::Rdi);
@@ -28270,10 +28893,19 @@ std::uint64_t ExecuteBackendBHleBridgeMarker(LsxMachineImage& state, const std::
     const std::uint64_t xmm1 = LoadUnaligned<std::uint64_t>(state.ymm[1].data());
     const std::uint64_t xmm2 = LoadUnaligned<std::uint64_t>(state.ymm[2].data());
     const std::uint64_t xmm3 = LoadUnaligned<std::uint64_t>(state.ymm[3].data());
-    const std::uint64_t result = ExecutorBackendBHleBridgeCallback(
+    static const bool trace_stall_thread_dump =
+        std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") != nullptr;
+    if (trace_stall_thread_dump) {
+        RecordJitThreadSnapshot("hle_marker", 0, marker_rip, return_rip, native_function,
+                                     state);
+    }
+    const std::uint64_t result = ExecutorJitHleBridgeCallback(
         native_function, arg0, arg1, arg2, arg3, arg4, arg5, original_guest_rsp,
         xmm0, xmm1, xmm2, xmm3);
-    ApplyBackendBHleFpResult(state, native_function, result);
+    if (ConsumeCurrentGuestStateOverride()) {
+        return state.rip_or_exit;
+    }
+    ApplyJitHleFpResult(state, native_function, result);
 
     WriteMemory(sideband, result, 8);
     if (original_guest_rsp != 0 && guest_return_after_hle != 0 &&
@@ -28294,12 +28926,12 @@ std::uint64_t ExecuteBackendBHleBridgeMarker(LsxMachineImage& state, const std::
     } else {
         SetGpr64(state, LsxGpr::Rsp, call_rsp + 8);
         state.rip_or_exit =
-            return_rip != 0 ? return_rip : marker_rip + kBackendBHleMarkerLength;
+            return_rip != 0 ? return_rip : marker_rip + kJitHleMarkerLength;
     }
     return state.rip_or_exit;
 }
 
-bool TryExecuteBackendBDirectHle(LsxMachineImage& state, const std::uint64_t thunk,
+bool TryExecuteJitDirectHle(LsxMachineImage& state, const std::uint64_t thunk,
                                  const std::uint64_t guest_rsp,
                                  const std::uint64_t return_rip,
                                  const std::uint64_t final_rsp,
@@ -28314,7 +28946,7 @@ bool TryExecuteBackendBDirectHle(LsxMachineImage& state, const std::uint64_t thu
                                                                std::memory_order_relaxed)) {
         }
         if (n != 0) {
-            BackendBLog("[EXECUTOR_BACKEND_B_DIRECT_HLE_ZERO] n=%u mode=%s thunk=0x%llx "
+            JitLog("[EXECUTOR_JIT_DIRECT_HLE_ZERO] n=%u mode=%s thunk=0x%llx "
                         "ret=0x%llx guestRsp=0x%llx finalRsp=0x%llx",
                         n,
                         mode != nullptr ? mode : "?",
@@ -28348,7 +28980,7 @@ bool TryExecuteBackendBDirectHle(LsxMachineImage& state, const std::uint64_t thu
                                                           std::memory_order_relaxed)) {
     }
     if (n != 0) {
-        BackendBLog("[EXECUTOR_BACKEND_B_DIRECT_HLE] n=%u mode=%s thunk=0x%llx native=0x%llx "
+        JitLog("[EXECUTOR_JIT_DIRECT_HLE] n=%u mode=%s thunk=0x%llx native=0x%llx "
                     "ret=0x%llx guestRsp=0x%llx finalRsp=0x%llx "
                     "rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx "
                     "rbx=0x%llx rbp=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx",
@@ -28384,10 +29016,18 @@ bool TryExecuteBackendBDirectHle(LsxMachineImage& state, const std::uint64_t thu
     const std::uint64_t xmm1 = LoadUnaligned<std::uint64_t>(state.ymm[1].data());
     const std::uint64_t xmm2 = LoadUnaligned<std::uint64_t>(state.ymm[2].data());
     const std::uint64_t xmm3 = LoadUnaligned<std::uint64_t>(state.ymm[3].data());
-    const std::uint64_t result = ExecutorBackendBHleBridgeCallback(
+    static const bool trace_stall_thread_dump =
+        std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") != nullptr;
+    if (trace_stall_thread_dump) {
+        RecordJitThreadSnapshot("hle_direct", 0, thunk, return_rip, native_function, state);
+    }
+    const std::uint64_t result = ExecutorJitHleBridgeCallback(
         native_function, arg0, arg1, arg2, arg3, arg4, arg5, guest_rsp,
         xmm0, xmm1, xmm2, xmm3);
-    ApplyBackendBHleFpResult(state, native_function, result);
+    if (ConsumeCurrentGuestStateOverride()) {
+        return true;
+    }
+    ApplyJitHleFpResult(state, native_function, result);
 
     SetGpr64(state, LsxGpr::Rax, result);
     SetGpr64(state, LsxGpr::Rbx, saved_rbx);
@@ -28401,7 +29041,7 @@ bool TryExecuteBackendBDirectHle(LsxMachineImage& state, const std::uint64_t thu
     return true;
 }
 
-bool IsBackendBHleThunkAddressCandidate(const std::uint64_t thunk) {
+bool IsJitHleThunkAddressCandidate(const std::uint64_t thunk) {
     if (thunk == 0) {
         return false;
     }
@@ -28421,7 +29061,7 @@ bool IsBackendBHleThunkAddressCandidate(const std::uint64_t thunk) {
     return (thunk >> 40u) != 0;
 }
 
-bool TryExecuteBackendBDirectHleCall(LsxMachineImage& state, const std::uint64_t thunk,
+bool TryExecuteJitDirectHleCall(LsxMachineImage& state, const std::uint64_t thunk,
                                      const std::uint64_t next_rip) {
     // Normal guest CALL targets are revisited millions of times. Resolve the immutable target
     // class through native_runtime_api's exact TLS cache before touching the guest stack; a
@@ -28429,31 +29069,31 @@ bool TryExecuteBackendBDirectHleCall(LsxMachineImage& state, const std::uint64_t
     // Reject an ordinary guest target before entering the dynamic-TLS classifier: doing that
     // lookup on every guest CALL made TLS resolution itself one of Game:Main's hottest functions.
     // A generated Android thunk may be a 39-bit pointer, so include the exact stub slab.
-    if (!IsBackendBHleThunkAddressCandidate(thunk)) {
+    if (!IsJitHleThunkAddressCandidate(thunk)) {
         return false;
     }
     std::uint64_t native_function = 0;
     const int resolved_kind =
-        executor_backend_b_resolve_hle_thunk(thunk, &native_function);
+        executor_jit_resolve_hle_thunk(thunk, &native_function);
     if (resolved_kind == 0) {
         return false;
     }
     const std::uint64_t original_rsp = GetGpr64(state, LsxGpr::Rsp);
     const std::uint64_t guest_rsp = original_rsp - sizeof(std::uint64_t);
     WriteMemory(guest_rsp, next_rip, sizeof(next_rip));
-    return TryExecuteBackendBDirectHle(state, thunk, guest_rsp, next_rip, original_rsp,
+    return TryExecuteJitDirectHle(state, thunk, guest_rsp, next_rip, original_rsp,
                                        "call", resolved_kind, native_function);
 }
 
-bool TryExecuteBackendBDirectHleTail(LsxMachineImage& state, const std::uint64_t thunk) {
+bool TryExecuteJitDirectHleTail(LsxMachineImage& state, const std::uint64_t thunk) {
     // Reject ordinary guest RIPs before ReadMemory/IsPlausibleHleGuestReturn and before either
     // Aerolib registry lookup. The classifier is exact-address, thread-local and allocation-free.
-    if (!IsBackendBHleThunkAddressCandidate(thunk)) {
+    if (!IsJitHleThunkAddressCandidate(thunk)) {
         return false;
     }
     std::uint64_t native_function = 0;
     const int resolved_kind =
-        executor_backend_b_resolve_hle_thunk(thunk, &native_function);
+        executor_jit_resolve_hle_thunk(thunk, &native_function);
     if (resolved_kind == 0) {
         return false;
     }
@@ -28461,7 +29101,7 @@ bool TryExecuteBackendBDirectHleTail(LsxMachineImage& state, const std::uint64_t
     const std::uint64_t return_rip = ReadMemory(guest_rsp, sizeof(std::uint64_t));
     // A mapped guest root has a null, unwind-terminating return address.  Tail-calling an HLE
     // import from that root is still a real call: execute the import, then translate the null
-    // boundary to Backend B's private exit sentinel.  Rejecting it here made the JMP block fall
+    // boundary to JIT's private exit sentinel.  Rejecting it here made the JMP block fall
     // through past the HLE thunk, while returning raw zero would make a non-RET block fall through
     // in the dispatcher.
     const bool exits_mapped_root =
@@ -28469,7 +29109,7 @@ bool TryExecuteBackendBDirectHleTail(LsxMachineImage& state, const std::uint64_t
     if (!exits_mapped_root && !IsPlausibleHleGuestReturn(return_rip)) {
         return false;
     }
-    const bool executed = TryExecuteBackendBDirectHle(
+    const bool executed = TryExecuteJitDirectHle(
         state, thunk, guest_rsp, return_rip, guest_rsp + sizeof(std::uint64_t), "tail",
         resolved_kind, native_function);
     if (executed && exits_mapped_root) {
@@ -28574,7 +29214,7 @@ std::uint64_t InterpretDecodedInstructionScoped(LsxMachineImage* state,
             const std::uint32_t n =
                 s_zero_ret_insn_budget.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
-                BackendBLog("[EXECUTOR_BACKEND_B_ZERO_RET_INSN] n=%u rip=0x%llx "
+                JitLog("[EXECUTOR_JIT_ZERO_RET_INSN] n=%u rip=0x%llx "
                             "rax=0x%llx rsp=0x%llx rbp=0x%llx",
                             n,
                             static_cast<unsigned long long>(ir->guest_rip),
@@ -28597,13 +29237,13 @@ std::uint64_t InterpretDecodedInstructionScoped(LsxMachineImage* state,
     } catch (const std::exception& e) {
         g_helper_fault_message = e.what();
         restore_fault_context();
-        BackendBLog("[EXECUTOR_BACKEND_B_HELPER_EXCEPTION] %s",
+        JitLog("[EXECUTOR_JIT_HELPER_EXCEPTION] %s",
                     g_helper_fault_message.c_str());
         return kGuestExitSentinel;
     } catch (...) {
-        g_helper_fault_message = "Backend B helper exception: unknown";
+        g_helper_fault_message = "JIT helper exception: unknown";
         restore_fault_context();
-        BackendBLog("[EXECUTOR_BACKEND_B_HELPER_EXCEPTION] %s",
+        JitLog("[EXECUTOR_JIT_HELPER_EXCEPTION] %s",
                     g_helper_fault_message.c_str());
         return kGuestExitSentinel;
     }
@@ -28662,8 +29302,8 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
     }
 
     state->rip_or_exit = ir->guest_rip;
-    if (IsBackendBHleBridgeMarkerInstruction(*ir)) {
-        return ExecuteBackendBHleBridgeMarker(*state, ir->guest_rip);
+    if (IsJitHleBridgeMarkerInstruction(*ir)) {
+        return ExecuteJitHleBridgeMarker(*state, ir->guest_rip);
     }
 
     const auto mnemonic = static_cast<X86Mnemonic>(ir->mnemonic);
@@ -28996,7 +29636,7 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
         const bool has_repne = (ir->decoded.attributes & X86_ATTRIB_HAS_REPNE) != 0;
         const bool has_repe = (ir->decoded.attributes &
                                (X86_ATTRIB_HAS_REPE | X86_ATTRIB_HAS_REP)) != 0;
-        Executor::BackendB::Cmps(*state, mnemonic, has_repe, has_repne);
+        Executor::Jit::Cmps(*state, mnemonic, has_repe, has_repne);
         return 0;
     }
     case X86_MNEMONIC_NOP:
@@ -29798,11 +30438,11 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
         state->rflags = PopSized(*state, 64) | 0x2u;
         return 0;
     case X86_MNEMONIC_CALL: {
-        if (g_backendb_selftest_differential_active) {
-            ++g_backendb_selftest_dynamic_control_semantic_calls;
+        if (g_jit_selftest_differential_active) {
+            ++g_jit_selftest_dynamic_control_semantic_calls;
         }
         const std::uint64_t target = ResolveDynamicTarget(*state, *ir);
-        if (TryExecuteBackendBDirectHleCall(*state, target, next_rip)) {
+        if (TryExecuteJitDirectHleCall(*state, target, next_rip)) {
             return next_rip;
         }
         Push64(*state, next_rip);
@@ -29810,11 +30450,11 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
         return target;
     }
     case X86_MNEMONIC_JMP: {
-        if (g_backendb_selftest_differential_active) {
-            ++g_backendb_selftest_dynamic_control_semantic_calls;
+        if (g_jit_selftest_differential_active) {
+            ++g_jit_selftest_dynamic_control_semantic_calls;
         }
         const std::uint64_t target = ResolveDynamicTarget(*state, *ir);
-        if (TryExecuteBackendBDirectHleTail(*state, target)) {
+        if (TryExecuteJitDirectHleTail(*state, target)) {
             return state->rip_or_exit;
         }
         state->rip_or_exit = target;
@@ -29827,7 +30467,7 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
         if (target == kGuestExitSentinel && SegmentBase(*state, X86_REGISTER_FS) != 0 &&
             !g_allow_guest_return_sentinel) {
             std::ostringstream error;
-            error << "Backend B mapped entry returned rip=0x" << std::hex << ir->guest_rip
+            error << "JIT mapped entry returned rip=0x" << std::hex << ir->guest_rip
                   << " rax=0x" << GetGpr64(*state, LsxGpr::Rax)
                   << " rsp=0x" << GetGpr64(*state, LsxGpr::Rsp)
                   << " rbp=0x" << GetGpr64(*state, LsxGpr::Rbp)
@@ -30081,7 +30721,7 @@ bool CanonicalizeLoadedIrDerivedMetadata(LsxDecodedRegion& block) {
         ir.attributes = static_cast<std::uint16_t>(ir.decoded.attributes & 0xffffu);
 
         const bool hle_marker_shape =
-            ir.length == kBackendBHleMarkerLength &&
+            ir.length == kJitHleMarkerLength &&
             ir.mnemonic == static_cast<std::uint32_t>(X86_MNEMONIC_INVALID) &&
             ir.bytes[0] == 0x0f && ir.bytes[1] == 0x3f;
         ir.category = hle_marker_shape ? LsxOpClass::System
@@ -30144,11 +30784,11 @@ LsxDecodedRegion BuildLsxCodeRegion(const std::uint64_t guest_rip, const std::ui
                 ? LiftOneMachineInstruction(decode_bytes, operation)
                 : ByteLensResult::Rejected;
         if (lens_result != ByteLensResult::Accepted) {
-            if (IsBackendBHleBridgeMarkerAt(rip)) {
+            if (IsJitHleBridgeMarkerAt(rip)) {
                 block.instructions.emplace_back();
                 LsxDecodedOp& ir = block.instructions.back();
                 ir.guest_rip = rip;
-                ir.length = kBackendBHleMarkerLength;
+                ir.length = kJitHleMarkerLength;
                 ir.mnemonic = static_cast<std::uint32_t>(X86_MNEMONIC_INVALID);
                 ir.bytes[0] = 0x0f;
                 ir.bytes[1] = 0x3f;
@@ -30321,7 +30961,7 @@ void ExecuteJitXchgMem(LsxMachineImage& state, void* target, const std::size_t s
     if (target == nullptr || size_bits == 0) {
         return;
     }
-    // ROOT of the Sonic Backend-B host-memory corruption: this LOCK XCHG helper (the mutex-acquire
+    // ROOT of the Sonic JIT host-memory corruption: this LOCK XCHG helper (the mutex-acquire
     // fast-path `lock xchg [owner], tid`) writes DIRECTLY to the raw host `target` — it bypasses
     // WriteMemoryBytes and therefore every guest-store guard and force-interpret. When the guest's
     // atomic targets an address that translates into OUR loaded .so image (a static std::mutex /
@@ -30334,12 +30974,12 @@ void ExecuteJitXchgMem(LsxMachineImage& state, void* target, const std::size_t s
         // Cover our .so image AND the adjacent host heap band above it (where guest PthreadMutex /
         // AAudio / Vulkan objects are malloc'd). A guest atomic must never hit any of these; guest
         // memory (direct 0x2xx, modules 0x8xx, stacks 0x7ef...) is far outside [img_lo, img_hi+768MB).
-        if (BackendBOwnHostImageRange(img_lo, img_hi) && taddr >= img_lo &&
+        if (JitOwnHostImageRange(img_lo, img_hi) && taddr >= img_lo &&
             taddr < img_hi + 0x30000000ull) {
             static std::atomic<std::uint32_t> b{0};
             const std::uint32_t n = b.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
-                BackendBLog("[EXECUTOR_BACKEND_B_XCHG_INTO_HOST_IMAGE] n=%u target=0x%llx sizeBits=%u "
+                JitLog("[EXECUTOR_JIT_XCHG_INTO_HOST_IMAGE] n=%u target=0x%llx sizeBits=%u "
                             "rip=0x%llx activeRip=0x%llx image=[0x%llx,0x%llx)",
                             n, static_cast<unsigned long long>(taddr), size_bits,
                             static_cast<unsigned long long>(g_current_fault_ir != nullptr
@@ -30349,7 +30989,7 @@ void ExecuteJitXchgMem(LsxMachineImage& state, void* target, const std::size_t s
                             static_cast<unsigned long long>(img_lo),
                             static_cast<unsigned long long>(img_hi));
                 std::FILE* cf = std::fopen(
-                    "/data/data/app.lsx4.android/files/lsx4-home/backendb-checkfail.txt",
+                    "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt",
                     "a");
                 if (cf != nullptr) {
                     std::fprintf(cf, "XCHG_INTO_HOST_IMAGE target=0x%llx rip=0x%llx\n",
@@ -30384,7 +31024,7 @@ void ExecuteJitXchgMem(LsxMachineImage& state, void* target, const std::size_t s
         switch (size_bits) {
         case 8:
 #if defined(__aarch64__)
-            if (BackendBHostHasLseAtomics()) {
+            if (JitHostHasLseAtomics()) {
                 // NDK's baseline compiler-rt outline atomic selected its LL/SC loop on this
                 // device despite HWCAP_ATOMICS. In a contended guest lock that loop alone
                 // consumed a quarter of Game:Main. The architectural byte exchange maps
@@ -31334,17 +31974,17 @@ bool TryBulkMovs(const std::uint64_t rsi, const std::uint64_t rdi,
         // overlaps instead of guessing from the libc implementation's chosen direction.
         return false;
     }
-    if (!ExecutorBackendBIsReadableGuestRange(source_begin, source_bytes) ||
-        !ExecutorBackendBIsReadableGuestRange(destination_begin, destination_bytes)) {
+    if (!ExecutorJitIsReadableGuestRange(source_begin, source_bytes) ||
+        !ExecutorJitIsReadableGuestRange(destination_begin, destination_bytes)) {
         return false;
     }
-    if (!ExecutorBackendBWriteGuestBytes(destination_begin,
+    if (!ExecutorJitWriteGuestBytes(destination_begin,
                                          reinterpret_cast<const void*>(source_begin),
                                          source_bytes)) {
         return false;
     }
-    g_backendb_rep_movs_bulk_calls.fetch_add(1, std::memory_order_relaxed);
-    g_backendb_rep_movs_bulk_bytes.fetch_add(source_bytes, std::memory_order_relaxed);
+    g_jit_rep_movs_bulk_calls.fetch_add(1, std::memory_order_relaxed);
+    g_jit_rep_movs_bulk_bytes.fetch_add(source_bytes, std::memory_order_relaxed);
     return true;
 }
 
@@ -31358,11 +31998,11 @@ bool TryBulkStos(const std::uint64_t rdi, const std::uint64_t rax,
     std::size_t destination_bytes = 0;
     if (!TryGetStringSpan(rdi, element_size, count, backward, destination_begin,
                           destination_bytes) ||
-        !ExecutorBackendBIsReadableGuestRange(destination_begin, destination_bytes)) {
+        !ExecutorJitIsReadableGuestRange(destination_begin, destination_bytes)) {
         return false;
     }
 
-    // A stack buffer is recognized by ExecutorBackendBWriteGuestBytes without consulting
+    // A stack buffer is recognized by ExecutorJitWriteGuestBytes without consulting
     // /proc/self/maps. Build the repeating lane once, then write large contiguous chunks instead of
     // invoking the complete guest-memory bridge once for every byte/word/qword.
     constexpr std::size_t kFillChunkBytes = 16 * 1024;
@@ -31378,7 +32018,7 @@ bool TryBulkStos(const std::uint64_t rdi, const std::uint64_t rax,
     std::size_t offset = 0;
     while (offset < destination_bytes) {
         const std::size_t chunk = std::min(pattern.size(), destination_bytes - offset);
-        if (!ExecutorBackendBWriteGuestBytes(destination_begin + offset, pattern.data(), chunk)) {
+        if (!ExecutorJitWriteGuestBytes(destination_begin + offset, pattern.data(), chunk)) {
             // The complete destination was proven guest-readable before the first write, so this is
             // an exceptional write/protection failure. Match the existing scalar WriteMemoryBytes
             // contract and surface a guest fault instead of pretending a partial fill completed.
@@ -31387,8 +32027,8 @@ bool TryBulkStos(const std::uint64_t rdi, const std::uint64_t rax,
         }
         offset += chunk;
     }
-    g_backendb_rep_stos_bulk_calls.fetch_add(1, std::memory_order_relaxed);
-    g_backendb_rep_stos_bulk_bytes.fetch_add(destination_bytes, std::memory_order_relaxed);
+    g_jit_rep_stos_bulk_calls.fetch_add(1, std::memory_order_relaxed);
+    g_jit_rep_stos_bulk_bytes.fetch_add(destination_bytes, std::memory_order_relaxed);
     return true;
 }
 
@@ -31562,12 +32202,12 @@ void Cmpxchg(LsxMachineImage& state, void* target, const bool target_is_register
             // the guest sees the CAS as succeeded) instead of corrupting a host mutex/BSS object.
             std::uint64_t img_lo = 0, img_hi = 0;
             const std::uint64_t taddr = reinterpret_cast<std::uint64_t>(target);
-            if (BackendBOwnHostImageRange(img_lo, img_hi) && taddr >= img_lo &&
+            if (JitOwnHostImageRange(img_lo, img_hi) && taddr >= img_lo &&
                 taddr < img_hi + 0x30000000ull) {
                 static std::atomic<std::uint32_t> b{0};
                 const std::uint32_t n = b.fetch_add(1, std::memory_order_relaxed);
                 if (n < 64) {
-                    BackendBLog("[EXECUTOR_BACKEND_B_CMPXCHG_INTO_HOST_IMAGE] n=%u target=0x%llx "
+                    JitLog("[EXECUTOR_JIT_CMPXCHG_INTO_HOST_IMAGE] n=%u target=0x%llx "
                                 "sizeBits=%u rip=0x%llx image=[0x%llx,0x%llx)",
                                 n, static_cast<unsigned long long>(taddr), size_bits,
                                 static_cast<unsigned long long>(g_current_fault_ir != nullptr
@@ -31576,7 +32216,7 @@ void Cmpxchg(LsxMachineImage& state, void* target, const bool target_is_register
                                 static_cast<unsigned long long>(img_lo),
                                 static_cast<unsigned long long>(img_hi));
                     std::FILE* cf = std::fopen("/data/data/app.lsx4.android/files/"
-                                               "lsx4-home/backendb-checkfail.txt",
+                                               "lsx4-home/jit-checkfail.txt",
                                                "a");
                     if (cf != nullptr) {
                         std::fprintf(cf, "CMPXCHG_INTO_HOST_IMAGE target=0x%llx rip=0x%llx\n",
@@ -31621,7 +32261,7 @@ void CmpxchgLocked(LsxMachineImage& state, void* target, const bool target_is_re
 
     std::uint64_t img_lo = 0;
     std::uint64_t img_hi = 0;
-    if (BackendBOwnHostImageRange(img_lo, img_hi) && address >= img_lo &&
+    if (JitOwnHostImageRange(img_lo, img_hi) && address >= img_lo &&
         address < img_hi + 0x30000000ull) {
         // Reuse the guarded non-atomic path: it observes the host value and refuses the write.
         Cmpxchg(state, target, false, 0, src_state_offset, src_shift, size_bits);
@@ -31991,33 +32631,33 @@ void Imul(LsxMachineImage& state, const std::size_t state_offset, const std::uin
 
 RuntimeStatsSnapshot GetRuntimeStatsSnapshot() noexcept {
     return {
-        .decoded_blocks = g_backendb_blocks_decoded.load(std::memory_order_relaxed),
-        .native_blocks = g_backendb_blocks_native.load(std::memory_order_relaxed),
-        .helper_blocks = g_backendb_blocks_helper.load(std::memory_order_relaxed),
-        .unsupported_blocks = g_backendb_blocks_unsupported.load(std::memory_order_relaxed),
-        .native_cache_hits = g_backendb_checked_native_hits.load(std::memory_order_relaxed),
+        .decoded_blocks = g_jit_blocks_decoded.load(std::memory_order_relaxed),
+        .native_blocks = g_jit_blocks_native.load(std::memory_order_relaxed),
+        .helper_blocks = g_jit_blocks_helper.load(std::memory_order_relaxed),
+        .unsupported_blocks = g_jit_blocks_unsupported.load(std::memory_order_relaxed),
+        .native_cache_hits = g_jit_checked_native_hits.load(std::memory_order_relaxed),
         .persistent_ir_enabled =
-            g_backendb_persistent_ir_enabled.load(std::memory_order_relaxed) ? 1u : 0u,
+            g_jit_persistent_ir_enabled.load(std::memory_order_relaxed) ? 1u : 0u,
         .persistent_ir_hits =
-            g_backendb_persistent_ir_hits.load(std::memory_order_relaxed),
+            g_jit_persistent_ir_hits.load(std::memory_order_relaxed),
         .persistent_ir_misses =
-            g_backendb_persistent_ir_misses.load(std::memory_order_relaxed),
+            g_jit_persistent_ir_misses.load(std::memory_order_relaxed),
         .persistent_ir_records_loaded =
-            g_backendb_persistent_ir_records_loaded.load(std::memory_order_relaxed),
+            g_jit_persistent_ir_records_loaded.load(std::memory_order_relaxed),
         .persistent_ir_records_written =
-            g_backendb_persistent_ir_records_written.load(std::memory_order_relaxed),
+            g_jit_persistent_ir_records_written.load(std::memory_order_relaxed),
         .persistent_native_hits =
-            g_backendb_persistent_native_hits.load(std::memory_order_relaxed),
+            g_jit_persistent_native_hits.load(std::memory_order_relaxed),
         .persistent_native_segments_restored =
-            g_backendb_persistent_native_segments_restored.load(std::memory_order_relaxed),
+            g_jit_persistent_native_segments_restored.load(std::memory_order_relaxed),
         .persistent_native_records_captured =
-            g_backendb_persistent_native_records_captured.load(std::memory_order_relaxed),
+            g_jit_persistent_native_records_captured.load(std::memory_order_relaxed),
         .persistent_native_records_written =
-            g_backendb_persistent_native_records_written.load(std::memory_order_relaxed),
+            g_jit_persistent_native_records_written.load(std::memory_order_relaxed),
         .persistent_native_restore_fallbacks =
-            g_backendb_persistent_native_restore_fallbacks.load(std::memory_order_relaxed),
+            g_jit_persistent_native_restore_fallbacks.load(std::memory_order_relaxed),
         .persistent_native_capture_rejected =
-            g_backendb_persistent_native_capture_rejected.load(std::memory_order_relaxed),
+            g_jit_persistent_native_capture_rejected.load(std::memory_order_relaxed),
     };
 }
 
@@ -32029,15 +32669,15 @@ std::string LsxEngineStatusJson() {
         std::uint32_t insn_count = 0;
         std::uint32_t first_mnemonic = 0;
     };
-    std::array<HotHelperSnapshot, kBackendBHotHelperSlots> hot_helpers{};
-    for (std::size_t i = 0; i < g_backendb_hot_helper_slots.size(); ++i) {
-        hot_helpers[i].rip = g_backendb_hot_helper_slots[i].rip.load(std::memory_order_relaxed);
+    std::array<HotHelperSnapshot, kJitHotHelperSlots> hot_helpers{};
+    for (std::size_t i = 0; i < g_jit_hot_helper_slots.size(); ++i) {
+        hot_helpers[i].rip = g_jit_hot_helper_slots[i].rip.load(std::memory_order_relaxed);
         hot_helpers[i].count =
-            g_backendb_hot_helper_slots[i].count.load(std::memory_order_relaxed);
+            g_jit_hot_helper_slots[i].count.load(std::memory_order_relaxed);
         hot_helpers[i].insn_count =
-            g_backendb_hot_helper_slots[i].insn_count.load(std::memory_order_relaxed);
+            g_jit_hot_helper_slots[i].insn_count.load(std::memory_order_relaxed);
         hot_helpers[i].first_mnemonic =
-            g_backendb_hot_helper_slots[i].first_mnemonic.load(std::memory_order_relaxed);
+            g_jit_hot_helper_slots[i].first_mnemonic.load(std::memory_order_relaxed);
     }
     for (std::size_t i = 0; i + 1 < hot_helpers.size(); ++i) {
         std::size_t best = i;
@@ -32062,86 +32702,86 @@ std::string LsxEngineStatusJson() {
         << R"("reason":")" << JsonEscape(st.reason) << R"(",)"
         << R"("engine":")" << JsonEscape(g_lsx_translation_engine.Name()) << R"(",)"
         << R"("runtimeBlocks":{)"
-        << R"("decoded":)" << g_backendb_blocks_decoded.load(std::memory_order_relaxed) << ","
-        << R"("native":)" << g_backendb_blocks_native.load(std::memory_order_relaxed) << ","
-        << R"("helper":)" << g_backendb_blocks_helper.load(std::memory_order_relaxed) << ","
-        << R"("unsupported":)" << g_backendb_blocks_unsupported.load(std::memory_order_relaxed)
+        << R"("decoded":)" << g_jit_blocks_decoded.load(std::memory_order_relaxed) << ","
+        << R"("native":)" << g_jit_blocks_native.load(std::memory_order_relaxed) << ","
+        << R"("helper":)" << g_jit_blocks_helper.load(std::memory_order_relaxed) << ","
+        << R"("unsupported":)" << g_jit_blocks_unsupported.load(std::memory_order_relaxed)
         << ","
         << R"("cacheHash":{)"
-        << R"("hits":)" << g_backendb_cache_hash_hits.load(std::memory_order_relaxed) << ","
+        << R"("hits":)" << g_jit_cache_hash_hits.load(std::memory_order_relaxed) << ","
         << R"("mismatches":)"
-        << g_backendb_cache_hash_misses.load(std::memory_order_relaxed) << "},"
+        << g_jit_cache_hash_misses.load(std::memory_order_relaxed) << "},"
         << R"("persistentIrCache":{)"
         << R"("enabled":)"
-        << (g_backendb_persistent_ir_enabled.load(std::memory_order_relaxed) ? "true" : "false")
+        << (g_jit_persistent_ir_enabled.load(std::memory_order_relaxed) ? "true" : "false")
         << ","
-        << R"("hits":)" << g_backendb_persistent_ir_hits.load(std::memory_order_relaxed) << ","
-        << R"("misses":)" << g_backendb_persistent_ir_misses.load(std::memory_order_relaxed)
+        << R"("hits":)" << g_jit_persistent_ir_hits.load(std::memory_order_relaxed) << ","
+        << R"("misses":)" << g_jit_persistent_ir_misses.load(std::memory_order_relaxed)
         << ","
         << R"("loaded":)"
-        << g_backendb_persistent_ir_records_loaded.load(std::memory_order_relaxed) << ","
+        << g_jit_persistent_ir_records_loaded.load(std::memory_order_relaxed) << ","
         << R"("written":)"
-        << g_backendb_persistent_ir_records_written.load(std::memory_order_relaxed) << ","
+        << g_jit_persistent_ir_records_written.load(std::memory_order_relaxed) << ","
         << R"("corruptShards":)"
-        << g_backendb_persistent_ir_corrupt_shards.load(std::memory_order_relaxed) << "},"
+        << g_jit_persistent_ir_corrupt_shards.load(std::memory_order_relaxed) << "},"
         << R"("persistentNative":{)"
         << R"("hits":)"
-        << g_backendb_persistent_native_hits.load(std::memory_order_relaxed) << ","
+        << g_jit_persistent_native_hits.load(std::memory_order_relaxed) << ","
         << R"("segmentsRestored":)"
-        << g_backendb_persistent_native_segments_restored.load(std::memory_order_relaxed)
+        << g_jit_persistent_native_segments_restored.load(std::memory_order_relaxed)
         << ","
         << R"("captured":)"
-        << g_backendb_persistent_native_records_captured.load(std::memory_order_relaxed)
+        << g_jit_persistent_native_records_captured.load(std::memory_order_relaxed)
         << ","
         << R"("written":)"
-        << g_backendb_persistent_native_records_written.load(std::memory_order_relaxed)
+        << g_jit_persistent_native_records_written.load(std::memory_order_relaxed)
         << ","
         << R"("restoreFallback":)"
-        << g_backendb_persistent_native_restore_fallbacks.load(std::memory_order_relaxed)
+        << g_jit_persistent_native_restore_fallbacks.load(std::memory_order_relaxed)
         << ","
         << R"("captureRejected":)"
-        << g_backendb_persistent_native_capture_rejected.load(std::memory_order_relaxed)
+        << g_jit_persistent_native_capture_rejected.load(std::memory_order_relaxed)
         << "},"
         << R"("checkedNative":{)"
-        << R"("hits":)" << g_backendb_checked_native_hits.load(std::memory_order_relaxed) << ","
-        << R"("trusted":)" << g_backendb_checked_native_trusted.load(std::memory_order_relaxed)
+        << R"("hits":)" << g_jit_checked_native_hits.load(std::memory_order_relaxed) << ","
+        << R"("trusted":)" << g_jit_checked_native_trusted.load(std::memory_order_relaxed)
         << ","
-        << R"("fallback":)" << g_backendb_checked_native_fallback.load(std::memory_order_relaxed)
+        << R"("fallback":)" << g_jit_checked_native_fallback.load(std::memory_order_relaxed)
         << "},"
         << R"("nativeSimd":{)"
-        << R"("blocks":)" << g_backendb_native_simd_blocks.load(std::memory_order_relaxed)
+        << R"("blocks":)" << g_jit_native_simd_blocks.load(std::memory_order_relaxed)
         << ","
         << R"("fastInstructions":)"
-        << g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) << ","
+        << g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) << ","
         << R"("semanticInstructions":)"
-        << g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) << ","
+        << g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) << ","
         << R"("faultableWritebackBlocks":)"
-        << g_backendb_native_simd_faultable_writeback_blocks.load(
+        << g_jit_native_simd_faultable_writeback_blocks.load(
                std::memory_order_relaxed)
         << "},"
         << R"("nativeScalar":{)"
-        << R"("blocks":)" << g_backendb_native_scalar_blocks.load(std::memory_order_relaxed)
+        << R"("blocks":)" << g_jit_native_scalar_blocks.load(std::memory_order_relaxed)
         << ","
         << R"("directInstructions":)"
-        << g_backendb_native_scalar_direct_instructions.load(std::memory_order_relaxed) << ","
+        << g_jit_native_scalar_direct_instructions.load(std::memory_order_relaxed) << ","
         << R"("semanticInstructions":)"
-        << g_backendb_native_scalar_semantic_instructions.load(std::memory_order_relaxed) << ","
+        << g_jit_native_scalar_semantic_instructions.load(std::memory_order_relaxed) << ","
         << R"("repStringBulk":{)"
         << R"("movsCalls":)"
-        << g_backendb_rep_movs_bulk_calls.load(std::memory_order_relaxed) << ","
+        << g_jit_rep_movs_bulk_calls.load(std::memory_order_relaxed) << ","
         << R"("movsBytes":)"
-        << g_backendb_rep_movs_bulk_bytes.load(std::memory_order_relaxed) << ","
+        << g_jit_rep_movs_bulk_bytes.load(std::memory_order_relaxed) << ","
         << R"("stosCalls":)"
-        << g_backendb_rep_stos_bulk_calls.load(std::memory_order_relaxed) << ","
+        << g_jit_rep_stos_bulk_calls.load(std::memory_order_relaxed) << ","
         << R"("stosBytes":)"
-        << g_backendb_rep_stos_bulk_bytes.load(std::memory_order_relaxed) << "},"
+        << g_jit_rep_stos_bulk_bytes.load(std::memory_order_relaxed) << "},"
         << R"("controlSemanticTerminators":)"
-        << g_backendb_native_control_semantic_terminators.load(
+        << g_jit_native_control_semantic_terminators.load(
                std::memory_order_relaxed)
         << "},"
         << R"("leafHleFusion":{)"
         << R"("compiledBlocks":)"
-        << g_backendb_leaf_hle_fused_blocks.load(std::memory_order_relaxed)
+        << g_jit_leaf_hle_fused_blocks.load(std::memory_order_relaxed)
         << "},"
         << R"("hotHelpers":[)";
     bool first_hot = true;
@@ -32182,7 +32822,7 @@ std::string LsxEngineStatusJson() {
         << R"("tlsSymbols":)" << st.tls_symbols
         << "},"
         << R"("nextRequired":["pc-interpreter parity across guest module boundaries",)"
-        << R"("Backend B thread state dump on render stalls",)"
+        << R"("JIT thread state dump on render stalls",)"
         << R"("replace remaining interpreter-helper blocks with reconstructed AArch64 blocks",)"
         << R"("stack-argument and guest-frame parity against the native execution contract"])"
         << "}";
@@ -33819,7 +34459,7 @@ void VMaskMov(void* vector, const void* mask, void* other, const std::size_t tot
 std::string LsxEngineSelfTestJson() {
     std::ostringstream out;
     try {
-        const ScopedBackendBSelfTestDifferential selftest_differential_scope;
+        const ScopedJitSelfTestDifferential selftest_differential_scope;
         Aarch64CodeArena arena;
         auto* ret_block = arena.EmitReturnImmediateBlock(0x123456789abcdef0ull);
         const std::uint64_t ret_value = ret_block(nullptr);
@@ -33998,18 +34638,18 @@ std::string LsxEngineSelfTestJson() {
         const std::uint64_t hash_before =
             FingerprintCodeSpan(smc_rip, static_cast<std::uint32_t>(mapped_entry.size()));
         const std::uint64_t mismatch_before =
-            g_backendb_cache_hash_misses.load(std::memory_order_relaxed);
+            g_jit_cache_hash_misses.load(std::memory_order_relaxed);
         const std::uint64_t smc_first = smc_backend.Execute(smc_rip, ctx);
         const TranslationRecord cache_result_before =
             smc_backend.ResolveTranslation(smc_rip);
         const std::uint64_t direct_slot_tls_hits_before =
-            g_backendb_thread_chain_patch_cache.hits;
+            g_jit_thread_chain_patch_cache.hits;
         auto* cache_direct_slot_before = smc_backend.AcquireChainPatchCell(smc_rip);
         auto* cache_direct_slot_repeat = smc_backend.AcquireChainPatchCell(smc_rip);
         const bool direct_slot_tls_lookup_ok =
             cache_direct_slot_before != nullptr &&
             cache_direct_slot_repeat == cache_direct_slot_before &&
-            g_backendb_thread_chain_patch_cache.hits >
+            g_jit_thread_chain_patch_cache.hits >
                 direct_slot_tls_hits_before;
         const Arm64BlockEntry cache_direct_entry_before =
             cache_direct_slot_before->target.load(std::memory_order_acquire);
@@ -34023,7 +34663,7 @@ std::string LsxEngineSelfTestJson() {
         const Arm64BlockEntry cache_direct_entry_after =
             cache_direct_slot_after->target.load(std::memory_order_acquire);
         const std::uint64_t mismatch_after =
-            g_backendb_cache_hash_misses.load(std::memory_order_relaxed);
+            g_jit_cache_hash_misses.load(std::memory_order_relaxed);
         mapped_entry[6] = 0x05;
         const bool cache_contract_ok =
             smc_first == 12 && smc_second == 13 && hash_before != hash_after &&
@@ -34044,7 +34684,7 @@ std::string LsxEngineSelfTestJson() {
         bool conditional_two_edge_safepoint_ok = false;
         bool conditional_two_edge_smc_ok = false;
         {
-            const ScopedBackendBSelfTestProductionDirect production_direct_scope;
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
             alignas(16) std::array<std::uint8_t, 32> conditional_code{};
             conditional_code.fill(0x90);
             conditional_code[0] = 0x83; // cmp edi,0
@@ -34062,7 +34702,7 @@ std::string LsxEngineSelfTestJson() {
             ChainPatchCell taken_slot(taken_rip, &conditional_epoch);
             ChainPatchCell fallthrough_slot(fallthrough_rip, &conditional_epoch);
             constexpr std::uint64_t kTakenMarker = 0x1122334455667788ull;
-            constexpr std::uint64_t kFallthroughMarker = 0x8877665544332211ull;
+            constexpr std::uint64_t kFallthroughMarker = 0x4C53585F4D41524Bull;
             Arm64BlockEntry taken_marker = arena.EmitReturnImmediateBlock(kTakenMarker);
             Arm64BlockEntry fallthrough_marker =
                 arena.EmitReturnImmediateBlock(kFallthroughMarker);
@@ -34075,7 +34715,7 @@ std::string LsxEngineSelfTestJson() {
                 slot.guest_size.store(1, std::memory_order_relaxed);
                 slot.guest_hash.store(FingerprintCodeSpan(slot.guest_rip, 1),
                                       std::memory_order_relaxed);
-                slot.refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+                slot.refresh_counter.store(kJitExecutionCacheRefreshMask,
                                            std::memory_order_relaxed);
                 slot.chain_target.store(chain_target,
                                         std::memory_order_relaxed);
@@ -34152,7 +34792,7 @@ std::string LsxEngineSelfTestJson() {
         std::uint64_t shared_chain_native_ns = 0;
         bool shared_chain_throughput_ok = false;
         {
-            const ScopedBackendBSelfTestProductionDirect production_direct_scope;
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
             constexpr std::size_t kBlockCount = 128;
             constexpr std::size_t kIterations = 4096;
             std::array<std::array<std::uint8_t, 4>, kBlockCount> chain_code{};
@@ -34243,7 +34883,7 @@ std::string LsxEngineSelfTestJson() {
         bool generic_indirect_pic_deny_retire_ok = false;
         bool generic_indirect_pic_persistence_roundtrip_ok = false;
         {
-            const ScopedBackendBSelfTestProductionDirect production_direct_scope;
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
             const auto set_chain_budget = [](LsxMachineImage& state,
                                              const std::uint32_t budget) {
                 state.direct_chain_budget = budget;
@@ -34253,7 +34893,7 @@ std::string LsxEngineSelfTestJson() {
                                      const std::uint64_t guest_hash = 0) {
                 slot.guest_size.store(guest_size, std::memory_order_relaxed);
                 slot.guest_hash.store(guest_hash, std::memory_order_relaxed);
-                slot.refresh_counter.store(kBackendBExecutionCacheRefreshMask,
+                slot.refresh_counter.store(kJitExecutionCacheRefreshMask,
                                            std::memory_order_relaxed);
                 slot.target.store(target, std::memory_order_release);
             };
@@ -34312,14 +34952,14 @@ std::string LsxEngineSelfTestJson() {
                 pic_jmp_block, nullptr, &cold_jmp_direct, nullptr, &cold_site,
                 &cold_jmp_used);
             const std::uint64_t bind_before =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             LsxMachineImage cold_state{};
             SetGpr64(cold_state, LsxGpr::Rax, kPicGuestTargetA);
             set_chain_budget(cold_state, 2);
             const std::uint64_t cold_result =
                 cold_jmp_direct != nullptr ? cold_jmp_direct(&cold_state) : 0;
             const std::uint64_t bind_after_miss =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             ChainPatchCell* cold_bound_slot =
                 cold_site.ways[0].load(std::memory_order_acquire);
             if (cold_bound_slot == nullptr) {
@@ -34333,7 +34973,7 @@ std::string LsxEngineSelfTestJson() {
             const std::uint64_t warm_result =
                 cold_jmp_direct != nullptr ? cold_jmp_direct(&warm_state) : 0;
             const std::uint64_t bind_after_hit =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             generic_indirect_pic_miss_publish_hit_ok =
                 cold_jmp_entry != nullptr && cold_jmp_used &&
                 cold_result == kPicGuestTargetA && cold_bound_slot != nullptr &&
@@ -34370,7 +35010,7 @@ std::string LsxEngineSelfTestJson() {
             const std::uint64_t pic_zero_rsp_before =
                 GetGpr64(pic_zero_state, LsxGpr::Rsp);
             const std::uint64_t zero_bind_before =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             const std::uint64_t pic_zero_result =
                 pic_ret_direct != nullptr ? pic_ret_direct(&pic_zero_state) : 1;
             generic_indirect_pic_ret_stack_zero_ok =
@@ -34379,7 +35019,7 @@ std::string LsxEngineSelfTestJson() {
                 GetGpr64(pic_ret_state, LsxGpr::Rsp) == pic_ret_rsp_before + 8 &&
                 pic_zero_result == 0 &&
                 GetGpr64(pic_zero_state, LsxGpr::Rsp) == pic_zero_rsp_before + 8 &&
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed) ==
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed) ==
                     zero_bind_before;
 
             // A return instruction belongs to one callee but can have many stable callers.  Warm
@@ -34434,10 +35074,10 @@ std::string LsxEngineSelfTestJson() {
                 return sequence_ok;
             };
             const std::uint64_t ret_nine_bind_before =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             const bool ret_nine_first_ok = run_ret_nine_sequence();
             const std::uint64_t ret_nine_bind_after_first =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             std::array<bool, kRetNineTargetCount> ret_nine_cached{};
             std::size_t ret_nine_populated_ways = 0;
             for (const auto& way : ret_nine_site.ways) {
@@ -34459,7 +35099,7 @@ std::string LsxEngineSelfTestJson() {
             }
             const bool ret_nine_second_ok = run_ret_nine_sequence();
             const std::uint64_t ret_nine_bind_after_second =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             generic_indirect_pic_ret_nine_way_warm_ok =
                 ret_nine_entry != nullptr && ret_nine_used &&
                 ret_nine_site.way_count == PolymorphicChainSite::kReturnWayCount &&
@@ -34524,7 +35164,7 @@ std::string LsxEngineSelfTestJson() {
             pic_smc_bytes[0] ^= 1u;
 
             const std::uint64_t retire_bind_before =
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed);
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             cold_site.Retire();
             LsxMachineImage retired_state{};
             SetGpr64(retired_state, LsxGpr::Rax, kPicGuestTargetA);
@@ -34536,12 +35176,12 @@ std::string LsxEngineSelfTestJson() {
                 retired_result == kPicGuestTargetA &&
                 cold_site.ways[0].load(std::memory_order_acquire) == nullptr &&
                 cold_site.ways[1].load(std::memory_order_acquire) == nullptr &&
-                g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed) ==
+                g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed) ==
                     retire_bind_before;
 
-            std::vector<BackendBNativeSegment> pic_segments;
-            std::uint32_t pic_entry_segment = kBackendBNativeNoSegment;
-            std::uint32_t pic_direct_segment = kBackendBNativeNoSegment;
+            std::vector<JitNativeSegment> pic_segments;
+            std::uint32_t pic_entry_segment = kJitNativeNoSegment;
+            std::uint32_t pic_direct_segment = kJitNativeNoSegment;
             const bool pic_persistence_captured =
                 pic_jmp_used && arena.CapturePersistentNativeBlock(
                     pic_jmp_entry,
@@ -34734,7 +35374,7 @@ std::string LsxEngineSelfTestJson() {
         const bool chain_patch_first_use_armed =
             direct_slot_precompile != nullptr &&
             direct_slot_precompile->refresh_counter.load(std::memory_order_relaxed) ==
-                kBackendBExecutionCacheRefreshMask;
+                kJitExecutionCacheRefreshMask;
 
         // A newly published slot must hash before its first direct execution. Keep this
         // independent from the larger generated-consumer test so changing that test's number
@@ -34754,7 +35394,7 @@ std::string LsxEngineSelfTestJson() {
                            static_cast<std::uint32_t>(direct_first_validation_code.size())),
             std::memory_order_relaxed);
         direct_first_validation_slot.refresh_counter.store(
-            kBackendBExecutionCacheRefreshMask, std::memory_order_relaxed);
+            kJitExecutionCacheRefreshMask, std::memory_order_relaxed);
         direct_first_validation_slot.target.store(direct_published_entry,
                                                   std::memory_order_release);
         direct_first_validation_code[0] = 0xcc;
@@ -34766,7 +35406,7 @@ std::string LsxEngineSelfTestJson() {
             direct_first_validation_result == nullptr &&
             direct_first_validation_slot.target.load(std::memory_order_acquire) == nullptr &&
             direct_first_validation_slot.refresh_counter.load(std::memory_order_relaxed) ==
-                kBackendBExecutionCacheRefreshMask &&
+                kJitExecutionCacheRefreshMask &&
             direct_first_validation_epoch.load(std::memory_order_acquire) == 8;
         LsxEntryPacket direct_execute_ctx{};
         const std::uint64_t direct_tls_before_mutation =
@@ -34918,7 +35558,7 @@ std::string LsxEngineSelfTestJson() {
         // before stale generated code can execute.
         if (direct_slot_precompile != nullptr) {
             direct_slot_precompile->refresh_counter.store(
-                kBackendBExecutionCacheRefreshMask, std::memory_order_relaxed);
+                kJitExecutionCacheRefreshMask, std::memory_order_relaxed);
         }
         chain_patch_code[kDirectTargetOffset + 1] = static_cast<std::uint8_t>(
             kDirectMutatedCalleeOffset - (kDirectTargetOffset + 2));
@@ -34987,7 +35627,7 @@ std::string LsxEngineSelfTestJson() {
         direct_fault_code[kDirectFaultTargetOffset] = 0x0f;
         direct_fault_code[kDirectFaultTargetOffset + 1] = 0x3f;
         std::memcpy(direct_fault_code.data() + kDirectFaultTargetOffset + 2,
-                    kBackendBHleThunkHash.data(), kBackendBHleThunkHash.size());
+                    kJitHleThunkHash.data(), kJitHleThunkHash.size());
         const std::uint64_t direct_fault_consumer_rip =
             reinterpret_cast<std::uint64_t>(direct_fault_code.data() +
                                             kDirectFaultConsumerOffset);
@@ -35022,7 +35662,7 @@ std::string LsxEngineSelfTestJson() {
         constexpr std::uint64_t kSyntheticFaultRecoveryRip =
             0xfeedface01234567ull;
         constexpr std::uint64_t kSyntheticGuestHandlerResult =
-            0x8877665544332211ull;
+            0x4C53585F4D41524Bull;
         LsxMachineImage synthetic_fault_state{};
         LsxMachineImage* const previous_synthetic_state =
             SwapDiagnosticMachineImage(&synthetic_fault_state);
@@ -35032,19 +35672,19 @@ std::string LsxEngineSelfTestJson() {
                 +[](LsxMachineImage* state) -> std::uint64_t {
                     state->rip_or_exit = kSyntheticFaultRecoveryRip;
                     SetGpr64(*state, LsxGpr::Rax, kSyntheticGuestHandlerResult);
-                    (void)executor_backend_b_resume_synchronous_guest_fault();
+                    (void)executor_jit_resume_synchronous_guest_fault();
                     return kGuestExitSentinel;
                 },
                 &synthetic_fault_state, synthetic_fault_result, nullptr,
-                &g_backend_b_fault_resume_frame,
-                &g_backend_b_deferred_guest_fault);
+                &g_jit_fault_resume_frame,
+                &g_jit_deferred_guest_fault);
         SwapDiagnosticMachineImage(previous_synthetic_state);
         direct_fault_synthetic_resume_ok =
             synthetic_fault_resumed && synthetic_fault_result == 0 &&
             synthetic_fault_state.rip_or_exit == kSyntheticFaultRecoveryRip &&
             GetGpr64(synthetic_fault_state, LsxGpr::Rax) ==
                 kSyntheticGuestHandlerResult &&
-            g_backend_b_fault_resume_frame == nullptr;
+            g_jit_fault_resume_frame == nullptr;
 #endif
 
         LsxTranslationEngine deny_backend;
@@ -35335,7 +35975,7 @@ std::string LsxEngineSelfTestJson() {
                 interpreter_memory[i] = static_cast<std::uint8_t>(0xa0u + i);
             }
             std::array<std::uint8_t, 64> native_memory = interpreter_memory;
-            constexpr std::uint64_t kMemoryValue = 0x8877665544332211ull;
+            constexpr std::uint64_t kMemoryValue = 0x4C53585F4D41524Bull;
             std::memcpy(interpreter_memory.data() + 16, &kMemoryValue,
                         sizeof(kMemoryValue));
             std::memcpy(native_memory.data() + 16, &kMemoryValue,
@@ -35426,7 +36066,7 @@ std::string LsxEngineSelfTestJson() {
             const bool case_ok = decoded_ok && interpreter_capable && emitted_ok && result_ok &&
                                  differential_state_ok && expected_state_ok && memory_ok;
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PARTIAL_MOVE_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_PARTIAL_MOVE_SELFTEST_FAIL] "
                             "bytes=%s vex=%d high=%d store=%d decoded=%d insns=%zu "
                             "canRef=%d entry=%d direct=%d refResult=0x%llx nativeResult=0x%llx "
                             "end=0x%llx diffState=%d expectedState=%d memory=%d "
@@ -35577,7 +36217,7 @@ std::string LsxEngineSelfTestJson() {
             const bool case_ok = decoded_ok && interpreter_capable && emitted_ok && result_ok &&
                                  memory_ok && state_ok && rcx_ok && flags_ok;
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_LEVEL_CLEAR_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_LEVEL_CLEAR_SELFTEST_FAIL] "
                             "initialRcx=0x%llx decoded=%d insns=%zu canRef=%d entry=%d direct=%d "
                             "refResult=0x%llx nativeResult=0x%llx expectedResult=0x%llx "
                             "memory=%d state=%d rcx=0x%llx expectedRcx=0x%llx "
@@ -35670,7 +36310,7 @@ std::string LsxEngineSelfTestJson() {
                                                           kStackOffset));
                 SetGpr64(state, LsxGpr::R8, 0x1020304050607080ull);
                 SetGpr64(state, LsxGpr::R10, 0xfedcba9800000000ull);
-                SetGpr64(state, LsxGpr::R11, 0x8877665544332211ull);
+                SetGpr64(state, LsxGpr::R11, 0x4C53585F4D41524Bull);
                 SetGpr64(state, LsxGpr::R12, 0x1122334455667788ull);
                 SetGpr64(state, LsxGpr::R13, 0x13579bdf2468ace0ull);
                 SetGpr64(state, LsxGpr::R14, 0x0f1e2d3c4b5a6978ull);
@@ -35735,7 +36375,7 @@ std::string LsxEngineSelfTestJson() {
                                  result_ok && state_ok && expected_ok &&
                                  interpreter_memory == native_memory;
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_TEXTURE_INDEX_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_TEXTURE_INDEX_SELFTEST_FAIL] "
                             "selected=%u decoded=%d refInsns=%zu nativeInsns=%zu "
                             "entry=%d direct=%d refOff=0x%llx nativeOff=0x%llx "
                             "expectedOff=0x%llx state=%d rcx=0x%llx rdx=0x%llx "
@@ -35920,7 +36560,7 @@ std::string LsxEngineSelfTestJson() {
                                  native_result == expected_native_result && state_ok &&
                                  expected_ok && interpreter_memory == native_memory;
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_TEXTURE_TAIL_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_TEXTURE_TAIL_SELFTEST_FAIL] "
                             "lookup=%d initialR13=0x%x carry=%d decoded=%d "
                             "refInsns=%zu nativeInsns=%zu entry=%d direct=%d "
                             "refOff=0x%llx nativeOff=0x%llx expectedRefOff=0x%llx "
@@ -36075,7 +36715,7 @@ std::string LsxEngineSelfTestJson() {
                                  (!lookup_and_store ||
                                   (interpreter_output == 0x1234 && native_output == 0x1234));
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_TEXTURE_UNROLLED_BYTE_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_TEXTURE_UNROLLED_BYTE_SELFTEST_FAIL] "
                             "size=%zu lookup=%d inputOffset=%u outputDisp=%d selected=%u "
                             "insns=%zu entry=%d direct=%d ref=0x%llx native=0x%llx "
                             "expected=0x%llx rcx=0x%llx flags=0x%llx expectedFlags=0x%llx "
@@ -36207,7 +36847,7 @@ std::string LsxEngineSelfTestJson() {
                                  native_state.rflags == expected_flags.rflags &&
                                  native_output == 0xbeef;
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_TEXTURE_UNROLLED_FINAL_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_TEXTURE_UNROLLED_FINAL_SELFTEST_FAIL] "
                             "initialEdx=0x%x insns=%zu entry=%d direct=%d "
                             "ref=0x%llx native=0x%llx expected=0x%llx "
                             "rcx=0x%llx rdx=0x%llx expectedRdx=0x%llx "
@@ -36288,7 +36928,7 @@ std::string LsxEngineSelfTestJson() {
             const bool case_ok = base_ok &&
                 validate(native_state, memory, native_result, decoded);
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_PACKED_NATIVE_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_PACKED_NATIVE_SELFTEST_FAIL] "
                             "case=%s size=%zu insns=%zu decoded=%d canRef=%d "
                             "entry=%d direct=%d ref=0x%llx native=0x%llx "
                             "state=%d memory=%d validate=%d",
@@ -36887,7 +37527,7 @@ std::string LsxEngineSelfTestJson() {
                     (0x1122334400000000ull | initial_r8d) &&
                 native_state.rflags == expected_flags.rflags;
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_RGB565_BLEND_NATIVE_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_RGB565_BLEND_NATIVE_SELFTEST_FAIL] "
                             "case=%s size=%zu insns=%zu decoded=%d canRef=%d "
                             "entry=%d direct=%d ref=0x%llx native=0x%llx "
                             "expected=0x%llx state=%d memory=%d word=0x%x expectedWord=0x%x "
@@ -37059,7 +37699,7 @@ std::string LsxEngineSelfTestJson() {
                 GetGpr64(native_state, LsxGpr::Rsi) ==
                     (0x9999999900000000ull | esi);
             if (!case_ok) {
-                BackendBLog("[EXECUTOR_BACKEND_B_RGB565_TABLE_NATIVE_SELFTEST_FAIL] "
+                JitLog("[EXECUTOR_JIT_RGB565_TABLE_NATIVE_SELFTEST_FAIL] "
                             "case=%s size=%zu insns=%zu decoded=%d canRef=%d "
                             "entry=%d direct=%d ref=0x%llx native=0x%llx "
                             "expected=0x%llx state=%d memory=%d slot=%d "
@@ -37881,10 +38521,10 @@ std::string LsxEngineSelfTestJson() {
             fast_guest_strcmp_program, 0,
             {'M', 'o', 'n', 'o', 'B', 'e', 'h', 'a', 'v', 'i', 'o', 'u', 'r'},
             {'M', 'o', 'n', 'o', 'B', 'e', 'h', 'a', 'v', 'i', 'o', 'u', 'r'},
-            0x8877665544332211ull);
+            0x4C53585F4D41524Bull);
         const bool fast_guest_strcmp_highbit_ok = fast_guest_compare_case(
             fast_guest_strcmp_program, 0, {'M', 'o', 'n', 'o', 0x80},
-            {'M', 'o', 'n', 'o', 0x7f}, 0x8877665544332211ull);
+            {'M', 'o', 'n', 'o', 0x7f}, 0x4C53585F4D41524Bull);
         const bool fast_guest_strcmp_native_ok =
             fast_guest_strcmp_match_ok && fast_guest_strcmp_highbit_ok;
         const bool fast_guest_strncmp_count_ok = fast_guest_compare_case(
@@ -37913,7 +38553,7 @@ std::string LsxEngineSelfTestJson() {
         // architected register/flag identical.
         const std::uint64_t mono_script_cache_strcmp_thunk =
             Core::AeroLib::GetAndroidX64HleStubForNative(
-                "backend-b-monoscript-cache-tree-strcmp",
+                "jit-monoscript-cache-tree-strcmp",
                 reinterpret_cast<std::uint64_t>(&Core::AeroLib::ExecutorLibcStrcmp));
         alignas(16) std::array<std::uint8_t, 0x180> mono_script_cache_program{};
         mono_script_cache_program.fill(0xcc);
@@ -38003,9 +38643,9 @@ std::string LsxEngineSelfTestJson() {
         std::uint64_t mono_script_cache_resolved_native = 0;
         const bool mono_script_cache_thunk_identity_ok =
             mono_script_cache_strcmp_thunk != 0 &&
-            executor_backend_b_classify_hle_thunk(
+            executor_jit_classify_hle_thunk(
                 mono_script_cache_strcmp_thunk) == 2 &&
-            executor_backend_b_lookup_hle_thunk(
+            executor_jit_lookup_hle_thunk(
                 mono_script_cache_strcmp_thunk,
                 &mono_script_cache_resolved_native) != 0 &&
             mono_script_cache_resolved_native ==
@@ -38040,7 +38680,7 @@ std::string LsxEngineSelfTestJson() {
                 SetGpr64(state, LsxGpr::Rcx,
                          entry_form ? mono_tree_wrong_head : mono_tree_head);
                 SetGpr64(state, LsxGpr::Rdx, 0x1122334455667788ull);
-                SetGpr64(state, LsxGpr::Rsi, 0x8877665544332211ull);
+                SetGpr64(state, LsxGpr::Rsi, 0x4C53585F4D41524Bull);
                 SetGpr64(state, LsxGpr::Rdi, 0x0123456789abcdefull);
                 SetGpr64(state, LsxGpr::Rbp, 0x1020304050607080ull);
                 SetGpr64(state, LsxGpr::Rsp, guest_rsp);
@@ -38099,8 +38739,8 @@ std::string LsxEngineSelfTestJson() {
                     interpreter_result = return_rip;
                     continue;
                 }
-                if (executor_backend_b_classify_hle_thunk(interpreter_result) != 0) {
-                    if (!TryExecuteBackendBDirectHleTail(interpreter_state,
+                if (executor_jit_classify_hle_thunk(interpreter_result) != 0) {
+                    if (!TryExecuteJitDirectHleTail(interpreter_state,
                                                          interpreter_result)) {
                         interpreter_result = 0;
                         break;
@@ -38287,8 +38927,8 @@ std::string LsxEngineSelfTestJson() {
                      0xdeadbeef00000000ull | hash);
             SetGpr64(interpreter_state, LsxGpr::Rbx, 0xaabbccddeeff0011ull);
             SetGpr64(native_state, LsxGpr::Rbx, 0xaabbccddeeff0011ull);
-            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x8877665544332211ull);
-            SetGpr64(native_state, LsxGpr::Rdx, 0x8877665544332211ull);
+            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
+            SetGpr64(native_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
             SetGpr64(interpreter_state, LsxGpr::R14,
                      reinterpret_cast<std::uint64_t>(table.data()));
             SetGpr64(native_state, LsxGpr::R14,
@@ -38363,8 +39003,8 @@ std::string LsxEngineSelfTestJson() {
             SetGpr64(native_state, LsxGpr::Rax, 0xdeadbeefcafebabeull);
             SetGpr64(interpreter_state, LsxGpr::Rcx, 0x11223344556677aaull);
             SetGpr64(native_state, LsxGpr::Rcx, 0x11223344556677aaull);
-            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x8877665544332211ull);
-            SetGpr64(native_state, LsxGpr::Rdx, 0x8877665544332211ull);
+            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
+            SetGpr64(native_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
             SetGpr64(interpreter_state, LsxGpr::Rdi,
                      reinterpret_cast<std::uint64_t>(memory.data()));
             SetGpr64(native_state, LsxGpr::Rdi,
@@ -38901,7 +39541,7 @@ std::string LsxEngineSelfTestJson() {
             }
 
             const std::uint64_t trusted_before =
-                g_backendb_checked_native_trusted.load(std::memory_order_relaxed);
+                g_jit_checked_native_trusted.load(std::memory_order_relaxed);
             bool matches = true;
             for (std::uint32_t iteration = 0; iteration < 18 && matches; ++iteration) {
                 LsxMachineImage interpreter_state{};
@@ -38915,7 +39555,7 @@ std::string LsxEngineSelfTestJson() {
                           CheckedNativeStateMatches(native_state, interpreter_state);
             }
             const std::uint64_t trusted_after =
-                g_backendb_checked_native_trusted.load(std::memory_order_relaxed);
+                g_jit_checked_native_trusted.load(std::memory_order_relaxed);
             return matches && (has_guest_memory_access
                 ? trusted_after == trusted_before
                 : trusted_after > trusted_before);
@@ -38954,11 +39594,11 @@ std::string LsxEngineSelfTestJson() {
             0x66, 0xff, 0xcb, 0x74, 0x02, // dec bx ; jz +2
         };
         const std::uint64_t generic_live_flags_inline_before =
-            g_backendb_selftest_scalar_flag_inline_emissions;
+            g_jit_selftest_scalar_flag_inline_emissions;
         const std::uint64_t generic_live_flags_helpers_before =
-            g_backendb_selftest_scalar_flag_helper_emissions;
+            g_jit_selftest_scalar_flag_helper_emissions;
         const std::uint64_t generic_live_flags_memory_order_before =
-            g_backendb_selftest_scalar_flag_post_memory_write_emissions;
+            g_jit_selftest_scalar_flag_post_memory_write_emissions;
         const bool generic_inc_native_ok = run_generic_scalar_case(
             generic_inc_jo, 4, 2,
             [](LsxMachineImage& state, const std::uint32_t iteration) {
@@ -39078,17 +39718,17 @@ std::string LsxEngineSelfTestJson() {
                              generic_live_flags_memory.data()));
             });
         const bool generic_live_flags_structural_ok =
-            g_backendb_selftest_scalar_flag_inline_emissions >=
+            g_jit_selftest_scalar_flag_inline_emissions >=
                 // The twelve width-matrix blocks are the mandatory generic witnesses.  Some
                 // compact opcode/high-byte shapes may be claimed by an earlier proven native
                 // shape emitter before the generic lowering, so they are semantic coverage but
                 // deliberately not part of this generic-emission count.
                 generic_live_flags_inline_before + 12u &&
-            g_backendb_selftest_scalar_flag_helper_emissions ==
+            g_jit_selftest_scalar_flag_helper_emissions ==
                 generic_live_flags_helpers_before;
         const bool generic_live_flags_memory_fault_ordering_ok =
             generic_live_flags_memory_semantic_ok &&
-            g_backendb_selftest_scalar_flag_post_memory_write_emissions ==
+            g_jit_selftest_scalar_flag_post_memory_write_emissions ==
                 generic_live_flags_memory_order_before + 1u;
         const bool generic_live_flags_native_ok =
             generic_incdec_native_ok && generic_live_flags_width_semantic_ok &&
@@ -39097,7 +39737,7 @@ std::string LsxEngineSelfTestJson() {
             generic_live_flags_memory_fault_ordering_ok;
 
         const std::uint64_t generic_shift_inline_before =
-            g_backendb_native_scalar_shift_inline_instructions.load(
+            g_jit_native_scalar_shift_inline_instructions.load(
                 std::memory_order_relaxed);
         const std::array<std::uint8_t, 4> generic_shl_jb = {
             0xd0, 0xe0, 0x72, 0x02,       // shl al,1 ; jb +2
@@ -39118,7 +39758,7 @@ std::string LsxEngineSelfTestJson() {
             0xc1, 0xfa, 0x10, 0x78, 0x02, // sar edx,16 ; js +2
         };
         const std::uint64_t generic_dead_flags_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::array<std::uint8_t, 12> generic_codec_dead_flags = {
             0x69, 0xc8, 0x05, 0xb5, 0x00, 0x00, // imul ecx,eax,0xb505
@@ -39256,18 +39896,18 @@ std::string LsxEngineSelfTestJson() {
                 SetGpr64(state, LsxGpr::R10, 0xfedcba9876543210ull);
             });
         const bool generic_codec_dead_flags_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) >= generic_dead_flags_before + 2u;
         const bool generic_codec_dead_flags_native_ok =
             generic_codec_dead_flags_semantic_ok &&
             generic_codec_dead_flags_structural_ok;
         const std::uint64_t generic_addsub_dead_flags_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::uint64_t generic_addsub_dead_inline_before =
-            g_backendb_selftest_scalar_flag_inline_emissions;
+            g_jit_selftest_scalar_flag_inline_emissions;
         const std::uint64_t generic_addsub_dead_helpers_before =
-            g_backendb_selftest_scalar_flag_helper_emissions;
+            g_jit_selftest_scalar_flag_helper_emissions;
         const bool generic_addsub_dead_flags_semantic_ok = run_generic_scalar_case(
             generic_addsub_dead_flags, 3, 3,
             [](LsxMachineImage& state, const std::uint32_t iteration) {
@@ -39293,17 +39933,17 @@ std::string LsxEngineSelfTestJson() {
                          values[(iteration + 5u) % values.size()]);
             });
         const bool generic_addsub_dead_flags_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) >= generic_addsub_dead_flags_before + 2u &&
-            g_backendb_selftest_scalar_flag_inline_emissions ==
+            g_jit_selftest_scalar_flag_inline_emissions ==
                 generic_addsub_dead_inline_before + 1u &&
-            g_backendb_selftest_scalar_flag_helper_emissions ==
+            g_jit_selftest_scalar_flag_helper_emissions ==
                 generic_addsub_dead_helpers_before;
         const std::uint64_t generic_addsub_fault_barrier_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::uint64_t generic_addsub_fault_inline_before =
-            g_backendb_selftest_scalar_flag_inline_emissions;
+            g_jit_selftest_scalar_flag_inline_emissions;
         const bool generic_addsub_fault_barrier_semantic_ok = run_generic_scalar_case(
             generic_addsub_fault_barrier, 3, 3,
             [&](LsxMachineImage& state, const std::uint32_t iteration) {
@@ -39321,11 +39961,11 @@ std::string LsxEngineSelfTestJson() {
                              generic_addsub_fault_memory.data()));
             });
         const bool generic_addsub_fault_barrier_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) == generic_addsub_fault_barrier_before &&
-            g_backendb_selftest_scalar_flag_inline_emissions ==
+            g_jit_selftest_scalar_flag_inline_emissions ==
                 generic_addsub_fault_inline_before + 2u &&
-            g_backendb_selftest_scalar_flag_helper_emissions ==
+            g_jit_selftest_scalar_flag_helper_emissions ==
                 generic_addsub_dead_helpers_before;
         const bool generic_addsub_dead_flags_native_ok =
             generic_addsub_dead_flags_semantic_ok &&
@@ -39334,12 +39974,12 @@ std::string LsxEngineSelfTestJson() {
             generic_addsub_fault_barrier_structural_ok;
 
         const std::uint64_t generic_logic_dead_elisions_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::uint64_t generic_logic_dead_inline_before =
-            g_backendb_selftest_scalar_flag_inline_emissions;
+            g_jit_selftest_scalar_flag_inline_emissions;
         const std::uint64_t generic_logic_dead_helpers_before =
-            g_backendb_selftest_scalar_flag_helper_emissions;
+            g_jit_selftest_scalar_flag_helper_emissions;
         const bool generic_logic_dead_flags_semantic_ok = run_generic_scalar_case(
             generic_logic_dead_flags, 6, 6,
             [](LsxMachineImage& state, const std::uint32_t iteration) {
@@ -39367,17 +40007,17 @@ std::string LsxEngineSelfTestJson() {
                          values[(iteration + 4u) % values.size()]);
             });
         const bool generic_logic_dead_flags_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) >= generic_logic_dead_elisions_before + 3u &&
-            g_backendb_selftest_scalar_flag_inline_emissions ==
+            g_jit_selftest_scalar_flag_inline_emissions ==
                 generic_logic_dead_inline_before + 3u &&
-            g_backendb_selftest_scalar_flag_helper_emissions ==
+            g_jit_selftest_scalar_flag_helper_emissions ==
                 generic_logic_dead_helpers_before;
 
         const std::uint64_t generic_logic_live_inline_before =
-            g_backendb_selftest_scalar_flag_inline_emissions;
+            g_jit_selftest_scalar_flag_inline_emissions;
         const std::uint64_t generic_logic_live_helpers_before =
-            g_backendb_selftest_scalar_flag_helper_emissions;
+            g_jit_selftest_scalar_flag_helper_emissions;
         const bool generic_logic_live_jcc_semantic_ok = run_generic_scalar_case(
             generic_logic_live_jcc, 2, 2,
             [](LsxMachineImage& state, const std::uint32_t iteration) {
@@ -39388,18 +40028,18 @@ std::string LsxEngineSelfTestJson() {
                          (iteration & 4u) != 0 ? 0xffffffffu : 0x0f0f0000u);
             });
         const bool generic_logic_live_jcc_structural_ok =
-            g_backendb_selftest_scalar_flag_inline_emissions ==
+            g_jit_selftest_scalar_flag_inline_emissions ==
                 generic_logic_live_inline_before + 1u &&
-            g_backendb_selftest_scalar_flag_helper_emissions ==
+            g_jit_selftest_scalar_flag_helper_emissions ==
                 generic_logic_live_helpers_before;
 
         const std::uint64_t generic_logic_fault_elisions_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::uint64_t generic_logic_fault_inline_before =
-            g_backendb_selftest_scalar_flag_inline_emissions;
+            g_jit_selftest_scalar_flag_inline_emissions;
         const std::uint64_t generic_logic_fault_helpers_before =
-            g_backendb_selftest_scalar_flag_helper_emissions;
+            g_jit_selftest_scalar_flag_helper_emissions;
         const bool generic_logic_fault_barrier_semantic_ok = run_generic_scalar_case(
             generic_logic_fault_barrier, 3, 3,
             [&](LsxMachineImage& state, const std::uint32_t iteration) {
@@ -39415,11 +40055,11 @@ std::string LsxEngineSelfTestJson() {
                              generic_addsub_fault_memory.data()));
             });
         const bool generic_logic_fault_barrier_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) == generic_logic_fault_elisions_before &&
-            g_backendb_selftest_scalar_flag_inline_emissions ==
+            g_jit_selftest_scalar_flag_inline_emissions ==
                 generic_logic_fault_inline_before + 2u &&
-            g_backendb_selftest_scalar_flag_helper_emissions ==
+            g_jit_selftest_scalar_flag_helper_emissions ==
                 generic_logic_fault_helpers_before;
         const bool generic_logic_dead_flags_native_ok =
             generic_logic_dead_flags_semantic_ok &&
@@ -39455,10 +40095,10 @@ std::string LsxEngineSelfTestJson() {
             SetGpr64(state, LsxGpr::Rdi, 0x7fffffffu - iteration);
         };
         const std::uint64_t generic_variable_shift_dead_elisions_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::uint64_t generic_variable_shift_dead_paths_before =
-            g_backendb_selftest_shift_flag_path_emissions;
+            g_jit_selftest_shift_flag_path_emissions;
         const bool generic_variable_shift_dead_flags_semantic_ok =
             run_generic_scalar_case(
                 generic_variable_shift_dead_flags, 6, 6,
@@ -39472,14 +40112,14 @@ std::string LsxEngineSelfTestJson() {
                     initialize_variable_shift_state(state, iteration, true);
                 });
         const bool generic_variable_shift_dead_flags_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) >=
                     generic_variable_shift_dead_elisions_before + 6u &&
-            g_backendb_selftest_shift_flag_path_emissions ==
+            g_jit_selftest_shift_flag_path_emissions ==
                 generic_variable_shift_dead_paths_before;
 
         const std::uint64_t generic_variable_shift_live_paths_before =
-            g_backendb_selftest_shift_flag_path_emissions;
+            g_jit_selftest_shift_flag_path_emissions;
         const bool generic_variable_shift_live_jcc_semantic_ok =
             run_generic_scalar_case(
                 generic_variable_shift_live_jcc, 2, 2,
@@ -39487,14 +40127,14 @@ std::string LsxEngineSelfTestJson() {
                     initialize_variable_shift_state(state, iteration, false);
                 });
         const bool generic_variable_shift_live_jcc_structural_ok =
-            g_backendb_selftest_shift_flag_path_emissions ==
+            g_jit_selftest_shift_flag_path_emissions ==
                 generic_variable_shift_live_paths_before + 1u;
 
         const std::uint64_t generic_variable_shift_fault_elisions_before =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
         const std::uint64_t generic_variable_shift_fault_paths_before =
-            g_backendb_selftest_shift_flag_path_emissions;
+            g_jit_selftest_shift_flag_path_emissions;
         const bool generic_variable_shift_fault_barrier_semantic_ok =
             run_generic_scalar_case(
                 generic_variable_shift_fault_barrier, 3, 3,
@@ -39507,10 +40147,10 @@ std::string LsxEngineSelfTestJson() {
                                  generic_addsub_fault_memory.data()));
                 });
         const bool generic_variable_shift_fault_barrier_structural_ok =
-            g_backendb_native_scalar_dead_flag_elisions.load(
+            g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed) ==
                     generic_variable_shift_fault_elisions_before &&
-            g_backendb_selftest_shift_flag_path_emissions ==
+            g_jit_selftest_shift_flag_path_emissions ==
                 generic_variable_shift_fault_paths_before + 1u;
         const bool generic_variable_shift_dead_flags_native_ok =
             generic_variable_shift_dead_flags_semantic_ok &&
@@ -39543,7 +40183,7 @@ std::string LsxEngineSelfTestJson() {
             GetGpr64(generic_shld_semantic_state, LsxGpr::R12) == 0 &&
             generic_shld_semantic_state.rflags == generic_shld_expected_flags;
         const bool generic_shift_inline_ok =
-            g_backendb_native_scalar_shift_inline_instructions.load(
+            g_jit_native_scalar_shift_inline_instructions.load(
                 std::memory_order_relaxed) >= generic_shift_inline_before + 6u;
         const bool generic_shift_native_ok =
             generic_shl_native_ok && generic_shr_native_ok && generic_sar_native_ok &&
@@ -39576,7 +40216,7 @@ std::string LsxEngineSelfTestJson() {
                 state.rflags = 0xad7u;
                 SetGpr64(state, LsxGpr::Rcx, 0x1020304050607000ull | iteration);
                 SetGpr64(state, LsxGpr::Rdi, 0xfedcba9876543210ull);
-                SetGpr64(state, LsxGpr::Rbx, 0x8877665544332211ull);
+                SetGpr64(state, LsxGpr::Rbx, 0x4C53585F4D41524Bull);
                 SetGpr64(state, LsxGpr::R10, ~std::uint64_t{0});
             });
         // WIDE_HOT_V5_COUNT_DIRECT_DIFFERENTIAL_GATE: cover every architectural width and
@@ -39819,11 +40459,11 @@ std::string LsxEngineSelfTestJson() {
         };
 
         const std::uint64_t simd_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t simd_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::uint64_t faultable_simd_writeback_before =
-            g_backendb_native_simd_faultable_writeback_blocks.load(
+            g_jit_native_simd_faultable_writeback_blocks.load(
                 std::memory_order_relaxed);
         const std::array<std::uint8_t, 18> generic_simd_ymm = {
             0xc5, 0xfe, 0x6f, 0x00,       // vmovdqu ymm0,[rax]
@@ -39838,7 +40478,7 @@ std::string LsxEngineSelfTestJson() {
             // The surrounding suite deliberately requests checked-native wrappers. Compile this
             // one structural gate with the production cache policy so it actually exercises the
             // faultable dirty-writeback path while retaining the independent interpreter image.
-            const ScopedBackendBSelfTestProductionDirect production_direct_scope;
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
             generic_simd_ymm_native_ok = run_generic_simd_case(
                 generic_simd_ymm, 5, 3,
                 [](LsxMachineImage& state, std::array<std::uint8_t, 128>& memory) {
@@ -39859,7 +40499,7 @@ std::string LsxEngineSelfTestJson() {
                 });
             generic_faultable_simd_writeback_ok =
                 generic_simd_ymm_native_ok &&
-                g_backendb_native_simd_faultable_writeback_blocks.load(
+                g_jit_native_simd_faultable_writeback_blocks.load(
                     std::memory_order_relaxed) > faultable_simd_writeback_before;
         }
 
@@ -39869,9 +40509,9 @@ std::string LsxEngineSelfTestJson() {
         // legacy SSE3 upper-YMM preservation, deliberately unaligned effective addresses and
         // VEX.128 upper-YMM clearing.  All six vector operations must stay on direct NEON.
         const std::uint64_t lddqu_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t lddqu_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 31> generic_lddqu_vlddqu = {
             0xc5, 0xfb, 0xf0, 0x0e,             // vlddqu xmm1,[rsi] (frontier)
             0xc5, 0xfa, 0x7f, 0x0b,             // vmovdqu [rbx],xmm1
@@ -39936,9 +40576,9 @@ std::string LsxEngineSelfTestJson() {
                 return state.rflags == 0xad7u && state.mxcsr == 0x5f80u;
             });
         const bool generic_lddqu_vlddqu_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 lddqu_fast_before + 6u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 lddqu_semantic_before;
         const bool generic_lddqu_vlddqu_native_ok =
             generic_lddqu_vlddqu_result_ok && generic_lddqu_vlddqu_counter_ok;
@@ -39951,9 +40591,9 @@ std::string LsxEngineSelfTestJson() {
         // selections, while the final xor makes the two independently-backed
         // memory images state-comparable.
         const std::uint64_t maskmovdqu_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t maskmovdqu_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 15> generic_maskmovdqu = {
             0x48, 0x89, 0xc7,                   // mov rdi,rax
             0xc5, 0xf9, 0xf7, 0xc1,             // vmaskmovdqu xmm0,xmm1
@@ -40003,9 +40643,9 @@ std::string LsxEngineSelfTestJson() {
                 return GetGpr64(state, LsxGpr::Rdi) == 0 && state.mxcsr == 0x5f80u;
             });
         const bool generic_maskmovdqu_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 maskmovdqu_fast_before + 2u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 maskmovdqu_semantic_before;
         const bool generic_maskmovdqu_native_ok =
             generic_maskmovdqu_result_ok && generic_maskmovdqu_counter_ok;
@@ -40015,9 +40655,9 @@ std::string LsxEngineSelfTestJson() {
         // AVX2 YMM form.  Every case stores the result to independent memory so
         // the checked-wrapper fault contract and register result are both proven.
         const std::uint64_t psadbw_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t psadbw_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
 
         const std::array<std::uint8_t, 10> generic_vpsadbw_direct_store_case = {
             0xc5, 0xe1, 0xf6, 0xd8,       // vpsadbw xmm3,xmm3,xmm0
@@ -40146,9 +40786,9 @@ std::string LsxEngineSelfTestJson() {
             generic_vpsadbw_direct_store_ok && generic_psadbw_memory_ok &&
             generic_vpsadbw_ymm_ok;
         const bool generic_psadbw_vpsadbw_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 psadbw_fast_before + 6u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 psadbw_semantic_before;
         const bool generic_psadbw_vpsadbw_native_ok =
             generic_psadbw_vpsadbw_result_ok && generic_psadbw_vpsadbw_counter_ok;
@@ -40198,9 +40838,9 @@ std::string LsxEngineSelfTestJson() {
             }
         };
         const std::uint64_t saturating_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t saturating_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         bool generic_saturating_packed_result_ok = true;
         std::size_t saturating_executed_cases = 0;
         for (std::size_t form = 0; form < 3; ++form) {
@@ -40312,9 +40952,9 @@ std::string LsxEngineSelfTestJson() {
             generic_saturating_packed_mmx_reject_ok;
         const bool generic_saturating_packed_counter_ok =
             saturating_executed_cases == 24u &&
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 saturating_fast_before + saturating_executed_cases * 2u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 saturating_semantic_before;
         const bool generic_saturating_packed_native_ok =
             generic_saturating_packed_result_ok &&
@@ -40368,9 +41008,9 @@ std::string LsxEngineSelfTestJson() {
         // direct publication mandatory; full state and memory remain byte-differential against
         // the interpreter executor, including NaN compare/minmax selection and VEX upper clearing.
         const std::uint64_t wide_hot_v5_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t wide_hot_v5_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 73> generic_wide_hot_v5_simd = {
             0xc5, 0xfc, 0xc2, 0xe1, 0x09,             // vcmpps ymm4,ymm0,ymm1,9
             0xc5, 0xfe, 0x7f, 0x23,                   // vmovdqu [rbx],ymm4
@@ -40425,9 +41065,9 @@ std::string LsxEngineSelfTestJson() {
                 return true;
             });
         const bool generic_wide_hot_v5_simd_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 wide_hot_v5_fast_before + 15u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 wide_hot_v5_semantic_before;
         const bool generic_wide_hot_v5_simd_ok =
             generic_wide_hot_v5_simd_result_ok &&
@@ -40438,9 +41078,9 @@ std::string LsxEngineSelfTestJson() {
         // directions. These are the measured million-call leaves after large-level load. Full
         // state equality also proves legacy upper-lane preservation and VEX upper clearing.
         const std::uint64_t post_load_v6_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t post_load_v6_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 70> generic_post_load_v6_packed = {
             0xc4, 0xe2, 0x7d, 0x40, 0xe1,             // vpmulld ymm4,ymm0,ymm1
             0xc4, 0xe2, 0x7d, 0x28, 0xe9,             // vpmuldq ymm5,ymm0,ymm1
@@ -40509,10 +41149,10 @@ std::string LsxEngineSelfTestJson() {
                 return true;
             });
         const std::uint64_t post_load_v6_fast_delta =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) -
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) -
             post_load_v6_fast_before;
         const std::uint64_t post_load_v6_semantic_delta =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) -
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) -
             post_load_v6_semantic_before;
         const bool generic_post_load_v6_counter_ok =
             post_load_v6_fast_delta == 26u && post_load_v6_semantic_delta == 0u;
@@ -40526,9 +41166,9 @@ std::string LsxEngineSelfTestJson() {
         // VPBLENDW deliberately uses a 256-bit destination: its imm8 repeats per 128-bit lane,
         // unlike the dword/float blend masks, and used to be wrong in the interpreter leaf itself.
         const std::uint64_t post_load_v7_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t post_load_v7_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 67> generic_post_load_v7 = {
             0xc4, 0xe2, 0x7d, 0x00, 0xe1,             // vpshufb ymm4,ymm0,ymm1
             0x66, 0x0f, 0x38, 0x00, 0xea,             // pshufb xmm5,xmm2
@@ -40591,10 +41231,10 @@ std::string LsxEngineSelfTestJson() {
                 return std::memcmp(memory.data(), state.ymm[11].data(), 32) == 0;
             });
         const std::uint64_t post_load_v7_fast_delta =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) -
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) -
             post_load_v7_fast_before;
         const std::uint64_t post_load_v7_semantic_delta =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) -
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) -
             post_load_v7_semantic_before;
         const bool generic_post_load_v7_counter_ok =
             post_load_v7_fast_delta == 12u && post_load_v7_semantic_delta == 0u;
@@ -40606,9 +41246,9 @@ std::string LsxEngineSelfTestJson() {
         // can_execute_vector.  Snapshot both counters so byte equality cannot hide that
         // structural regression.
         const std::uint64_t scalar_move_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t scalar_move_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 20> generic_simd_scalar_moves = {
             0xf3, 0x0f, 0x10, 0x30,             // movss xmm6,[rax]
             0xc5, 0xfb, 0x10, 0x78, 0x08,       // vmovsd xmm7,[rax+8]
@@ -40657,9 +41297,9 @@ std::string LsxEngineSelfTestJson() {
                            0xffe123456789abcdull;
             });
         const bool generic_simd_scalar_move_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 scalar_move_fast_before + 4u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 scalar_move_semantic_before;
         const bool generic_simd_scalar_move_native_ok =
             generic_simd_scalar_move_result_ok && generic_simd_scalar_move_counter_ok;
@@ -40667,9 +41307,9 @@ std::string LsxEngineSelfTestJson() {
         // CODEC_SIMD_DIRECT_DIFFERENTIAL_GATE: byte-exact comparison plus counters below prove
         // these codec/YUV primitives stay direct NEON instead of regressing to a semantic BLR.
         const std::uint64_t codec_simd_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t codec_simd_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
 
         const std::array<std::uint8_t, 11> generic_vpshufd_ymm = {
             0xc5, 0xfd, 0x70, 0xc1, 0x1b, // vpshufd ymm0,ymm1,0x1b
@@ -40846,9 +41486,9 @@ std::string LsxEngineSelfTestJson() {
             });
 
         const bool codec_simd_direct_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 codec_simd_fast_before + 17u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 codec_simd_semantic_before;
         const bool codec_simd_direct_native_ok = generic_vpshufd_ymm_native_ok &&
             generic_pshufd_memory_native_ok && generic_packed_q_shift_native_ok &&
@@ -40859,9 +41499,9 @@ std::string LsxEngineSelfTestJson() {
         // the exact fast/semantic counter delta prevent byte-equal code from silently falling
         // back to sixty C++ semantic calls per IDCT-tail execution.
         const std::uint64_t theora_simd_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t theora_simd_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 48> generic_theora_idct_simd = {
             0xc4, 0xe2, 0x79, 0x23, 0x08,       // vpmovsxwd xmm1,qword ptr [rax]
             0xc5, 0xd1, 0x72, 0xd1, 0x04,       // vpsrld xmm5,xmm1,4
@@ -40933,9 +41573,9 @@ std::string LsxEngineSelfTestJson() {
                 return state.rflags == 0xad7u && state.mxcsr == 0x5f80u;
             });
         const bool generic_theora_idct_simd_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 theora_simd_fast_before + 9u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 theora_simd_semantic_before;
         const bool generic_theora_idct_simd_native_ok =
             generic_theora_idct_simd_result_ok && generic_theora_idct_simd_counter_ok;
@@ -40945,9 +41585,9 @@ std::string LsxEngineSelfTestJson() {
         // preservation and VEX upper-YMM clearing.  The exact counter delta proves none of
         // these six transfers silently falls back to the SIMD semantic thunk.
         const std::uint64_t movd_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t movd_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 27> generic_movd_transfers = {
             0x66, 0x0f, 0x6e, 0xc1,             // movd xmm0,ecx
             0x66, 0x0f, 0x7e, 0xc2,             // movd edx,xmm0
@@ -40998,9 +41638,9 @@ std::string LsxEngineSelfTestJson() {
                 return state.rflags == 0xad7u && state.mxcsr == 0x5f80u;
             });
         const bool generic_movd_transfer_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 movd_fast_before + 6u &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 movd_semantic_before;
         const bool generic_movd_transfer_native_ok =
             generic_movd_transfer_result_ok && generic_movd_transfer_counter_ok;
@@ -41011,9 +41651,9 @@ std::string LsxEngineSelfTestJson() {
         // one-instruction partial-move path. VMOVLPD m64,xmm stores XMM0[63:0] and must leave all
         // 256 source bits unchanged: VEX upper-lane clearing applies only to register destinations.
         const std::uint64_t vmovlpd_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t vmovlpd_semantic_before =
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 11> generic_vmovlpd_cusa07010 = {
             0xc4, 0xc1, 0x79, 0x13, 0x86, 0x48, 0x44, 0x00, 0x00,
             0xeb, 0x00,
@@ -41046,16 +41686,16 @@ std::string LsxEngineSelfTestJson() {
             });
         const bool generic_vmovlpd_cusa07010_native_ok =
             generic_vmovlpd_cusa07010_result_ok &&
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 vmovlpd_fast_before + 1 &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 vmovlpd_semantic_before;
 
         // Exact FMOD mixer frontier plus the legacy XMM form.  The independent byte interpreter
         // makes this stronger than native-vs-interpreter alone: both implementations must select
         // from concat(src2,src1), preserve alias ordering, and apply the VEX upper-lane rule.
         const std::uint64_t align_right_fast_before =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed);
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::array<std::uint8_t, 12> generic_vpalignr_fmod = {
             0xc4, 0xe3, 0x39, 0x0f, 0xc9, 0x04, // vpalignr xmm1,xmm8,xmm1,4
             0xf3, 0x0f, 0x7f, 0x08,             // movdqu [rax],xmm1
@@ -41133,7 +41773,7 @@ std::string LsxEngineSelfTestJson() {
                 return state.rflags == 0x246u && state.mxcsr == 0x1f80u;
             });
         const bool generic_align_right_fast_counter_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) >=
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) >=
                 align_right_fast_before + 2;
         const bool generic_align_right_native_ok = generic_vpalignr_fmod_native_ok &&
             generic_palignr_legacy_native_ok && generic_align_right_fast_counter_ok;
@@ -41235,7 +41875,7 @@ std::string LsxEngineSelfTestJson() {
                 }
 
                 const std::uint64_t trusted_before =
-                    g_backendb_checked_native_trusted.load(std::memory_order_relaxed);
+                    g_jit_checked_native_trusted.load(std::memory_order_relaxed);
                 bool matches = true;
                 for (std::uint32_t iteration = 0; iteration < 18 && matches; ++iteration) {
                     alignas(32) std::array<std::uint8_t, 33> memory{};
@@ -41308,7 +41948,7 @@ std::string LsxEngineSelfTestJson() {
                                 fault_slot_retired));
                 }
                 return matches &&
-                       g_backendb_checked_native_trusted.load(std::memory_order_relaxed) >
+                       g_jit_checked_native_trusted.load(std::memory_order_relaxed) >
                            trusted_before;
             };
 
@@ -41354,9 +41994,9 @@ std::string LsxEngineSelfTestJson() {
             generic_vunpcklps_xmm_memory_ok && generic_vunpcklps_ymm_lane_local_ok &&
             generic_vunpcklps_ymm_src2_alias_ok && generic_vunpcklps_ymm_memory_ok;
         const bool generic_simd_counter_gate_ok =
-            g_backendb_native_simd_fast_instructions.load(std::memory_order_relaxed) >=
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) >=
                 simd_fast_before + 32 &&
-            g_backendb_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 simd_semantic_before;
         const bool generic_simd_native_ok = generic_simd_ymm_native_ok &&
             generic_lddqu_vlddqu_native_ok && generic_maskmovdqu_native_ok &&
@@ -41535,7 +42175,7 @@ std::string LsxEngineSelfTestJson() {
         // Cover the structural direct classes added for the helper-zero conversion.  These
         // instructions are intentionally unrelated and share no RIP-specific pattern.
         const std::uint64_t generic_imul_inline_before =
-            g_backendb_native_scalar_imul_inline_instructions.load(
+            g_jit_native_scalar_imul_inline_instructions.load(
                 std::memory_order_relaxed);
         const std::array<std::uint8_t, 21> generic_scalar_extended = {
             0x48, 0x11, 0xd8,                   // adc rax,rbx
@@ -41612,7 +42252,7 @@ std::string LsxEngineSelfTestJson() {
                 SetGpr64(state, LsxGpr::Rdx, rhs[iteration & 3u]);
             });
         const bool generic_imul_inline_ok =
-            g_backendb_native_scalar_imul_inline_instructions.load(
+            g_jit_native_scalar_imul_inline_instructions.load(
                 std::memory_order_relaxed) >= generic_imul_inline_before + 4u;
         const bool generic_scalar_extended_native_ok =
             generic_scalar_extended_sequence_native_ok &&
@@ -41620,7 +42260,7 @@ std::string LsxEngineSelfTestJson() {
             generic_imul_r64_r64_native_ok && generic_imul_inline_ok;
 
         const std::uint64_t scalar_semantic_before =
-            g_backendb_native_scalar_semantic_instructions.load(
+            g_jit_native_scalar_semantic_instructions.load(
                 std::memory_order_relaxed);
         const std::array<std::uint8_t, 12> generic_scalar_semantic = {
             0x0f, 0xc8,                         // bswap eax
@@ -41639,7 +42279,7 @@ std::string LsxEngineSelfTestJson() {
                 SetGpr64(state, LsxGpr::R10, 0xfedcba9876543210ull);
             });
         const bool generic_scalar_semantic_counter_ok =
-            g_backendb_native_scalar_semantic_instructions.load(
+            g_jit_native_scalar_semantic_instructions.load(
                 std::memory_order_relaxed) >= scalar_semantic_before + 4;
 
         // LAHF_SAHF_NATIVE_CONTRACT_GATE
@@ -41826,7 +42466,7 @@ std::string LsxEngineSelfTestJson() {
         LsxDecodedRegion generic_stack_jmp_block = BuildLsxCodeRegion(
             reinterpret_cast<std::uint64_t>(generic_stack_jmp.data()), 8);
         const std::uint64_t generic_control_semantic_before =
-            g_backendb_native_control_semantic_terminators.load(
+            g_jit_native_control_semantic_terminators.load(
                 std::memory_order_relaxed);
         Arm64BlockEntry generic_stack_jmp_direct = nullptr;
         Arm64BlockEntry generic_stack_jmp_entry = arena.EmitNativeControlFlowBlock(
@@ -41853,18 +42493,18 @@ std::string LsxEngineSelfTestJson() {
         initialize_generic_stack_state(generic_stack_native_state,
                                        generic_stack_native);
         const std::uint64_t generic_stack_semantic_before_interpreter =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const std::uint64_t generic_stack_interpreter_result =
             InterpretDecodedRegion(&generic_stack_interpreter_state,
                                          &generic_stack_jmp_block);
         const std::uint64_t generic_stack_semantic_after_interpreter =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const std::uint64_t generic_stack_native_result =
             generic_stack_jmp_entry != nullptr
                 ? generic_stack_jmp_entry(&generic_stack_native_state)
                 : 0;
         const std::uint64_t generic_stack_semantic_after_native =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         SetGpr64(generic_stack_interpreter_state, LsxGpr::Rsp, 0);
         SetGpr64(generic_stack_native_state, LsxGpr::Rsp, 0);
         const bool generic_stack_control_native_ok =
@@ -41885,7 +42525,7 @@ std::string LsxEngineSelfTestJson() {
             generic_stack_semantic_after_native ==
                 generic_stack_semantic_after_interpreter;
         const bool generic_indirect_control_semantic_counter_ok =
-            g_backendb_native_control_semantic_terminators.load(
+            g_jit_native_control_semantic_terminators.load(
                 std::memory_order_relaxed) > generic_control_semantic_before;
 
         const std::array<std::uint8_t, 2> generic_indirect_call = {
@@ -41913,18 +42553,18 @@ std::string LsxEngineSelfTestJson() {
         initialize_generic_call_state(generic_call_native_state,
                                       generic_call_native_stack);
         const std::uint64_t generic_call_semantic_before_interpreter =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const std::uint64_t generic_call_interpreter_result =
             InterpretDecodedRegion(&generic_call_interpreter_state,
                                          &generic_indirect_call_block);
         const std::uint64_t generic_call_semantic_after_interpreter =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const std::uint64_t generic_call_native_result =
             generic_indirect_call_entry != nullptr
                 ? generic_indirect_call_entry(&generic_call_native_state)
                 : 0;
         const std::uint64_t generic_call_semantic_after_native =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         SetGpr64(generic_call_interpreter_state, LsxGpr::Rsp, 0);
         SetGpr64(generic_call_native_state, LsxGpr::Rsp, 0);
         const bool generic_indirect_call_native_ok =
@@ -41980,16 +42620,16 @@ std::string LsxEngineSelfTestJson() {
             initialize_state(interpreter_state, interpreter_targets, interpreter_stack);
             initialize_state(native_state, native_targets, native_stack);
             const std::uint64_t semantic_before_interpreter =
-                g_backendb_selftest_dynamic_control_semantic_calls;
+                g_jit_selftest_dynamic_control_semantic_calls;
             const std::uint64_t interpreter_result = InterpretDecodedRegion(
                 &interpreter_state, &memory_control_block);
             const std::uint64_t semantic_after_interpreter =
-                g_backendb_selftest_dynamic_control_semantic_calls;
+                g_jit_selftest_dynamic_control_semantic_calls;
             const std::uint64_t native_result = memory_control_entry != nullptr
                 ? memory_control_entry(&native_state)
                 : 0;
             const std::uint64_t semantic_after_native =
-                g_backendb_selftest_dynamic_control_semantic_calls;
+                g_jit_selftest_dynamic_control_semantic_calls;
             fast_gate_ok =
                 semantic_after_interpreter == semantic_before_interpreter + 1 &&
                 semantic_after_native == semantic_after_interpreter;
@@ -42026,7 +42666,7 @@ std::string LsxEngineSelfTestJson() {
         // HLE classification, stack restoration, or callback-visible state.
         const std::uint64_t generic_indirect_hle_thunk =
             Core::AeroLib::GetAndroidX64HleStubForNative(
-                "backend-b-indirect-control-hle-gate-strcmp",
+                "jit-indirect-control-hle-gate-strcmp",
                 reinterpret_cast<std::uint64_t>(
                     &Core::AeroLib::ExecutorLibcStrcmp));
         const std::uint64_t generic_indirect_hle_slab_base =
@@ -42042,9 +42682,9 @@ std::string LsxEngineSelfTestJson() {
         std::uint64_t generic_indirect_hle_native = 0;
         const bool generic_indirect_hle_identity_ok =
             generic_indirect_hle_thunk != 0 &&
-            executor_backend_b_classify_hle_thunk(
+            executor_jit_classify_hle_thunk(
                 generic_indirect_hle_thunk) != 0 &&
-            executor_backend_b_lookup_hle_thunk(
+            executor_jit_lookup_hle_thunk(
                 generic_indirect_hle_thunk,
                 &generic_indirect_hle_native) != 0 &&
             generic_indirect_hle_native == reinterpret_cast<std::uint64_t>(
@@ -42081,7 +42721,7 @@ std::string LsxEngineSelfTestJson() {
             generic_indirect_hle_native_state,
             generic_indirect_hle_native_stack);
         const std::uint64_t generic_indirect_hle_semantic_before_interpreter =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const std::uint64_t generic_indirect_hle_interpreter_result =
             generic_indirect_hle_identity_ok
                 ? InterpretDecodedRegion(
@@ -42089,7 +42729,7 @@ std::string LsxEngineSelfTestJson() {
                       &generic_indirect_call_block)
                 : 0;
         const std::uint64_t generic_indirect_hle_semantic_after_interpreter =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const std::uint64_t generic_indirect_hle_native_result =
             generic_indirect_hle_identity_ok &&
                     generic_indirect_call_entry != nullptr
@@ -42097,7 +42737,7 @@ std::string LsxEngineSelfTestJson() {
                       &generic_indirect_hle_native_state)
                 : 0;
         const std::uint64_t generic_indirect_hle_semantic_after_native =
-            g_backendb_selftest_dynamic_control_semantic_calls;
+            g_jit_selftest_dynamic_control_semantic_calls;
         const bool generic_indirect_hle_rsp_ok =
             GetGpr64(generic_indirect_hle_interpreter_state, LsxGpr::Rsp) ==
                 reinterpret_cast<std::uint64_t>(
@@ -42159,12 +42799,12 @@ std::string LsxEngineSelfTestJson() {
             generic_indirect_memory_jmp_fast_gate_ok &&
             generic_indirect_memory_call_fast_gate_ok;
 
-        std::array<std::uint8_t, kBackendBHleMarkerLength>
+        std::array<std::uint8_t, kJitHleMarkerLength>
             generic_hle_marker_program{};
         generic_hle_marker_program[0] = 0x0f;
         generic_hle_marker_program[1] = 0x3f;
         std::memcpy(generic_hle_marker_program.data() + 2,
-                    kBackendBHleThunkHash.data(), kBackendBHleThunkHash.size());
+                    kJitHleThunkHash.data(), kJitHleThunkHash.size());
         LsxDecodedRegion generic_hle_marker_block = BuildLsxCodeRegion(
             reinterpret_cast<std::uint64_t>(generic_hle_marker_program.data()), 1);
         Arm64BlockEntry generic_hle_marker_direct = nullptr;
@@ -42173,7 +42813,7 @@ std::string LsxEngineSelfTestJson() {
         const bool generic_hle_marker_native_ok =
             !generic_hle_marker_block.decode_failed &&
             generic_hle_marker_block.instructions.size() == 1 &&
-            IsBackendBHleBridgeMarkerInstruction(
+            IsJitHleBridgeMarkerInstruction(
                 generic_hle_marker_block.instructions.front()) &&
             generic_hle_marker_entry != nullptr &&
             generic_hle_marker_direct != nullptr &&
@@ -42183,7 +42823,7 @@ std::string LsxEngineSelfTestJson() {
         const bool generic_hle_marker_stable_hash_ok =
             generic_hle_marker_stable.block != nullptr &&
             generic_hle_marker_stable.block->instructions.size() == 1 &&
-            IsBackendBHleBridgeMarkerInstruction(
+            IsJitHleBridgeMarkerInstruction(
                 generic_hle_marker_stable.block->instructions.front()) &&
             generic_hle_marker_stable.guest_hash == FingerprintCodeSpan(
                 reinterpret_cast<std::uint64_t>(generic_hle_marker_program.data()),
@@ -42378,7 +43018,7 @@ std::string LsxEngineSelfTestJson() {
             GetGpr64(bounded_split_state, LsxGpr::Rax) == 42;
 
         const bool manual_ok = manual_last == kGuestExitSentinel && manual_rax == 12;
-        const bool hle_fp_bridge_ok = executor_backend_b_hle_fp_bridge_selftest() != 0;
+        const bool hle_fp_bridge_ok = executor_jit_hle_fp_bridge_selftest() != 0;
         const bool generic_indirect_pic_ok =
             generic_indirect_pic_core_ok && generic_indirect_hle_slow_gate_ok;
         const bool full_ok = ok && manual_ok && unwind_stop_frames_ok &&
@@ -43127,9 +43767,9 @@ std::string LsxEngineSelfTestJson() {
             << R"("genericIndirectPicPersistenceRoundtripOk":)"
             << (generic_indirect_pic_persistence_roundtrip_ok ? "true" : "false") << ","
             << R"("genericIndirectPicBindCalls":)"
-            << g_backendb_indirect_pic_bind_calls.load(std::memory_order_relaxed) << ","
+            << g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed) << ","
             << R"("genericIndirectPicNativeBlocks":)"
-            << g_backendb_indirect_pic_native_blocks.load(std::memory_order_relaxed) << ","
+            << g_jit_indirect_pic_native_blocks.load(std::memory_order_relaxed) << ","
             << R"("genericIndirectHleSlowGateOk":)"
             << (generic_indirect_hle_slow_gate_ok ? "true" : "false") << ","
             << R"("genericIndirectHleFailureMask":)"
@@ -43239,4 +43879,4 @@ LsxProbeLocateNativeRange(const std::uint64_t host_pc, std::uint64_t* range_base
     }
 }
 
-} // namespace Executor::BackendB
+} // namespace Executor::Jit

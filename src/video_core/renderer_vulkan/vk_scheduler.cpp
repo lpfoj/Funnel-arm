@@ -48,6 +48,7 @@ struct ExecutorVkJournalEntry {
     u64 depth_address{};
     u64 attachment_signature{};
     u32 op_variant{};
+    u32 primitive_type{};
     u32 element_count{};
     u32 instance_count{};
     u32 max_draw_count{};
@@ -510,7 +511,8 @@ void ExecutorVkProbeDumpAtSubmit(const void* stream, u64 tick, vk::Result result
 
 u64 ExecutorVkJournalGraphicsDraw(const void* stream, u64 tick, u64 pipeline_key_hash,
                                   u64 pipeline_handle, u64 vs_hash, u64 ps_hash,
-                                  ExecutorVkJournalDrawType draw_type, u32 element_count,
+                                  ExecutorVkJournalDrawType draw_type, u32 primitive_type,
+                                  u32 element_count,
                                   u32 instance_count, u32 max_draw_count, u32 stride,
                                   VAddr argument_address, VAddr count_address,
                                   VAddr color_address, VAddr depth_address,
@@ -530,6 +532,7 @@ u64 ExecutorVkJournalGraphicsDraw(const void* stream, u64 tick, u64 pipeline_key
         entry.address0 = argument_address;
         entry.address1 = count_address;
         entry.op_variant = static_cast<u32>(draw_type);
+        entry.primitive_type = primitive_type;
         entry.element_count = element_count;
         entry.instance_count = instance_count;
         entry.max_draw_count = max_draw_count;
@@ -797,7 +800,8 @@ void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept {
         if (entry.op == ExecutorVkJournalOp::GraphicsDraw) {
             __android_log_print(
                 ANDROID_LOG_ERROR, "LSX4Native",
-                "[EXECUTOR_VK_JOURNAL_DRAW] seq=%llu stream=0x%llx tick=%llu type=%u key=0x%llx "
+                "[EXECUTOR_VK_JOURNAL_DRAW] seq=%llu stream=0x%llx tick=%llu type=%u prim=%u "
+                "key=0x%llx "
                 "pipe=0x%llx vs=0x%llx ps=0x%llx elements=%u instances=%u "
                 "maxDraws=%u stride=%u args=0x%llx countAddr=0x%llx attach=0x%llx "
                 "cb0=0x%llx db=0x%llx colors=%u extent=%ux%u colorFmt=%u depthFmt=%u "
@@ -805,7 +809,7 @@ void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept {
                 static_cast<unsigned long long>(sequence),
                 static_cast<unsigned long long>(entry.stream_id),
                 static_cast<unsigned long long>(entry.tick),
-                entry.op_variant,
+                entry.op_variant, entry.primitive_type,
                 static_cast<unsigned long long>(entry.pipeline_key_hash),
                 static_cast<unsigned long long>(entry.pipeline_handle),
                 static_cast<unsigned long long>(entry.vs_hash),
@@ -1275,6 +1279,20 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
         // VK_ERROR_DEVICE_LOST is terminal: do not query the timeline or allocate another buffer.
         return;
     }
+
+#ifdef __ANDROID__
+    // Diagnostic contract check for Android drivers: keep exactly one Vulkan submission in flight.
+    // If this mode removes a device loss, the recorded commands are valid and the fault is in
+    // cross-submit lifetime/visibility rather than title data or shader translation.
+    static const bool serialize_gnm_submits =
+        std::getenv("EXECUTOR_ANDROID_SERIALIZE_GNM_SUBMITS") != nullptr;
+    if (serialize_gnm_submits) {
+        master_semaphore.Wait(signal_value);
+        if (master_semaphore.IsDeviceLost()) {
+            return;
+        }
+    }
+#endif
 
     master_semaphore.Refresh();
     if (master_semaphore.IsDeviceLost()) {

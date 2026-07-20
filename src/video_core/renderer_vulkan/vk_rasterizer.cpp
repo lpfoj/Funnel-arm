@@ -62,7 +62,12 @@ static u64 ExecutorVkPipelineHandle(vk::Pipeline pipeline) noexcept {
 // are coalesced before reaching this path, avoiding the repeated End/BeginRendering churn which
 // exposed the Adreno state-loss bug without recording a dozen redundant EDS commands per draw.
 static bool ExecutorNeedsQualcommPostBindDynamicState(const Instance& instance) noexcept {
-    return instance.GetDriverID() == vk::DriverId::eQualcommProprietary &&
+    static const bool disabled_for_bisection =
+        ::access("/data/data/app.lsx4.android/files/lsx4-home/"
+                 "run-bisect-disable-qualcomm-post-bind",
+                 F_OK) == 0;
+    return !disabled_for_bisection &&
+           instance.GetDriverID() == vk::DriverId::eQualcommProprietary &&
            !instance.IsExtendedDynamicState3Supported();
 }
 
@@ -596,6 +601,9 @@ void Rasterizer::ExecutorGpuLatePassFlush(u64 next_attachment_signature, u64 nex
 #endif
 
 void Rasterizer::CpSync() {
+#ifdef __ANDROID__
+    ++executor_completion_work_serial;
+#endif
     scheduler.EndRendering();
     auto cmdbuf = scheduler.CommandBuffer();
 
@@ -621,7 +629,8 @@ void Rasterizer::CompletionWaitBarrier() {
     const bool barrier_is_redundant =
         executor_completion_barrier_valid &&
         executor_completion_barrier_tick == current_tick &&
-        executor_completion_barrier_epoch == current_epoch;
+        executor_completion_barrier_epoch == current_epoch &&
+        executor_completion_barrier_work_serial == executor_completion_work_serial;
     if (barrier_is_redundant) {
         ++executor_completion_barrier_elided;
         if ((executor_completion_barrier_calls & 4095u) == 0u) {
@@ -663,6 +672,7 @@ void Rasterizer::CompletionWaitBarrier() {
     if (scheduler.CurrentTick() == current_tick) {
         executor_completion_barrier_tick = current_tick;
         executor_completion_barrier_epoch = barrier_epoch;
+        executor_completion_barrier_work_serial = executor_completion_work_serial;
         executor_completion_barrier_valid = true;
     } else {
         executor_completion_barrier_valid = false;
@@ -847,6 +857,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 #ifdef __ANDROID__
+    ++executor_completion_work_serial;
     static const bool trace_actual_draw =
         ExecutorTraceLiveWideEnabled() ||
         ExecutorTracePm4Enabled() ||
@@ -944,7 +955,17 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                             regs.num_indices);
     }
 #endif
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    // A single PS4 QuadList is already a four-vertex perimeter suitable for Vulkan's
+    // TriangleFan topology. Bypass auxiliary tessellation for this common fullscreen path:
+    // it avoids a mobile-driver varying corruption between TES and fragment stages and is also
+    // cheaper. Multi-quad and indirect draws retain the general tessellation fallback.
+    const bool single_quad_fan =
+        regs.primitive_type == AmdGpu::PrimitiveType::QuadList && regs.num_indices == 4 &&
+        regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
+    const GraphicsPipeline* pipeline =
+        pipeline_cache.GetGraphicsPipeline(single_quad_fan
+                                               ? std::optional{AmdGpu::PrimitiveType::TriangleFan}
+                                               : std::nullopt);
     if (!pipeline || !pipeline->IsValid()) {
         EXEC_DRAW_TRACE("no_pipeline_return");
         return;
@@ -1266,7 +1287,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             "[EXECUTOR_GPU_DRAW_STATE] seq=%llu fs=0x%llx tcs=0x%llx tes=0x%llx "
             "vs=0x%llx gs=0x%llx indexed=%u numIdx=%u "
             "instances=%u psMrtMask=0x%x keyMrtMask=0x%x keyWriteMask0=0x%x ctMask0=0x%x "
-            "discard=%u colorMode=%u blend0=%u src=%u dst=%u vp=%.2f,%.2f,%.1f,%.1f "
+            "discard=%u colorMode=%u colorCtlRaw=0x%x rop3=%u keyLogicOp=%u "
+            "blend0=%u blendRaw0=0x%x disableRop0=%u src=%u dst=%u "
+            "vp=%.2f,%.2f,%.1f,%.1f "
             "scissor=%d,%d-%d,%d cb0=0x%llx idxReg=%u voff=%u ioff=%u prim=%u "
             "polyRaw=0x%x cull=%u front=%u depthRaw=0x%x depthEn=%u depthWrite=%u depthFunc=%u "
             "stageEnable=0x%x hsInCp=%u hsOutCp=%u rasterKill=%u keyDiscard=%u clipDis=%u "
@@ -1291,7 +1314,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             regs.color_target_mask.GetMask(0),
             executor_gpu_probe_fragment && executor_gpu_probe_fragment->has_discard ? 1u : 0u,
             static_cast<unsigned>(regs.color_control.mode),
+            std::bit_cast<u32>(regs.color_control),
+            static_cast<unsigned>(regs.color_control.rop3),
+            static_cast<unsigned>(probe_key.logic_op),
             static_cast<unsigned>(regs.blend_control[0].enable),
+            std::bit_cast<u32>(regs.blend_control[0]),
+            static_cast<unsigned>(regs.blend_control[0].disable_rop3),
             static_cast<unsigned>(regs.blend_control[0].color_src_factor),
             static_cast<unsigned>(regs.blend_control[0].color_dst_factor),
             regs.viewports[0].xscale, regs.viewports[0].yscale, regs.viewports[0].xoffset,
@@ -1435,6 +1463,35 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                 flat_at(10), flat_at(11), flat_at(12), flat_at(13), flat_at(14), flat_at(15));
         }
         if (executor_gpu_probe_fragment) {
+            for (u32 image_index = 0;
+                 image_index < executor_gpu_probe_fragment->images.size(); ++image_index) {
+                const auto& image_desc = executor_gpu_probe_fragment->images[image_index];
+                const auto image = image_desc.GetSharp(*executor_gpu_probe_fragment);
+                const auto swizzle = image.DstSelect();
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_GPU_IMAGE_STATE] seq=%llu fs=0x%llx slot=%u sharp=%u "
+                    "guest=0x%llx type=%u extent=%ux%ux%u pitch=%u dataFmt=%u numFmt=%u "
+                    "dst=%u,%u,%u,%u levels=%u..%u array=%u..%u depth=%u written=%u "
+                    "isDepth=%u",
+                    static_cast<unsigned long long>(executor_gpu_probe_draw),
+                    static_cast<unsigned long long>(executor_gpu_probe_fragment_hash),
+                    image_index, image_desc.sharp_idx,
+                    static_cast<unsigned long long>(image.Address()),
+                    static_cast<unsigned>(image.GetType()), static_cast<unsigned>(image.width + 1),
+                    static_cast<unsigned>(image.height + 1),
+                    static_cast<unsigned>(image.depth + 1), image.Pitch(),
+                    static_cast<unsigned>(image.GetDataFmt()),
+                    static_cast<unsigned>(image.GetNumberFmt()),
+                    static_cast<unsigned>(swizzle.r), static_cast<unsigned>(swizzle.g),
+                    static_cast<unsigned>(swizzle.b), static_cast<unsigned>(swizzle.a),
+                    static_cast<unsigned>(image.base_level),
+                    static_cast<unsigned>(image.last_level),
+                    static_cast<unsigned>(image.base_array),
+                    static_cast<unsigned>(image.last_array),
+                    static_cast<unsigned>(image.depth), image_desc.is_written ? 1u : 0u,
+                    image_desc.is_depth ? 1u : 0u);
+            }
             for (u32 sampler_index = 0;
                  sampler_index < executor_gpu_probe_fragment->samplers.size(); ++sampler_index) {
                 const auto& sampler_desc = executor_gpu_probe_fragment->samplers[sampler_index];
@@ -1493,6 +1550,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             buffer_cache.PrepareIndexBuffer(index_offset, buffer_barriers,
                                             executor_gpu_probe_selected, executor_gpu_probe_draw);
     }
+
+    // Buffer/resource preparation above may submit and rotate the command buffer. Stream allocations
+    // were initially watched under the preparation tick, but the descriptors and vertex bindings are
+    // consumed by the current draw tick. Retain the populated ring prefix until that tick completes.
+    buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).RetainCurrentAllocation();
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 #ifdef __ANDROID__
@@ -1731,7 +1793,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             key.stage_hashes[u32(Shader::LogicalStage::Fragment)],
             is_indexed ? ExecutorVkJournalDrawType::IndexedDirect
                        : ExecutorVkJournalDrawType::Direct,
-            regs.num_indices, regs.num_instances.NumInstances(), 0, 0, 0, 0,
+            static_cast<u32>(key.prim_type), regs.num_indices,
+            regs.num_instances.NumInstances(), 0, 0, 0, 0,
             cb_descs[0].first ? color.guest_address : 0,
             executor_gpu_probe_attachments.depth_address,
             executor_gpu_probe_attachments.signature,
@@ -1780,6 +1843,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
+#ifdef __ANDROID__
+    ++executor_completion_work_serial;
+#endif
 
     scheduler.PopPendingOperations();
 
@@ -2030,7 +2096,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             key.stage_hashes[u32(Shader::LogicalStage::Fragment)],
             is_indexed ? ExecutorVkJournalDrawType::IndexedIndirect
                        : ExecutorVkJournalDrawType::Indirect,
-            0, 0, max_count, stride, arg_address + offset, count_address,
+            static_cast<u32>(key.prim_type), 0, 0, max_count, stride,
+            arg_address + offset, count_address,
             cb_descs[0].first ? color.guest_address : 0,
             executor_gpu_probe_attachments.depth_address,
             executor_gpu_probe_attachments.signature,
@@ -2068,6 +2135,7 @@ void Rasterizer::DispatchDirect() {
 
     scheduler.PopPendingOperations();
 #ifdef __ANDROID__
+    ++executor_completion_work_serial;
     if (AmdGpu::RenderWaveTrace::LateFrameCaptureActive()) {
         ExecutorGpuLatePassTransition(0, executor_gpu_probe_dispatch_sequence + 1,
                                       "compute_direct");
@@ -2128,6 +2196,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     scheduler.PopPendingOperations();
 #ifdef __ANDROID__
+    ++executor_completion_work_serial;
     if (AmdGpu::RenderWaveTrace::LateFrameCaptureActive()) {
         ExecutorGpuLatePassTransition(0, executor_gpu_probe_dispatch_sequence + 1,
                                       "compute_indirect");
@@ -3338,10 +3407,16 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+#ifdef __ANDROID__
+    ++executor_completion_work_serial;
+#endif
     buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+#ifdef __ANDROID__
+    ++executor_completion_work_serial;
+#endif
     buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
 }
 
@@ -3396,6 +3471,9 @@ bool Rasterizer::IsMemoryGpuModified(VAddr addr, u64 size) {
 }
 
 void Rasterizer::ProcessDownloadImages() {
+#ifdef __ANDROID__
+    ++executor_completion_work_serial;
+#endif
     texture_cache.ProcessDownloadImages();
 }
 

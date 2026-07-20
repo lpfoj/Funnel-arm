@@ -145,7 +145,7 @@ void ThreadState::FreeStack(PthreadAttr* attr) {
     }
 
     auto* stack_base = static_cast<char*>(attr->stackaddr_attr);
-    // Backend B publishes controlled guest stacks as conservative Boehm roots. Cached stack VMAs
+    // JIT publishes controlled guest stacks as conservative Boehm roots. Cached stack VMAs
     // remain mapped after thread exit, so scrub stale managed pointers before placing the stack on
     // the spare queue; otherwise dead stacks retain objects forever and recreate the mspace OOM.
 #ifdef __ANDROID__

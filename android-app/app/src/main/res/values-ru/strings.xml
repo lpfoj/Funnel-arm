@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">LSX4</string><string name="library_scanning">Поиск установленных игр…</string><string name="library_found">Найдено игр: %1$d</string><string name="library_empty_status">Игры не найдены</string><string name="library_empty">Нет установленных игр. Нажмите +, чтобы импортировать извлечённый каталог или PKG.</string>
     <string name="menu_import_directory">Импортировать каталог</string><string name="menu_import_pkg">Импортировать PKG</string><string name="menu_settings">Настройки</string><string name="menu_add">Добавить игру</string><string name="menu_remove_game">Удалить выбранную игру</string><string name="game_removing">Удаление %1$s…</string><string name="game_removed">%1$s удалена</string><string name="game_remove_failed">Не удалось удалить %1$s</string>
+    <string name="game_selected_for_removal">%1$s выбрана для удаления</string><string name="game_selection_cleared">Выделение %1$s снято</string><string name="game_marked_unsupported">%1$s добавлена в список неподдерживаемых</string><string name="game_marked_supported">%1$s добавлена в список поддерживаемых</string>
+    <string name="game_status_unclassified">Не распределена</string><string name="game_status_unsupported">Не поддерживается</string><string name="game_status_supported">Поддерживается</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Удерживайте 2 секунды для выбора на удаление, 4 секунды для отметки как неподдерживаемой или 8 секунд для отметки как поддерживаемой.</string>
     <string name="metadata_only">Только метаданные · eboot отсутствует</string>
     <string name="settings_title">Настройки</string><string name="settings_subtitle">Изменения сохраняются автоматически</string><string name="section_general">Общие</string><string name="language">Язык приложения</string>
     <string name="category_graphics">Графика</string><string name="category_graphics_summary">GPU, разрешение и патчи</string><string name="category_audio">Аудио</string><string name="category_audio_summary">Вывод звука</string><string name="category_controls">Управление</string><string name="category_controls_summary">Экранное управление</string><string name="category_cache">Кэширование</string><string name="category_cache_summary">Кэш скомпилированных блоков</string><string name="category_other">Другое</string><string name="category_other_summary">Отладочный HUD</string>
@@ -30,4 +33,20 @@
     <string name="controls_gamepad_hint">При подключении поддерживаемого геймпада экранный оверлей автоматически скрывается. Геймпады поддерживаются.</string>
     <string name="resolution_native">Нативное (устройство)</string>
     <string name="resolution_upscale_150">Масштаб 1,5× (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">Аудиомодуль NGS2 установлен. Он будет использован при следующем запуске игры.</string>
+    <string name="audio_ngs2_module_missing">Аудиомодуль NGS2 отсутствует. Игры, использующие NGS2, будут работать без звука.</string>
+    <string name="audio_import_ngs2_module">Импортировать libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">Импортируйте только расшифрованный модуль прошивки, снятый с вашей собственной PlayStation 4. После импорта перезапустите игру; перезапуск приложения не требуется.</string>
+    <string name="audio_ngs2_import_success">Аудиомодуль NGS2 импортирован. Перезапустите игру, чтобы включить звук.</string>
+    <string name="audio_ngs2_import_failed">Не удалось импортировать аудиомодуль NGS2: %1$s</string>
+    <string name="audio_ngs2_error_directory">Не удалось создать каталог системных модулей</string>
+    <string name="audio_ngs2_error_open">Не удалось открыть выбранный файл</string>
+    <string name="audio_ngs2_error_size">Выбранный модуль слишком большой</string>
+    <string name="audio_ngs2_error_name">Выберите модуль прошивки с именем %1$s</string>
+    <string name="audio_ngs2_error_format">Выбранный файл не является расшифрованным модулем PS4</string>
+    <string name="game_hold_waiting">Удерживайте: 2 с удалить · 4 с не поддерживается · 8 с поддерживается</string>
+    <string name="game_hold_release_remove">Отпустите: выбрать для удаления</string>
+    <string name="game_hold_release_unsupported">Отпустите: отметить неподдерживаемой</string>
+    <string name="game_hold_release_supported">Отпустите: отметить поддерживаемой</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 с · %2$s</string>
 </resources>

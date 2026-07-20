@@ -195,6 +195,14 @@ public:
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
 
+    /// Extends the lifetime of all allocations made so far to the scheduler's current tick.
+    ///
+    /// Resource preparation may submit and rotate the command buffer after a stream allocation was
+    /// committed but before the draw that consumes it is recorded. In that case the original watch
+    /// protects only the preparation tick and the ring can reuse the bytes while the later draw is
+    /// still pending.
+    void RetainCurrentAllocation();
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);

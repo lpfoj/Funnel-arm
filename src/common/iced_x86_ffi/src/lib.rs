@@ -188,7 +188,7 @@ fn relative_target_delta(instruction: &Instruction, kind: OpKind) -> i64 {
 
 fn normalized_mnemonic(mnemonic: Mnemonic) -> Mnemonic {
     match mnemonic {
-        // iced-x86 exposes the REX.W forms as separate mnemonic values. Backend B models width in
+        // iced-x86 exposes the REX.W forms as separate mnemonic values. JIT models width in
         // operand_width, so both encodings must dispatch through the same semantic handler.
         Mnemonic::Pcmpestri64 => Mnemonic::Pcmpestri,
         Mnemonic::Pcmpestrm64 => Mnemonic::Pcmpestrm,
@@ -212,7 +212,7 @@ fn normalized_mnemonic(mnemonic: Mnemonic) -> Mnemonic {
 
 fn public_operand_start(instruction: &Instruction) -> u32 {
     // iced-x86 exposes MASKMOVDQU's architectural write-only [R/E]DI destination
-    // as operand zero. Backend B's public decoder contract follows the assembly
+    // as operand zero. JIT's public decoder contract follows the assembly
     // spelling: two explicit XMM sources, with the implicit destination handled
     // by the instruction semantic itself.
     if matches!(
@@ -581,6 +581,18 @@ mod tests {
     }
 
     #[test]
+    fn indirect_call_with_disp8_preserves_its_full_length() {
+        let (instruction, operands) = decode(&[0xff, 0x50, 0x18]);
+        assert_eq!(instruction.mnemonic, Mnemonic::Call as u32);
+        assert_eq!(instruction.length, 3);
+        assert_eq!(instruction.operand_count, 1);
+        assert_eq!(operands[0].operand_type, OPERAND_MEMORY);
+        assert_eq!(unsafe { operands[0].value.mem.base }, Register::RAX as u32);
+        assert_eq!(unsafe { operands[0].value.mem.disp.value }, 0x18);
+        assert_eq!(operands[0].size, 64);
+    }
+
+    #[test]
     fn sign_extended_immediate_keeps_semantic_and_encoded_widths() {
         let (instruction, operands) = decode(&[0x48, 0x83, 0xc0, 0xff]);
         assert_eq!(instruction.mnemonic, Mnemonic::Add as u32);
@@ -632,5 +644,30 @@ mod tests {
         assert_eq!(unsafe { operands[1].value.reg.value }, Register::XMM1 as u32);
         assert_eq!(operands[0].size, 128);
         assert_eq!(operands[1].size, 128);
+    }
+
+    #[test]
+    fn fxch_preserves_iced_explicit_st0_and_stack_register_operands() {
+        let (instruction, operands) = decode(&[0xd9, 0xc9]);
+        assert_eq!(instruction.mnemonic, Mnemonic::Fxch as u32);
+        assert_eq!(instruction.operand_count, 2);
+        assert_eq!(operands[0].operand_type, OPERAND_REGISTER);
+        assert_eq!(operands[1].operand_type, OPERAND_REGISTER);
+        assert_eq!(unsafe { operands[0].value.reg.value }, Register::ST0 as u32);
+        assert_eq!(unsafe { operands[1].value.reg.value }, Register::ST1 as u32);
+    }
+
+    #[test]
+    fn f16c_float_to_half_exposes_destination_source_and_rounding_control() {
+        // VCVTPS2PH xmm4, xmm4, 0: a generic renderer float-buffer conversion form.
+        let (instruction, operands) = decode(&[0xc4, 0xe3, 0x79, 0x1d, 0xe4, 0x00]);
+        assert_eq!(instruction.mnemonic, Mnemonic::Vcvtps2ph as u32);
+        assert_eq!(instruction.operand_count, 3);
+        assert_eq!(unsafe { operands[0].value.reg.value }, Register::XMM4 as u32);
+        assert_eq!(unsafe { operands[1].value.reg.value }, Register::XMM4 as u32);
+        assert_eq!(operands[0].size, 128);
+        assert_eq!(operands[1].size, 128);
+        assert_eq!(operands[2].operand_type, OPERAND_IMMEDIATE);
+        assert_eq!(unsafe { operands[2].value.imm.value.u }, 0);
     }
 }

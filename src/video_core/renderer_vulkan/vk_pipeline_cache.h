@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <variant>
@@ -173,7 +174,8 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    const GraphicsPipeline*
+    GetGraphicsPipeline(std::optional<AmdGpu::PrimitiveType> host_primitive_override = std::nullopt);
 
     const ComputePipeline* GetComputePipeline();
 
@@ -200,7 +202,7 @@ public:
 private:
     void StartBackgroundWarmUp(std::vector<std::vector<u8>>&& pipeline_blobs);
     void StopBackgroundWarmUp();
-    bool RefreshGraphicsKey();
+    bool RefreshGraphicsKey(std::optional<AmdGpu::PrimitiveType> host_primitive_override);
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 
@@ -255,6 +257,8 @@ private:
     ComputePipelineKey compute_key{};
     const GraphicsPipeline* last_graphics_pipeline{};
     u64 last_graphics_state_generation{std::numeric_limits<u64>::max()};
+    std::optional<AmdGpu::PrimitiveType> graphics_primitive_override{};
+    std::optional<AmdGpu::PrimitiveType> last_graphics_primitive_override{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 
     u64 srt_snapshot_lookups{};

@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">LSX4</string><string name="library_scanning">正在扫描已安装游戏…</string><string name="library_found">找到游戏：%1$d</string><string name="library_empty_status">未找到游戏</string><string name="library_empty">没有已安装的游戏。点击 + 导入已解压目录或 PKG。</string>
     <string name="menu_import_directory">导入目录</string><string name="menu_import_pkg">导入 PKG</string><string name="menu_settings">设置</string><string name="menu_add">添加游戏</string><string name="menu_remove_game">删除所选游戏</string><string name="game_removing">正在删除 %1$s…</string><string name="game_removed">已删除 %1$s</string><string name="game_remove_failed">无法删除 %1$s</string>
+    <string name="game_selected_for_removal">已选择删除 %1$s</string><string name="game_selection_cleared">已取消选择 %1$s</string><string name="game_marked_unsupported">已将 %1$s 添加到不受支持游戏</string><string name="game_marked_supported">已将 %1$s 添加到受支持游戏</string>
+    <string name="game_status_unclassified">未分类</string><string name="game_status_unsupported">不受支持</string><string name="game_status_supported">受支持</string>
+    <string name="game_item_accessibility">%1$s，%2$s。%3$s。按住 2 秒可选择删除，按住 4 秒可标记为不受支持，按住 8 秒可标记为受支持。</string>
     <string name="metadata_only">仅元数据 · 缺少 eboot</string>
     <string name="settings_title">设置</string><string name="settings_subtitle">更改会自动保存</string><string name="section_general">通用</string><string name="language">应用语言</string>
     <string name="category_graphics">图形</string><string name="category_graphics_summary">GPU、分辨率和补丁</string><string name="category_audio">音频</string><string name="category_audio_summary">音频输出</string><string name="category_controls">控制</string><string name="category_controls_summary">屏幕控制</string><string name="category_cache">缓存</string><string name="category_cache_summary">已编译块缓存</string><string name="category_other">其他</string><string name="category_other_summary">调试 HUD</string>
@@ -30,4 +33,20 @@
     <string name="controls_gamepad_hint">连接受支持的游戏手柄后，屏幕控制层会自动隐藏。支持游戏手柄。</string>
     <string name="resolution_native">原生（设备）</string>
     <string name="resolution_upscale_150">1.5× 放大（2880×1620）</string>
+    <string name="audio_ngs2_module_ready">NGS2 音频模块已安装，将在下次启动游戏时使用。</string>
+    <string name="audio_ngs2_module_missing">缺少 NGS2 音频模块。使用 NGS2 的游戏将没有声音。</string>
+    <string name="audio_import_ngs2_module">导入 libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">请仅导入从您自己的 PlayStation 4 转储并解密的固件模块。导入后只需重新启动游戏，无需重新启动应用。</string>
+    <string name="audio_ngs2_import_success">NGS2 音频模块已导入。请重新启动游戏以启用声音。</string>
+    <string name="audio_ngs2_import_failed">无法导入 NGS2 音频模块：%1$s</string>
+    <string name="audio_ngs2_error_directory">无法创建系统模块目录</string>
+    <string name="audio_ngs2_error_open">无法打开所选文件</string>
+    <string name="audio_ngs2_error_size">所选模块过大</string>
+    <string name="audio_ngs2_error_name">请选择名为 %1$s 的固件模块</string>
+    <string name="audio_ngs2_error_format">所选文件不是已解密的 PS4 模块</string>
+    <string name="game_hold_waiting">按住：2 秒删除 · 4 秒不支持 · 8 秒支持</string>
+    <string name="game_hold_release_remove">现在松开：选择删除</string>
+    <string name="game_hold_release_unsupported">现在松开：标记为不支持</string>
+    <string name="game_hold_release_supported">现在松开：标记为支持</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 秒 · %2$s</string>
 </resources>

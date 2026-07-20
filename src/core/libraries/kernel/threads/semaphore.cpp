@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +34,7 @@ extern "C" int executor_live_get_current_hle_call_site(std::uint64_t* guest_retu
 extern "C" void executor_live_dump_current_hle_context(const char* reason,
                                                        std::uint64_t focus)
     __attribute__((weak));
-extern "C" void executor_backend_b_dump_thread_states(const char* reason) __attribute__((weak));
+extern "C" void executor_jit_dump_thread_states(const char* reason) __attribute__((weak));
 
 static std::atomic<std::uintptr_t> g_executor_unity_gfx_worker{0};
 
@@ -61,6 +62,9 @@ static bool ExecutorLightOracleMode() {
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#ifdef __ANDROID__
+#include "video_core/amdgpu/liverpool.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -68,12 +72,103 @@ constexpr s32 ORBIS_KERNEL_SEM_VALUE_MAX = 0x7FFFFFFF;
 
 struct PthreadSem {
     explicit PthreadSem(s32 value_)
-        : semaphore{value_}, value{value_} {
+        :
+#ifndef __ANDROID__
+          semaphore{value_},
+#endif
+          value{value_} {
     }
 
+#ifdef __ANDROID__
+    // libc++'s counting_semaphore::release() uses atomic_notify_all on this platform. Unity posts
+    // its job semaphores from Game:Main thousands of times per second, so that implementation
+    // enters the kernel and wakes every worker even when only one token was added. Keep the guest
+    // count authoritative and wake exactly one registered waiter.
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    u32 waiters = 0;
+#else
     CountingSemaphore semaphore;
+#endif
     std::atomic<s32> value;
 };
+
+#ifdef __ANDROID__
+static bool PostPthreadSemToken(PthreadSem* native, s32* before_out = nullptr) {
+    bool wake_waiter = false;
+    {
+        std::lock_guard lock{native->wait_mutex};
+        const s32 before = native->value.load(std::memory_order_relaxed);
+        if (before_out != nullptr) {
+            *before_out = before;
+        }
+        if (before == ORBIS_KERNEL_SEM_VALUE_MAX) {
+            return false;
+        }
+        native->value.store(before + 1, std::memory_order_release);
+        wake_waiter = native->waiters != 0;
+    }
+    if (wake_waiter) {
+        native->wait_cv.notify_one();
+    }
+    return true;
+}
+
+static u32 ExecutorEopTraceThreadKind() {
+    if (!g_curthread) {
+        return 0;
+    }
+    if (g_curthread->name == "Game:Main") {
+        return 1;
+    }
+    if (g_curthread->name.find("UnityGfxDeviceWorker") != std::string::npos) {
+        return 2;
+    }
+    return 0;
+}
+#endif
+
+// Guest semaphore slots are plain pointers in guest memory and may be destroyed concurrently with
+// a final post/wait completion. Keep the native object alive for the process lifetime and only
+// detach the guest slot on destroy. This mirrors a kernel handle table: an operation which already
+// resolved a handle remains valid, while later operations observe an invalid handle. Guest ABI
+// slots can be only four-byte aligned, so striped locks protect the short memcpy snapshot instead
+// of imposing an invalid eight-byte atomic alignment requirement.
+static std::mutex pthread_sem_pool_mutex;
+static std::vector<std::unique_ptr<PthreadSem>> pthread_sem_pool;
+static std::array<std::mutex, 64> pthread_sem_slot_mutexes;
+
+static std::mutex& PthreadSemSlotMutex(PthreadSem** sem) {
+    const auto address = reinterpret_cast<std::uintptr_t>(sem);
+    return pthread_sem_slot_mutexes[(address >> 2) % pthread_sem_slot_mutexes.size()];
+}
+
+static PthreadSem* LoadPthreadSem(PthreadSem** sem) {
+    if (sem == nullptr) {
+        return nullptr;
+    }
+    std::scoped_lock lock{PthreadSemSlotMutex(sem)};
+    PthreadSem* native;
+    std::memcpy(&native, sem, sizeof(native));
+    return native;
+}
+
+static void StorePthreadSem(PthreadSem** sem, PthreadSem* native) {
+    std::scoped_lock lock{PthreadSemSlotMutex(sem)};
+    std::memcpy(sem, &native, sizeof(native));
+}
+
+static PthreadSem* DetachPthreadSem(PthreadSem** sem) {
+    if (sem == nullptr) {
+        return nullptr;
+    }
+    std::scoped_lock lock{PthreadSemSlotMutex(sem)};
+    PthreadSem* native;
+    std::memcpy(&native, sem, sizeof(native));
+    PthreadSem* const empty = nullptr;
+    std::memcpy(sem, &empty, sizeof(empty));
+    return native;
+}
 
 class OrbisSem;
 
@@ -166,14 +261,14 @@ static void PcOraclePosixSemInvalidLog(const char* op, PthreadSem** slot,
 class OrbisSem;
 
 extern "C" void executor_live_mono_run_pending_signal_safe_point() __attribute__((weak));
-extern "C" bool executor_lsx4_android_backend_b_active() __attribute__((weak));
+extern "C" bool executor_lsx4_android_jit_active() __attribute__((weak));
 
-static bool UseBackendBNativeSemaphorePark() {
-    // Backend B installs a real host SIGUSR1 handler and sends pthread_kill to the target host
+static bool UseJitNativeSemaphorePark() {
+    // JIT installs a real host SIGUSR1 handler and sends pthread_kill to the target host
     // pthread, so a futex-blocked waiter is interruptible and can run Mono's guest suspend handler.
     // The older backends can still use the queued safe-point route, which requires periodic polls.
-    return executor_lsx4_android_backend_b_active != nullptr &&
-           executor_lsx4_android_backend_b_active();
+    return executor_lsx4_android_jit_active != nullptr &&
+           executor_lsx4_android_jit_active();
 }
 
 static void RunMonoPendingSignalSafePointFromWait() {
@@ -242,6 +337,23 @@ static bool ShouldTraceLiveSync() {
     static const bool enabled = ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_WIDE") ||
                                 ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_SYNC") ||
                                 ExecutorEnvFlag("EXECUTOR_LIGHT_ORACLE");
+    return enabled;
+}
+
+static bool ShouldRecordKernelSemFrontier() {
+    // The targeted HLE-flight run also needs the kernel-semaphore balance that explains host
+    // binary_semaphore parks. Unlike the broad sync tracer, this records only one compact entry per
+    // kernel semaphore and emits nothing on the hot path.
+    static const bool enabled = ShouldTraceLiveSync() ||
+                                ExecutorEnvFlag("EXECUTOR_SYNC_FRONTIER") ||
+                                ExecutorEnvFlag("EXECUTOR_LIVE_HLE_FLIGHT");
+    return enabled;
+}
+
+static bool ShouldRecordPosixSemFrontier() {
+    static const bool enabled = ShouldTraceLiveSync() ||
+                                ExecutorEnvFlag("EXECUTOR_SYNC_FRONTIER") ||
+                                ExecutorEnvFlag("EXECUTOR_LIVE_HLE_FLIGHT");
     return enabled;
 }
 
@@ -456,7 +568,7 @@ extern "C" void executor_live_record_posix_sem_hle_site(const char* op, void* se
                                                         std::uint64_t guest_return,
                                                         std::uint64_t module_offset,
                                                         const char* module_name) {
-    if (!ShouldTraceLiveSync() || sem_addr == nullptr || op == nullptr) {
+    if (!ShouldRecordPosixSemFrontier() || sem_addr == nullptr || op == nullptr) {
         return;
     }
     const auto key = reinterpret_cast<std::uintptr_t>(sem_addr);
@@ -480,7 +592,7 @@ extern "C" void executor_live_record_posix_sem_hle_site(const char* op, void* se
         }
     }
     static std::atomic_int budget{2048};
-    if (budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+    if (ShouldTraceLiveSync() && budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_LIVE_SEM_SITE] op=%s sem=%p ret=%p off=0x%llx module=%s "
@@ -492,7 +604,7 @@ extern "C" void executor_live_record_posix_sem_hle_site(const char* op, void* se
 }
 
 extern "C" void executor_live_dump_posix_sem_records(const char* reason) {
-    if (!ShouldTraceLiveSync()) {
+    if (!ShouldRecordPosixSemFrontier()) {
         return;
     }
     struct Snapshot {
@@ -607,21 +719,8 @@ extern "C" int executor_live_signal_pending_mono_posix_sems(int max_posts) {
         if (native == nullptr) {
             continue;
         }
-        const s32 before = native->value.load(std::memory_order_relaxed);
-        bool overflow = false;
-        s32 current = native->value.load(std::memory_order_relaxed);
-        for (;;) {
-            if (current == ORBIS_KERNEL_SEM_VALUE_MAX) {
-                overflow = true;
-                break;
-            }
-            if (native->value.compare_exchange_weak(current, current + 1,
-                                                    std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
-                break;
-            }
-        }
-        if (overflow) {
+        s32 before = 0;
+        if (!PostPthreadSemToken(native, &before)) {
             __android_log_print(
                 ANDROID_LOG_WARN, "LSX4Native",
                 "[EXECUTOR_MONO_POSIX_SEM_SIGNAL] sem=%p native=%p result=overflow before=%d "
@@ -631,7 +730,6 @@ extern "C" int executor_live_signal_pending_mono_posix_sems(int max_posts) {
                 candidate.last_thread.c_str());
             continue;
         }
-        native->semaphore.release();
         const s32 after = native->value.load(std::memory_order_relaxed);
         {
             std::lock_guard records_lock{LivePosixSemRecordsMutex()};
@@ -679,7 +777,7 @@ static std::unordered_map<u32, LiveKernelSemRecord>& LiveKernelSemRecords() {
 
 static void UpdateLivePosixSemRecord(const char* op, PthreadSem** sem, PthreadSem* native,
                                      s32 before, s32 after, s32 ret) {
-    if (!ShouldTraceLiveSync() || sem == nullptr) {
+    if (!ShouldRecordPosixSemFrontier() || sem == nullptr) {
         return;
     }
     const auto key = reinterpret_cast<std::uintptr_t>(sem);
@@ -737,8 +835,8 @@ static void DumpLivePosixSemNeighborhood(PthreadSem** stuck_sem) {
     }
     const auto stuck = reinterpret_cast<std::uintptr_t>(stuck_sem);
 #ifdef __ANDROID__
-    if (executor_backend_b_dump_thread_states != nullptr) {
-        executor_backend_b_dump_thread_states("posix-sem-stuck");
+    if (executor_jit_dump_thread_states != nullptr) {
+        executor_jit_dump_thread_states("posix-sem-stuck");
     }
 #endif
     struct Snapshot {
@@ -797,7 +895,7 @@ static void DumpLivePosixSemNeighborhood(PthreadSem** stuck_sem) {
 static void UpdateLiveKernelSemRecord(const char* op, Common::SlotId sem, const OrbisSem* native,
                                       s32 before, s32 after, s32 count, s32 ret,
                                       const char* name) {
-    if (!ShouldTraceLiveSync()) {
+    if (!ShouldRecordKernelSemFrontier()) {
         return;
     }
     const auto key = sem.index + 1;
@@ -845,7 +943,7 @@ static void UpdateLiveKernelSemRecord(const char* op, Common::SlotId sem, const 
 }
 
 static void DumpLiveKernelSemLedger(Common::SlotId stuck_sem) {
-    if (!ShouldTraceLiveSync()) {
+    if (!ShouldRecordKernelSemFrontier()) {
         return;
     }
     const auto stuck_key = stuck_sem.index + 1;
@@ -890,6 +988,59 @@ static void DumpLiveKernelSemLedger(Common::SlotId stuck_sem) {
             r.init_tid, r.last_op.c_str(), r.last_thread.c_str(), r.last_tid,
             r.name.empty() ? "<none>" : r.name.c_str());
     }
+}
+
+extern "C" void executor_live_dump_kernel_sem_records(const char* reason) {
+    if (!ShouldRecordKernelSemFrontier()) {
+        return;
+    }
+    std::vector<LiveKernelSemRecord> snapshot;
+    {
+        std::lock_guard lock{LiveKernelSemRecordsMutex()};
+        snapshot.reserve(LiveKernelSemRecords().size());
+        for (const auto& [key, record] : LiveKernelSemRecords()) {
+            (void)key;
+            snapshot.push_back(record);
+        }
+    }
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto& lhs, const auto& rhs) {
+        const auto lhs_outstanding =
+            static_cast<std::int64_t>(lhs.wait_enter_count) - lhs.wait_return_count;
+        const auto rhs_outstanding =
+            static_cast<std::int64_t>(rhs.wait_enter_count) - rhs.wait_return_count;
+        if (lhs_outstanding != rhs_outstanding) {
+            return lhs_outstanding > rhs_outstanding;
+        }
+        return lhs.slot < rhs.slot;
+    });
+
+    std::size_t active = 0;
+    for (const auto& record : snapshot) {
+        const auto outstanding =
+            static_cast<std::int64_t>(record.wait_enter_count) - record.wait_return_count;
+        if (outstanding <= 0) {
+            continue;
+        }
+        ++active;
+        __android_log_print(
+            ANDROID_LOG_WARN, "LSX4Native",
+            "[EXECUTOR_KERNEL_SEM_FRONTIER] reason=%s slot=%u native=%p name=%s "
+            "outstanding=%lld create=%u wait_enter=%u wait_return=%u signal=%u poll=%u "
+            "cancel=%u invalid=%u init=%d max=%d last_before=%d last_after=%d "
+            "last_count=%d last_ret=0x%x init_thread=%s last_op=%s last_thread=%s",
+            reason && reason[0] ? reason : "<none>", record.slot,
+            reinterpret_cast<void*>(record.native),
+            record.name.empty() ? "<none>" : record.name.c_str(),
+            static_cast<long long>(outstanding), record.create_count, record.wait_enter_count,
+            record.wait_return_count, record.signal_count, record.poll_count,
+            record.cancel_count, record.invalid_count, record.init_value, record.max_value,
+            record.last_before, record.last_after, record.last_count,
+            static_cast<u32>(record.last_ret), record.init_thread.c_str(),
+            record.last_op.c_str(), record.last_thread.c_str());
+    }
+    __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                        "[EXECUTOR_KERNEL_SEM_FRONTIER_SUMMARY] reason=%s records=%zu active=%zu",
+                        reason && reason[0] ? reason : "<none>", snapshot.size(), active);
 }
 
 static void TraceLiveUnityGfxSemContext(const char* op, PthreadSem** sem) {
@@ -1329,7 +1480,7 @@ public:
             if (!timeout) {
                 // Wait indefinitely until we are woken up.
 #ifdef __ANDROID__
-                if (UseBackendBNativeSemaphorePark()) {
+                if (UseJitNativeSemaphorePark()) {
                     sem.acquire();
                 } else {
                     while (!sem.try_acquire_for(std::chrono::milliseconds(1))) {
@@ -1345,7 +1496,7 @@ public:
                 // Wait until timeout runs out, recording how much remaining time there was.
                 const auto start = std::chrono::high_resolution_clock::now();
 #ifdef __ANDROID__
-                if (UseBackendBNativeSemaphorePark()) {
+                if (UseJitNativeSemaphorePark()) {
                     sem.try_acquire_for(std::chrono::microseconds(*timeout));
                 } else {
                     const auto deadline = start + std::chrono::microseconds(*timeout);
@@ -1676,199 +1827,241 @@ s32 PS4_SYSV_ABI sceKernelDeleteSema(OrbisKernelSema sem) {
 }
 
 s32 PS4_SYSV_ABI posix_sem_init(PthreadSem** sem, s32 pshared, u32 value) {
-    if (value > ORBIS_KERNEL_SEM_VALUE_MAX) {
+    if (sem == nullptr || value > ORBIS_KERNEL_SEM_VALUE_MAX) {
         *__Error() = POSIX_EINVAL;
         return -1;
     }
-    if (sem != nullptr) {
-        *sem = new PthreadSem(static_cast<s32>(value));
+    PthreadSem* native;
+    {
+        std::scoped_lock lock{pthread_sem_pool_mutex};
+        native = pthread_sem_pool.emplace_back(
+            std::make_unique<PthreadSem>(static_cast<s32>(value))).get();
     }
+    StorePthreadSem(sem, native);
 #ifdef __ANDROID__
-    TraceLivePosixSem("init", sem, sem ? *sem : nullptr, static_cast<s32>(value),
-                      sem && *sem ? (*sem)->value.load(std::memory_order_relaxed) : -1, 0);
+    TraceLivePosixSem("init", sem, native, static_cast<s32>(value),
+                      native->value.load(std::memory_order_relaxed), 0);
 #else
-    PcOraclePosixSemLog("init", sem, sem ? *sem : nullptr, static_cast<s32>(value),
-                        sem && *sem ? (*sem)->value.load(std::memory_order_relaxed) : -1, 0,
+    PcOraclePosixSemLog("init", sem, native, static_cast<s32>(value),
+                        native->value.load(std::memory_order_relaxed), 0,
                         __builtin_return_address(0));
 #endif
     return 0;
 }
 
 s32 PS4_SYSV_ABI posix_sem_destroy(PthreadSem** sem) {
-    if (sem == nullptr || *sem == nullptr) {
+    if (DetachPthreadSem(sem) == nullptr) {
         *__Error() = POSIX_EINVAL;
         return -1;
     }
-    delete *sem;
-    *sem = nullptr;
     return 0;
 }
 
 s32 PS4_SYSV_ABI posix_sem_wait(PthreadSem** sem) {
-    if (sem == nullptr || *sem == nullptr) {
+    PthreadSem* const native = LoadPthreadSem(sem);
+    if (native == nullptr) {
         *__Error() = POSIX_EINVAL;
 #ifdef __ANDROID__
-        TraceLivePosixSem("wait_invalid", sem, sem ? *sem : nullptr, -1, -1, -1);
+        TraceLivePosixSem("wait_invalid", sem, nullptr, -1, -1, -1);
         TraceLiveInvalidPosixSemSlot("wait_invalid", sem);
 #else
-        PcOraclePosixSemLog("wait_invalid", sem, sem ? *sem : nullptr, -1, -1, -1,
+        PcOraclePosixSemLog("wait_invalid", sem, nullptr, -1, -1, -1,
                             __builtin_return_address(0));
         PcOraclePosixSemInvalidLog("wait_invalid", sem, __builtin_return_address(0));
 #endif
         return -1;
     }
-    const s32 before = (*sem)->value.load(std::memory_order_relaxed);
+    const s32 before = native->value.load(std::memory_order_relaxed);
 #ifdef __ANDROID__
+    const u32 executor_eop_thread_kind = ExecutorEopTraceThreadKind();
+    if (executor_eop_thread_kind != 0) {
+        AmdGpu::ExecutorEopTraceSemSync(0, reinterpret_cast<uintptr_t>(sem),
+                                       reinterpret_cast<uintptr_t>(native), before, before, 0,
+                                       executor_eop_thread_kind);
+    }
     if (ShouldBypassLiveMonoSemWait(sem)) {
         static std::atomic_int log_budget{128};
         if (log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
             __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
                                 "[EXECUTOR_LIVE_MONO_SEM_BYPASS] op=wait sem=%p native=%p "
                                 "before=%d thread=%s tid=%ld ret=0 note=nonblocking_live_probe",
-                                sem, *sem, before,
+                                sem, native, before,
                                 g_curthread ? g_curthread->name.c_str() : "<no-gcurthread>",
                                 static_cast<long>(::syscall(SYS_gettid)));
         }
-        TraceLivePosixSem("wait_bypass", sem, *sem, before, before, 0);
+        TraceLivePosixSem("wait_bypass", sem, native, before, before, 0);
         return 0;
     }
 #endif
 #ifdef __ANDROID__
-    TraceLivePosixSem("wait_enter", sem, *sem, before, before, 0);
-    auto executor_wait_watch = BeginLivePosixSemWaitWatch(sem, *sem, before);
+    TraceLivePosixSem("wait_enter", sem, native, before, before, 0);
+    auto executor_wait_watch = BeginLivePosixSemWaitWatch(sem, native, before);
     const auto executor_wait_start = std::chrono::steady_clock::now();
 #else
     const void* pc_oracle_return = __builtin_return_address(0);
-    PcOraclePosixSemLog("wait_enter", sem, *sem, before, before, 0, pc_oracle_return);
+    PcOraclePosixSemLog("wait_enter", sem, native, before, before, 0, pc_oracle_return);
 #endif
 #ifdef __ANDROID__
-    if (UseBackendBNativeSemaphorePark()) {
-        // Reference parity: an unsatisfied Backend-B guest semaphore parks its owning host pthread.
-        // SIGUSR1 interrupts that pthread and runs the guest handler before the futex is re-entered.
-        (*sem)->semaphore.acquire();
-    } else {
-        while (!(*sem)->semaphore.try_acquire_for(std::chrono::milliseconds(1))) {
+    {
+        std::unique_lock wait_lock{native->wait_mutex};
+        ++native->waiters;
+        while (native->value.load(std::memory_order_acquire) == 0) {
+            if (UseJitNativeSemaphorePark()) {
+                // Reference parity: an unsatisfied JIT guest semaphore parks its owning host
+                // pthread. A post wakes one waiter, matching one newly available token.
+                native->wait_cv.wait(wait_lock);
+                continue;
+            }
+            native->wait_cv.wait_for(wait_lock, std::chrono::milliseconds(1));
+            if (native->value.load(std::memory_order_acquire) != 0) {
+                break;
+            }
+            wait_lock.unlock();
             RunMonoPendingSignalSafePointFromWait();
             std::this_thread::yield();
+            wait_lock.lock();
         }
+        --native->waiters;
+        native->value.fetch_sub(1, std::memory_order_acq_rel);
     }
 #else
-    (*sem)->semaphore.acquire();
+    native->semaphore.acquire();
+    native->value.fetch_sub(1, std::memory_order_acq_rel);
 #endif
-    (*sem)->value.fetch_sub(1, std::memory_order_acq_rel);
 #ifdef __ANDROID__
+    if (executor_eop_thread_kind != 0) {
+        AmdGpu::ExecutorEopTraceSemSync(
+            1, reinterpret_cast<uintptr_t>(sem), reinterpret_cast<uintptr_t>(native), before,
+            native->value.load(std::memory_order_relaxed), 0, executor_eop_thread_kind);
+    }
     if (executor_wait_watch) {
         executor_wait_watch->store(true, std::memory_order_release);
     }
-    TraceLivePosixSem("wait_return", sem, *sem, before,
-                      (*sem)->value.load(std::memory_order_relaxed), 0);
+    TraceLivePosixSem("wait_return", sem, native, before,
+                      native->value.load(std::memory_order_relaxed), 0);
     const auto executor_wait_end = std::chrono::steady_clock::now();
     TraceLivePosixSemDuration(
-        "wait", sem, *sem, 0,
+        "wait", sem, native, 0,
         std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
                                                               executor_wait_start)
             .count());
 #else
-    PcOraclePosixSemLog("wait_return", sem, *sem, before,
-                        (*sem)->value.load(std::memory_order_relaxed), 0, pc_oracle_return);
+    PcOraclePosixSemLog("wait_return", sem, native, before,
+                        native->value.load(std::memory_order_relaxed), 0, pc_oracle_return);
 #endif
     return 0;
 }
 
 s32 PS4_SYSV_ABI posix_sem_trywait(PthreadSem** sem) {
-    if (sem == nullptr || *sem == nullptr) {
+    PthreadSem* const native = LoadPthreadSem(sem);
+    if (native == nullptr) {
         *__Error() = POSIX_EINVAL;
 #ifdef __ANDROID__
-        TraceLivePosixSem("trywait_invalid", sem, sem ? *sem : nullptr, -1, -1, -1);
+        TraceLivePosixSem("trywait_invalid", sem, nullptr, -1, -1, -1);
         TraceLiveInvalidPosixSemSlot("trywait_invalid", sem);
 #else
-        PcOraclePosixSemLog("trywait_invalid", sem, sem ? *sem : nullptr, -1, -1, -1,
+        PcOraclePosixSemLog("trywait_invalid", sem, nullptr, -1, -1, -1,
                             __builtin_return_address(0));
         PcOraclePosixSemInvalidLog("trywait_invalid", sem, __builtin_return_address(0));
 #endif
         return -1;
     }
-    const s32 before = (*sem)->value.load(std::memory_order_relaxed);
+    const s32 before = native->value.load(std::memory_order_relaxed);
 #ifdef __ANDROID__
-    if (!(*sem)->semaphore.try_acquire()) {
+    {
+        std::lock_guard wait_lock{native->wait_mutex};
+        if (native->value.load(std::memory_order_acquire) == 0) {
+            *__Error() = POSIX_EAGAIN;
+            TraceLivePosixSem("trywait_busy", sem, native, before,
+                              native->value.load(std::memory_order_relaxed), -1);
+            return -1;
+        }
+        native->value.fetch_sub(1, std::memory_order_acq_rel);
+    }
+#else
+    if (!native->semaphore.try_acquire()) {
         *__Error() = POSIX_EAGAIN;
 #ifdef __ANDROID__
-        TraceLivePosixSem("trywait_busy", sem, *sem, before,
-                          (*sem)->value.load(std::memory_order_relaxed), -1);
+        TraceLivePosixSem("trywait_busy", sem, native, before,
+                          native->value.load(std::memory_order_relaxed), -1);
 #endif
         return -1;
     }
-#else
-    if (!(*sem)->semaphore.try_acquire()) {
-        *__Error() = POSIX_EAGAIN;
-#ifdef __ANDROID__
-        TraceLivePosixSem("trywait_busy", sem, *sem, before,
-                          (*sem)->value.load(std::memory_order_relaxed), -1);
+    native->value.fetch_sub(1, std::memory_order_acq_rel);
 #endif
-        return -1;
-    }
-#endif
-    (*sem)->value.fetch_sub(1, std::memory_order_acq_rel);
 #ifdef __ANDROID__
-    TraceLivePosixSem("trywait_return", sem, *sem, before,
-                      (*sem)->value.load(std::memory_order_relaxed), 0);
+    TraceLivePosixSem("trywait_return", sem, native, before,
+                      native->value.load(std::memory_order_relaxed), 0);
 #else
-    PcOraclePosixSemLog("trywait_return", sem, *sem, before,
-                        (*sem)->value.load(std::memory_order_relaxed), 0,
+    PcOraclePosixSemLog("trywait_return", sem, native, before,
+                        native->value.load(std::memory_order_relaxed), 0,
                         __builtin_return_address(0));
 #endif
     return 0;
 }
 
 s32 PS4_SYSV_ABI posix_sem_timedwait(PthreadSem** sem, const OrbisKernelTimespec* t) {
-    if (sem == nullptr || *sem == nullptr) {
+    PthreadSem* const native = LoadPthreadSem(sem);
+    if (native == nullptr) {
         *__Error() = POSIX_EINVAL;
 #ifdef __ANDROID__
-        TraceLivePosixSem("timedwait_invalid", sem, sem ? *sem : nullptr, -1, -1, -1);
+        TraceLivePosixSem("timedwait_invalid", sem, nullptr, -1, -1, -1);
         TraceLiveInvalidPosixSemSlot("timedwait_invalid", sem);
 #else
-        PcOraclePosixSemLog("timedwait_invalid", sem, sem ? *sem : nullptr, -1, -1, -1,
+        PcOraclePosixSemLog("timedwait_invalid", sem, nullptr, -1, -1, -1,
                             __builtin_return_address(0));
         PcOraclePosixSemInvalidLog("timedwait_invalid", sem, __builtin_return_address(0));
 #endif
         return -1;
     }
-    const s32 before = (*sem)->value.load(std::memory_order_relaxed);
+    const s32 before = native->value.load(std::memory_order_relaxed);
 #ifdef __ANDROID__
-    TraceLivePosixSem("timedwait_enter", sem, *sem, before, before, 0);
-    auto executor_wait_watch = BeginLivePosixSemWaitWatch(sem, *sem, before);
+    TraceLivePosixSem("timedwait_enter", sem, native, before, before, 0);
+    auto executor_wait_watch = BeginLivePosixSemWaitWatch(sem, native, before);
     const auto executor_wait_start = std::chrono::steady_clock::now();
 #else
     const void* pc_oracle_return = __builtin_return_address(0);
-    PcOraclePosixSemLog("timedwait_enter", sem, *sem, before, before, 0, pc_oracle_return);
+    PcOraclePosixSemLog("timedwait_enter", sem, native, before, before, 0, pc_oracle_return);
 #endif
     {
         bool acquired = false;
 #ifdef __ANDROID__
-        if (UseBackendBNativeSemaphorePark()) {
-            acquired = (*sem)->semaphore.try_acquire_until(t->TimePoint());
-        } else {
+        {
             const auto deadline = t->TimePoint();
-            for (;;) {
-                if ((*sem)->semaphore.try_acquire()) {
-                    acquired = true;
-                    break;
+            std::unique_lock wait_lock{native->wait_mutex};
+            ++native->waiters;
+            while (native->value.load(std::memory_order_acquire) == 0) {
+                if (UseJitNativeSemaphorePark()) {
+                    if (native->wait_cv.wait_until(wait_lock, deadline) ==
+                            std::cv_status::timeout &&
+                        native->value.load(std::memory_order_acquire) == 0) {
+                        break;
+                    }
+                    continue;
                 }
                 const auto now = std::chrono::system_clock::now();
                 if (now >= deadline) {
                     break;
                 }
-                const auto slice_deadline = std::min(deadline, now + std::chrono::milliseconds(1));
-                if ((*sem)->semaphore.try_acquire_until(slice_deadline)) {
-                    acquired = true;
+                const auto slice_deadline =
+                    std::min(deadline, now + std::chrono::milliseconds(1));
+                native->wait_cv.wait_until(wait_lock, slice_deadline);
+                if (native->value.load(std::memory_order_acquire) != 0) {
                     break;
                 }
+                wait_lock.unlock();
                 RunMonoPendingSignalSafePointFromWait();
                 std::this_thread::yield();
+                wait_lock.lock();
+            }
+            acquired = native->value.load(std::memory_order_acquire) != 0;
+            --native->waiters;
+            if (acquired) {
+                native->value.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
 #else
-        acquired = (*sem)->semaphore.try_acquire_until(t->TimePoint());
+        acquired = native->semaphore.try_acquire_until(t->TimePoint());
 #endif
         if (!acquired) {
             *__Error() = POSIX_ETIMEDOUT;
@@ -1876,100 +2069,97 @@ s32 PS4_SYSV_ABI posix_sem_timedwait(PthreadSem** sem, const OrbisKernelTimespec
             if (executor_wait_watch) {
                 executor_wait_watch->store(true, std::memory_order_release);
             }
-            TraceLivePosixSem("timedwait_timeout", sem, *sem, before,
-                              (*sem)->value.load(std::memory_order_relaxed), -1);
+            TraceLivePosixSem("timedwait_timeout", sem, native, before,
+                              native->value.load(std::memory_order_relaxed), -1);
             const auto executor_wait_end = std::chrono::steady_clock::now();
             TraceLivePosixSemDuration(
-                "timedwait_timeout", sem, *sem, -1,
+                "timedwait_timeout", sem, native, -1,
                 std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
                                                                       executor_wait_start)
                     .count());
 #endif
             return -1;
         }
-        (*sem)->value.fetch_sub(1, std::memory_order_acq_rel);
+#ifndef __ANDROID__
+        native->value.fetch_sub(1, std::memory_order_acq_rel);
+#endif
     }
 #ifdef __ANDROID__
     if (executor_wait_watch) {
         executor_wait_watch->store(true, std::memory_order_release);
     }
-    TraceLivePosixSem("timedwait_return", sem, *sem, before,
-                      (*sem)->value.load(std::memory_order_relaxed), 0);
+    TraceLivePosixSem("timedwait_return", sem, native, before,
+                      native->value.load(std::memory_order_relaxed), 0);
     const auto executor_wait_end = std::chrono::steady_clock::now();
     TraceLivePosixSemDuration(
-        "timedwait", sem, *sem, 0,
+        "timedwait", sem, native, 0,
         std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
                                                               executor_wait_start)
             .count());
 #else
-    PcOraclePosixSemLog("timedwait_return", sem, *sem, before,
-                        (*sem)->value.load(std::memory_order_relaxed), 0, pc_oracle_return);
+    PcOraclePosixSemLog("timedwait_return", sem, native, before,
+                        native->value.load(std::memory_order_relaxed), 0, pc_oracle_return);
 #endif
     return 0;
 }
 
 s32 PS4_SYSV_ABI posix_sem_post(PthreadSem** sem) {
-    if (sem == nullptr || *sem == nullptr) {
+    PthreadSem* const native = LoadPthreadSem(sem);
+    if (native == nullptr) {
         *__Error() = POSIX_EINVAL;
 #ifdef __ANDROID__
-        TraceLivePosixSem("post_invalid", sem, sem ? *sem : nullptr, -1, -1, -1);
+        TraceLivePosixSem("post_invalid", sem, nullptr, -1, -1, -1);
         TraceLiveInvalidPosixSemSlot("post_invalid", sem);
 #else
-        PcOraclePosixSemLog("post_invalid", sem, sem ? *sem : nullptr, -1, -1, -1,
+        PcOraclePosixSemLog("post_invalid", sem, nullptr, -1, -1, -1,
                             __builtin_return_address(0));
         PcOraclePosixSemInvalidLog("post_invalid", sem, __builtin_return_address(0));
 #endif
         return -1;
     }
-    const s32 before = (*sem)->value.load(std::memory_order_relaxed);
+    const s32 before = native->value.load(std::memory_order_relaxed);
 #ifdef __ANDROID__
-    {
-        s32 current = (*sem)->value.load(std::memory_order_relaxed);
-        for (;;) {
-            if (current == ORBIS_KERNEL_SEM_VALUE_MAX) {
-                *__Error() = POSIX_EOVERFLOW;
-#ifdef __ANDROID__
-                TraceLivePosixSem("post_overflow", sem, *sem, before, before, -1);
-#endif
-                return -1;
-            }
-            if ((*sem)->value.compare_exchange_weak(current, current + 1,
-                                                    std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
-                break;
-            }
-        }
+    const u32 executor_eop_thread_kind = ExecutorEopTraceThreadKind();
+    if (!PostPthreadSemToken(native)) {
+        *__Error() = POSIX_EOVERFLOW;
+        TraceLivePosixSem("post_overflow", sem, native, before, before, -1);
+        return -1;
     }
-    (*sem)->semaphore.release();
+    if (executor_eop_thread_kind != 0) {
+        AmdGpu::ExecutorEopTraceSemSync(
+            2, reinterpret_cast<uintptr_t>(sem), reinterpret_cast<uintptr_t>(native), before,
+            native->value.load(std::memory_order_relaxed), 0, executor_eop_thread_kind);
+    }
 #else
-    if ((*sem)->value == ORBIS_KERNEL_SEM_VALUE_MAX) {
+    if (native->value == ORBIS_KERNEL_SEM_VALUE_MAX) {
         *__Error() = POSIX_EOVERFLOW;
 #ifdef __ANDROID__
-        TraceLivePosixSem("post_overflow", sem, *sem, before, before, -1);
+        TraceLivePosixSem("post_overflow", sem, native, before, before, -1);
 #endif
         return -1;
     }
-    ++(*sem)->value;
-    (*sem)->semaphore.release();
+    ++native->value;
+    native->semaphore.release();
 #endif
 #ifdef __ANDROID__
-    TraceLivePosixSem("post_return", sem, *sem, before,
-                      (*sem)->value.load(std::memory_order_relaxed), 0);
+    TraceLivePosixSem("post_return", sem, native, before,
+                      native->value.load(std::memory_order_relaxed), 0);
 #else
-    PcOraclePosixSemLog("post_return", sem, *sem, before,
-                        (*sem)->value.load(std::memory_order_relaxed), 0,
+    PcOraclePosixSemLog("post_return", sem, native, before,
+                        native->value.load(std::memory_order_relaxed), 0,
                         __builtin_return_address(0));
 #endif
     return 0;
 }
 
 s32 PS4_SYSV_ABI posix_sem_getvalue(PthreadSem** sem, s32* sval) {
-    if (sem == nullptr || *sem == nullptr) {
+    PthreadSem* const native = LoadPthreadSem(sem);
+    if (native == nullptr) {
         *__Error() = POSIX_EINVAL;
         return -1;
     }
     if (sval) {
-        *sval = (*sem)->value;
+        *sval = native->value;
     }
     return 0;
 }

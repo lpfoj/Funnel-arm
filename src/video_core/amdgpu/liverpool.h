@@ -44,6 +44,9 @@ struct PM4CmdWaitRegMem;
 void ExecutorEopTraceHleSubmit(std::span<const u32> dcb, std::span<const u32> ccb,
                                const char* label, u32 workload, u32 cbpair);
 void ExecutorEopTraceEqTrigger(u64 id, s64 eq);
+void ExecutorEopTraceEqWait(bool entering, s64 eq, s32 result, u64 id, s16 filter);
+void ExecutorEopTraceSemSync(u32 operation, uintptr_t slot, uintptr_t native, s32 before,
+                             s32 after, s32 result, u32 thread_kind);
 void ExecutorEopTraceSubmitDonePulse(u64 pulse);
 #endif
 
@@ -99,7 +102,7 @@ public:
     }
 
     void WaitGpuIdle() noexcept {
-        // Lock-free (Sonic Backend-B): a host wild write during draw processing corrupts submit_mutex,
+        // Lock-free (Sonic JIT): a host wild write during draw processing corrupts submit_mutex,
         // so a unique_lock here FORTIFY-aborts the render thread before the present. num_submits is
         // atomic; poll it with a bound instead of locking the (possibly corrupted) mutex/cv.
         for (int i = 0; i < 250 && num_submits.load(std::memory_order_acquire) != 0; ++i) {
