@@ -73,4 +73,12 @@
     <string name="game_hold_release_unsupported">Suelta ahora: marcar como no compatible</string>
     <string name="game_hold_release_supported">Suelta ahora: marcar como compatible</string>
     <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
+    <string name="game_menu_title">Controles rápidos</string>
+    <string name="game_menu_hint">Desliza a la derecha o toca fuera para cerrar</string>
+    <string name="game_menu_open">Abrir controles rápidos</string>
+    <string name="game_menu_close">Cerrar controles rápidos</string>
+    <string name="game_menu_overlay">Controles en pantalla</string>
+    <string name="game_menu_opacity">Opacidad de los controles</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Salir a la biblioteca</string>
 </resources>

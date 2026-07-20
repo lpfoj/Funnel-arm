@@ -24,6 +24,7 @@
             android:name="app.lsx4.android.GameActivity"
             android:exported="false"
             android:launchMode="singleTask"
+            android:process=":game"
             android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
             android:showWhenLocked="true"
             android:screenOrientation="landscape"

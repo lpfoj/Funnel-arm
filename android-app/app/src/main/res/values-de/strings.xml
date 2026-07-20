@@ -49,4 +49,12 @@
     <string name="game_hold_release_unsupported">Jetzt loslassen: als nicht unterstützt markieren</string>
     <string name="game_hold_release_supported">Jetzt loslassen: als unterstützt markieren</string>
     <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
+    <string name="game_menu_title">Schnellsteuerung</string>
+    <string name="game_menu_hint">Zum Schließen nach rechts wischen oder außerhalb tippen</string>
+    <string name="game_menu_open">Schnellsteuerung öffnen</string>
+    <string name="game_menu_close">Schnellsteuerung schließen</string>
+    <string name="game_menu_overlay">Bildschirmsteuerung</string>
+    <string name="game_menu_opacity">Deckkraft der Steuerung</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Zur Spielebibliothek</string>
 </resources>

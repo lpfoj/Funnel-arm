@@ -123,4 +123,12 @@
     <string name="game_hold_release_unsupported">Release now: mark unsupported</string>
     <string name="game_hold_release_supported">Release now: mark supported</string>
     <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
+    <string name="game_menu_title">Quick controls</string>
+    <string name="game_menu_hint">Swipe right or tap outside to close</string>
+    <string name="game_menu_open">Open quick controls</string>
+    <string name="game_menu_close">Close quick controls</string>
+    <string name="game_menu_overlay">On-screen controls</string>
+    <string name="game_menu_opacity">Overlay opacity</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Exit to game library</string>
 </resources>

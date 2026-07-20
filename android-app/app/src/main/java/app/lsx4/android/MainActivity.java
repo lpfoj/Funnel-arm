@@ -56,6 +56,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -74,7 +75,7 @@ public class MainActivity extends Activity {
     // EXECUTOR build marker: bump this every UI APK rebuild so a fresh install is verifiable in
     // logcat (grep EXECUTOR_UI_BUILD_MARKER). Confirms the new APK actually installed, not a stale one.
     private static final String BUILD_MARKER =
-            "ps4run-2026-07-18-r26-identity-resolution-aa";
+            "lsx4-2026-07-20-r27-game-side-menu";
     private static final String JIT_PERSISTENT_JIT_CACHE_MARKER =
             "run-jit-persistent-jit-cache";
     private static final String JIT_PERSISTENT_JIT_CACHE_FORCE_MARKER =
@@ -104,6 +105,8 @@ public class MainActivity extends Activity {
     private static final String EXTRA_RELOCATE_IMPORTS_AFTER_LAUNCH = "relocate_imports_after_launch";
     private static final String EXTRA_PREPARE_BOX64_ENTRY_AFTER_RELOCATE = "prepare_box64_entry_after_relocate";
     private static final String EXTRA_FULLSCREEN_RENDER = "fullscreen_render";
+    private static final String EXTRA_SYNC_OVERLAY_ENABLED = "sync_overlay_enabled";
+    private static final String EXTRA_SYNC_OVERLAY_OPACITY = "sync_overlay_opacity";
     private static final String EXTRA_PROBE_DLOPEN_PATH = "probe_dlopen_path";
     private static final String EXTRA_EMBEDDED_BOX64_PATH = "embedded_box64_path";
     private static final String EXTRA_VALIDATE_EMBEDDED_BOX64_MAPPED_ENTRY =
@@ -174,6 +177,15 @@ public class MainActivity extends Activity {
     private StoreCatalogView storeCatalogPreview;
     private FrameLayout gameRenderFrame;
     private FrameLayout inputOverlay;
+    private FrameLayout gameMenuLayer;
+    private LinearLayout gameMenuPanel;
+    private View gameMenuEdge;
+    private View gameMenuScrim;
+    private MenuToggleView gameMenuOverlayToggle;
+    private TextView gameMenuOpacityValue;
+    private SeekBar gameMenuOpacitySlider;
+    private boolean gameMenuOpen;
+    private boolean gameExitRequested;
     private LinearLayout debugHudPanel;
     private TextView debugHud;
     private TextView debugHudCollapsedButton;
@@ -389,6 +401,7 @@ public class MainActivity extends Activity {
         if (getClass() == MainActivity.class) {
             if (isLauncherHomeIntent(getIntent()) || !hasIntentAutomationExtras(getIntent())) {
                 launcherMode = true;
+                synchronizeGameMenuPreferences(getIntent());
                 configurePortraitLauncherWindow();
                 launcherUi = new LauncherUi(this);
                 setContentView(launcherUi.createView());
@@ -551,6 +564,7 @@ public class MainActivity extends Activity {
             if (inputDebugHud) {
                 installDebugHud(renderFrame);
             }
+            installGameSideMenu(renderFrame);
         }
         if (fullscreenRender) {
             root.addView(renderFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -661,6 +675,7 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         if (launcherMode) {
             setIntent(intent);
+            synchronizeGameMenuPreferences(intent);
             if (isLauncherHomeIntent(intent) || !hasIntentAutomationExtras(intent)) {
                 if (launcherUi != null) {
                     launcherUi.refresh();
@@ -726,6 +741,21 @@ public class MainActivity extends Activity {
         // CATEGORY_LAUNCHER belongs to the portrait library, not the render host.
         routed.removeCategory(Intent.CATEGORY_LAUNCHER);
         startActivity(routed);
+    }
+
+    private void synchronizeGameMenuPreferences(Intent intent) {
+        if (intent == null || !intent.hasExtra(EXTRA_SYNC_OVERLAY_ENABLED) ||
+                !intent.hasExtra(EXTRA_SYNC_OVERLAY_OPACITY)) {
+            return;
+        }
+        boolean enabled = intent.getBooleanExtra(EXTRA_SYNC_OVERLAY_ENABLED, true);
+        int opacity = Math.max(20, Math.min(100,
+                intent.getIntExtra(EXTRA_SYNC_OVERLAY_OPACITY, 74)));
+        getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(SettingsActivity.K_OVERLAY, enabled)
+                .putInt(SettingsActivity.K_OVERLAY_OPACITY, opacity)
+                .apply();
     }
 
     private void configurePortraitLauncherWindow() {
@@ -997,6 +1027,19 @@ public class MainActivity extends Activity {
             tone.release();
         }
         super.onDestroy();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (!launcherMode && fullscreenRender) {
+            if (gameMenuOpen) {
+                closeGameSideMenu();
+            } else {
+                openGameSideMenu();
+            }
+            return;
+        }
+        super.onBackPressed();
     }
 
     @Override
@@ -1878,6 +1921,483 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void installGameSideMenu(FrameLayout renderFrame) {
+        if (gameMenuLayer != null || renderFrame == null) {
+            return;
+        }
+
+        gameMenuLayer = new FrameLayout(this);
+        gameMenuLayer.setVisibility(View.GONE);
+        gameMenuLayer.setElevation(dp(80));
+
+        gameMenuScrim = new View(this);
+        gameMenuScrim.setBackgroundColor(0xaa03060b);
+        gameMenuScrim.setAlpha(0f);
+        gameMenuScrim.setContentDescription(getString(R.string.game_menu_close));
+        gameMenuScrim.setOnClickListener(view -> closeGameSideMenu());
+        gameMenuLayer.addView(gameMenuScrim, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER));
+
+        gameMenuPanel = new LinearLayout(this);
+        gameMenuPanel.setOrientation(LinearLayout.VERTICAL);
+        gameMenuPanel.setGravity(Gravity.TOP);
+        gameMenuPanel.setPadding(dp(24), dp(24), dp(24), dp(22));
+        gameMenuPanel.setClickable(true);
+        gameMenuPanel.setFocusable(true);
+        gameMenuPanel.setElevation(dp(82));
+        GradientDrawable panelBackground = new GradientDrawable();
+        panelBackground.setColor(0xf51a202b);
+        panelBackground.setStroke(dp(1), 0x4d8db7ed);
+        panelBackground.setCornerRadii(new float[]{
+                dp(28), dp(28), 0, 0, 0, 0, dp(28), dp(28)
+        });
+        gameMenuPanel.setBackground(panelBackground);
+
+        TextView title = new TextView(this);
+        title.setText(R.string.game_menu_title);
+        title.setTextColor(0xffffffff);
+        title.setTextSize(22);
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        title.setIncludeFontPadding(false);
+        gameMenuPanel.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView subtitle = new TextView(this);
+        subtitle.setText(R.string.game_menu_hint);
+        subtitle.setTextColor(0xff9dadc1);
+        subtitle.setTextSize(12);
+        LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        subtitleParams.topMargin = dp(6);
+        subtitleParams.bottomMargin = dp(20);
+        gameMenuPanel.addView(subtitle, subtitleParams);
+
+        LinearLayout overlayRow = new LinearLayout(this);
+        overlayRow.setOrientation(LinearLayout.HORIZONTAL);
+        overlayRow.setGravity(Gravity.CENTER_VERTICAL);
+        overlayRow.setPadding(dp(16), dp(13), dp(12), dp(13));
+        overlayRow.setClickable(true);
+        overlayRow.setFocusable(true);
+        overlayRow.setContentDescription(getString(R.string.game_menu_overlay));
+        overlayRow.setBackground(gameMenuCardBackground());
+
+        TextView overlayLabel = new TextView(this);
+        overlayLabel.setText(R.string.game_menu_overlay);
+        overlayLabel.setTextColor(0xfff2f6fb);
+        overlayLabel.setTextSize(15);
+        overlayLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        overlayRow.addView(overlayLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        gameMenuOverlayToggle = new MenuToggleView(this);
+        gameMenuOverlayToggle.setChecked(overlayEnabledByPreference);
+        overlayRow.addView(gameMenuOverlayToggle, new LinearLayout.LayoutParams(
+                dp(50), dp(29)));
+        overlayRow.setOnClickListener(view -> {
+            view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+            boolean enabled = !overlayEnabledByPreference;
+            overlayEnabledByPreference = enabled;
+            gameMenuOverlayToggle.setChecked(enabled);
+            if (liveSettings != null) {
+                liveSettings.edit().putBoolean(SettingsActivity.K_OVERLAY, enabled).apply();
+            }
+            updateTouchOverlayVisibility();
+        });
+        gameMenuPanel.addView(overlayRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout opacityHeader = new LinearLayout(this);
+        opacityHeader.setOrientation(LinearLayout.HORIZONTAL);
+        opacityHeader.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams opacityHeaderParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        opacityHeaderParams.topMargin = dp(22);
+        gameMenuPanel.addView(opacityHeader, opacityHeaderParams);
+
+        TextView opacityLabel = new TextView(this);
+        opacityLabel.setText(R.string.game_menu_opacity);
+        opacityLabel.setTextColor(0xfff2f6fb);
+        opacityLabel.setTextSize(14);
+        opacityHeader.addView(opacityLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        gameMenuOpacityValue = new TextView(this);
+        gameMenuOpacityValue.setTextColor(0xff6faaff);
+        gameMenuOpacityValue.setTextSize(13);
+        gameMenuOpacityValue.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        opacityHeader.addView(gameMenuOpacityValue, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        int initialOpacity = liveSettings == null ? 74 : Math.max(20, Math.min(100,
+                liveSettings.getInt(SettingsActivity.K_OVERLAY_OPACITY, 74)));
+        gameMenuOpacityValue.setText(getString(R.string.game_menu_opacity_value, initialOpacity));
+        gameMenuOpacitySlider = new SeekBar(this);
+        gameMenuOpacitySlider.setMin(20);
+        gameMenuOpacitySlider.setMax(100);
+        gameMenuOpacitySlider.setProgress(initialOpacity);
+        gameMenuOpacitySlider.setProgressTintList(
+                android.content.res.ColorStateList.valueOf(0xff6faaff));
+        gameMenuOpacitySlider.setThumbTintList(
+                android.content.res.ColorStateList.valueOf(0xffffffff));
+        gameMenuOpacitySlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (!fromUser) {
+                    return;
+                }
+                gameMenuOpacityValue.setText(
+                        getString(R.string.game_menu_opacity_value, progress));
+                applyOverlayOpacity(progress);
+                if (liveSettings != null) {
+                    liveSettings.edit()
+                            .putInt(SettingsActivity.K_OVERLAY_OPACITY, progress)
+                            .apply();
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                if (liveSettings != null) {
+                    liveSettings.edit()
+                            .putInt(SettingsActivity.K_OVERLAY_OPACITY, seekBar.getProgress())
+                            .commit();
+                }
+            }
+        });
+        LinearLayout.LayoutParams sliderParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        sliderParams.topMargin = dp(2);
+        gameMenuPanel.addView(gameMenuOpacitySlider, sliderParams);
+
+        TextView gamepadHint = new TextView(this);
+        gamepadHint.setText(R.string.controls_gamepad_hint);
+        gamepadHint.setTextColor(0xff8493a5);
+        gamepadHint.setTextSize(11);
+        LinearLayout.LayoutParams gamepadHintParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        gamepadHintParams.topMargin = dp(4);
+        gameMenuPanel.addView(gamepadHint, gamepadHintParams);
+
+        View spacer = new View(this);
+        gameMenuPanel.addView(spacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        TextView exit = new TextView(this);
+        exit.setText(R.string.game_menu_exit);
+        exit.setTextColor(0xffffe9ea);
+        exit.setTextSize(15);
+        exit.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        exit.setGravity(Gravity.CENTER);
+        exit.setPadding(dp(16), dp(13), dp(16), dp(13));
+        exit.setClickable(true);
+        exit.setFocusable(true);
+        GradientDrawable exitBackground = new GradientDrawable();
+        exitBackground.setColor(0x2ee65058);
+        exitBackground.setStroke(dp(1), 0x99f26b72);
+        exitBackground.setCornerRadius(dp(14));
+        exit.setBackground(exitBackground);
+        exit.setOnClickListener(view -> {
+            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            exitGameToLibrary();
+        });
+        gameMenuPanel.addView(exit, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
+                dp(320), ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.END | Gravity.CENTER_VERTICAL);
+        panelParams.topMargin = dp(8);
+        panelParams.bottomMargin = dp(8);
+        panelParams.rightMargin = dp(8);
+        gameMenuLayer.addView(gameMenuPanel, panelParams);
+        gameMenuPanel.setOnTouchListener(new View.OnTouchListener() {
+            private float downX;
+
+            @Override
+            public boolean onTouch(View view, MotionEvent event) {
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    downX = event.getRawX();
+                } else if (event.getActionMasked() == MotionEvent.ACTION_UP &&
+                        event.getRawX() - downX > dp(56)) {
+                    closeGameSideMenu();
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        renderFrame.addView(gameMenuLayer, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER));
+
+        gameMenuEdge = new GameMenuHandleView(this);
+        gameMenuEdge.setContentDescription(getString(R.string.game_menu_open));
+        gameMenuEdge.setElevation(dp(78));
+        gameMenuEdge.setOnClickListener(view -> openGameSideMenu());
+        gameMenuEdge.setOnTouchListener(new View.OnTouchListener() {
+            private float downX;
+            private float downY;
+            private boolean opened;
+
+            @Override
+            public boolean onTouch(View view, MotionEvent event) {
+                switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    downX = event.getRawX();
+                    downY = event.getRawY();
+                    opened = false;
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    float horizontal = downX - event.getRawX();
+                    float vertical = Math.abs(downY - event.getRawY());
+                    if (!opened && horizontal > dp(28) && horizontal > vertical) {
+                        opened = true;
+                        openGameSideMenu();
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    if (!opened && Math.abs(downX - event.getRawX()) < dp(12) &&
+                            Math.abs(downY - event.getRawY()) < dp(12)) {
+                        view.performClick();
+                    }
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    return true;
+                default:
+                    return false;
+                }
+            }
+        });
+        FrameLayout.LayoutParams edgeParams = new FrameLayout.LayoutParams(
+                dp(28), dp(132), Gravity.END | Gravity.CENTER_VERTICAL);
+        renderFrame.addView(gameMenuEdge, edgeParams);
+        gameMenuEdge.bringToFront();
+    }
+
+    private GradientDrawable gameMenuCardBackground() {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0x99404b5c);
+        background.setStroke(dp(1), 0x3dffffff);
+        background.setCornerRadius(dp(14));
+        return background;
+    }
+
+    private void applyOverlayOpacity(int opacity) {
+        if (inputOverlay == null) {
+            return;
+        }
+        int clamped = Math.max(20, Math.min(100, opacity));
+        inputOverlay.setAlpha((clamped / 100f) * DUALSHOCK_ARTWORK_ALPHA);
+    }
+
+    private void syncGameMenuState() {
+        if (liveSettings == null) {
+            return;
+        }
+        overlayEnabledByPreference =
+                liveSettings.getBoolean(SettingsActivity.K_OVERLAY, true);
+        if (gameMenuOverlayToggle != null) {
+            gameMenuOverlayToggle.setChecked(overlayEnabledByPreference);
+        }
+        int opacity = Math.max(20, Math.min(100,
+                liveSettings.getInt(SettingsActivity.K_OVERLAY_OPACITY, 74)));
+        if (gameMenuOpacitySlider != null && gameMenuOpacitySlider.getProgress() != opacity) {
+            gameMenuOpacitySlider.setProgress(opacity);
+        }
+        if (gameMenuOpacityValue != null) {
+            gameMenuOpacityValue.setText(
+                    getString(R.string.game_menu_opacity_value, opacity));
+        }
+    }
+
+    private void openGameSideMenu() {
+        if (gameMenuLayer == null || gameMenuPanel == null || gameMenuOpen) {
+            return;
+        }
+        syncGameMenuState();
+        if (dualShockOverlay != null) {
+            dualShockOverlay.resetAllInputs();
+        }
+        gameMenuOpen = true;
+        gameMenuLayer.setVisibility(View.VISIBLE);
+        gameMenuLayer.bringToFront();
+        if (gameMenuEdge != null) {
+            gameMenuEdge.setVisibility(View.GONE);
+        }
+        gameMenuScrim.setAlpha(0f);
+        gameMenuPanel.post(() -> {
+            if (!gameMenuOpen || gameMenuPanel == null) {
+                return;
+            }
+            gameMenuPanel.setTranslationX(gameMenuPanel.getWidth() + dp(16));
+            gameMenuPanel.animate().cancel();
+            gameMenuScrim.animate().cancel();
+            gameMenuPanel.animate()
+                    .translationX(0f)
+                    .setDuration(220)
+                    .start();
+            gameMenuScrim.animate()
+                    .alpha(1f)
+                    .setDuration(180)
+                    .start();
+        });
+    }
+
+    private void closeGameSideMenu() {
+        if (gameMenuLayer == null || gameMenuPanel == null || !gameMenuOpen) {
+            return;
+        }
+        gameMenuOpen = false;
+        gameMenuPanel.animate().cancel();
+        gameMenuScrim.animate().cancel();
+        gameMenuScrim.animate().alpha(0f).setDuration(150).start();
+        gameMenuPanel.animate()
+                .translationX(gameMenuPanel.getWidth() + dp(16))
+                .setDuration(190)
+                .withEndAction(() -> {
+                    if (gameMenuOpen || gameMenuLayer == null) {
+                        return;
+                    }
+                    gameMenuLayer.setVisibility(View.GONE);
+                    if (gameMenuEdge != null) {
+                        gameMenuEdge.setVisibility(View.VISIBLE);
+                        gameMenuEdge.bringToFront();
+                    }
+                })
+                .start();
+    }
+
+    private void exitGameToLibrary() {
+        if (gameExitRequested) {
+            return;
+        }
+        gameExitRequested = true;
+        if (dualShockOverlay != null) {
+            dualShockOverlay.resetAllInputs();
+        }
+        resetExternalGamepadInputs();
+        runtimeHudRunning = false;
+        runtimeHudHandler.removeCallbacks(runtimeHudTick);
+        detachSurface();
+        try {
+            if (runtimeLoaded) {
+                RuntimeBridge.stopServicePresentPump();
+            }
+        } catch (Throwable error) {
+            Log.w(TAG, "Present pump did not stop cleanly while exiting the game", error);
+        }
+
+        Intent library = new Intent(this, MainActivity.class);
+        library.setAction(Intent.ACTION_MAIN);
+        library.addCategory(Intent.CATEGORY_LAUNCHER);
+        int overlayOpacity = gameMenuOpacitySlider == null ? 74
+                : gameMenuOpacitySlider.getProgress();
+        library.putExtra(EXTRA_SYNC_OVERLAY_ENABLED, overlayEnabledByPreference);
+        library.putExtra(EXTRA_SYNC_OVERLAY_OPACITY, overlayOpacity);
+        library.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                Intent.FLAG_ACTIVITY_SINGLE_TOP |
+                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+        startActivity(library);
+        finish();
+        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+
+        // GameActivity runs in the app's private :game process. Its synchronous JNI guest call
+        // intentionally owns that process for the guest lifetime, so finishing the Activity alone
+        // cannot unwind every guest thread. Terminate only this isolated process after Activity
+        // Manager has brought the already-running library process to the foreground.
+        new Handler(Looper.getMainLooper()).postDelayed(
+                () -> android.os.Process.killProcess(android.os.Process.myPid()), 180);
+    }
+
+    private static final class MenuToggleView extends View {
+        private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint thumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private boolean checked;
+
+        MenuToggleView(Context context) {
+            super(context);
+            setClickable(false);
+            setFocusable(false);
+            thumbPaint.setColor(0xffffffff);
+        }
+
+        void setChecked(boolean value) {
+            if (checked == value) {
+                return;
+            }
+            checked = value;
+            setSelected(value);
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float height = getHeight();
+            float radius = height * 0.5f;
+            trackPaint.setColor(checked ? 0xff397eea : 0xff596474);
+            canvas.drawRoundRect(0, 0, getWidth(), height, radius, radius, trackPaint);
+            float thumbRadius = radius - dpStatic(getContext(), 3);
+            float centerX = checked ? getWidth() - radius : radius;
+            canvas.drawCircle(centerX, radius, thumbRadius, thumbPaint);
+        }
+    }
+
+    private static final class GameMenuHandleView extends View {
+        private final Paint pillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path arrow = new Path();
+
+        GameMenuHandleView(Context context) {
+            super(context);
+            setClickable(true);
+            setFocusable(true);
+            pillPaint.setColor(0xb925303e);
+            arrowPaint.setColor(0xffd7e4f5);
+            arrowPaint.setStyle(Paint.Style.STROKE);
+            arrowPaint.setStrokeCap(Paint.Cap.ROUND);
+            arrowPaint.setStrokeJoin(Paint.Join.ROUND);
+            arrowPaint.setStrokeWidth(dpStatic(context, 2));
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float width = getWidth();
+            float height = getHeight();
+            float left = width * 0.48f;
+            canvas.drawRoundRect(left, height * 0.22f, width + dpStatic(getContext(), 8),
+                    height * 0.78f, dpStatic(getContext(), 9),
+                    dpStatic(getContext(), 9), pillPaint);
+            float centerX = width * 0.68f;
+            float centerY = height * 0.5f;
+            float size = dpStatic(getContext(), 5);
+            arrow.reset();
+            arrow.moveTo(centerX + size * 0.45f, centerY - size);
+            arrow.lineTo(centerX - size * 0.45f, centerY);
+            arrow.lineTo(centerX + size * 0.45f, centerY + size);
+            canvas.drawPath(arrow, arrowPaint);
+        }
+    }
+
+    private static int dpStatic(Context context, int value) {
+        return Math.round(value * context.getResources().getDisplayMetrics().density);
+    }
+
     private void installGamepadOverlay(FrameLayout renderFrame) {
         inputOverlay = new FrameLayout(this);
         inputOverlay.setFocusable(false);
@@ -2107,13 +2627,22 @@ public class MainActivity extends Activity {
         if (key == null || SettingsActivity.K_OVERLAY.equals(key)) {
             overlayEnabledByPreference =
                     preferences.getBoolean(SettingsActivity.K_OVERLAY, true);
+            if (gameMenuOverlayToggle != null) {
+                gameMenuOverlayToggle.setChecked(overlayEnabledByPreference);
+            }
             updateTouchOverlayVisibility();
         }
         if (key == null || SettingsActivity.K_OVERLAY_OPACITY.equals(key)) {
-            if (inputOverlay != null) {
-                int opacity = Math.max(20, Math.min(100,
-                        preferences.getInt(SettingsActivity.K_OVERLAY_OPACITY, 74)));
-                inputOverlay.setAlpha((opacity / 100f) * DUALSHOCK_ARTWORK_ALPHA);
+            int opacity = Math.max(20, Math.min(100,
+                    preferences.getInt(SettingsActivity.K_OVERLAY_OPACITY, 74)));
+            applyOverlayOpacity(opacity);
+            if (gameMenuOpacitySlider != null &&
+                    gameMenuOpacitySlider.getProgress() != opacity) {
+                gameMenuOpacitySlider.setProgress(opacity);
+            }
+            if (gameMenuOpacityValue != null) {
+                gameMenuOpacityValue.setText(
+                        getString(R.string.game_menu_opacity_value, opacity));
             }
         }
         if (key == null || SettingsActivity.K_PERF_HUD.equals(key)) {
