@@ -129,6 +129,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
+    liverpool->NotifyMemoryPublicationForExecutor(device_addr, size);
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
@@ -292,6 +293,7 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
     scheduler.Finish(Vulkan::Scheduler::ExecutorFinishReason::BufferReadbackWave);
 
     auto* guest_memory = Core::Memory::Instance();
+    bool published_any = false;
     for (const WaveCopy& copy : copies) {
         if (!guest_memory->TryWriteBacking(std::bit_cast<u8*>(copy.guest_addr),
                                            download + copy.download_offset, copy.size)) {
@@ -311,6 +313,10 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
         NotifyGuestReadback();
         gpu_modified_ranges.Subtract(copy.guest_addr, copy.size);
         memory_tracker->UnmarkRegionAsGpuModified(copy.guest_addr, copy.size);
+        published_any = true;
+    }
+    if (published_any) {
+        liverpool->NotifyMemoryPublicationForExecutor(device_addr, size);
     }
 }
 #endif
@@ -420,6 +426,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
+        liverpool->NotifyMemoryPublicationForExecutor(device_addr, size);
     };
     if constexpr (async) {
         scheduler.DeferOperation(write_data);

@@ -140,6 +140,10 @@ public:
     // Liverpool thread before the normal buffer-cache readback is allowed to continue.
     [[nodiscard]] bool ResolvePendingCompletionReadForExecutor(VAddr address, u64 size);
 
+    // Publish a CPU-visible memory transition to the command processor. Parked WAIT_REG_MEM
+    // coroutines use this edge to recheck their predicates without continuously polling.
+    void NotifyMemoryPublicationForExecutor(VAddr address, u64 size) noexcept;
+
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
     }
@@ -511,9 +515,18 @@ private:
     u64 executor_parked_wait_count{};
     u64 executor_parked_wait_wake_count{};
     u64 executor_parked_wait_poll_count{};
+    std::atomic<u64> executor_wait_event_generation{1};
+    u64 executor_parked_event_sleep_count{};
+    u64 executor_parked_event_wake_count{};
+    u64 executor_parked_event_timeout_count{};
+    u64 executor_parked_event_sleep_ns{};
     u64 executor_metrics_last_parked_wait_count{};
     u64 executor_metrics_last_parked_wait_wake_count{};
     u64 executor_metrics_last_parked_wait_poll_count{};
+    u64 executor_metrics_last_parked_event_sleep_count{};
+    u64 executor_metrics_last_parked_event_wake_count{};
+    u64 executor_metrics_last_parked_event_timeout_count{};
+    u64 executor_metrics_last_parked_event_sleep_ns{};
     u64 executor_completion_wait_stalls{};
     u64 executor_completion_wait_stall_ns{};
     u64 executor_metrics_last_completion_wait_stalls{};

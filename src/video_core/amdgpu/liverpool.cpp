@@ -162,6 +162,13 @@ bool ExecutorEopWaitBatchingV2() {
     return enabled;
 }
 
+bool ExecutorGpuWaitEventDriven() {
+    // Enabled by default because the fallback remains a bounded predicate recheck, not a semantic
+    // shortcut. The opt-out restores the former yield/poll loop for compatibility bisection.
+    static const bool enabled = !ExecutorEnvFlag("EXECUTOR_DISABLE_GPU_WAIT_EVENT_DRIVEN");
+    return enabled;
+}
+
 bool ExecutorShouldLogWaitYield(u32 yields) {
     return yields == 1 || yields == 64 || yields == 4096 || yields == 65536;
 }
@@ -1051,6 +1058,7 @@ void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u64 val
     for (const VAddr page : pages_to_untrack) {
         rasterizer->UntrackPendingCompletionRead(page, PageSize);
     }
+    NotifyMemoryPublicationForExecutor(address, num_bytes);
 }
 
 u64 Liverpool::ConsumeCompletionWaitForExecutor(const Pm4SubmissionStatePtr& state,
@@ -1198,6 +1206,20 @@ bool Liverpool::ResolvePendingCompletionReadForExecutor(VAddr address, u64 size)
     return true;
 #else
     return false;
+#endif
+}
+
+void Liverpool::NotifyMemoryPublicationForExecutor(VAddr address, u64 size) noexcept {
+#ifdef __ANDROID__
+    (void)address;
+    if (size == 0) {
+        return;
+    }
+    executor_wait_event_generation.fetch_add(1, std::memory_order_release);
+    submit_cv.notify_one();
+#else
+    (void)address;
+    (void)size;
 #endif
 }
 
@@ -1397,6 +1419,7 @@ Liverpool::Liverpool() {
 
 Liverpool::~Liverpool() {
     process_thread.request_stop();
+    submit_cv.notify_all();
     process_thread.join();
 }
 
@@ -1408,6 +1431,7 @@ void Liverpool::MarkRendererTerminal(const char* where) noexcept {
     if (rasterizer != nullptr) {
         rasterizer->MarkDeviceTerminal(vk::Result::eTimeout, where);
     }
+    NotifyMemoryPublicationForExecutor(0, 1);
 }
 
 #ifdef __ANDROID__
@@ -1786,14 +1810,46 @@ void Liverpool::Process(std::stop_token stoken) {
             if (ready_mask == 0) {
 #ifdef __ANDROID__
                 if (executor_parked_memory_wait_mask != 0) {
+                    const u64 observed_wait_generation =
+                        executor_wait_event_generation.load(std::memory_order_acquire);
                     RefreshParkedMemoryWaitsForExecutor();
                     ready_mask = submit_ready_mask.load(std::memory_order_acquire) &
                                  valid_queue_mask & ~executor_parked_memory_wait_mask;
                     if (ready_mask == 0) {
-                        // All published fronts are waiting on guest memory. Yield the host CPU so
-                        // the guest worker or GPU retirement callback which owns those labels can
-                        // run; the old tight coroutine round-robin competed with its own producers.
-                        std::this_thread::yield();
+                        if (ExecutorGpuWaitEventDriven()) {
+                            // Every runnable queue front is blocked on a memory predicate. Sleep
+                            // until a known publisher advances the generation, while retaining a
+                            // short timeout for ordinary guest CPU stores that bypass GPU tracking.
+                            // Capturing the generation before the predicate scan closes the lost-
+                            // wake window: publication either changes the sampled value or is seen
+                            // by RefreshParkedMemoryWaitsForExecutor above.
+                            constexpr auto RecheckBound = std::chrono::microseconds{250};
+                            const auto sleep_begin = std::chrono::steady_clock::now();
+                            std::unique_lock wait_lock{submit_mutex};
+                            const bool event_wake = submit_cv.wait_for(
+                                wait_lock, RecheckBound, [this, observed_wait_generation] {
+                                    return executor_wait_event_generation.load(
+                                               std::memory_order_acquire) !=
+                                               observed_wait_generation ||
+                                           num_commands.load(std::memory_order_acquire) != 0 ||
+                                           (submit_ready_mask.load(std::memory_order_acquire) &
+                                            ~executor_parked_memory_wait_mask) != 0 ||
+                                           IsRendererTerminal();
+                                });
+                            const u64 sleep_ns = static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - sleep_begin)
+                                    .count());
+                            ++executor_parked_event_sleep_count;
+                            executor_parked_event_sleep_ns += sleep_ns;
+                            if (event_wake) {
+                                ++executor_parked_event_wake_count;
+                            } else {
+                                ++executor_parked_event_timeout_count;
+                            }
+                        } else {
+                            std::this_thread::yield();
+                        }
                         continue;
                     }
                 }
@@ -2028,6 +2084,18 @@ void Liverpool::Process(std::stop_token stoken) {
                 const u64 parked_poll_delta =
                     executor_parked_wait_poll_count -
                     executor_metrics_last_parked_wait_poll_count;
+                const u64 parked_event_sleep_delta =
+                    executor_parked_event_sleep_count -
+                    executor_metrics_last_parked_event_sleep_count;
+                const u64 parked_event_wake_delta =
+                    executor_parked_event_wake_count -
+                    executor_metrics_last_parked_event_wake_count;
+                const u64 parked_event_timeout_delta =
+                    executor_parked_event_timeout_count -
+                    executor_metrics_last_parked_event_timeout_count;
+                const u64 parked_event_sleep_ns_delta =
+                    executor_parked_event_sleep_ns -
+                    executor_metrics_last_parked_event_sleep_ns;
                 const u64 wait_stall_delta =
                     executor_completion_wait_stalls -
                     executor_metrics_last_completion_wait_stalls;
@@ -2049,6 +2117,7 @@ void Liverpool::Process(std::stop_token stoken) {
                     "completionPoints=%llu hostSubmits=%llu waitFlushes=%llu "
                     "untrackedWaits=%llu untrackedWaitMs=%.3f untrackedWaitMaxMs=%.3f "
                     "parkedWaits=%llu parkedWakes=%llu parkedPolls=%llu parkedNow=%u "
+                    "eventSleeps=%llu eventWakes=%llu eventTimeouts=%llu eventSleepMs=%.3f "
                     "completionWaits=%llu completionWaitMs=%.3f completionWaitMaxMs=%.3f "
                     "logicalWaits=%llu admissionWaits=%llu admissionWaitMs=%.3f "
                     "admissionWaitMaxMs=%.3f admissionFree=%llu",
@@ -2063,6 +2132,10 @@ void Liverpool::Process(std::stop_token stoken) {
                     static_cast<unsigned long long>(parked_wake_delta),
                     static_cast<unsigned long long>(parked_poll_delta),
                     static_cast<unsigned>(std::popcount(executor_parked_memory_wait_mask)),
+                    static_cast<unsigned long long>(parked_event_sleep_delta),
+                    static_cast<unsigned long long>(parked_event_wake_delta),
+                    static_cast<unsigned long long>(parked_event_timeout_delta),
+                    static_cast<double>(parked_event_sleep_ns_delta) / 1'000'000.0,
                     static_cast<unsigned long long>(wait_stall_delta),
                     static_cast<double>(wait_stall_ns_delta) / 1'000'000.0,
                     static_cast<double>(executor_completion_wait_stall_max_ns) / 1'000'000.0,
@@ -2082,6 +2155,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 executor_metrics_last_parked_wait_count = executor_parked_wait_count;
                 executor_metrics_last_parked_wait_wake_count = executor_parked_wait_wake_count;
                 executor_metrics_last_parked_wait_poll_count = executor_parked_wait_poll_count;
+                executor_metrics_last_parked_event_sleep_count =
+                    executor_parked_event_sleep_count;
+                executor_metrics_last_parked_event_wake_count =
+                    executor_parked_event_wake_count;
+                executor_metrics_last_parked_event_timeout_count =
+                    executor_parked_event_timeout_count;
+                executor_metrics_last_parked_event_sleep_ns = executor_parked_event_sleep_ns;
                 executor_metrics_last_completion_wait_stalls =
                     executor_completion_wait_stalls;
                 executor_metrics_last_completion_wait_stall_ns =
