@@ -4,7 +4,7 @@
 
 <div align="center">
   <img src="https://img.shields.io/badge/APRIL-2026-02?style=for-the-badge" alt="April 2026">
-  <a href="https://discord.gg/vHkKA6jFhh"><img src="https://img.shields.io/discord/1459510161512333519?style=for-the-badge&amp;logo=discord&amp;logoColor=white&amp;label=Discord&amp;color=5865F2" alt="Discord"></a>
+  <a href="https://discord.gg/p5KBs5cHsX"><img src="https://img.shields.io/discord/1459510161512333519?style=for-the-badge&amp;logo=discord&amp;logoColor=white&amp;label=Discord&amp;color=5865F2" alt="Discord"></a>
   <br>
   <a href="https://ko-fi.com/llayer"><img src="https://img.shields.io/badge/Support%20me%20on-Ko--fi-%23FF5E5B?style=for-the-badge&amp;logo=ko-fi&amp;logoColor=white" alt="Support LSX4 on Ko-fi"></a>
 </div>
