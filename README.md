@@ -30,15 +30,16 @@ LSX4 does not include games, firmware, or other copyrighted system content.
     <td align="center" width="50%"><img src="assets/screenshots/rain-world.jpg" alt="Rain World running in LSX4"><br><sub><b>Rain World</b></sub></td>
   </tr>
   <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/nidhogg.jpg" alt="Nidhogg running in LSX4"><br><sub><b>Nidhogg</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/nidhogg-2.jpg" alt="Nidhogg 2 running in LSX4"><br><sub><b>Nidhogg 2</b></sub></td>
+  </tr>
+  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/deltarune.jpg" alt="Deltarune running in LSX4"><br><sub><b>Deltarune Chapters 1 &amp; 2</b></sub></td>
-  </tr>
-  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/just-shapes-and-beats.jpg" alt="Just Shapes &amp; Beats running in LSX4"><br><sub><b>Just Shapes &amp; Beats</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/undertale.jpg" alt="Undertale running in LSX4"><br><sub><b>Undertale</b></sub></td>
   </tr>
   <tr>
-    <td align="center" colspan="2"><img src="assets/screenshots/downwell.jpg" width="50%" alt="Downwell running in LSX4"><br><sub><b>Downwell</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/undertale.jpg" alt="Undertale running in LSX4"><br><sub><b>Undertale</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/downwell.jpg" alt="Downwell running in LSX4"><br><sub><b>Downwell</b></sub></td>
   </tr>
 </table>
 
