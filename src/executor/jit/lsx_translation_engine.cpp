@@ -2715,7 +2715,7 @@ private:
     // v9: semantic-leaf calls reconstruct caller-saved register caches. Native payloads emitted
     // by v8 can retain a helper-clobbered guest base and must never be restored; decoded IR remains
     // reusable and will be lowered again without discarding the expensive decode cache.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210002ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210003ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -7465,12 +7465,15 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     // Non-architectural per-execution direct-chain budget. This lives in the ABI-reserved
     // padding rather than in a shared ChainPatchCell cache line, so threads executing the same
     // guest library code never contend on an atomic increment.
-    constexpr std::uint32_t kStateDirectChainBudgetOffset = 0xa8;
-    // Amortize dispatcher lookup and the synchronous-fault resume frame across a short region,
-    // while retaining a frequent scheduling/HLE/signal safepoint. A value of one never performed
-    // a production chain at all: zero was rearmed to one and immediately decremented back to the
-    // validation/fallback path.
-    constexpr std::uint32_t kDirectChainBudget = 64;
+    constexpr std::uint32_t kStateDispatchChainBudgetOffset =
+        offsetof(LsxMachineImage, dispatch_chain_budget);
+    constexpr std::uint32_t kStateCodeValidationBudgetOffset =
+        offsetof(LsxMachineImage, code_validation_budget);
+    // Dispatcher admission and SMC validation have very different latency requirements. Return
+    // often enough for pending runtime work, but hash guest bytes only once per several slices.
+    // Both counters are thread-private, avoiding any shared cache-line RMW in hot loops.
+    constexpr std::uint32_t kDirectChainBudget = 1024;
+    constexpr std::uint32_t kDirectValidationSliceBudget = 4;
     // Every generic chain body uses the same shared-frame contract and flushes its block-local
     // caches before the edge. Enter the destination body directly so the root frame is created and
     // destroyed once per bounded chain instead of once per guest basic block.
@@ -7521,8 +7524,10 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     static_assert(offsetof(LsxMachineImage, gpr) + (15 * sizeof(std::uint64_t)) == kStateR15Offset);
     static_assert(offsetof(LsxMachineImage, rip_or_exit) == kStateRipOffset);
     static_assert(kStateRflagsOffset == 0x98);
-    static_assert(offsetof(LsxMachineImage, direct_chain_budget) ==
-                  kStateDirectChainBudgetOffset);
+    static_assert(offsetof(LsxMachineImage, dispatch_chain_budget) ==
+                  kStateDispatchChainBudgetOffset);
+    static_assert(offsetof(LsxMachineImage, code_validation_budget) ==
+                  kStateCodeValidationBudgetOffset);
     static_assert(offsetof(LsxMachineImage, ymm) == kStateYmm0Offset);
     static_assert(offsetof(LsxMachineImage, fault_ir_slot) ==
                   kStateFaultIrSlotOffset);
@@ -8686,6 +8691,15 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                    can_native_read_operand(ir.operands[1]) &&
                    !(ir.operands[0].type == X86_OPERAND_TYPE_MEMORY &&
                      ir.operands[1].type == X86_OPERAND_TYPE_MEMORY);
+        case X86_MNEMONIC_MOVBE:
+            return ir.operand_count >= 2 &&
+                   (ir.operands[0].size == 16 || ir.operands[0].size == 32 ||
+                    ir.operands[0].size == 64) &&
+                   ir.operands[0].size == ir.operands[1].size &&
+                   can_native_write_operand(ir.operands[0]) &&
+                   can_native_read_operand(ir.operands[1]) &&
+                   ((ir.operands[0].type == X86_OPERAND_TYPE_MEMORY) !=
+                    (ir.operands[1].type == X86_OPERAND_TYPE_MEMORY));
         case X86_MNEMONIC_MOVZX:
             return ir.operand_count >= 2 &&
                    ir.operands[0].type == X86_OPERAND_TYPE_REGISTER &&
@@ -14042,6 +14056,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     is_native_scalar_semantic_instruction(ir);
                 const bool proven_direct_writer =
                     mnemonic == X86_MNEMONIC_MOV ||
+                    mnemonic == X86_MNEMONIC_MOVBE ||
                     mnemonic == X86_MNEMONIC_INC ||
                     mnemonic == X86_MNEMONIC_DEC ||
                     mnemonic == X86_MNEMONIC_ADD ||
@@ -14438,6 +14453,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     switch (candidate_mnemonic) {
                     case X86_MNEMONIC_NOP:
                     case X86_MNEMONIC_MOV:
+                    case X86_MNEMONIC_MOVBE:
                     case X86_MNEMONIC_MOVZX:
                     case X86_MNEMONIC_MOVSX:
                     case X86_MNEMONIC_MOVSXD:
@@ -14454,6 +14470,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_DEC:
                     case X86_MNEMONIC_NEG:
                     case X86_MNEMONIC_NOT:
+                    case X86_MNEMONIC_BEXTR:
+                    case X86_MNEMONIC_BLSI:
+                    case X86_MNEMONIC_BLSR:
                         break;
                     default:
                         generic_gpr_cache_eligible = false;
@@ -14485,6 +14504,36 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     }
                 }
                 if (generic_gpr_cache_eligible) {
+                    std::uint32_t generic_fault_publication_count = 0;
+                    if (generic_has_faultable_memory_access) {
+                        for (std::size_t instruction_index = 0;
+                             instruction_index < generic_scalar_instruction_count;
+                             ++instruction_index) {
+                            const auto& candidate =
+                                block.instructions[instruction_index];
+                            std::uint32_t publications = 0;
+                            for (std::uint8_t operand_index = 0;
+                                 operand_index < candidate.operand_count;
+                                 ++operand_index) {
+                                const auto& operand =
+                                    candidate.operands[operand_index];
+                                if (operand.type != X86_OPERAND_TYPE_MEMORY) {
+                                    continue;
+                                }
+                                publications += static_cast<std::uint32_t>(
+                                    (operand.actions &
+                                     X86_OPERAND_ACTION_MASK_READ) != 0);
+                                publications += static_cast<std::uint32_t>(
+                                    (operand.actions &
+                                     X86_OPERAND_ACTION_MASK_WRITE) != 0);
+                            }
+                            if (publications == 0 &&
+                                instruction_has_faultable_memory_access(candidate)) {
+                                publications = 1;
+                            }
+                            generic_fault_publication_count += publications;
+                        }
+                    }
                     struct CachedGprCandidate {
                         std::uint32_t state_offset;
                         std::uint32_t saved_accesses;
@@ -14494,16 +14543,16 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     std::size_t candidate_count = 0;
                     for (std::size_t slot = 0;
                          slot < generic_gpr_access_count.size(); ++slot) {
-                        if (generic_has_faultable_memory_access &&
-                            generic_gpr_written[slot]) {
-                            // A dirty cached value would have to be stored before every possible
-                            // fault. Keep memory-block caching focused on stable base/index/source
-                            // registers, where one entry load replaces repeated address reloads.
-                            continue;
-                        }
+                        // Dirty values are published before every possible fault and at exit.
+                        // Admit them only when the saved register-file traffic still exceeds that
+                        // conservative cost. This recovers hot pointer/counter blocks without
+                        // weakening exact signal state or requiring speculative deoptimization.
                         const std::uint32_t cost =
                             1u + static_cast<std::uint32_t>(
-                                     generic_gpr_written[slot]);
+                                     generic_gpr_written[slot]) +
+                            (generic_gpr_written[slot]
+                                 ? generic_fault_publication_count
+                                 : 0u);
                         if (generic_gpr_access_count[slot] <= cost) {
                             continue;
                         }
@@ -14603,6 +14652,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_CLFLUSH:
                     case X86_MNEMONIC_CLFLUSHOPT:
                     case X86_MNEMONIC_MOV:
+                    case X86_MNEMONIC_MOVBE:
                     case X86_MNEMONIC_MOVZX:
                     case X86_MNEMONIC_MOVSX:
                     case X86_MNEMONIC_MOVSXD:
@@ -14619,6 +14669,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_DEC:
                     case X86_MNEMONIC_NEG:
                     case X86_MNEMONIC_NOT:
+                    case X86_MNEMONIC_BEXTR:
+                    case X86_MNEMONIC_BLSI:
+                    case X86_MNEMONIC_BLSR:
                         return true;
                     default:
                         return false;
@@ -15034,16 +15087,16 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // LDXR/STXR retries. Use the state object's reserved padding as a private
                     // chain budget. It is non-architectural and naturally unique per RunGuest.
                     // A zero value also makes standalone self-test states initialize safely.
-                    code->ldr(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateDirectChainBudgetOffset));
+                    code->ldrh(code->w11,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateDispatchChainBudgetOffset));
                     code->cbnz(code->w11, budget_ready);
                     code->mov(code->w11, kDirectChainBudget);
                     code->L(budget_ready);
                     code->subs(code->w11, code->w11, 1);
-                    code->str(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateDirectChainBudgetOffset));
+                    code->strh(code->w11,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateDispatchChainBudgetOffset));
                     code->cbz(code->w11, validate);
                     // Committed code is never reclaimed while an engine is live. A second target
                     // acquire here could still race retirement immediately after the load and
@@ -15052,6 +15105,23 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->b(chain);
 
                     code->L(validate);
+                    // A dispatcher return is a cheap scheduling boundary. Only every Nth such
+                    // boundary performs the substantially more expensive executable-byte hash.
+                    // The first counter is therefore free to be tuned for responsiveness without
+                    // forcing the SMC cadence to the same value.
+                    Xbyak_aarch64::Label validation_budget_ready;
+                    Xbyak_aarch64::Label dispatch_only;
+                    code->ldrh(code->w12,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateCodeValidationBudgetOffset));
+                    code->cbnz(code->w12, validation_budget_ready);
+                    code->mov(code->w12, kDirectValidationSliceBudget);
+                    code->L(validation_budget_ready);
+                    code->subs(code->w12, code->w12, 1);
+                    code->strh(code->w12,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateCodeValidationBudgetOffset));
+                    code->cbnz(code->w12, dispatch_only);
                     // x6-x8 and q16-q23 may hold block-local guest state. Publish them before
                     // entering the safepoint callback, then restore both caches because all are
                     // intentionally caller-saved under the host ABI.
@@ -15075,6 +15145,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // runtime admission work before starting a fresh chain. Treating zero as both
                     // "uninitialized" and "continue" silently restarted the budget on every edge
                     // and turned the supposedly bounded chain into an unbounded one.
+                    code->b(fallback);
+                    code->L(dispatch_only);
                     code->b(fallback);
                     code->L(chain);
                     // Raw generated targets use the Arm64BlockEntry ABI (x0 = LsxMachineImage*).
@@ -15186,20 +15258,33 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
                     // Reuse the exact finite-chain budget and hash safepoint used by static direct
                     // links. A valid safepoint deliberately returns to RunGuest after validation.
-                    code->ldr(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateDirectChainBudgetOffset));
+                    code->ldrh(code->w11,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateDispatchChainBudgetOffset));
                     code->cbnz(code->w11, budget_ready);
                     code->mov(code->w11, kDirectChainBudget);
                     code->L(budget_ready);
                     code->subs(code->w11, code->w11, 1);
-                    code->str(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateDirectChainBudgetOffset));
+                    code->strh(code->w11,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateDispatchChainBudgetOffset));
                     code->cbz(code->w11, validate);
                     code->b(chain);
 
                     code->L(validate);
+                    Xbyak_aarch64::Label validation_budget_ready;
+                    Xbyak_aarch64::Label dispatch_only;
+                    code->ldrh(code->w12,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateCodeValidationBudgetOffset));
+                    code->cbnz(code->w12, validation_budget_ready);
+                    code->mov(code->w12, kDirectValidationSliceBudget);
+                    code->L(validation_budget_ready);
+                    code->subs(code->w12, code->w12, 1);
+                    code->strh(code->w12,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateCodeValidationBudgetOffset));
+                    code->cbnz(code->w12, dispatch_only);
                     emit_flush_register_caches();
                     code->mov(code->x0, code->x13);
                     code->mov(code->x1, code->x16);
@@ -15209,6 +15294,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
                     emit_reload_register_caches();
+                    code->b(fallback);
+                    code->L(dispatch_only);
                     code->b(fallback);
 
                     code->L(chain);
@@ -15292,42 +15379,68 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                 SignedMemoryDisplacement(operand));
                         code->mov(dst, absolute);
                     } else {
-                        code->mov(dst, 0);
-                        if (operand.mem.base != X86_REGISTER_NONE) {
+                        const bool has_base =
+                            operand.mem.base != X86_REGISTER_NONE;
+                        const bool has_index =
+                            operand.mem.index != X86_REGISTER_NONE;
+                        if (has_base) {
                             if (!emit_gpr_load(operand.mem.base, 64, dst)) {
                                 return false;
                             }
+                        } else if (!has_index) {
+                            code->mov(dst, 0);
                         }
-                        if (operand.mem.index != X86_REGISTER_NONE) {
+                        if (has_index) {
                             if (!emit_gpr_load(operand.mem.index, 64, code->x15)) {
                                 return false;
                             }
+                            std::uint32_t scale_shift = 0;
                             switch (operand.mem.scale) {
                             case 1:
                                 break;
                             case 2:
-                                code->lsl(code->x15, code->x15, 1);
+                                scale_shift = 1;
                                 break;
                             case 4:
-                                code->lsl(code->x15, code->x15, 2);
+                                scale_shift = 2;
                                 break;
                             case 8:
-                                code->lsl(code->x15, code->x15, 3);
+                                scale_shift = 3;
                                 break;
                             default:
                                 return false;
                             }
-                            code->add(dst, dst, code->x15);
+                            if (has_base) {
+                                // AArch64 folds the x86 index scale into ADD; this is the common
+                                // array/table addressing form in game and codec loops.
+                                code->add(dst, dst, code->x15,
+                                          Xbyak_aarch64::LSL, scale_shift);
+                            } else if (scale_shift != 0) {
+                                code->lsl(dst, code->x15, scale_shift);
+                            } else {
+                                code->mov(dst, code->x15);
+                            }
                         }
                         if (operand.mem.disp.size != 0) {
                             const std::int64_t displacement =
                                 SignedMemoryDisplacement(operand);
-                            code->mov(code->x15, static_cast<std::uint64_t>(
-                                displacement < 0 ? -displacement : displacement));
-                            if (displacement < 0) {
-                                code->sub(dst, dst, code->x15);
+                            const std::uint64_t magnitude = static_cast<std::uint64_t>(
+                                displacement < 0 ? -displacement : displacement);
+                            if (magnitude <= 4095) {
+                                if (displacement < 0) {
+                                    code->sub(dst, dst,
+                                              static_cast<std::uint32_t>(magnitude));
+                                } else {
+                                    code->add(dst, dst,
+                                              static_cast<std::uint32_t>(magnitude));
+                                }
                             } else {
-                                code->add(dst, dst, code->x15);
+                                code->mov(code->x15, magnitude);
+                                if (displacement < 0) {
+                                    code->sub(dst, dst, code->x15);
+                                } else {
+                                    code->add(dst, dst, code->x15);
+                                }
                             }
                         }
                     }
@@ -18913,6 +19026,21 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         emitted = emit_read_operand(ir, ir.operands[1], code->x12) &&
                                   emit_write_operand(ir, ir.operands[0], code->x12);
                         break;
+                    case X86_MNEMONIC_MOVBE:
+                        emitted = emit_read_operand(ir, ir.operands[1], code->x12);
+                        if (emitted) {
+                            if (ir.operands[0].size == 16) {
+                                code->rev16(code->w12, code->w12);
+                                code->ubfx(code->x12, code->x12, 0, 16);
+                            } else if (ir.operands[0].size == 32) {
+                                code->rev(code->w12, code->w12);
+                            } else {
+                                code->rev(code->x12, code->x12);
+                            }
+                            emitted = emit_write_operand(
+                                ir, ir.operands[0], code->x12);
+                        }
+                        break;
                     case X86_MNEMONIC_MOVZX:
                         emitted = emit_read_operand(ir, ir.operands[1], code->x12) &&
                                   emit_write_operand(ir, ir.operands[0], code->x12);
@@ -19142,17 +19270,21 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                       emit_memory_address(ir, memory_operand, code->x14);
                             if (emitted) {
                                 emit_publish_fault_ir(ir);
-                                // Byte XCHG is the hot guest spin/lock primitive in native games.
-                                // Calling compiler-rt's outline atomic through a C++ helper made
-                                // __aarch64_swp1_acq alone consume ~30% of Game:Main. On an LSE
-                                // host, emit the architectural acquire/release exchange directly.
-                                // Retain the host-image corruption guard and the exact old helper
-                                // as a slow path; other widths keep the helper until their alignment
-                                // and partial-register cases are lowered equivalently.
-                                if (size_bits == 8 && JitHostHasLseAtomics()) {
+                                // Emit LSE SWPAL directly for every naturally-aligned scalar
+                                // width. Byte locks were the original hotspot; 16/32/64-bit queue
+                                // and refcount exchanges benefit from the same single instruction.
+                                // Unaligned x86 operands and protected host-image addresses retain
+                                // the exact helper as a cold correctness path.
+                                if (JitHostHasLseAtomics()) {
                                     Xbyak_aarch64::Label direct_exchange;
                                     Xbyak_aarch64::Label slow_exchange;
                                     Xbyak_aarch64::Label exchange_done;
+                                    if (size_bits > 8) {
+                                        code->tst(code->x14,
+                                                  static_cast<std::uint32_t>(
+                                                      size_bits / 8u - 1u));
+                                        code->bne(slow_exchange);
+                                    }
                                     std::uint64_t image_lo = 0;
                                     std::uint64_t image_hi = 0;
                                     if (JitOwnHostImageRange(image_lo, image_hi)) {
@@ -19170,8 +19302,19 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                     code->L(direct_exchange);
                                     emitted = emit_read_operand(ir, register_operand, code->x10);
                                     if (emitted) {
-                                        code->swpalb(code->w10, code->w11,
-                                                     Xbyak_aarch64::ptr(code->x14));
+                                        if (size_bits == 8) {
+                                            code->swpalb(code->w10, code->w11,
+                                                         Xbyak_aarch64::ptr(code->x14));
+                                        } else if (size_bits == 16) {
+                                            code->swpalh(code->w10, code->w11,
+                                                         Xbyak_aarch64::ptr(code->x14));
+                                        } else if (size_bits == 32) {
+                                            code->swpal(code->w10, code->w11,
+                                                        Xbyak_aarch64::ptr(code->x14));
+                                        } else {
+                                            code->swpal(code->x10, code->x11,
+                                                        Xbyak_aarch64::ptr(code->x14));
+                                        }
                                         emitted = emit_write_operand(ir, register_operand,
                                                                      code->x11);
                                     }
@@ -19213,8 +19356,6 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_BTR:
                     case X86_MNEMONIC_BTS: {
                         emitted = emit_read_operand(ir, ir.operands[1], code->x12);
-                        std::uint32_t state_offset = 0;
-                        std::uint32_t ignored_size = 0;
                         const bool target_is_memory =
                             ir.operands[0].type == X86_OPERAND_TYPE_MEMORY;
                         if (emitted && target_is_memory) {
@@ -19223,8 +19364,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                 emit_publish_fault_ir(ir);
                             }
                         } else if (emitted) {
-                            emitted = register_state_offset(ir.operands[0].reg.value,
-                                                            state_offset, ignored_size);
+                            emitted = emit_read_operand(
+                                ir, ir.operands[0], code->x10);
                         }
                         if (emitted) {
                             BitTestOp op = BitTestOp::Inspect;
@@ -19235,45 +19376,147 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             } else if (mnemonic == X86_MNEMONIC_BTS) {
                                 op = BitTestOp::Raise;
                             }
-                            code->mov(code->x0, code->x19);
-                            code->mov(code->x1, target_is_memory ? code->x14 :
-                                                                  code->x13);
                             if (!target_is_memory) {
-                                code->mov(code->x1, state_offset);
+                                const std::uint32_t width = ir.operands[0].size;
+                                code->and_(code->x13, code->x12, width - 1u);
+                                code->lsrv(code->x14, code->x10, code->x13);
+                                code->and_(code->x14, code->x14, 1);
+                                code->ldr(
+                                    code->x9,
+                                    Xbyak_aarch64::ptr(code->x19,
+                                                      kStateRflagsOffset));
+                                code->bfi(code->x9, code->x14, kCfBit, 1);
+                                code->str(
+                                    code->x9,
+                                    Xbyak_aarch64::ptr(code->x19,
+                                                      kStateRflagsOffset));
+                                generic_rflags_live_in_x9 = true;
+                                if (op != BitTestOp::Inspect) {
+                                    code->mov(code->x15, 1);
+                                    code->lslv(code->x15, code->x15, code->x13);
+                                    if (op == BitTestOp::Toggle) {
+                                        code->eor(code->x10, code->x10, code->x15);
+                                    } else if (op == BitTestOp::Clear) {
+                                        code->bic(code->x10, code->x10, code->x15);
+                                    } else {
+                                        code->orr(code->x10, code->x10, code->x15);
+                                    }
+                                    emitted = emit_write_operand(
+                                        ir, ir.operands[0], code->x10);
+                                }
+                            } else {
+                                code->mov(code->x0, code->x19);
+                                code->mov(code->x1, code->x14);
+                                code->mov(code->x2, 1);
+                                code->mov(code->x3, code->x12);
+                                code->mov(
+                                    code->x4,
+                                    ir.operands[1].type ==
+                                            X86_OPERAND_TYPE_IMMEDIATE
+                                        ? 1
+                                        : 0);
+                                code->mov(code->x5, ir.operands[0].size);
+                                code->mov(code->x6,
+                                          static_cast<std::uint64_t>(op));
+                                EmitJitRelocatablePointer(
+                                    *code, code->x16,
+                                    reinterpret_cast<std::uint64_t>(
+                                        &ModifyRegisterBit));
+                                code->blr(code->x16);
                             }
-                            code->mov(code->x2, target_is_memory ? 1 : 0);
-                            code->mov(code->x3, code->x12);
-                            code->mov(code->x4,
-                                      ir.operands[1].type == X86_OPERAND_TYPE_IMMEDIATE
-                                          ? 1
-                                          : 0);
-                            code->mov(code->x5, ir.operands[0].size);
-                            code->mov(code->x6, static_cast<std::uint64_t>(op));
-                            EmitJitRelocatablePointer(
-                                *code, code->x16,
-                                reinterpret_cast<std::uint64_t>(&ModifyRegisterBit));
-                            code->blr(code->x16);
                         }
                         break;
                     }
                     case X86_MNEMONIC_MUL:
-                    case X86_MNEMONIC_DIV:
-                    case X86_MNEMONIC_IDIV:
                         emitted = emit_read_operand(ir, ir.operands[0], code->x12);
                         if (emitted) {
                             code->mov(code->x0, code->x19);
                             code->mov(code->x1, code->x12);
                             code->mov(code->x2, ir.operands[0].size);
-                            code->mov(code->x3,
-                                      mnemonic == X86_MNEMONIC_IDIV ? 1 : 0);
+                            code->mov(code->x3, 0);
                             EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
-                                    mnemonic == X86_MNEMONIC_MUL ? &MultiplyAccumulatorPair
-                                                                   : &DivideAccumulatorPair));
+                                    &MultiplyAccumulatorPair));
                             code->blr(code->x16);
                         }
                         break;
+                    case X86_MNEMONIC_DIV:
+                    case X86_MNEMONIC_IDIV: {
+                        emitted = emit_read_operand(
+                            ir, ir.operands[0], code->x12);
+                        if (!emitted) {
+                            break;
+                        }
+                        const bool signed_divide =
+                            mnemonic == X86_MNEMONIC_IDIV;
+                        if (ir.operands[0].size != 32) {
+                            code->mov(code->x0, code->x19);
+                            code->mov(code->x1, code->x12);
+                            code->mov(code->x2, ir.operands[0].size);
+                            code->mov(code->x3, signed_divide ? 1 : 0);
+                            EmitJitRelocatablePointer(
+                                *code, code->x16,
+                                reinterpret_cast<std::uint64_t>(
+                                    &DivideAccumulatorPair));
+                            code->blr(code->x16);
+                            break;
+                        }
+
+                        Xbyak_aarch64::Label divide_slow;
+                        Xbyak_aarch64::Label divide_done;
+                        // The 32-bit x86 dividend EDX:EAX fits exactly in one AArch64 X register.
+                        // Use native UDIV/SDIV plus MSUB for the common path; only divide-by-zero
+                        // and quotient overflow enter the precise guest-#DE helper.
+                        if (signed_divide) {
+                            code->sxtw(code->x12, code->w12);
+                        } else {
+                            code->mov(code->w12, code->w12);
+                        }
+                        code->cbz(code->x12, divide_slow);
+                        code->ldr(code->w10,
+                                  Xbyak_aarch64::ptr(code->x19,
+                                                    kStateRaxOffset));
+                        code->ldr(code->w11,
+                                  Xbyak_aarch64::ptr(code->x19,
+                                                    kStateRdxOffset));
+                        code->orr(code->x10, code->x10, code->x11,
+                                  Xbyak_aarch64::LSL, 32);
+                        if (signed_divide) {
+                            code->sdiv(code->x11, code->x10, code->x12);
+                            code->sxtw(code->x14, code->w11);
+                            code->cmp(code->x11, code->x14);
+                            code->bne(divide_slow);
+                        } else {
+                            code->udiv(code->x11, code->x10, code->x12);
+                            code->lsr(code->x14, code->x11, 32);
+                            code->cbnz(code->x14, divide_slow);
+                        }
+                        code->msub(code->x13, code->x11, code->x12,
+                                   code->x10);
+                        code->mov(code->w11, code->w11);
+                        code->mov(code->w13, code->w13);
+                        code->str(code->x11,
+                                  Xbyak_aarch64::ptr(code->x19,
+                                                    kStateRaxOffset));
+                        code->str(code->x13,
+                                  Xbyak_aarch64::ptr(code->x19,
+                                                    kStateRdxOffset));
+                        code->b(divide_done);
+
+                        code->L(divide_slow);
+                        code->mov(code->x0, code->x19);
+                        code->mov(code->x1, code->x12);
+                        code->mov(code->x2, 32);
+                        code->mov(code->x3, signed_divide ? 1 : 0);
+                        EmitJitRelocatablePointer(
+                            *code, code->x16,
+                            reinterpret_cast<std::uint64_t>(
+                                &DivideAccumulatorPair));
+                        code->blr(code->x16);
+                        code->L(divide_done);
+                        break;
+                    }
                     case X86_MNEMONIC_IMUL:
                         if (ir.operand_count == 1) {
                             emitted = emit_read_operand(ir, ir.operands[0], code->x12);
@@ -19368,15 +19611,37 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                   emit_read_operand(ir, ir.operands[1], code->x10) &&
                                   emit_read_operand(ir, ir.operands[2], code->x11);
                         if (emitted) {
-                            code->mov(code->x0, code->x19);
-                            code->mov(code->x1, state_offset);
-                            code->mov(code->x2, code->x10);
-                            code->mov(code->x3, code->x11);
-                            code->mov(code->x4, ir.operands[0].size);
-                            EmitJitRelocatablePointer(
-                                *code, code->x16,
-                                reinterpret_cast<std::uint64_t>(&ExtractContiguousBits));
-                            code->blr(code->x16);
+                            const std::uint32_t width = ir.operands[0].size;
+                            Xbyak_aarch64::Label zero_result;
+                            Xbyak_aarch64::Label have_result;
+                            // start = control[7:0], length = control[15:8]. Clamp length to the
+                            // remaining source width exactly as x86 does, then use ARM's variable
+                            // shift/mask datapath. This removes a full helper ABI round-trip.
+                            code->ubfx(code->w13, code->w11, 0, 8);
+                            code->ubfx(code->w14, code->w11, 8, 8);
+                            code->cmp(code->w13, width);
+                            code->bhs(zero_result);
+                            code->cbz(code->w14, zero_result);
+                            code->mov(code->w15, width);
+                            code->sub(code->w15, code->w15, code->w13);
+                            code->cmp(code->w14, code->w15);
+                            code->csel(code->w14, code->w14, code->w15,
+                                       Xbyak_aarch64::LS);
+                            code->lsrv(code->x12, code->x10, code->x13);
+                            code->mov(code->x15, ~std::uint64_t{0});
+                            code->mov(code->w17, 64);
+                            code->sub(code->w17, code->w17, code->w14);
+                            code->lsrv(code->x15, code->x15, code->x17);
+                            code->and_(code->x12, code->x12, code->x15);
+                            code->b(have_result);
+                            code->L(zero_result);
+                            code->mov(code->x12, 0);
+                            code->L(have_result);
+                            emitted = emit_write_operand(
+                                ir, ir.operands[0], code->x12);
+                            if (emitted) {
+                                emit_inline_flags_logic(width);
+                            }
                         }
                         break;
                     }
@@ -19388,16 +19653,54 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                                         state_offset, ignored_size) &&
                                   emit_read_operand(ir, ir.operands[1], code->x12);
                         if (emitted) {
-                            code->mov(code->x0, code->x19);
-                            code->mov(code->x1, state_offset);
-                            code->mov(code->x2, code->x12);
-                            code->mov(code->x3, ir.operands[0].size);
-                            EmitJitRelocatablePointer(
-                                *code, code->x16,
-                                reinterpret_cast<std::uint64_t>(
-                                    mnemonic == X86_MNEMONIC_BLSI ? &IsolateLeastSignificantSetBit
-                                                                    : &ClearLeastSignificantSetBit));
-                            code->blr(code->x16);
+                            const std::uint32_t width = ir.operands[0].size;
+                            code->mov(code->x10, code->x12);
+                            if (mnemonic == X86_MNEMONIC_BLSI) {
+                                code->neg(code->x11, code->x10);
+                            } else {
+                                code->sub(code->x11, code->x10, 1);
+                            }
+                            code->and_(code->x12, code->x10, code->x11);
+                            emitted = emit_write_operand(
+                                ir, ir.operands[0], code->x12);
+                            if (emitted) {
+                                // BLSI/BLSR preserve the interpreter's undefined PF/AF bits,
+                                // clear OF, and materialize CF/ZF/SF directly from source/result.
+                                code->cmp(code->x10, 0);
+                                code->cset(
+                                    code->x13,
+                                    mnemonic == X86_MNEMONIC_BLSI
+                                        ? Xbyak_aarch64::NE
+                                        : Xbyak_aarch64::EQ);
+                                if (width == 32) {
+                                    code->ands(code->wzr, code->w12, code->w12);
+                                } else {
+                                    code->ands(code->xzr, code->x12, code->x12);
+                                }
+                                code->cset(code->x14, Xbyak_aarch64::EQ);
+                                code->cset(code->x15, Xbyak_aarch64::MI);
+                                code->lsl(code->x14, code->x14, kZfBit);
+                                code->lsl(code->x15, code->x15, kSfBit);
+                                code->orr(code->x13, code->x13, code->x14);
+                                code->orr(code->x13, code->x13, code->x15);
+                                code->ldr(
+                                    code->x9,
+                                    Xbyak_aarch64::ptr(code->x19,
+                                                      kStateRflagsOffset));
+                                code->mov(
+                                    code->x17,
+                                    (std::uint64_t{1} << kCfBit) |
+                                        (std::uint64_t{1} << kZfBit) |
+                                        (std::uint64_t{1} << kSfBit) |
+                                        (std::uint64_t{1} << kOfBit));
+                                code->bic(code->x9, code->x9, code->x17);
+                                code->orr(code->x9, code->x9, code->x13);
+                                code->str(
+                                    code->x9,
+                                    Xbyak_aarch64::ptr(code->x19,
+                                                      kStateRflagsOffset));
+                                generic_rflags_live_in_x9 = true;
+                            }
                         }
                         break;
                     }
@@ -20569,14 +20872,47 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         if (outgoing_direct_slot == nullptr) {
             return false;
         }
+        Xbyak_aarch64::Label budget_ready;
+        Xbyak_aarch64::Label scheduling_boundary;
+        Xbyak_aarch64::Label validation_budget_ready;
+        Xbyak_aarch64::Label chain;
         Xbyak_aarch64::Label fallback;
         EmitJitRelocatablePointer(
             code, code.x9,
             reinterpret_cast<std::uint64_t>(&outgoing_direct_slot->target));
-        // Stable slots are published with release stores. Consume them with a
-        // real AArch64 acquire load before validating the guest byte hash.
+        // Stable slots are published with release stores. The steady-state edge consists only of
+        // this acquire, two private-counter operations and the tail branch; C++ is reserved for
+        // the sparse SMC validation boundary.
         code.ldar(code.x16, Xbyak_aarch64::ptr(code.x9));
         code.cbz(code.x16, fallback);
+
+        code.ldrh(code.w11,
+                  Xbyak_aarch64::ptr(code.x0,
+                                    kStateDispatchChainBudgetOffset));
+        code.cbnz(code.w11, budget_ready);
+        code.mov(code.w11, kDirectChainBudget);
+        code.L(budget_ready);
+        code.subs(code.w11, code.w11, 1);
+        code.strh(code.w11,
+                  Xbyak_aarch64::ptr(code.x0,
+                                    kStateDispatchChainBudgetOffset));
+        code.cbz(code.w11, scheduling_boundary);
+        code.b(chain);
+
+        code.L(scheduling_boundary);
+        code.ldrh(code.w12,
+                  Xbyak_aarch64::ptr(code.x0,
+                                    kStateCodeValidationBudgetOffset));
+        code.cbnz(code.w12, validation_budget_ready);
+        code.mov(code.w12, kDirectValidationSliceBudget);
+        code.L(validation_budget_ready);
+        code.subs(code.w12, code.w12, 1);
+        code.strh(code.w12,
+                  Xbyak_aarch64::ptr(code.x0,
+                                    kStateCodeValidationBudgetOffset));
+        // Most scheduling boundaries return immediately; no frame and no validator call.
+        code.cbnz(code.w12, fallback);
+
         code.stp(code.x29, code.x30,
                  Xbyak_aarch64::pre_ptr(code.sp, -32));
         code.stp(code.x19, code.x20, Xbyak_aarch64::ptr(code.sp, 16));
@@ -20596,7 +20932,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         code.ldp(code.x19, code.x20, Xbyak_aarch64::ptr(code.sp, 16));
         code.ldp(code.x29, code.x30,
                  Xbyak_aarch64::post_ptr(code.sp, 32));
-        code.cbz(code.x16, fallback);
+        // Whether validation retained or retired the slot, return to the dispatcher at this
+        // scheduling boundary. It observes the authoritative cache epoch before re-entry.
+        code.b(fallback);
+
+        code.L(chain);
         // The tail target bypasses RunGuest's next loop iteration.  Publish its
         // static guest RIP before BR so a fault in the linked entry maps to the
         // target block rather than the consumer block.
@@ -36042,8 +36382,10 @@ std::string ExerciseTranslationEngineJson() {
                 conditional_block, &taken_slot, &conditional_direct,
                 &fallthrough_slot);
             const auto set_chain_budget = [](LsxMachineImage& state,
-                                             const std::uint32_t budget) {
-                state.direct_chain_budget = budget;
+                                             const std::uint16_t dispatch_budget,
+                                             const std::uint16_t validation_budget = 2) {
+                state.dispatch_chain_budget = dispatch_budget;
+                state.code_validation_budget = validation_budget;
             };
 
             LsxMachineImage taken_state{};
@@ -36080,7 +36422,7 @@ std::string ExerciseTranslationEngineJson() {
             conditional_code[16] ^= 0x01;
             LsxMachineImage smc_state{};
             WriteGuestGpr64(smc_state, LsxGpr::Rdi, 0);
-            set_chain_budget(smc_state, 1);
+            set_chain_budget(smc_state, 1, 1);
             const std::uint64_t smc_result =
                 conditional_direct != nullptr ? conditional_direct(&smc_state) : 0;
             conditional_two_edge_smc_ok =
@@ -36178,7 +36520,8 @@ std::string ExerciseTranslationEngineJson() {
                 }
                 const auto begin = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < kIterations; ++iteration) {
-                    chained_state.direct_chain_budget = 4096;
+                    chained_state.dispatch_chain_budget = 4096;
+                    chained_state.code_validation_budget = 4096;
                     (void)chain_entries[0](&chained_state);
                 }
                 return static_cast<std::uint64_t>(
@@ -36238,8 +36581,10 @@ std::string ExerciseTranslationEngineJson() {
         {
             const ScopedJitSelfTestProductionDirect production_direct_scope;
             const auto set_chain_budget = [](LsxMachineImage& state,
-                                             const std::uint32_t budget) {
-                state.direct_chain_budget = budget;
+                                             const std::uint16_t dispatch_budget,
+                                             const std::uint16_t validation_budget = 2) {
+                state.dispatch_chain_budget = dispatch_budget;
+                state.code_validation_budget = validation_budget;
             };
             const auto arm_slot = [](ChainPatchCell& slot, Arm64BlockEntry target,
                                      const std::uint32_t guest_size = 0,
@@ -36505,7 +36850,7 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage pic_mutated_state{};
             WriteGuestGpr64(pic_mutated_state, LsxGpr::Rsp,
                      reinterpret_cast<std::uint64_t>(pic_mutated_stack.data()));
-            set_chain_budget(pic_mutated_state, 1);
+            set_chain_budget(pic_mutated_state, 1, 1);
             const std::uint64_t pic_mutated_result =
                 pic_smc_ret_direct != nullptr
                     ? pic_smc_ret_direct(&pic_mutated_state)
@@ -36918,6 +37263,10 @@ std::string ExerciseTranslationEngineJson() {
             kDirectMutatedCalleeOffset - (kDirectTargetOffset + 2));
         direct_stack[0] = kDirectReturnSentinel;
         LsxMachineImage direct_mutated_state{};
+        // Force both independent boundaries: this probe verifies immediate retirement of a
+        // deliberately mutated target rather than the production amortization cadence.
+        direct_mutated_state.dispatch_chain_budget = 1;
+        direct_mutated_state.code_validation_budget = 1;
         WriteGuestGpr64(direct_mutated_state, LsxGpr::Rax, 0xdeadbeefull);
         WriteGuestGpr64(direct_mutated_state, LsxGpr::Rsp,
                  reinterpret_cast<std::uint64_t>(direct_stack.data()));
@@ -43792,13 +44141,95 @@ std::string ExerciseTranslationEngineJson() {
                 WriteGuestGpr64(state, LsxGpr::Rbx, lhs[iteration & 3u]);
                 WriteGuestGpr64(state, LsxGpr::Rdx, rhs[iteration & 3u]);
             });
+        const std::array<std::uint8_t, 5> generic_bextr_r32 = {
+            0xc4, 0xe2, 0x70, 0xf7, 0xc3, // bextr eax,ebx,ecx
+        };
+        const bool generic_bextr_inline_ok = run_generic_scalar_case(
+            generic_bextr_r32, 1, 1,
+            [](LsxMachineImage& state, const std::uint32_t iteration) {
+                constexpr std::array<std::uint32_t, 4> controls = {
+                    0x0804u, 0x2010u, 0x0000u, 0x1001u,
+                };
+                state.rflags = 0xa57u;
+                WriteGuestGpr64(state, LsxGpr::Rbx,
+                                 0xf0e1d2c3u ^ (iteration * 0x11111111u));
+                WriteGuestGpr64(state, LsxGpr::Rcx,
+                                 controls[iteration & 3u]);
+            });
+        const std::array<std::uint8_t, 10> generic_blsi_blsr_r32 = {
+            0xc4, 0xe2, 0x78, 0xf3, 0xdb, // blsi eax,ebx
+            0xc4, 0xe2, 0x78, 0xf3, 0xcb, // blsr eax,ebx
+        };
+        const bool generic_blsi_blsr_inline_ok = run_generic_scalar_case(
+            generic_blsi_blsr_r32, 2, 2,
+            [](LsxMachineImage& state, const std::uint32_t iteration) {
+                constexpr std::array<std::uint32_t, 4> values = {
+                    0u, 1u, 0x80000000u, 0xf0e10040u,
+                };
+                state.rflags = 0xa57u;
+                WriteGuestGpr64(state, LsxGpr::Rbx,
+                                 values[iteration & 3u]);
+            });
+        alignas(8) std::array<std::uint32_t, 2> generic_movbe_source = {
+            0x01234567u, 0x89abcdefu,
+        };
+        alignas(8) std::array<std::uint32_t, 2> generic_movbe_destination{};
+        const std::array<std::uint8_t, 8> generic_movbe_pair = {
+            0x0f, 0x38, 0xf0, 0x08, // movbe ecx,dword ptr [rax]
+            0x0f, 0x38, 0xf1, 0x0a, // movbe dword ptr [rdx],ecx
+        };
+        const bool generic_movbe_inline_ok = run_generic_scalar_case(
+            generic_movbe_pair, 2, 2,
+            [&](LsxMachineImage& state, const std::uint32_t iteration) {
+                state.rflags = 0xa57u;
+                WriteGuestGpr64(
+                    state, LsxGpr::Rax,
+                    reinterpret_cast<std::uint64_t>(
+                        &generic_movbe_source[iteration & 1u]));
+                WriteGuestGpr64(
+                    state, LsxGpr::Rdx,
+                    reinterpret_cast<std::uint64_t>(
+                        &generic_movbe_destination[iteration & 1u]));
+            });
+        const std::array<std::uint8_t, 2> generic_div_r32 = {
+            0xf7, 0xf1, // div ecx
+        };
+        const bool generic_div_r32_inline_ok = run_generic_scalar_case(
+            generic_div_r32, 1, 1,
+            [](LsxMachineImage& state, const std::uint32_t iteration) {
+                state.rflags = 0xa57u;
+                WriteGuestGpr64(state, LsxGpr::Rax,
+                                 0x12345678u + iteration * 17u);
+                WriteGuestGpr64(state, LsxGpr::Rdx, iteration & 1u);
+                WriteGuestGpr64(state, LsxGpr::Rcx,
+                                 0x10001u + iteration);
+            });
+        const std::array<std::uint8_t, 2> generic_idiv_r32 = {
+            0xf7, 0xf9, // idiv ecx
+        };
+        const bool generic_idiv_r32_inline_ok = run_generic_scalar_case(
+            generic_idiv_r32, 1, 1,
+            [](LsxMachineImage& state, const std::uint32_t iteration) {
+                const std::int32_t dividend =
+                    (iteration & 1u) != 0 ? -123456789 : 123456789;
+                state.rflags = 0xa57u;
+                WriteGuestGpr32(state, LsxGpr::Rax,
+                                 static_cast<std::uint32_t>(dividend));
+                WriteGuestGpr32(state, LsxGpr::Rdx,
+                                 dividend < 0 ? 0xffffffffu : 0u);
+                WriteGuestGpr32(state, LsxGpr::Rcx,
+                                 (iteration & 2u) != 0 ? 97u : 31u);
+            });
         const bool generic_imul_inline_ok =
             g_jit_native_scalar_imul_inline_instructions.load(
                 std::memory_order_relaxed) >= generic_imul_inline_before + 4u;
         const bool generic_scalar_extended_native_ok =
             generic_scalar_extended_sequence_native_ok &&
             generic_imul_r32_r32_native_ok && generic_imul_r16_r16_native_ok &&
-            generic_imul_r64_r64_native_ok && generic_imul_inline_ok;
+            generic_imul_r64_r64_native_ok && generic_imul_inline_ok &&
+            generic_bextr_inline_ok && generic_blsi_blsr_inline_ok &&
+            generic_movbe_inline_ok && generic_div_r32_inline_ok &&
+            generic_idiv_r32_inline_ok;
 
         const std::uint64_t scalar_semantic_before =
             g_jit_native_scalar_semantic_instructions.load(

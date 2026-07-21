@@ -185,7 +185,8 @@ bool CapturePostHleContinuation(LsxMachineImage& destination, const u64 result) 
 
     if (Executor::Jit::SnapshotGuestStateAfterBridge(destination)) {
         Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rax, result);
-        destination.direct_chain_budget = 0;
+        destination.dispatch_chain_budget = 0;
+        destination.code_validation_budget = 0;
         return destination.rip_or_exit != 0 &&
                Executor::Jit::ReadGuestGpr64(destination, LsxGpr::Rsp) != 0;
     }
@@ -208,7 +209,8 @@ bool CapturePostHleContinuation(LsxMachineImage& destination, const u64 result) 
     Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rax, result);
     Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rsp, guest_rsp + sizeof(u64));
     destination.rip_or_exit = guest_return;
-    destination.direct_chain_budget = 0;
+    destination.dispatch_chain_budget = 0;
+    destination.code_validation_budget = 0;
     return true;
 }
 
@@ -249,7 +251,8 @@ bool BuildInitialAndroidFiberState(OrbisFiber* fiber, const u64 arg_on_run_to,
     destination.gpr.fill(0);
     destination.rip_or_exit = reinterpret_cast<u64>(fiber->entry);
     destination.rflags = 0x202;
-    destination.direct_chain_budget = 0;
+    destination.dispatch_chain_budget = 0;
+    destination.code_validation_budget = 0;
     destination.x87_status_word = 0;
     destination.x87_last_opcode = 0;
     destination.x87_instruction_pointer = 0;

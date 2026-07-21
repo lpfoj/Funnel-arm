@@ -115,10 +115,12 @@ struct alignas(32) LsxMachineImage {
     std::uint8_t x87_top = 0;
     std::uint8_t x87_tag_word = 0;
     std::uint32_t mxcsr = 0x1f80;
-    // The first dword is a non-architectural, per-execution direct-chain budget.  The
-    // remaining word-sized fields are architectural x87 state that used to be discarded by
-    // FNSTENV/FXSAVE.  Keeping them in the ABI padding preserves every proven state offset.
-    std::uint32_t direct_chain_budget = 0;
+    // Two non-architectural, per-execution counters share the old ABI padding. The first bounds
+    // time spent outside the dispatcher; the second independently amortizes executable-byte
+    // validation. Keeping them separate avoids coupling scheduler latency to an expensive SMC
+    // hash while preserving every architectural x87/SIMD offset below.
+    std::uint16_t dispatch_chain_budget = 0;
+    std::uint16_t code_validation_budget = 0;
     std::uint16_t x87_status_word = 0;
     std::uint16_t x87_last_opcode = 0;
     // Physical x87 registers: architectural binary80 in bytes 0..9, zero padding in 10..15.
@@ -156,7 +158,8 @@ static_assert(offsetof(LsxMachineImage, x87_control_word) == 0xa0);
 static_assert(offsetof(LsxMachineImage, x87_top) == 0xa2);
 static_assert(offsetof(LsxMachineImage, x87_tag_word) == 0xa3);
 static_assert(offsetof(LsxMachineImage, mxcsr) == 0xa4);
-static_assert(offsetof(LsxMachineImage, direct_chain_budget) == 0xa8);
+static_assert(offsetof(LsxMachineImage, dispatch_chain_budget) == 0xa8);
+static_assert(offsetof(LsxMachineImage, code_validation_budget) == 0xaa);
 static_assert(offsetof(LsxMachineImage, x87_status_word) == 0xac);
 static_assert(offsetof(LsxMachineImage, x87_last_opcode) == 0xae);
 static_assert(offsetof(LsxMachineImage, x87_values) == 0xb0);
