@@ -33,6 +33,7 @@
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -206,11 +207,6 @@ struct ExecutorBox64GuestRegsSnapshot {
 extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const void* regs, std::size_t regs_size);
 
-// BDWGC stops JIT guest threads through the guest SIGUSR1/SIG30 handler.  The collector can
-// scan the separate x86 stacks once they are registered below, but a managed reference may exist
-// only in an emulated x86 GPR at that exact safepoint.  Native AArch64 ucontext registers do not
-// contain those values.  Keep one compact, permanently-rooted register image per host TID; the
-// signal bridge refreshes the slot before it enters Mono's suspend handler.
 constexpr std::size_t kJitGcRegisterRootSlots = 256;
 alignas(64) std::array<ExecutorBox64GuestRegsSnapshot, kJitGcRegisterRootSlots>
     g_jit_gc_register_roots{};
@@ -312,7 +308,7 @@ std::uint64_t RunJitMappedFunction(const std::uint64_t guest_rip,
     ctx.stack_base = stack_base;
     ctx.stack_size = stack_size;
     ctx.allow_guest_return_sentinel = 1;
-    return Executor::Jit::RunArm64Translation(guest_rip, ctx);
+    return Executor::Jit::DispatchGuestOnArm64(guest_rip, ctx);
 }
 
 constexpr std::size_t JitFsBaseStateOffset =
@@ -331,7 +327,7 @@ std::uint64_t ReadJitStateQword(const Executor::Jit::LsxMachineImage& state,
 
 std::uint64_t JitGpr(const Executor::Jit::LsxMachineImage& state,
                           const Executor::Jit::LsxGpr reg) {
-    return Executor::Jit::GetGpr64(state, reg);
+    return Executor::Jit::ReadGuestGpr64(state, reg);
 }
 
 void FillBox64RegsFromJitState(const Executor::Jit::LsxMachineImage& state,
@@ -361,22 +357,22 @@ void FillBox64RegsFromJitState(const Executor::Jit::LsxMachineImage& state,
 
 void RestoreJitStateFromBox64Regs(Executor::Jit::LsxMachineImage& state,
                                        const ExecutorBox64GuestRegsSnapshot& in) {
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rax, in.regs[0]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rcx, in.regs[1]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rdx, in.regs[2]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rbx, in.regs[3]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rsp, in.regs[4]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rbp, in.regs[5]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rsi, in.regs[6]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rdi, in.regs[7]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R8, in.regs[8]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R9, in.regs[9]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R10, in.regs[10]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R11, in.regs[11]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R12, in.regs[12]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R13, in.regs[13]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R14, in.regs[14]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R15, in.regs[15]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rax, in.regs[0]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rcx, in.regs[1]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rdx, in.regs[2]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rbx, in.regs[3]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rsp, in.regs[4]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rbp, in.regs[5]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rsi, in.regs[6]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rdi, in.regs[7]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R8, in.regs[8]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R9, in.regs[9]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R10, in.regs[10]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R11, in.regs[11]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R12, in.regs[12]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R13, in.regs[13]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R14, in.regs[14]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R15, in.regs[15]);
     state.rip_or_exit = in.rip;
     state.fs_base = in.fsbase;
     state.gs_base = in.gsbase;
@@ -431,12 +427,6 @@ std::vector<ExecutorGuestReadableRange> g_box64_guest_stack_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_gc_sideband_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_readable_ranges;
 
-// JIT reference validation reads guest stacks through ExecutorJitReadGuestBytes.
-// Those mmap-backed stacks are intentionally outside Core::MemoryManager, so the old path first
-// missed its VMA tree and then serialized on g_box64_guest_stack_lock for every operand.  Registered
-// readable ranges are process-lifetime objects in this runtime; publish only pages fully contained
-// by a range into an exact-address lock-free cache.  A hit is therefore a sufficient containment
-// proof, while unaligned/cross-page accesses retain the authoritative locked range check.
 constexpr std::uint64_t JitRegisteredPageSize = 4_KB;
 constexpr std::uint64_t JitRegisteredPageMask = JitRegisteredPageSize - 1;
 constexpr std::size_t JitRegisteredPageCacheSlots = 16384;
@@ -600,7 +590,7 @@ std::atomic_bool g_load_exec_process_worker_active{false};
 
 int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
     if (RuntimeGuestJitActive()) {
-        auto* state = Executor::Jit::CurrentMachineImage();
+        auto* state = Executor::Jit::FindActiveMachineImage();
         if (state == nullptr) {
             out = {};
             return -1;
@@ -1245,7 +1235,7 @@ extern "C" bool executor_lsx4_android_should_suppress_guest_thread(void* start_r
     (void)arg;
     // On Android every *guest* pthread MUST run through the mapped guest-thread path
     // (RunBox64GuestThread -> run_guest_thread). In the FEX route this registers the thread's FEX
-    // TLS/alt-stack, and in JIT it dispatches the x86 start routine through the reconstructed
+    // TLS/alt-stack, and in JIT it dispatches the x86 start routine through the translated
     // AArch64 JIT. The fallthrough RunThread path calls start_routine() directly as host code; on
     // arm64 that executes the guest x86 bytes as arm64 -> SIGILL/ILL_ILLOPC (host pc == guest addr).
     // That is exactly what kills JIT worker threads once Mono creates Thread2.
@@ -2126,18 +2116,6 @@ bool IsJitOrdinaryGuestRange(const std::uint64_t address, const std::size_t size
         return false;
     }
 
-    // IsValidMapping walks the VMA std::map. Reference-helper loads and stores call this path for
-    // every guest operand, even though the set of usable address-space regions is fixed for the
-    // lifetime of the process MemoryManager (map/unmap only carve and merge VMAs inside those
-    // regions). Cache successful whole-page validations so the common 1/2/4/8/16-byte operand path
-    // is one relaxed atomic load instead of an ordered-map lookup. This deliberately is not
-    // thread_local: Android resolves function-local TLS in this dlopened library through
-    // tlsdesc_resolver_dynamic, which profiling showed consuming 10% of Game:Main after the VMA
-    // lookup itself had fallen to 1.2%. The validated property is process-global, and the
-    // MemoryManager singleton is not replaced during a process lifetime, so a shared lock-free
-    // direct map is the exact contract and avoids that resolver entirely. Validating the complete
-    // page on a miss keeps boundary/gap behavior byte-exact; cross-page operands retain the
-    // authoritative slow path below.
     constexpr std::uint64_t GuestValidationPageSize = 64_KB;
     constexpr std::uint64_t GuestValidationPageMask = GuestValidationPageSize - 1;
     constexpr std::size_t GuestValidationCacheSlots = 256;
@@ -2194,9 +2172,6 @@ bool IsJitCurrentThreadStackRange(const std::uint64_t address, const std::size_t
 }
 
 bool IsJitGuestRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
-    // Registered pthread/fallback stacks live outside Core::MemoryManager.  Check their
-    // process-lifetime page publication first so hot reference-validation operands do not pay an
-    // expected VMA miss before reaching the range which actually owns them.
     return IsJitRegisteredPageCached(address, size) ||
            IsJitOrdinaryGuestRange(address, size) ||
            IsJitRegisteredGuestRange(address, size);
@@ -2441,9 +2416,6 @@ extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const vo
          !IsHostAddressReadableByProcMaps(host_src + size - 1))) {
         return false;
     }
-    // PageManager intentionally write-protects GPU-observed guest pages. If this store reaches a
-    // watched page, Linux supplies ESR_ELx.WnR in the AArch64 signal context; the shared reference
-    // signal path invalidates/unprotects the page and resumes this instruction.
     std::memcpy(reinterpret_cast<void*>(host_address), reinterpret_cast<const void*>(host_src),
                 size);
     return true;
@@ -5541,6 +5513,74 @@ extern "C" int executor_live_get_current_hle_guest_rsp(std::uint64_t* guest_rsp)
     return -1;
 }
 
+extern "C" void executor_live_log_fiber_transition(
+    const char* operation, const char* phase, const std::int32_t result,
+    const void* subject, const void* current_fiber, const void* tcb_fiber,
+    const std::uint64_t guest_rip, const std::uint64_t guest_rsp,
+    const std::uint64_t guest_return) {
+    // GetSelf is the scheduler's normal outside-a-fiber probe and may execute thousands of
+    // times before the first useful transition.  Letting it consume this diagnostic budget hid
+    // the Run -> Return sequence that matters when a fiber context is lost.
+    if (operation != nullptr && std::strcmp(operation, "GetSelf") == 0) {
+        return;
+    }
+
+    static std::atomic_int budget{16384};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    const auto tid = static_cast<std::uint32_t>(syscall(SYS_gettid));
+    NativeLog(
+        ANDROID_LOG_INFO,
+        "[EXECUTOR_FIBER_TRANSITION] tid=%u op=%s phase=%s result=0x%08x subject=%p "
+        "current=%p tcbFiber=%p guestRip=%p guestRsp=%p guestReturn=%p",
+        tid, operation ? operation : "<unknown>", phase ? phase : "<unknown>",
+        static_cast<std::uint32_t>(result), subject, current_fiber, tcb_fiber,
+        reinterpret_cast<void*>(guest_rip), reinterpret_cast<void*>(guest_rsp),
+        reinterpret_cast<void*>(guest_return));
+
+    // Logcat is intentionally small on Android devices and a long title-screen load can rotate
+    // the decisive transition out before the failure is inspected.  Persist the same bounded
+    // diagnostic stream while the explicit fiber marker is enabled.
+    static std::mutex trace_mutex;
+    std::lock_guard trace_lock{trace_mutex};
+    if (std::FILE* trace = std::fopen(
+            "/data/data/app.lsx4.android/files/lsx4-home/fiber-transitions.txt", "a");
+        trace != nullptr) {
+        std::fprintf(
+            trace,
+            "tid=%u op=%s phase=%s result=0x%08x subject=%p current=%p tcbFiber=%p "
+            "guestRip=0x%llx guestRsp=0x%llx guestReturn=0x%llx\n",
+            tid, operation ? operation : "<unknown>", phase ? phase : "<unknown>",
+            static_cast<std::uint32_t>(result), subject, current_fiber, tcb_fiber,
+            static_cast<unsigned long long>(guest_rip),
+            static_cast<unsigned long long>(guest_rsp),
+            static_cast<unsigned long long>(guest_return));
+        if (result != 0) {
+            std::uint64_t guest_rbp = 0;
+            if (const auto* machine = Executor::Jit::FindActiveMachineImage();
+                machine != nullptr) {
+                guest_rbp = Executor::Jit::ReadGuestGpr64(
+                    *machine, Executor::Jit::LsxGpr::Rbp);
+            }
+            std::fprintf(trace, "  failureStack rbp=0x%llx",
+                         static_cast<unsigned long long>(guest_rbp));
+            std::lock_guard probe_lock{g_box64_boundary_probe_lock};
+            for (std::uint64_t offset = 0; offset != 0x100; offset += sizeof(std::uint64_t)) {
+                std::uint64_t value = 0;
+                const bool readable =
+                    GuestReadQwordCheckedLocked(guest_rsp + offset, value);
+                std::fprintf(trace, " sp%+03llx=%s0x%llx",
+                             static_cast<unsigned long long>(offset),
+                             readable ? "" : "?",
+                             static_cast<unsigned long long>(value));
+            }
+            std::fprintf(trace, "\n");
+        }
+        std::fclose(trace);
+    }
+}
+
 extern "C" void executor_live_dump_current_hle_context(const char* reason,
                                                        const std::uint64_t focus) {
     const auto tid = static_cast<std::uint32_t>(syscall(SYS_gettid));
@@ -6102,6 +6142,12 @@ enum class ExecutorHleFpAbi : std::uint8_t {
     VideoOutGamma,
 };
 
+enum class ExecutorHleStackAbi : std::uint8_t {
+    None = 0,
+    FiberInitialize,
+    FiberInitializeImpl,
+};
+
 bool HleNameMatchesAnyNid(const char* name,
                           const std::initializer_list<const char*> nids) {
     return std::any_of(nids.begin(), nids.end(), [&](const char* nid) {
@@ -6199,6 +6245,7 @@ struct ExecutorHleTargetMetadata {
     bool light_oracle_hle_flight_target = false;
     bool audio_out_target = false;
     ExecutorHleFpAbi fp_abi = ExecutorHleFpAbi::None;
+    ExecutorHleStackAbi stack_abi = ExecutorHleStackAbi::None;
     bool gl_uniform1f = false;
     bool gl_uniform2f = false;
     bool gl_uniform4f = false;
@@ -6280,6 +6327,15 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "sceAudioOutOutput", "QOQtbeDqsT4") ||
         SymbolNameContains(symbol_name, "sceAudioOutOutput");
     metadata.fp_abi = ClassifyLibcMathHleAbi(native_function, name);
+    if (HleNameMatches(name, "sceFiberInitialize", "hVYD7Ou2pCQ") ||
+        SymbolNameContains(symbol_name, "sceFiberInitializeE")) {
+        metadata.stack_abi = ExecutorHleStackAbi::FiberInitialize;
+    } else if (HleNameMatches(name, "_sceFiberInitializeWithInternalOptionImpl",
+                              "7+OJIpko9RY") ||
+               SymbolNameContains(symbol_name, "TraceFiberInitializeImpl") ||
+               SymbolNameContains(symbol_name, "sceFiberInitializeImpl")) {
+        metadata.stack_abi = ExecutorHleStackAbi::FiberInitializeImpl;
+    }
     metadata.gl_uniform1f = HleNameMatches(name, "glUniform1f", "POq8+5-inHY");
     metadata.gl_uniform2f = HleNameMatches(name, "glUniform2f", "e5HOpV5feq8");
     metadata.gl_uniform4f = HleNameMatches(name, "glUniform4f", "H8Dp8lwh8QQ");
@@ -6793,6 +6849,33 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         return raw;
     }
     case ExecutorHleFpAbi::None:
+        break;
+    }
+    switch (target_metadata.stack_abi) {
+    case ExecutorHleStackAbi::FiberInitialize: {
+        using Fn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t);
+        const auto opt_param = GuestStackArg(guest_rsp, 0);
+        const auto build_version = GuestStackArg(guest_rsp, 1);
+        const auto result = reinterpret_cast<Fn>(native_function)(
+            arg0, arg1, arg2, arg3, arg4, arg5, opt_param, build_version);
+        record_hle_return(result);
+        return result;
+    }
+    case ExecutorHleStackAbi::FiberInitializeImpl: {
+        using Fn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t, std::uint64_t);
+        const auto opt_param = GuestStackArg(guest_rsp, 0);
+        const auto flags = GuestStackArg(guest_rsp, 1);
+        const auto build_version = GuestStackArg(guest_rsp, 2);
+        const auto result = reinterpret_cast<Fn>(native_function)(
+            arg0, arg1, arg2, arg3, arg4, arg5, opt_param, flags, build_version);
+        record_hle_return(result);
+        return result;
+    }
+    case ExecutorHleStackAbi::None:
         break;
     }
     if (target_metadata.system_service_load_exec_target) {
@@ -7423,7 +7506,7 @@ extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
             std::uint64_t calls{};
         };
         static thread_local std::array<HotLeafHleEdge, 16> hot_edges{};
-        const auto* const guest_state = Executor::Jit::CurrentMachineImage();
+        const auto* const guest_state = Executor::Jit::FindActiveMachineImage();
         const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
         const std::size_t hot_index =
             static_cast<std::size_t>(((native_function >> 4) ^ (guest_rip >> 4)) &
@@ -9293,24 +9376,6 @@ static int ExecutorInstallMonoLibcStringFastpath(void* seg_host, std::size_t seg
     return (strlen_already && equal_already && aot_compare_already) ? 1 : 0;
 }
 
-// mono_aot_get_class_from_name has two independent cache walks.  The GHash walk below is already
-// bounded, but a GHash miss falls through to the AOT file's compact class_name_table.  Unity 4.6's
-// upstream loop trusts every uint16 `next` index and has no cycle check:
-//
-//   table_size = class_name_table[0]; table = class_name_table + 1;
-//   entry = &table[hash * 2];
-//   while (TRUE) { index=entry[0]; next=entry[1]; ...;
-//                  if (next) entry=&table[next * 2]; else break; }
-//
-// `table_size` is only the number of primary buckets.  The official AOT compiler appends collision
-// records after those buckets (`new_entry->index = table->len`), so next>=table_size is legal.  It
-// emits one class record per TypeDef row, which gives two reference-safe structural bounds without
-// needing the unstored final table length:
-//   * every valid next index is below table_size + TypeDef.rows;
-//   * a valid chain visits at most TypeDef.rows class records.
-// A normal next==0 remains on Mono's untouched TRUE/null path.  A guard violation instead unlocks
-// and returns FALSE so mono_class_from_name performs its normal metadata/name-cache fallback;
-// returning TRUE/null for corruption would silently lose System.Enum.
 enum class ExecutorMonoAotChainOutcome : std::uint8_t {
     Hit,
     Miss,
@@ -9419,7 +9484,7 @@ static bool ExecutorMonoAotChainPolicySelfTest() {
 static int ExecutorInstallMonoAotClassNameChainGuard(void* seg_host, std::size_t seg_size) {
     auto* bytes = static_cast<std::uint8_t*>(seg_host);
     if (!RuntimeGuestJitActive()) {
-        return 2;  // Backend A/reference path is intentionally untouched.
+        return 2;
     }
     if (!bytes || !ExecutorMonoSetupImtPool() || !ExecutorMonoAotChainPolicySelfTest()) {
         return -1;
@@ -10898,19 +10963,6 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_STACK_CANARY_PATCH] direct_got_stack_chk skipped branchPatch=0");
     }
-    // ROOT-CAUSE FIX (2026-06-15): this IMT trampoline "overflow" fix WAS the dominant black-screen
-    // crash. A/B proven: with it installed sig11=2 (RAX=0 byte-cmp in a generated 0x7f slab block, reached
-    // via IMT-builder->get_numerous_trampoline -> our alloc-patch's rax=0 sentinel + jmp slab); with it
-    // skipped sig11=0 and the game progresses to UnityGfxDeviceWorker/SceneObserver. The type-2 pool does
-    // NOT actually overflow in normal play, so this patch was a self-inflicted crash. DEFAULT-OFF now;
-    // opt back in only with the run-enable-imt-fix marker (debugging).
-    // RE-ENABLED 2026-06-15 (default-ON) with Codex's reference-correct overflow fix. ROOT CONFIRMED:
-    // the type-2 IMT pool (128) DOES overflow during mscorlib class setup -> mono fatally logs
-    // "Ran out of trampolines of type 2 ... (128)" and the loader thread exits(-1) -> Assembly-CSharp
-    // never loads -> scene never builds. The old crash was NOT "the fix is unnecessary"; it was the
-    // rax=0 sentinel below. The overflow branch now returns a VALID pre-gen IMT thunk (see CODEX FIX),
-    // honouring Mono's get_numerous_trampoline contract (return executable thunk, never 0). Disable for
-    // A/B with the run-no-imt-fix marker.
     if (std::fopen("/data/data/app.lsx4.android/files/run-no-imt-fix", "r")) {
         NativeLog(ANDROID_LOG_WARN, "[EXECUTOR_IMT_FIX] disabled by run-no-imt-fix marker");
         return -2;
@@ -13390,20 +13442,6 @@ extern "C" void executor_mono_vcall_entry_dump() {
                         (unsigned long long)this_ptr, (unsigned long long)r11, pre.c_str());
 }
 
-// Register JIT guest stacks/TLS as Boehm GC roots. Boehm scans the native AArch64 stacks (and
-// therefore the current JIT LsxMachineImage/register spill), but it cannot discover references
-// that exist only on the separate x86-64 guest stacks. Register only real guest stack/TLS ranges:
-// pinning the heap or disabling collection masks this boundary bug and eventually exhausts mspace.
-//
-// We append each tracked guest stack/TLS range to BDWGC's GC_static_roots[] directly (decoded from
-// the stripped sprx via the "Too many root sets" string -> GC_add_roots_inner @0x8032ae740):
-//   GC_static_roots base = 0x8033c02c8, entry stride 0x20 {r_start@0, r_end@8, r_next@0x10, r_tmp@0x18}
-//   GC_n_root_sets (dword) = 0x803398818  (MAX_ROOT_SETS = 0x400)
-//   GC_root_size  (qword)  = 0x803398808
-// Guest VA == host VA (1:1; GuestReadByteCheckedLocked deref proves it). Called from sceGnmSubmitDone
-// (has the mapped-entry read context + runs during the loading frames, before/while the scene builds).
-// Idempotent + gated by the run-gc-guest-roots marker. Writes the entry fields first, then bumps the
-// count last, so a concurrent GC mark sees only complete entries.
 extern "C" void executor_lsx4_register_guest_gc_roots() {
     const bool guest_roots_enabled = ExecutorGcGuestRootsEnabled();
     static const bool force_no_gc = std::filesystem::exists(
@@ -19976,7 +20014,7 @@ void ConfigureJitPersistentCacheForLaunch(
     const bool jit_launch, const std::filesystem::path& app0_path,
     const std::filesystem::path& executable_path) {
     if (!jit_launch) {
-        Executor::Jit::ConfigurePersistentBlockCache({}, {}, 0, false);
+        Executor::Jit::ConfigureTranslationStore({}, {}, 0, false);
         return;
     }
 
@@ -20001,7 +20039,7 @@ void ConfigureJitPersistentCacheForLaunch(
         : 0;
     const std::string cache_title =
         JitCacheTitleId(app0_path, executable_path, executable_fingerprint);
-    Executor::Jit::ConfigurePersistentBlockCache(
+    Executor::Jit::ConfigureTranslationStore(
         g_root, cache_title, executable_fingerprint,
         cache_enabled && executable_fingerprint != 0);
     const auto fingerprint_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -22776,7 +22814,7 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
         if (regs == nullptr || regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
             return -2;
         }
-        auto* state = Executor::Jit::CurrentMachineImage();
+        auto* state = Executor::Jit::FindActiveMachineImage();
         if (state == nullptr) {
             return -1;
         }
@@ -22792,6 +22830,7 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
 }
 
 extern "C" void executor_jit_dump_thread_states(const char* reason);
+extern "C" void executor_live_dump_kernel_sem_records(const char* reason);
 
 extern "C" __attribute__((visibility("default"), used)) void
 executor_lsx4_android_dump_box64_emu_states(const char* reason) {
@@ -23204,10 +23243,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto force_interpret_audio_sentinel =
         std::filesystem::path(g_root) / "run-force-interpret-audio";
     if (std::filesystem::exists(force_interpret_audio_sentinel)) {
-        // Keep the main/render path native.  Only the RSDK audio worker needs the reference
-        // semantics while the remaining native SIMD discrepancy is narrowed down; applying this
-        // address range process-wide used to destroy frame rate because Game:Main executes code
-        // from the same eboot range.
         setenv("EXECUTOR_FORCE_INTERPRET_LO", "0x8001e0000", 1);
         setenv("EXECUTOR_FORCE_INTERPRET_HI", "0x801700000", 1);
         const bool thread2_only = std::filesystem::exists(
@@ -23223,10 +23258,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   force_interpret_audio_sentinel.string().c_str(),
                   thread2_only ? "Thread2" : "all");
     }
-    // Generic, data-driven differential bisection. File format:
-    //   <inclusive-lo> <exclusive-hi> [guest-thread-name]
-    // Keeping the range outside the binary lets one isolate a native/reference divergence
-    // without adding title addresses or rebuilding between bisection steps.
     const auto force_interpret_range_sentinel =
         std::filesystem::path(g_root) / "diag-force-interpret-range";
     if (std::filesystem::exists(force_interpret_range_sentinel)) {
@@ -23253,6 +23284,112 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
             NativeLog(ANDROID_LOG_ERROR,
                       "[EXECUTOR_FORCE_INTERPRET_RANGE] invalid source=%s lo=%s hi=%s",
                       force_interpret_range_sentinel.string().c_str(), lo.c_str(), hi.c_str());
+        }
+    }
+    // Generic guest-store provenance probe. File format:
+    //   <inclusive-lo> <exclusive-hi>
+    //   [object-vtable field-offset [alternate-field-offset]]
+    // The JIT emits the probe only when this marker is present, so normal builds keep the exact
+    // production code shape and cost. This is intentionally address-data driven: diagnostic guest
+    // addresses never become title-specific constants in the runtime.
+    const auto store_watch_range_sentinel =
+        std::filesystem::path(g_root) / "diag-store-watch-range";
+    if (std::filesystem::exists(store_watch_range_sentinel)) {
+        std::ifstream range_file(store_watch_range_sentinel);
+        std::string lo;
+        std::string hi;
+        std::string object_vtable;
+        std::string field_offset;
+        std::string alternate_field_offset;
+        range_file >> lo >> hi >> object_vtable >> field_offset >> alternate_field_offset;
+        const std::uint64_t lo_value = std::strtoull(lo.c_str(), nullptr, 0);
+        const std::uint64_t hi_value = std::strtoull(hi.c_str(), nullptr, 0);
+        if (lo_value != 0 && hi_value > lo_value) {
+            setenv("EXECUTOR_DIAG_STORE_WATCH_LO", lo.c_str(), 1);
+            setenv("EXECUTOR_DIAG_STORE_WATCH_HI", hi.c_str(), 1);
+            if (!object_vtable.empty() && !field_offset.empty()) {
+                setenv("EXECUTOR_DIAG_STORE_WATCH_OBJECT_VTABLE", object_vtable.c_str(), 1);
+                setenv("EXECUTOR_DIAG_STORE_WATCH_FIELD_OFFSET", field_offset.c_str(), 1);
+                if (!alternate_field_offset.empty()) {
+                    setenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET",
+                           alternate_field_offset.c_str(), 1);
+                } else {
+                    unsetenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET");
+                }
+            } else {
+                unsetenv("EXECUTOR_DIAG_STORE_WATCH_OBJECT_VTABLE");
+                unsetenv("EXECUTOR_DIAG_STORE_WATCH_FIELD_OFFSET");
+                unsetenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET");
+            }
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_DIAG_STORE_WATCH_RANGE] source=%s lo=%s hi=%s "
+                      "objectVtable=%s fieldOffset=%s alternateFieldOffset=%s",
+                      store_watch_range_sentinel.string().c_str(), lo.c_str(), hi.c_str(),
+                      object_vtable.empty() ? "any" : object_vtable.c_str(),
+                      field_offset.empty() ? "any" : field_offset.c_str(),
+                      alternate_field_offset.empty() ? "none"
+                                                     : alternate_field_offset.c_str());
+        } else {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_DIAG_STORE_WATCH_RANGE] invalid source=%s lo=%s hi=%s",
+                      store_watch_range_sentinel.string().c_str(), lo.c_str(), hi.c_str());
+        }
+    }
+    // Generic dispatcher-boundary probe. Each line contains a guest block RIP followed by an
+    // optional expected return RIP (zero accepts any caller):
+    //   <guest-rip> <expected-return-rip>
+    // Keeping both values in an external marker makes the probe reusable without embedding title
+    // addresses in the runtime. Unlike a generated store watch, this observes restored native
+    // cache entries without changing their code shape.
+    const auto jit_rip_probe_sentinel =
+        std::filesystem::path(g_root) / "diag-jit-rip-probe";
+    if (std::filesystem::exists(jit_rip_probe_sentinel)) {
+        std::ifstream probe_file(jit_rip_probe_sentinel);
+        std::ostringstream probe_spec;
+        probe_spec << probe_file.rdbuf();
+        const std::string spec = probe_spec.str();
+        if (!spec.empty()) {
+            setenv("EXECUTOR_DIAG_JIT_RIP_PROBE", spec.c_str(), 1);
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_DIAG_JIT_RIP_PROBE] source=%s bytes=%zu",
+                      jit_rip_probe_sentinel.string().c_str(), spec.size());
+        } else {
+            unsetenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_DIAG_JIT_RIP_PROBE] empty source=%s",
+                      jit_rip_probe_sentinel.string().c_str());
+        }
+    } else {
+        unsetenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+    }
+    const auto fiber_transition_sentinel =
+        std::filesystem::path(g_root) / "diag-fiber-transitions";
+    if (std::filesystem::exists(fiber_transition_sentinel)) {
+        setenv("EXECUTOR_DIAG_FIBER_TRANSITIONS", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FIBER_TRANSITION] diagnostics=enabled source=%s",
+                  fiber_transition_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_DIAG_FIBER_TRANSITIONS");
+    }
+    const auto jit_live_watchdog_sentinel =
+        std::filesystem::path(g_root) / "diag-jit-live-watchdog";
+    if (std::filesystem::exists(jit_live_watchdog_sentinel)) {
+        static std::atomic_bool watchdog_started{false};
+        if (!watchdog_started.exchange(true, std::memory_order_acq_rel)) {
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_JIT_LIVE_WATCHDOG] source=%s intervalSec=5 enabled=1",
+                      jit_live_watchdog_sentinel.string().c_str());
+            std::thread([] {
+                for (std::uint64_t sequence = 1;; ++sequence) {
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    char reason[64]{};
+                    std::snprintf(reason, sizeof(reason), "diag-watchdog-%llu",
+                                  static_cast<unsigned long long>(sequence));
+                    executor_jit_dump_thread_states(reason);
+                    executor_live_dump_kernel_sem_records(reason);
+                }
+            }).detach();
         }
     }
     const auto skip_rasterizer_finish_sentinel =
@@ -23586,9 +23723,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto force_interpret_all_sentinel =
         std::filesystem::path(g_root) / "run-force-interpret-all";
     if (std::filesystem::exists(force_interpret_all_sentinel)) {
-        // Diagnostic: route the WHOLE eboot code range through the reference interpreter so EVERY
-        // guest store passes WriteMemoryBytes' host-image guard — captures the exact guest RIP of the
-        // native block that stores a garbage host address (STORE_INTO_HOST_IMAGE). Slow; capture-only.
         setenv("EXECUTOR_FORCE_INTERPRET_LO", "0x800000000", 1);
         setenv("EXECUTOR_FORCE_INTERPRET_HI", "0x810000000", 1);
         NativeLog(ANDROID_LOG_INFO,
@@ -23853,12 +23987,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                       "[EXECUTOR_BOX64_FAST] enabled=1 profile=fast bigblock=3 callret=1 "
                       "safeflags=0 fastround=1 fastnan=1 dirty=1 strongmem=%s log=0", sm);
         }
-        // Unity Mono normally relies on SIGSEGV-driven null checks. In the Android embedded-box64
-        // service that competes with box64/ART signal handling, so force Mono's portable explicit
-        // null-check path for live Unity bring-up. Keep thread suspension on the PC/reference
-        // preemptive path and deliver SIGUSR1 at HLE alertable wait safe points with the Orbis
-        // ucontext adapter. That preserves the native wait lifetime while still running Mono's
-        // real guest suspend handler instead of synthesizing the semaphore ACK.
         setenv("MONO_DEBUG", "explicit-null-checks", 1);
         unsetenv("MONO_THREADS_SUSPEND");
         if (std::filesystem::exists(light_oracle_sentinel)) {
@@ -24464,7 +24592,7 @@ extern "C" const char* executor_lsx4_runtime_status() {
 
 extern "C" const char* executor_lsx4_runtime_jit_status() {
     static std::string status;
-    status = Executor::Jit::LsxEngineStatusJson();
+    status = Executor::Jit::DescribeTranslationEngineJson();
     return status.c_str();
 }
 
@@ -24510,7 +24638,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
         return -1;
     }
 
-    const auto cpu = Executor::Jit::GetRuntimeStatsSnapshot();
+    const auto cpu = Executor::Jit::SnapshotTranslationTelemetry();
     const auto gpu = Libraries::GnmDriver::ExecutorGetGnmHudStats();
     values[0] = cpu.decoded_blocks;
     values[1] = cpu.native_blocks;
@@ -24522,7 +24650,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     values[7] = gpu.builder_shader;
     values[8] = gpu.submit_calls;
     values[9] = gpu.submit_done_calls;
-    values[10] = gpu.present_requests;
+    values[10] = Vulkan::ExecutorGetLivePresentCount();
     values[11] = cpu.persistent_ir_enabled;
     values[12] = cpu.persistent_ir_records_loaded;
     values[13] = cpu.persistent_ir_hits;
@@ -24535,7 +24663,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
 
 extern "C" const char* executor_lsx4_runtime_jit_selftest() {
     static std::string status;
-    status = Executor::Jit::LsxEngineSelfTestJson();
+    status = Executor::Jit::ExerciseTranslationEngineJson();
     const bool guest_range_ok = executor_jit_guest_range_selftest() != 0;
     if (!status.empty() && status.back() == '}') {
         status.pop_back();
@@ -25514,7 +25642,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     << R"("tlsImageSize":)" << request.tls_image_size << ","
                     << R"("tcbBase":")" << Hex64(request.tcb_base) << R"(",)"
                     << R"("segmentCount":)" << request.segment_count << ","
-                    << R"("next_step":"JIT is executing the loaded module entry through the reconstructed AArch64 JIT route")"
+                    << R"("next_step":"JIT is executing the loaded module entry through the native AArch64 JIT route")"
                     << "}";
             g_box64_mapped_entry_info = running.str();
             g_status = std::string(
@@ -25533,14 +25661,6 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     if (primary_guest_thread != nullptr) {
                         Libraries::Kernel::g_curthread = primary_guest_thread;
                         Common::SetCurrentThreadName(primary_guest_thread->name.c_str());
-                        // The primary guest Pthread is allocated while the mapped-entry request is
-                        // prepared, but JIT executes it on this dedicated native worker.  A
-                        // normal guest pthread binds NativeThread from RunThread(); the primary
-                        // path previously skipped that step, leaving GetHandle()==0.  Mono could
-                        // then enumerate Game:Main for stop-the-world, but pthread_kill(0, SIGUSR1)
-                        // never delivered its suspend handler and the initiator waited forever for
-                        // the missing ACK.  Bind the Pthread to the worker that actually owns its
-                        // JIT guest state, matching the reference's 1:1 native thread model.
                         primary_guest_thread->native_thr.Initialize();
                         // std::thread inherits the creator's host signal mask.  The Android launch
                         // thread has SIGURG blocked, so Mono's suspend signal was successfully
@@ -25584,7 +25704,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     // false mapped-entry completion.
                     ctx.allow_guest_return_sentinel = 1;
                     const std::uint64_t guest_result =
-                        Executor::Jit::RunArm64Translation(request.entry, ctx);
+                        Executor::Jit::DispatchGuestOnArm64(request.entry, ctx);
                     result = static_cast<int>(guest_result);
                 } catch (const std::exception& e) {
                     exception_text = e.what();

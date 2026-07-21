@@ -49,4 +49,12 @@
     <string name="game_hold_release_unsupported">Отпустите: отметить неподдерживаемой</string>
     <string name="game_hold_release_supported">Отпустите: отметить поддерживаемой</string>
     <string name="game_hold_elapsed">%1$.1f / 8.0 с · %2$s</string>
+    <string name="game_menu_title">Быстрые настройки</string>
+    <string name="game_menu_hint">Смахните вправо или нажмите вне панели, чтобы закрыть</string>
+    <string name="game_menu_open">Открыть быстрые настройки</string>
+    <string name="game_menu_close">Закрыть быстрые настройки</string>
+    <string name="game_menu_overlay">Экранное управление</string>
+    <string name="game_menu_opacity">Прозрачность управления</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Выйти к списку игр</string>
 </resources>

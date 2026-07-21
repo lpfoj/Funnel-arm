@@ -230,6 +230,7 @@ const char* ResourceManifestClass(std::string_view path) {
         {".bnd.dcx", "archive"}, {".bhd", "archive-index"},
         {".bdt", "archive-data"}, {".psarc", "archive"},
         {".pak", "archive"},    {".cpk", "archive"},
+        {".dat", "archive-data"},
     };
     for (const auto& pattern : kPatterns) {
         if (lower.find(pattern.needle) != std::string::npos) {
@@ -319,6 +320,12 @@ void NoteResourceManifestRead(s32 fd, const char* op, u64 request, s64 range_off
     std::string path;
     const char* resource_class = "resource";
     bool emit_first_read = false;
+    bool emit_detailed_read = false;
+    u64 calls = 0;
+    u64 returned = 0;
+    u64 file_size = 0;
+    u64 short_reads = 0;
+    u64 errors = 0;
     {
         std::scoped_lock lock{ResourceManifestMutex()};
         const auto it = ResourceManifestFiles().find(fd);
@@ -349,6 +356,24 @@ void NoteResourceManifestRead(s32 fd, const char* op, u64 request, s64 range_off
             path = state.path;
             resource_class = state.resource_class;
         }
+        // A large opaque container can hold an entire streamed level while exposing no useful
+        // filename at the inner-resource boundary. With the explicit manifest marker enabled,
+        // retain a bounded per-read chronology so short/out-of-order completion can be separated
+        // from a parser or publication bug. This is resource-family based and title agnostic.
+        static std::atomic_int detailed_read_budget{4096};
+        if (state.resource_class == std::string_view{"archive-data"} &&
+            state.file_size >= (64ull << 20) &&
+            detailed_read_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            emit_detailed_read = true;
+            id = state.id;
+            path = state.path;
+            resource_class = state.resource_class;
+            calls = state.calls;
+            returned = state.returned;
+            file_size = state.file_size;
+            short_reads = state.short_reads;
+            errors = state.errors;
+        }
     }
 
     if (emit_first_read) {
@@ -359,7 +384,20 @@ void NoteResourceManifestRead(s32 fd, const char* op, u64 request, s64 range_off
                      static_cast<unsigned long long>(id), fd, resource_class, op,
                      static_cast<long long>(prefix_offset),
                      static_cast<unsigned long long>(request), static_cast<long long>(result),
-                     prefix, path.c_str(), CurrentLiveThreadName());
+                      prefix, path.c_str(), CurrentLiveThreadName());
+    }
+    if (emit_detailed_read) {
+        AndroidFsLog("[EXECUTOR_RESOURCE_READ] id=%llu fd=%d class=%s op=%s call=%llu "
+                     "offset=%lld request=%llu result=%lld returned=%llu size=%llu short=%llu "
+                     "errors=%llu thread=%s path=%s",
+                     static_cast<unsigned long long>(id), fd, resource_class, op,
+                     static_cast<unsigned long long>(calls), static_cast<long long>(range_offset),
+                     static_cast<unsigned long long>(request), static_cast<long long>(result),
+                     static_cast<unsigned long long>(returned),
+                     static_cast<unsigned long long>(file_size),
+                     static_cast<unsigned long long>(short_reads),
+                     static_cast<unsigned long long>(errors), CurrentLiveThreadName(),
+                     path.c_str());
     }
 }
 

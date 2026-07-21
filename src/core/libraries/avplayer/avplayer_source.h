@@ -182,6 +182,7 @@ private:
     void DemuxerThread(std::stop_token stop);
     void VideoDecoderThread(std::stop_token stop);
     void AudioDecoderThread(std::stop_token stop);
+    bool RewindDemuxer();
 
     bool HasRunningThreads() const;
 

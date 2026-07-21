@@ -625,6 +625,43 @@ void AvPlayerSource::ReleaseAVFormatContext(AVFormatContext* context) {
     }
 }
 
+bool AvPlayerSource::RewindDemuxer() {
+    if (m_avformat_context == nullptr) {
+        return false;
+    }
+
+    // Seek the whole presentation once. Seeking the selected audio and video
+    // streams independently can leave the demuxer's shared cursor at EOF after
+    // the second operation.
+    int result =
+        avformat_seek_file(m_avformat_context.get(), -1, std::numeric_limits<s64>::min(), 0,
+                           std::numeric_limits<s64>::max(), AVSEEK_FLAG_BACKWARD);
+
+    // Replacement-file streams are backed by a positional callback. Some
+    // demuxers cannot translate a timestamp seek for that AVIO source, while a
+    // byte rewind is still exact. Reset both the replacement cursor and
+    // FFmpeg's buffered view before retrying.
+    if (result < 0 && m_avformat_context->pb != nullptr) {
+        if (m_up_data_streamer != nullptr) {
+            m_up_data_streamer->Reset();
+        }
+        result = static_cast<int>(avio_seek(m_avformat_context->pb, 0, SEEK_SET));
+    }
+
+    if (result < 0) {
+        LOG_ERROR(Lib_AvPlayer, "Could not rewind looping source: error = {}",
+                  av_err2str(result));
+        return false;
+    }
+
+    avformat_flush(m_avformat_context.get());
+    if (m_avformat_context->pb != nullptr) {
+        m_avformat_context->pb->eof_reached = 0;
+        m_avformat_context->pb->error = 0;
+    }
+    return true;
+}
+
 void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvDemuxer");
@@ -635,6 +672,7 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
     }
     LOG_INFO(Lib_AvPlayer, "Demuxer Thread started");
 
+    bool awaiting_packet_after_rewind = false;
     while (!stop.stop_requested()) {
         if (m_video_packets.Size() > 30 &&
             (!m_audio_stream_index.has_value() || m_audio_packets.Size() > 8)) {
@@ -646,21 +684,20 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
         if (res < 0) {
             if (res == AVERROR_EOF) {
                 if (m_is_looping) {
+                    // A seek API can report success even when a custom source
+                    // remains at EOF. Never enqueue another guest warning until
+                    // at least one packet proves that the rewind took effect.
+                    if (awaiting_packet_after_rewind) {
+                        LOG_ERROR(Lib_AvPlayer,
+                                  "Looping source remained at EOF after a successful rewind.");
+                        break;
+                    }
                     LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Looping the source...");
+                    if (!RewindDemuxer()) {
+                        break;
+                    }
+                    awaiting_packet_after_rewind = true;
                     m_state.OnWarning(ORBIS_AVPLAYER_ERROR_WAR_LOOPING_BACK);
-                    avio_seek(m_avformat_context->pb, 0, SEEK_SET);
-                    if (m_video_stream_index.has_value()) {
-                        const auto index = m_video_stream_index.value();
-                        const auto stream = m_avformat_context->streams[index];
-                        avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
-                                           0);
-                    }
-                    if (m_audio_stream_index.has_value()) {
-                        const auto index = m_audio_stream_index.value();
-                        const auto stream = m_avformat_context->streams[index];
-                        avformat_seek_file(m_avformat_context.get(), index, 0, 0, stream->duration,
-                                           0);
-                    }
                     continue;
                 } else {
                     LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Exiting.");
@@ -673,6 +710,7 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
             }
             break;
         }
+        awaiting_packet_after_rewind = false;
         if (up_packet->stream_index == m_video_stream_index) {
             m_video_packets.Push(std::move(up_packet));
             m_video_packets_cv.Notify();

@@ -1172,8 +1172,19 @@ add_library(lsx4_executor_android SHARED
     src/executor/jit/lsx_translation_engine.cpp
     src/executor/jit/jit_ir_cache.cpp
     src/executor/jit/machine_code_lens.cpp
+    src/executor/jit/native_vector_plan.cpp
+    src/executor/jit/vector_semantic_kernel.cpp
     src/executor/runtime_death_catcher.cpp
 )
+
+# The translation unit exposes many indirect helper targets to generated AArch64. Give every
+# function entry in that unit a BTI landing pad, including inline Xbyak allocator methods emitted
+# into the object. Besides hardening indirect dispatch, this prevents generic two-instruction
+# capability getters from sharing an unguarded machine body with unrelated external runtimes.
+if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set_source_files_properties(src/executor/jit/lsx_translation_engine.cpp PROPERTIES
+        COMPILE_OPTIONS "-mbranch-protection=bti")
+endif()
 
 # Persistent JIT native blocks contain generated AArch64, so their compatibility key must
 # follow the lowering ABI rather than the build-id of the whole shadps4 shared object.  Hash every
@@ -1239,6 +1250,26 @@ set_target_properties(lsx4_executor_android PROPERTIES
     OUTPUT_NAME lsx4_executor_android
 )
 
+# The runtime bridge discovers the stable C surface through dlsym. Keep implementation details,
+# third-party static-library symbols and C++ JIT helpers local to the shared object so the internal
+# execution ABI can evolve without becoming an accidental Android ABI.
+set(LSX4_EXECUTOR_ANDROID_EXPORT_MAP
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/lsx4_executor_android.map")
+target_link_options(lsx4_executor_android PRIVATE
+    "LINKER:--version-script=${LSX4_EXECUTOR_ANDROID_EXPORT_MAP}")
+set_property(TARGET lsx4_executor_android APPEND PROPERTY
+    LINK_DEPENDS "${LSX4_EXECUTOR_ANDROID_EXPORT_MAP}")
+
+# Android packages do not need the static symbol table or DWARF payload. Keeping only the
+# dynamic surface also prevents private implementation names from becoming part of shipped
+# artifacts while leaving code, relocations and the stable dlsym ABI untouched.
+if(CMAKE_STRIP AND CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+    add_custom_command(TARGET lsx4_executor_android POST_BUILD
+        COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:lsx4_executor_android>"
+        COMMENT "Stripping private symbols from liblsx4_executor_android.so"
+        VERBATIM)
+endif()
+
 create_target_directory_groups(lsx4_executor_android)
 add_dependencies(lsx4_executor_android lsx_iced_decoder_build)
 
@@ -1260,7 +1291,7 @@ if(TARGET xbyak_aarch64::xbyak_aarch64)
     target_link_libraries(lsx4_executor_android PRIVATE xbyak_aarch64::xbyak_aarch64)
 endif()
 if(ANDROID)
-    target_link_libraries(lsx4_executor_android PRIVATE android aaudio dl log EGL GLESv3)
+    target_link_libraries(lsx4_executor_android PRIVATE android aaudio mediandk dl log EGL GLESv3)
     target_link_options(lsx4_executor_android PRIVATE
         -Wl,--wrap=exit
         -Wl,--wrap=_exit

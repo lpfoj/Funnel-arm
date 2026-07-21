@@ -338,7 +338,7 @@ private:
 
 [[nodiscard]] bool ValidNativeRelocationKind(const JitNativeRelocationKind kind) noexcept {
     return static_cast<std::uint8_t>(kind) <=
-           static_cast<std::uint8_t>(JitNativeRelocationKind::PolymorphicChainSite);
+           static_cast<std::uint8_t>(JitNativeRelocationKind::IndirectEdgeFanout);
 }
 
 [[nodiscard]] std::uint32_t ReadLittleEndianU32(const std::uint8_t* bytes) noexcept {
@@ -435,7 +435,7 @@ private:
                 return false;
             }
             if (!ValidPointerMaterializationSequence(segment, relocation)) {
-                error = "cached native relocation does not reference fixed MOVZ/MOVK sequence";
+                error = "cached native relocation lacks a fixed MOVZ/MOVK sequence";
                 return false;
             }
             switch (relocation.kind) {
@@ -460,9 +460,9 @@ private:
             case JitNativeRelocationKind::ModuleRelative:
             case JitNativeRelocationKind::BackendRelative:
                 break;
-            case JitNativeRelocationKind::ChainPatchCell:
+            case JitNativeRelocationKind::OutboundEdgeState:
                 if (relocation.target_index > 1) {
-                    error = "cached direct-link relocation edge out of bounds";
+                    error = "cached outbound-edge relocation index out of bounds";
                     return false;
                 }
                 break;
@@ -472,9 +472,9 @@ private:
                     return false;
                 }
                 break;
-            case JitNativeRelocationKind::PolymorphicChainSite:
+            case JitNativeRelocationKind::IndirectEdgeFanout:
                 if (relocation.target_index != 0 || relocation.addend != 0) {
-                    error = "invalid cached indirect-link-site relocation";
+                    error = "invalid cached indirect-fanout relocation";
                     return false;
                 }
                 break;
@@ -595,7 +595,7 @@ void WriteInstruction(ByteWriter& writer, const LsxDecodedOp& instruction) {
     std::uint8_t flags = 0;
     flags |= instruction.can_execute_vector ? kInstructionFlagCanExecuteVector : 0;
     flags |= instruction.can_execute_scalar_float ? kInstructionFlagCanExecuteScalarFloat : 0;
-    flags |= instruction.can_jit_initial ? kInstructionFlagCanJitInitial : 0;
+    flags |= instruction.eligible_for_initial_native ? kInstructionFlagCanJitInitial : 0;
     flags |= instruction.terminates_block ? kInstructionFlagTerminatesBlock : 0;
     writer.U8(flags);
     writer.U8(instruction.operand_count);
@@ -748,7 +748,7 @@ void WriteNativeRelocation(ByteWriter& writer,
     instruction.category = static_cast<LsxOpClass>(category);
     instruction.can_execute_vector = (flags & kInstructionFlagCanExecuteVector) != 0;
     instruction.can_execute_scalar_float = (flags & kInstructionFlagCanExecuteScalarFloat) != 0;
-    instruction.can_jit_initial = (flags & kInstructionFlagCanJitInitial) != 0;
+    instruction.eligible_for_initial_native = (flags & kInstructionFlagCanJitInitial) != 0;
     instruction.terminates_block = (flags & kInstructionFlagTerminatesBlock) != 0;
     instruction.decoded.attributes = decoded_attributes;
 
@@ -767,14 +767,14 @@ void WriteNativeRelocation(ByteWriter& writer,
 
     // These fields are compiler products, not decoded guest facts.  Keep their serialized bytes
     // only for format compatibility/strict validation, then discard them fail-closed.  The
-    // current JIT production classifiers reconstruct them before a loaded block can be
+    // current JIT production classifiers regenerate them before a loaded block can be
     // lowered or published.
     instruction.attributes = 0;
     instruction.category = LsxOpClass::Unsupported;
     instruction.can_execute_vector = false;
     instruction.can_execute_scalar_float = false;
     instruction.can_execute_x87 = false;
-    instruction.can_jit_initial = false;
+    instruction.eligible_for_initial_native = false;
     instruction.terminates_block = false;
     return true;
 }
@@ -788,8 +788,8 @@ void WriteNativeRelocation(ByteWriter& writer,
     ByteWriter body{limits.max_file_bytes};
     body.U16(kRecordSchemaVersion);
     std::uint16_t flags = 0;
-    flags |= record.block.can_jit_initial ? kBlockFlagCanJitInitial : 0;
-    flags |= record.block.decode_failed ? kBlockFlagDecodeFailed : 0;
+    flags |= record.block.SupportsInitialNativeTier() ? kBlockFlagCanJitInitial : 0;
+    flags |= record.block.HasDecodeFailure() ? kBlockFlagDecodeFailed : 0;
     body.U16(flags);
     body.U64(record.guest_rip);
     body.U64(record.guest_hash);
@@ -876,10 +876,12 @@ void WriteNativeRelocation(ByteWriter& writer,
         error = "truncated cache diagnostic";
         return false;
     }
-    // can_jit_initial is derived from current instruction capabilities.  Deserialize it only as
+    // Initial-tier eligibility is derived from current instruction capabilities. Deserialize it only as
     // a known schema bit, then leave the block fail-closed until production canonicalization.
-    record.block.can_jit_initial = false;
-    record.block.decode_failed = (flags & kBlockFlagDecodeFailed) != 0;
+    record.block.SelectInitialNativeTier(false);
+    if ((flags & kBlockFlagDecodeFailed) != 0) {
+        record.block.RejectDecode();
+    }
     if (diagnostic.empty()) {
         record.block.diagnostic.clear();
     } else {

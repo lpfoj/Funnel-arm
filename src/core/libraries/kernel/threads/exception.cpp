@@ -454,7 +454,7 @@ static void RecordJitSignalProbeEntry(const s32 orbis_signal,
         !ExecutorJitSignalParityActive()) {
         return;
     }
-    auto* state = Executor::Jit::CurrentMachineImage();
+    auto* state = Executor::Jit::FindActiveMachineImage();
     const auto next_sequence =
         g_jit_signal_probe_sequence.load(std::memory_order_relaxed) + 1;
     g_jit_signal_probe_linux_tid.store(CurrentKernelTidForSignalTrace(),
@@ -536,14 +536,14 @@ static void TraceLiveSignal(const char* stage, s32 orbis_sig, s32 native_sig,
     if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
         return;
     }
-    const auto* guest_state = Executor::Jit::CurrentMachineImage();
+    const auto* guest_state = Executor::Jit::FindActiveMachineImage();
     const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
     const std::uint64_t guest_rsp = guest_state != nullptr
-                                        ? Executor::Jit::GetGpr64(
+                                        ? Executor::Jit::ReadGuestGpr64(
                                               *guest_state, Executor::Jit::LsxGpr::Rsp)
                                         : 0;
     const auto guest_gpr = [guest_state](const Executor::Jit::LsxGpr reg) {
-        return guest_state != nullptr ? Executor::Jit::GetGpr64(*guest_state, reg) : 0;
+        return guest_state != nullptr ? Executor::Jit::ReadGuestGpr64(*guest_state, reg) : 0;
     };
     const std::uint64_t guest_rdi = guest_gpr(Executor::Jit::LsxGpr::Rdi);
     const std::uint64_t guest_rsi = guest_gpr(Executor::Jit::LsxGpr::Rsi);
@@ -661,28 +661,28 @@ static void TraceLightOracleThreadSnapshot(const char* reason, PthreadT target, 
 }
 
 static bool CaptureJitGuestUcontext(Ucontext& ctx) {
-    const auto* state = Executor::Jit::CurrentMachineImage();
+    const auto* state = Executor::Jit::FindActiveMachineImage();
     if (state == nullptr) {
         return false;
     }
-    using Executor::Jit::GetGpr64;
+    using Executor::Jit::ReadGuestGpr64;
     using Executor::Jit::LsxGpr;
-    ctx.uc_mcontext.mc_rax = GetGpr64(*state, LsxGpr::Rax);
-    ctx.uc_mcontext.mc_rcx = GetGpr64(*state, LsxGpr::Rcx);
-    ctx.uc_mcontext.mc_rdx = GetGpr64(*state, LsxGpr::Rdx);
-    ctx.uc_mcontext.mc_rbx = GetGpr64(*state, LsxGpr::Rbx);
-    ctx.uc_mcontext.mc_rsp = GetGpr64(*state, LsxGpr::Rsp);
-    ctx.uc_mcontext.mc_rbp = GetGpr64(*state, LsxGpr::Rbp);
-    ctx.uc_mcontext.mc_rsi = GetGpr64(*state, LsxGpr::Rsi);
-    ctx.uc_mcontext.mc_rdi = GetGpr64(*state, LsxGpr::Rdi);
-    ctx.uc_mcontext.mc_r8 = GetGpr64(*state, LsxGpr::R8);
-    ctx.uc_mcontext.mc_r9 = GetGpr64(*state, LsxGpr::R9);
-    ctx.uc_mcontext.mc_r10 = GetGpr64(*state, LsxGpr::R10);
-    ctx.uc_mcontext.mc_r11 = GetGpr64(*state, LsxGpr::R11);
-    ctx.uc_mcontext.mc_r12 = GetGpr64(*state, LsxGpr::R12);
-    ctx.uc_mcontext.mc_r13 = GetGpr64(*state, LsxGpr::R13);
-    ctx.uc_mcontext.mc_r14 = GetGpr64(*state, LsxGpr::R14);
-    ctx.uc_mcontext.mc_r15 = GetGpr64(*state, LsxGpr::R15);
+    ctx.uc_mcontext.mc_rax = ReadGuestGpr64(*state, LsxGpr::Rax);
+    ctx.uc_mcontext.mc_rcx = ReadGuestGpr64(*state, LsxGpr::Rcx);
+    ctx.uc_mcontext.mc_rdx = ReadGuestGpr64(*state, LsxGpr::Rdx);
+    ctx.uc_mcontext.mc_rbx = ReadGuestGpr64(*state, LsxGpr::Rbx);
+    ctx.uc_mcontext.mc_rsp = ReadGuestGpr64(*state, LsxGpr::Rsp);
+    ctx.uc_mcontext.mc_rbp = ReadGuestGpr64(*state, LsxGpr::Rbp);
+    ctx.uc_mcontext.mc_rsi = ReadGuestGpr64(*state, LsxGpr::Rsi);
+    ctx.uc_mcontext.mc_rdi = ReadGuestGpr64(*state, LsxGpr::Rdi);
+    ctx.uc_mcontext.mc_r8 = ReadGuestGpr64(*state, LsxGpr::R8);
+    ctx.uc_mcontext.mc_r9 = ReadGuestGpr64(*state, LsxGpr::R9);
+    ctx.uc_mcontext.mc_r10 = ReadGuestGpr64(*state, LsxGpr::R10);
+    ctx.uc_mcontext.mc_r11 = ReadGuestGpr64(*state, LsxGpr::R11);
+    ctx.uc_mcontext.mc_r12 = ReadGuestGpr64(*state, LsxGpr::R12);
+    ctx.uc_mcontext.mc_r13 = ReadGuestGpr64(*state, LsxGpr::R13);
+    ctx.uc_mcontext.mc_r14 = ReadGuestGpr64(*state, LsxGpr::R14);
+    ctx.uc_mcontext.mc_r15 = ReadGuestGpr64(*state, LsxGpr::R15);
     ctx.uc_mcontext.mc_rip = state->rip_or_exit;
     ctx.uc_mcontext.mc_rflags = state->rflags;
     ctx.uc_mcontext.mc_fs = static_cast<u16>(state->fs_base & 0xffffu);
@@ -736,30 +736,30 @@ static bool ApplyGuestUcontextToBackend(s32 orbis_sig, s32 native_sig,
                                         OrbisKernelExceptionHandler handler,
                                         const Ucontext& ctx, void* fault_addr) {
     if (ExecutorJitSignalParityActive()) {
-        auto* state = Executor::Jit::CurrentMachineImage();
+        auto* state = Executor::Jit::FindActiveMachineImage();
         if (state == nullptr) {
             TraceLiveSignal("handler_guest_ucontext_apply_no_state", orbis_sig, native_sig,
                             handler, nullptr, -1, 0, fault_addr);
             return false;
         }
-        using Executor::Jit::SetGpr64;
+        using Executor::Jit::WriteGuestGpr64;
         using Executor::Jit::LsxGpr;
-        SetGpr64(*state, LsxGpr::Rax, ctx.uc_mcontext.mc_rax);
-        SetGpr64(*state, LsxGpr::Rcx, ctx.uc_mcontext.mc_rcx);
-        SetGpr64(*state, LsxGpr::Rdx, ctx.uc_mcontext.mc_rdx);
-        SetGpr64(*state, LsxGpr::Rbx, ctx.uc_mcontext.mc_rbx);
-        SetGpr64(*state, LsxGpr::Rsp, ctx.uc_mcontext.mc_rsp);
-        SetGpr64(*state, LsxGpr::Rbp, ctx.uc_mcontext.mc_rbp);
-        SetGpr64(*state, LsxGpr::Rsi, ctx.uc_mcontext.mc_rsi);
-        SetGpr64(*state, LsxGpr::Rdi, ctx.uc_mcontext.mc_rdi);
-        SetGpr64(*state, LsxGpr::R8, ctx.uc_mcontext.mc_r8);
-        SetGpr64(*state, LsxGpr::R9, ctx.uc_mcontext.mc_r9);
-        SetGpr64(*state, LsxGpr::R10, ctx.uc_mcontext.mc_r10);
-        SetGpr64(*state, LsxGpr::R11, ctx.uc_mcontext.mc_r11);
-        SetGpr64(*state, LsxGpr::R12, ctx.uc_mcontext.mc_r12);
-        SetGpr64(*state, LsxGpr::R13, ctx.uc_mcontext.mc_r13);
-        SetGpr64(*state, LsxGpr::R14, ctx.uc_mcontext.mc_r14);
-        SetGpr64(*state, LsxGpr::R15, ctx.uc_mcontext.mc_r15);
+        WriteGuestGpr64(*state, LsxGpr::Rax, ctx.uc_mcontext.mc_rax);
+        WriteGuestGpr64(*state, LsxGpr::Rcx, ctx.uc_mcontext.mc_rcx);
+        WriteGuestGpr64(*state, LsxGpr::Rdx, ctx.uc_mcontext.mc_rdx);
+        WriteGuestGpr64(*state, LsxGpr::Rbx, ctx.uc_mcontext.mc_rbx);
+        WriteGuestGpr64(*state, LsxGpr::Rsp, ctx.uc_mcontext.mc_rsp);
+        WriteGuestGpr64(*state, LsxGpr::Rbp, ctx.uc_mcontext.mc_rbp);
+        WriteGuestGpr64(*state, LsxGpr::Rsi, ctx.uc_mcontext.mc_rsi);
+        WriteGuestGpr64(*state, LsxGpr::Rdi, ctx.uc_mcontext.mc_rdi);
+        WriteGuestGpr64(*state, LsxGpr::R8, ctx.uc_mcontext.mc_r8);
+        WriteGuestGpr64(*state, LsxGpr::R9, ctx.uc_mcontext.mc_r9);
+        WriteGuestGpr64(*state, LsxGpr::R10, ctx.uc_mcontext.mc_r10);
+        WriteGuestGpr64(*state, LsxGpr::R11, ctx.uc_mcontext.mc_r11);
+        WriteGuestGpr64(*state, LsxGpr::R12, ctx.uc_mcontext.mc_r12);
+        WriteGuestGpr64(*state, LsxGpr::R13, ctx.uc_mcontext.mc_r13);
+        WriteGuestGpr64(*state, LsxGpr::R14, ctx.uc_mcontext.mc_r14);
+        WriteGuestGpr64(*state, LsxGpr::R15, ctx.uc_mcontext.mc_r15);
         state->rip_or_exit = ctx.uc_mcontext.mc_rip;
         state->rflags = ctx.uc_mcontext.mc_rflags;
         state->fs_base = ctx.uc_mcontext.mc_fsbase != 0 ? ctx.uc_mcontext.mc_fsbase

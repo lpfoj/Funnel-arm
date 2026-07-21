@@ -992,7 +992,7 @@ void Liverpool::RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& st
     {
         std::scoped_lock lock{executor_pending_completion_mutex};
         ++executor_pending_completion_writes[ExecutorPendingCompletionWrite{
-            address, gpu_tick, num_bytes}];
+            address, value, gpu_tick, num_bytes, engine}];
         const VAddr first_page = Common::AlignDown(address, PageSize);
         const VAddr last_page = Common::AlignDown(address + num_bytes - 1, PageSize);
         for (VAddr page = first_page;; page += PageSize) {
@@ -1012,7 +1012,8 @@ void Liverpool::RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& st
     }
 }
 
-void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u32 num_bytes,
+void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u64 value,
+                                                          Pm4Engine engine, u32 num_bytes,
                                                           u64 gpu_tick) {
     if (!ExecutorEopWaitBatchingV2() || address == 0 || gpu_tick == 0) {
         return;
@@ -1021,7 +1022,7 @@ void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u32 num
     std::vector<VAddr> pages_to_untrack;
     {
         std::scoped_lock lock{executor_pending_completion_mutex};
-        const ExecutorPendingCompletionWrite key{address, gpu_tick, num_bytes};
+        const ExecutorPendingCompletionWrite key{address, value, gpu_tick, num_bytes, engine};
         const auto it = executor_pending_completion_writes.find(key);
         if (it != executor_pending_completion_writes.end()) {
             const u32 completed_refs = it->second;
@@ -1054,7 +1055,7 @@ void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u32 num
 
 u64 Liverpool::ConsumeCompletionWaitForExecutor(const Pm4SubmissionStatePtr& state,
                                                  Pm4Engine engine,
-                                                 const PM4CmdWaitRegMem& wait) const {
+                                                 const PM4CmdWaitRegMem& wait) {
     if (!ExecutorEopWaitBatchingV2() || !state ||
         wait.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
         return 0;
@@ -1071,7 +1072,28 @@ u64 Liverpool::ConsumeCompletionWaitForExecutor(const Pm4SubmissionStatePtr& sta
             return tick;
         }
     }
-    return 0;
+
+    // A producer and its WAIT frequently arrive as separate guest submissions and therefore own
+    // different Pm4SubmissionState objects. The page-protection registry already carries those
+    // still-pending completion writes globally; consult it before degrading a cross-submit pair to
+    // a host flush/readback. Choose the newest matching tick so later queued writes cannot be
+    // observed out of order. Retirement remains the sole owner of global-entry removal because
+    // more than one consumer can legally wait on the same completion value.
+    u64 dependency_tick = 0;
+    {
+        std::scoped_lock lock{executor_pending_completion_mutex};
+        const ExecutorPendingCompletionWrite first{
+            address, 0, 0, 0, Pm4Engine::Graphics};
+        for (auto it = executor_pending_completion_writes.lower_bound(first);
+             it != executor_pending_completion_writes.end() && it->first.address == address;
+             ++it) {
+            const auto& pending = it->first;
+            if (TestWaitRegMemValue(wait, static_cast<u32>(pending.value))) {
+                dependency_tick = std::max(dependency_tick, pending.gpu_tick);
+            }
+        }
+    }
+    return dependency_tick;
 }
 
 bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(const PM4CmdWaitRegMem& wait,
@@ -1090,13 +1112,12 @@ bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(const PM4CmdWaitRegMem
     // deadlock: the front Liverpool submission waits, while every later submission remains behind
     // it on the same guest queue.
     //
+    const bool gpu_modified = rasterizer->IsMemoryGpuModified(address, sizeof(value));
     // Logical EOP->WAIT pairs have already returned from ConsumeCompletionWaitForExecutor above, so
-    // this is the correctness boundary for the remaining, genuine dependencies. Flush once before
-    // the caller enters its yield loop. If BufferCache owns newer device bytes, perform the precise
-    // readback as well; that wait is required by the guest packet and does not add serialization to
-    // independent or logically folded waits.
+    // this is the correctness boundary for the remaining genuine dependencies. Publish the work
+    // before parking the guest queue. The queue is woken only after its exact memory predicate passes.
     FlushGpuCompletionBatchForExecutor(true, true);
-    if (rasterizer->IsMemoryGpuModified(address, sizeof(value))) {
+    if (gpu_modified) {
         rasterizer->ReadMemory(address, sizeof(value));
     }
 
@@ -1108,9 +1129,9 @@ bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(const PM4CmdWaitRegMem
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_UNTRACKED_MEMORY_WAIT_SYNC] n=%u addr=0x%llx value=0x%x ref=0x%x "
-            "mask=0x%x source=%s resolved=%u",
+            "mask=0x%x source=%s gpuModified=%u resolved=%u",
             ordinal + 1, static_cast<unsigned long long>(address), value, wait.ref, wait.mask,
-            source, resolved ? 1u : 0u);
+            source, gpu_modified ? 1u : 0u, resolved ? 1u : 0u);
     }
     return resolved;
 }
@@ -1520,6 +1541,77 @@ bool Liverpool::PublishSubmit(u32 qid, Task::Handle handle, u32* published_submi
     return true;
 }
 
+#ifdef __ANDROID__
+void Liverpool::ParkMemoryWaitForExecutor(const u32 queue_id,
+                                          const PM4CmdWaitRegMem& wait) {
+    ASSERT(queue_id < NumTotalQueues);
+    auto& parked = executor_parked_memory_waits[queue_id];
+    if (!parked.active) {
+        ++executor_parked_wait_count;
+    }
+    parked.address = reinterpret_cast<VAddr>(wait.Address<const u32*>());
+    parked.function = static_cast<u32>(wait.function.Value());
+    parked.reference = wait.ref;
+    parked.mask = wait.mask;
+    parked.active = true;
+    const u64 queue_bit = u64{1} << queue_id;
+    executor_parked_memory_wait_mask |= queue_bit;
+    // A producer may append another submit while the current front task is parked. It can set this
+    // bit again, but Process always intersects the published mask with the consumer-owned blocked
+    // mask, so strict in-queue ordering is retained until this exact predicate becomes true.
+    submit_ready_mask.fetch_and(~queue_bit, std::memory_order_acq_rel);
+}
+
+void Liverpool::RefreshParkedMemoryWaitsForExecutor() {
+    u64 blocked = executor_parked_memory_wait_mask;
+    if (blocked == 0) {
+        return;
+    }
+    ++executor_parked_wait_poll_count;
+    while (blocked != 0) {
+        const u32 queue_id = static_cast<u32>(std::countr_zero(blocked));
+        const u64 queue_bit = u64{1} << queue_id;
+        blocked &= ~queue_bit;
+        auto& parked = executor_parked_memory_waits[queue_id];
+        if (!parked.active) {
+            executor_parked_memory_wait_mask &= ~queue_bit;
+            continue;
+        }
+        const u32 value = ExecutorReadMappedWaitValueFast(
+            reinterpret_cast<const u64*>(parked.address));
+        const u32 masked_value = value & parked.mask;
+        const bool satisfied = [&] {
+            switch (static_cast<PM4CmdWaitRegMem::Function>(parked.function)) {
+            case PM4CmdWaitRegMem::Function::Always:
+                return true;
+            case PM4CmdWaitRegMem::Function::LessThan:
+                return masked_value < parked.reference;
+            case PM4CmdWaitRegMem::Function::LessThanEqual:
+                return masked_value <= parked.reference;
+            case PM4CmdWaitRegMem::Function::Equal:
+                return masked_value == parked.reference;
+            case PM4CmdWaitRegMem::Function::NotEqual:
+                return masked_value != parked.reference;
+            case PM4CmdWaitRegMem::Function::GreaterThanEqual:
+                return masked_value >= parked.reference;
+            case PM4CmdWaitRegMem::Function::GreaterThan:
+                return masked_value > parked.reference;
+            case PM4CmdWaitRegMem::Function::Reserved:
+            default:
+                return false;
+            }
+        }();
+        if (!satisfied) {
+            continue;
+        }
+        parked.active = false;
+        executor_parked_memory_wait_mask &= ~queue_bit;
+        submit_ready_mask.fetch_or(queue_bit, std::memory_order_release);
+        ++executor_parked_wait_wake_count;
+    }
+}
+#endif
+
 u32 Liverpool::RecountQueuedSubmits() {
     // Called only by the sole consumer after an apparently empty round-robin pass. Holding
     // submit_mutex prevents a producer from linking another node, yielding an exact snapshot.
@@ -1531,7 +1623,11 @@ u32 Liverpool::RecountQueuedSubmits() {
         auto& queue = mapped_queues[qid];
         const u32 queued = static_cast<u32>(queue.submits.size());
         actual_submits += queued;
-        if (queued != 0) {
+        if (queued != 0
+#ifdef __ANDROID__
+            && (executor_parked_memory_wait_mask & (u64{1} << qid)) == 0
+#endif
+        ) {
             actual_ready_mask |= u64{1} << qid;
         }
     }
@@ -1631,6 +1727,12 @@ void Liverpool::Process(std::stop_token stoken) {
             if (num_submits.load(std::memory_order_acquire) == 0) {
                 break;
             }
+#ifdef __ANDROID__
+            if (executor_parked_memory_wait_mask != 0 &&
+                ((executor_parked_wait_poll_counter++ & 7u) == 0u)) {
+                RefreshParkedMemoryWaitsForExecutor();
+            }
+#endif
 
 #ifdef __ANDROID__
             const bool renderer_terminal =
@@ -1661,6 +1763,10 @@ void Liverpool::Process(std::stop_token stoken) {
                     submit_ready_mask.store(0, std::memory_order_release);
 #ifdef __ANDROID__
                     executor_completion_flush_pending = false;
+                    executor_parked_memory_wait_mask = 0;
+                    for (auto& parked : executor_parked_memory_waits) {
+                        parked.active = false;
+                    }
 #endif
                     submit_done = false;
                     submit_cv.notify_all();
@@ -1672,7 +1778,27 @@ void Liverpool::Process(std::stop_token stoken) {
             ASSERT(queue_count != 0);
             const u64 valid_queue_mask = (u64{1} << queue_count) - 1;
             u64 ready_mask =
-                submit_ready_mask.load(std::memory_order_acquire) & valid_queue_mask;
+                submit_ready_mask.load(std::memory_order_acquire) & valid_queue_mask
+#ifdef __ANDROID__
+                & ~executor_parked_memory_wait_mask
+#endif
+                ;
+            if (ready_mask == 0) {
+#ifdef __ANDROID__
+                if (executor_parked_memory_wait_mask != 0) {
+                    RefreshParkedMemoryWaitsForExecutor();
+                    ready_mask = submit_ready_mask.load(std::memory_order_acquire) &
+                                 valid_queue_mask & ~executor_parked_memory_wait_mask;
+                    if (ready_mask == 0) {
+                        // All published fronts are waiting on guest memory. Yield the host CPU so
+                        // the guest worker or GPU retirement callback which owns those labels can
+                        // run; the old tight coroutine round-robin competed with its own producers.
+                        std::this_thread::yield();
+                        continue;
+                    }
+                }
+#endif
+            }
             if (ready_mask == 0) {
                 const u32 reported_submits = num_submits.load(std::memory_order_acquire);
                 const u32 actual_submits = RecountQueuedSubmits();
@@ -1690,7 +1816,11 @@ void Liverpool::Process(std::stop_token stoken) {
                     break;
                 }
                 ready_mask =
-                    submit_ready_mask.load(std::memory_order_acquire) & valid_queue_mask;
+                    submit_ready_mask.load(std::memory_order_acquire) & valid_queue_mask
+#ifdef __ANDROID__
+                    & ~executor_parked_memory_wait_mask
+#endif
+                    ;
                 if (ready_mask == 0) {
                     continue;
                 }
@@ -1704,6 +1834,14 @@ void Liverpool::Process(std::stop_token stoken) {
             curr_qid = static_cast<s32>(std::countr_zero(ready_at_or_after != 0
                                                              ? ready_at_or_after
                                                              : ready_mask));
+
+#ifdef __ANDROID__
+            const u64 selected_queue_bit = u64{1} << curr_qid;
+            if ((executor_parked_memory_wait_mask & selected_queue_bit) != 0) {
+                submit_ready_mask.fetch_and(~selected_queue_bit, std::memory_order_acq_rel);
+                continue;
+            }
+#endif
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -1753,6 +1891,10 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
 #endif
                 active_tasks[curr_qid] = {};
+#ifdef __ANDROID__
+                executor_parked_memory_waits[curr_qid].active = false;
+                executor_parked_memory_wait_mask &= ~(u64{1} << curr_qid);
+#endif
                 task.destroy();
 #ifdef __ANDROID__
                 ++executor_guest_submit_count;
@@ -1872,6 +2014,20 @@ void Liverpool::Process(std::stop_token stoken) {
                     scheduler_tick - executor_metrics_last_scheduler_tick;
                 const u64 wait_flush_delta =
                     executor_metrics_wait_flushes - executor_metrics_last_wait_flushes;
+                const u64 untracked_wait_delta =
+                    executor_untracked_wait_stalls -
+                    executor_metrics_last_untracked_wait_stalls;
+                const u64 untracked_wait_ns_delta =
+                    executor_untracked_wait_stall_ns -
+                    executor_metrics_last_untracked_wait_stall_ns;
+                const u64 parked_wait_delta =
+                    executor_parked_wait_count - executor_metrics_last_parked_wait_count;
+                const u64 parked_wake_delta =
+                    executor_parked_wait_wake_count -
+                    executor_metrics_last_parked_wait_wake_count;
+                const u64 parked_poll_delta =
+                    executor_parked_wait_poll_count -
+                    executor_metrics_last_parked_wait_poll_count;
                 const u64 wait_stall_delta =
                     executor_completion_wait_stalls -
                     executor_metrics_last_completion_wait_stalls;
@@ -1891,6 +2047,8 @@ void Liverpool::Process(std::stop_token stoken) {
                     ANDROID_LOG_INFO, "LSX4Native",
                     "[EXECUTOR_GPU_SUBMIT_COALESCE] frames=16 guestSubmits=%llu "
                     "completionPoints=%llu hostSubmits=%llu waitFlushes=%llu "
+                    "untrackedWaits=%llu untrackedWaitMs=%.3f untrackedWaitMaxMs=%.3f "
+                    "parkedWaits=%llu parkedWakes=%llu parkedPolls=%llu parkedNow=%u "
                     "completionWaits=%llu completionWaitMs=%.3f completionWaitMaxMs=%.3f "
                     "logicalWaits=%llu admissionWaits=%llu admissionWaitMs=%.3f "
                     "admissionWaitMaxMs=%.3f admissionFree=%llu",
@@ -1898,6 +2056,13 @@ void Liverpool::Process(std::stop_token stoken) {
                     static_cast<unsigned long long>(completion_delta),
                     static_cast<unsigned long long>(host_submit_delta),
                     static_cast<unsigned long long>(wait_flush_delta),
+                    static_cast<unsigned long long>(untracked_wait_delta),
+                    static_cast<double>(untracked_wait_ns_delta) / 1'000'000.0,
+                    static_cast<double>(executor_untracked_wait_stall_max_ns) / 1'000'000.0,
+                    static_cast<unsigned long long>(parked_wait_delta),
+                    static_cast<unsigned long long>(parked_wake_delta),
+                    static_cast<unsigned long long>(parked_poll_delta),
+                    static_cast<unsigned>(std::popcount(executor_parked_memory_wait_mask)),
                     static_cast<unsigned long long>(wait_stall_delta),
                     static_cast<double>(wait_stall_ns_delta) / 1'000'000.0,
                     static_cast<double>(executor_completion_wait_stall_max_ns) / 1'000'000.0,
@@ -1910,6 +2075,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 executor_metrics_last_completion_points = executor_completion_point_count;
                 executor_metrics_last_scheduler_tick = scheduler_tick;
                 executor_metrics_last_wait_flushes = executor_metrics_wait_flushes;
+                executor_metrics_last_untracked_wait_stalls = executor_untracked_wait_stalls;
+                executor_metrics_last_untracked_wait_stall_ns =
+                    executor_untracked_wait_stall_ns;
+                executor_untracked_wait_stall_max_ns = 0;
+                executor_metrics_last_parked_wait_count = executor_parked_wait_count;
+                executor_metrics_last_parked_wait_wake_count = executor_parked_wait_wake_count;
+                executor_metrics_last_parked_wait_poll_count = executor_parked_wait_poll_count;
                 executor_metrics_last_completion_wait_stalls =
                     executor_completion_wait_stalls;
                 executor_metrics_last_completion_wait_stall_ns =
@@ -2996,8 +3168,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     }
 #ifdef __ANDROID__
                                     CompletePendingCompletionWriteForExecutor(
-                                        reinterpret_cast<VAddr>(address), num_bytes,
-                                        completion_tick);
+                                        reinterpret_cast<VAddr>(address), data,
+                                        Pm4Engine::Graphics, num_bytes, completion_tick);
 #endif
                                 }
                             });
@@ -3075,8 +3247,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             state, reinterpret_cast<VAddr>(address), num_bytes);
                                     }
                                     CompletePendingCompletionWriteForExecutor(
-                                        reinterpret_cast<VAddr>(address), num_bytes,
-                                        completion_tick);
+                                        reinterpret_cast<VAddr>(address), data,
+                                        Pm4Engine::Graphics, num_bytes, completion_tick);
                                 }
                             },
                             [eop_dcb, eop_trace_dcb_dw, eop_offset_dw, eop_int_sel,
@@ -3413,7 +3585,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         break;
                     }
                 }
-                if (!TestWaitRegMemValue(*wait_reg_mem, wait_value) &&
+                const bool untracked_wait_pending =
+                    !TestWaitRegMemValue(*wait_reg_mem, wait_value);
+                const auto untracked_wait_start =
+                    untracked_wait_pending ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+                SCOPE_EXIT {
+                    if (untracked_wait_pending) {
+                        const u64 elapsed_ns = static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - untracked_wait_start)
+                                .count());
+                        ++executor_untracked_wait_stalls;
+                        executor_untracked_wait_stall_ns += elapsed_ns;
+                        executor_untracked_wait_stall_max_ns =
+                            std::max(executor_untracked_wait_stall_max_ns, elapsed_ns);
+                    }
+                };
+                if (untracked_wait_pending &&
                     SynchronizeUntrackedMemoryWaitForExecutor(*wait_reg_mem, wait_value)) {
                     ++executor_logical_wait_count;
                     break;
@@ -3502,6 +3691,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                 wait_value, wait_reg_mem->ref,
                                                 wait_reg_mem->mask);
                         }
+#endif
+#ifdef __ANDROID__
+                        ParkMemoryWaitForExecutor(GfxQueueId, *wait_reg_mem);
 #endif
                         YIELD_GFX();
                         wait_value = ExecutorReadMappedWaitValueFast(wait_addr);
@@ -4169,34 +4361,37 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                         break;
                     }
                 }
-                if (!TestWaitRegMemValue(*wait_reg_mem, current_value) &&
+                const bool untracked_wait_pending =
+                    !TestWaitRegMemValue(*wait_reg_mem, current_value);
+                const auto untracked_wait_start =
+                    untracked_wait_pending ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+                SCOPE_EXIT {
+                    if (untracked_wait_pending) {
+                        const u64 elapsed_ns = static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - untracked_wait_start)
+                                .count());
+                        ++executor_untracked_wait_stalls;
+                        executor_untracked_wait_stall_ns += elapsed_ns;
+                        executor_untracked_wait_stall_max_ns =
+                            std::max(executor_untracked_wait_stall_max_ns, elapsed_ns);
+                    }
+                };
+                if (untracked_wait_pending &&
                     SynchronizeUntrackedMemoryWaitForExecutor(*wait_reg_mem, current_value)) {
                     ++executor_logical_wait_count;
                     break;
                 }
+                while (!wait_reg_mem->Test(regs.reg_array) && !state->abort) {
+                    ParkMemoryWaitForExecutor(vqid + 1, *wait_reg_mem);
+                    YIELD_ASC(vqid);
+                }
+                break;
             }
-            const bool completion_wait_stall =
-                executor_completion_flush_pending && !wait_reg_mem->Test(regs.reg_array);
-            const auto completion_wait_start =
-                completion_wait_stall ? std::chrono::steady_clock::now()
-                                      : std::chrono::steady_clock::time_point{};
-            if (executor_completion_flush_pending && !wait_reg_mem->Test(regs.reg_array)) {
-                FlushGpuCompletionBatchForExecutor(false, true);
-            }
-#endif
+#else
             while (!wait_reg_mem->Test(regs.reg_array) && !state->abort) {
                 YIELD_ASC(vqid);
-            }
-#ifdef __ANDROID__
-            if (completion_wait_stall) {
-                const u64 elapsed_ns = static_cast<u64>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - completion_wait_start)
-                        .count());
-                ++executor_completion_wait_stalls;
-                executor_completion_wait_stall_ns += elapsed_ns;
-                executor_completion_wait_stall_max_ns =
-                    std::max(executor_completion_wait_stall_max_ns, elapsed_ns);
             }
 #endif
             break;
@@ -4254,26 +4449,31 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                         void* const address = packet.Address<void*>();
                         bool wrote_completion = false;
                         u32 completion_bytes = 0;
+                        u64 completion_value = 0;
                         switch (packet.data_sel.Value()) {
                         case DataSelect::Data32Low:
                             completion_bytes = sizeof(u32);
+                            completion_value = packet.DataDWord();
                             wrote_completion = ExecutorWriteFenceToCpuAddress(
-                                "release_mem", address, packet.DataDWord(), sizeof(u32));
+                                "release_mem", address, completion_value, sizeof(u32));
                             break;
                         case DataSelect::Data64:
                             completion_bytes = sizeof(u64);
+                            completion_value = packet.DataQWord();
                             wrote_completion = ExecutorWriteFenceToCpuAddress(
-                                "release_mem", address, packet.DataQWord(), sizeof(u64));
+                                "release_mem", address, completion_value, sizeof(u64));
                             break;
                         case DataSelect::GpuClock64:
                             completion_bytes = sizeof(u64);
+                            completion_value = GetGpuClock64();
                             wrote_completion = ExecutorWriteFenceToCpuAddress(
-                                "release_mem", address, GetGpuClock64(), sizeof(u64));
+                                "release_mem", address, completion_value, sizeof(u64));
                             break;
                         case DataSelect::PerfCounter:
                             completion_bytes = sizeof(u64);
+                            completion_value = GetGpuPerfCounter();
                             wrote_completion = ExecutorWriteFenceToCpuAddress(
-                                "release_mem", address, GetGpuPerfCounter(), sizeof(u64));
+                                "release_mem", address, completion_value, sizeof(u64));
                             break;
                         default:
                             UNREACHABLE_MSG(
@@ -4282,8 +4482,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                         }
                         if (wrote_completion) {
                             CompletePendingCompletionWriteForExecutor(
-                                reinterpret_cast<VAddr>(address), completion_bytes,
-                                completion_tick);
+                                reinterpret_cast<VAddr>(address), completion_value,
+                                Pm4Engine::Compute, completion_bytes, completion_tick);
                         }
                         signal_irq();
                     };

@@ -71,14 +71,18 @@ s64 AvPlayerFileStreamer::Seek(void* opaque, s64 offset, int whence) {
         return self->m_file_size;
     }
 
-    if (whence == SEEK_CUR) {
+    // FFmpeg may combine the ordinary stdio origin with AVSEEK_FORCE.  Treat the
+    // latter as a hint; rejecting the combined value leaves the AVIO context at
+    // EOF and turns a looping source into a tight sequence of failed rewinds.
+    const int origin = whence & ~AVSEEK_FORCE;
+    if (origin == SEEK_CUR) {
         self->m_position =
             std::min(u64(std::max(s64(0), s64(self->m_position) + offset)), self->m_file_size);
         return self->m_position;
-    } else if (whence == SEEK_SET) {
+    } else if (origin == SEEK_SET) {
         self->m_position = std::min(u64(std::max(s64(0), offset)), self->m_file_size);
         return self->m_position;
-    } else if (whence == SEEK_END) {
+    } else if (origin == SEEK_END) {
         self->m_position =
             std::min(u64(std::max(s64(0), s64(self->m_file_size) + offset)), self->m_file_size);
         return self->m_position;

@@ -49,4 +49,12 @@
     <string name="game_hold_release_unsupported">Relâchez : marquer non pris en charge</string>
     <string name="game_hold_release_supported">Relâchez : marquer pris en charge</string>
     <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
+    <string name="game_menu_title">Commandes rapides</string>
+    <string name="game_menu_hint">Balayez vers la droite ou touchez à l’extérieur pour fermer</string>
+    <string name="game_menu_open">Ouvrir les commandes rapides</string>
+    <string name="game_menu_close">Fermer les commandes rapides</string>
+    <string name="game_menu_overlay">Commandes à l’écran</string>
+    <string name="game_menu_opacity">Opacité des commandes</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Quitter vers la bibliothèque</string>
 </resources>

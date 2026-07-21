@@ -25,6 +25,10 @@ struct Liverpool;
 
 namespace Vulkan {
 
+// Monotonic count of frames that reached the Android swapchain through the live direct-present
+// path.  The runtime HUD samples this counter; replay/capture requests are intentionally excluded.
+[[nodiscard]] u64 ExecutorGetLivePresentCount() noexcept;
+
 struct Frame {
     u32 width;
     u32 height;

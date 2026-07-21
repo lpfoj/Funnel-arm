@@ -285,13 +285,6 @@ static bool TryFixupMisalignedReleaseAcquire(int sig, siginfo_t* info, void* raw
 #endif
 
 #ifdef __ANDROID__
-// Survival escape hatch: a JIT reconstruction gap in the RSDK audio worker (Thread2) computes
-// a corrupted store target (e.g. a host-lib address 0x77xx) and the native JIT block's STR SIGSEGVs,
-// taking the WHOLE process down (killing the render main thread too). When
-// EXECUTOR_SKIP_FAULTING_STORES is set, discard a faulting guest STORE (the value is lost but the
-// offending thread survives, exactly as a real guest fault would be handled) and step past the
-// single 4-byte AArch64 store instruction so the renderer can be observed. Only WRITE faults are
-// skipped; reads/execs still crash. Not the default; opt-in for bring-up.
 static bool TrySkipFaultingGuestStore(int sig, siginfo_t* info, void* raw_context) {
     if (sig != SIGSEGV || raw_context == nullptr) {
         return false;
@@ -560,17 +553,15 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                     static_cast<unsigned long long>(guest_rip),
                     static_cast<unsigned long long>(active_rip), instruction_meta & 0x00ffffffu,
                     instruction_meta >> 24u, static_cast<unsigned long long>(instruction),
-                    // LsxMachineImage::gpr uses the physical-state order
-                    // RAX,RBX,RCX,RDX,RSI,RDI,RBP,RSP rather than the x86
-                    // encoding order used by the human-readable line above.
+                    // The fault-state register bank uses the x86 encoding order shown above.
                     static_cast<unsigned long long>(fault_gpr(0)),
+                    static_cast<unsigned long long>(fault_gpr(1)),
                     static_cast<unsigned long long>(fault_gpr(2)),
                     static_cast<unsigned long long>(fault_gpr(3)),
-                    static_cast<unsigned long long>(fault_gpr(1)),
-                    static_cast<unsigned long long>(fault_gpr(7)),
-                    static_cast<unsigned long long>(fault_gpr(6)),
                     static_cast<unsigned long long>(fault_gpr(4)),
-                    static_cast<unsigned long long>(fault_gpr(5)));
+                    static_cast<unsigned long long>(fault_gpr(5)),
+                    static_cast<unsigned long long>(fault_gpr(6)),
+                    static_cast<unsigned long long>(fault_gpr(7)));
                 for (u32 index = 0; index < recent_count && n > 0 &&
                                     static_cast<size_t>(n) < sizeof(line); ++index) {
                     n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
