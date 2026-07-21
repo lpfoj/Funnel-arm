@@ -14,6 +14,7 @@
 #include "common/x86_decoder.h"
 #include <xbyak_aarch64/xbyak_aarch64.h>
 #include <nlohmann/json.hpp>
+#include <xxhash.h>
 
 #include <algorithm>
 #include <array>
@@ -1387,42 +1388,49 @@ LsxEngineReport QueryTranslationEngine() {
     };
 }
 
-class GuestCodeFingerprinter {
-public:
-    GuestCodeFingerprinter(const std::uint64_t base, const std::uint32_t length)
-        : base_(base), length_(length) {}
-
-    std::uint64_t Run() {
-        Common::ContentFingerprint64 digest{Common::FingerprintDomain::GuestCode};
-        while (consumed_ != length_) {
-            const auto count = static_cast<std::uint32_t>(
-                std::min<std::size_t>(buffer_.size(), length_ - consumed_));
-            if (!ReadGuestBytesChecked(base_ + consumed_, buffer_.data(), count)) {
-                FailUnreadable();
-            }
-            digest.Update(std::span<const std::uint8_t>{buffer_.data(), count});
-            consumed_ += count;
-        }
-        return digest.Finish();
-    }
-
-private:
-    [[noreturn]] void FailUnreadable() const {
-        std::ostringstream message;
-        message << "guest code digest cannot read va=0x" << std::hex << base_
-                << " length=0x" << length_ << " consumed=0x" << consumed_;
-        throw std::runtime_error(message.str());
-    }
-
-    std::uint64_t base_{};
-    std::uint32_t length_{};
-    std::uint32_t consumed_{};
-    std::array<std::uint8_t, 512> buffer_{};
-};
+constexpr std::uint64_t kJitGuestCodeHashSeed = 0x6c7378344a495431ull;
 
 std::uint64_t HashGuestCodeWindow(const std::uint64_t guest_va,
                                   const std::uint32_t size_bytes) {
-    return GuestCodeFingerprinter{guest_va, size_bytes}.Run();
+    // A decoded x86 block is capped at 128 instructions, so a 2 KiB slab covers the
+    // normal 15-byte/instruction ceiling in one guarded kernel read. Keep it uninitialized:
+    // every byte passed to the fingerprint is filled by the reader first. Besides avoiding a
+    // 2 KiB clear, this replaces the former four process_vm_readv calls for a maximal block with
+    // one while preserving the exact, chunk-independent fingerprint contract.
+    std::array<std::uint8_t, 2048> slab;
+    std::uint32_t consumed = 0;
+    if (size_bytes <= slab.size()) {
+        if (!ReadGuestBytesChecked(guest_va, slab.data(), size_bytes)) {
+            std::ostringstream message;
+            message << "guest code digest cannot read va=0x" << std::hex << guest_va
+                    << " length=0x" << size_bytes << " consumed=0x0";
+            throw std::runtime_error(message.str());
+        }
+        return XXH3_64bits_withSeed(slab.data(), size_bytes,
+                                    kJitGuestCodeHashSeed);
+    }
+
+    std::unique_ptr<XXH3_state_t, decltype(&XXH3_freeState)> digest{
+        XXH3_createState(), &XXH3_freeState};
+    if (!digest ||
+        XXH3_64bits_reset_withSeed(digest.get(), kJitGuestCodeHashSeed) != XXH_OK) {
+        throw std::runtime_error("guest code digest initialization failed");
+    }
+    while (consumed != size_bytes) {
+        const auto count = static_cast<std::uint32_t>(
+            std::min<std::size_t>(slab.size(), size_bytes - consumed));
+        if (!ReadGuestBytesChecked(guest_va + consumed, slab.data(), count)) {
+            std::ostringstream message;
+            message << "guest code digest cannot read va=0x" << std::hex << guest_va
+                    << " length=0x" << size_bytes << " consumed=0x" << consumed;
+            throw std::runtime_error(message.str());
+        }
+        if (XXH3_64bits_update(digest.get(), slab.data(), count) != XXH_OK) {
+            throw std::runtime_error("guest code digest update failed");
+        }
+        consumed += count;
+    }
+    return XXH3_64bits_digest(digest.get());
 }
 
 void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
@@ -2738,10 +2746,9 @@ private:
     // iced-x86's implicit [R/E]DI destination. Cached IR from the prior epoch
     // contains three operands and must not cross this semantic boundary.
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    // v9: semantic-leaf calls reconstruct caller-saved register caches. Native payloads emitted
-    // by v8 can retain a helper-clobbered guest base and must never be restored; decoded IR remains
-    // reusable and will be lowered again without discarding the expensive decode cache.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210006ull;
+    // v10: direct-link countdown layout and cache-register allocation changed. Native payloads
+    // emitted by v9 must be lowered again; decoded IR remains reusable.
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210007ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -3308,24 +3315,27 @@ struct alignas(16) ChainPatchCell {
     const std::uint64_t guest_rip = 0;
     std::atomic<std::uint64_t> guest_hash{0};
     std::atomic<std::uint32_t> guest_size{0};
-    // Publication stores a dedicated sentinel to force a byte hash on the first observed use.
-    // Periodic sampling is thread-local: a shared fetch_add here made a hot guest
-    // loop bounce this cache line between cores on every direct tail link.
-    std::atomic<std::uint32_t> refresh_counter{kJitCacheInitialValidation};
+    // Publishers advance a generation once after replacing the slot metadata. Readers compare
+    // it with a private observation ticket, so publication never requires a contended CAS.
+    std::atomic<std::uint32_t> publication_generation{1};
     std::atomic<std::uint64_t>* const execution_cache_epoch = nullptr;
+
+    void MarkPublication() noexcept {
+        publication_generation.fetch_add(1, std::memory_order_release);
+    }
 };
 
 static_assert(offsetof(ChainPatchCell, target) == 0);
 static_assert(offsetof(ChainPatchCell, chain_target) == 0x08);
 static_assert(offsetof(ChainPatchCell, guest_rip) == 0x10);
-static_assert(offsetof(ChainPatchCell, refresh_counter) == 0x24);
+static_assert(offsetof(ChainPatchCell, publication_generation) == 0x24);
 static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
 static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
 
 struct DirectTargetRefreshWay {
     ChainPatchCell* slot = nullptr;
-    Arm64BlockEntry observed = nullptr;
-    std::uint32_t counter = 0;
+    std::uint32_t generation = 0;
+    std::uint32_t countdown = kJitCacheValidationPeriod;
 };
 
 constexpr std::size_t kDirectTargetRefreshWayCount = 256;
@@ -3333,33 +3343,21 @@ static_assert(std::has_single_bit(kDirectTargetRefreshWayCount));
 thread_local std::array<DirectTargetRefreshWay, kDirectTargetRefreshWayCount>
     g_direct_target_refresh_ways{};
 
-bool ShouldHashObservedDirectTarget(ChainPatchCell* const slot,
-                                    const Arm64BlockEntry observed) noexcept {
-    // Only the first observer after publication performs the shared transition.
-    // Steady-state direct links execute one relaxed load and a thread-local increment,
-    // instead of a contended atomic read-modify-write.
-    std::uint32_t armed = slot->refresh_counter.load(std::memory_order_relaxed);
-    bool publication_refresh = false;
-    if (armed == kJitCacheInitialValidation) {
-        publication_refresh = slot->refresh_counter.compare_exchange_strong(
-            armed, 0, std::memory_order_relaxed, std::memory_order_relaxed);
-    }
-
+bool ShouldInspectDirectTarget(ChainPatchCell* const slot) noexcept {
     const std::size_t index =
         (reinterpret_cast<std::uintptr_t>(slot) >> 4u) &
         (kDirectTargetRefreshWayCount - 1u);
     auto& way = g_direct_target_refresh_ways[index];
-    if (way.slot != slot || way.observed != observed) {
-        way = {.slot = slot, .observed = observed, .counter = 0};
+    const std::uint32_t generation =
+        slot->publication_generation.load(std::memory_order_acquire);
+    if (way.slot != slot || way.generation != generation) {
+        way = {.slot = slot,
+               .generation = generation,
+               .countdown = kJitCacheValidationPeriod};
         return true;
     }
-    if (publication_refresh) {
-        way.counter = 0;
-        return true;
-    }
-
-    if (++way.counter >= kJitCacheValidationPeriod) {
-        way.counter = 0;
+    if (--way.countdown == 0) {
+        way.countdown = kJitCacheValidationPeriod;
         return true;
     }
     return false;
@@ -3707,7 +3705,16 @@ bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_ou
     // Hash the exact instruction bytes consumed by X86.  A decoded basic block is contiguous;
     // rejecting any gap/overlap here keeps the byte snapshot and the published guest span tied
     // together even if guest code is being modified concurrently.
-    Common::ContentFingerprint64 fingerprint{Common::FingerprintDomain::GuestCode};
+    std::array<std::uint8_t, 2048> flattened;
+    std::size_t flattened_size = 0;
+    const auto append = [&](const std::span<const std::uint8_t> bytes) {
+        if (bytes.size() > flattened.size() - flattened_size) {
+            return false;
+        }
+        std::memcpy(flattened.data() + flattened_size, bytes.data(), bytes.size());
+        flattened_size += bytes.size();
+        return true;
+    };
     std::uint64_t expected_rip = block.start_rip;
     for (const LsxDecodedOp& instruction : block.instructions) {
         if (instruction.length == 0 || instruction.guest_rip != expected_rip ||
@@ -3720,21 +3727,25 @@ bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_ou
             // by IsJitHleBridgeMarkerAt during decode, so reconstruct those constexpr bytes
             // here instead of overflowing/growing every LsxDecodedOp for this one sentinel.
             constexpr std::array marker_prefix{std::uint8_t{0x0f}, std::uint8_t{0x3f}};
-            fingerprint.Update(marker_prefix);
-            fingerprint.Update(kJitHleThunkHash);
+            if (!append(marker_prefix) || !append(kJitHleThunkHash)) {
+                return false;
+            }
         } else {
             if (instruction.length > instruction.bytes.size()) {
                 return false;
             }
-            fingerprint.Update(std::span<const std::uint8_t>{
-                instruction.bytes.data(), instruction.length});
+            if (!append(std::span<const std::uint8_t>{
+                    instruction.bytes.data(), instruction.length})) {
+                return false;
+            }
         }
         expected_rip += instruction.length;
     }
     if (expected_rip != block.end_rip) {
         return false;
     }
-    hash_out = fingerprint.Finish();
+    hash_out = XXH3_64bits_withSeed(flattened.data(), flattened_size,
+                                    kJitGuestCodeHashSeed);
     return true;
 }
 
@@ -4579,8 +4590,7 @@ public:
                                              std::memory_order_release);
                     slot->guest_size.store(0, std::memory_order_relaxed);
                     slot->guest_hash.store(0, std::memory_order_relaxed);
-                    slot->refresh_counter.store(kJitCacheInitialValidation,
-                                                std::memory_order_relaxed);
+                    slot->MarkPublication();
                 }
             }
             chain_patch_slots_.clear();
@@ -5147,11 +5157,10 @@ public:
                                            std::memory_order_relaxed);
                     slot->guest_hash.store(plan.result.guest_hash,
                                            std::memory_order_relaxed);
-                    slot->refresh_counter.store(kJitCacheInitialValidation,
-                                                std::memory_order_relaxed);
                     slot->chain_target.store(
                         plan.chain_abi ? plan.direct : nullptr,
                         std::memory_order_relaxed);
+                    slot->MarkPublication();
                     slot->target.store(
                         plan.chain_abi ? plan.entry : plan.direct,
                         std::memory_order_release);
@@ -5309,9 +5318,7 @@ public:
                 if (auto slot_it = chain_patch_slots_.find(guest_rip);
                     slot_it != chain_patch_slots_.end() && slot_it->second) {
                     slot_it->second->target.store(nullptr, std::memory_order_release);
-                    slot_it->second->refresh_counter.store(
-                        kJitCacheInitialValidation,
-                        std::memory_order_relaxed);
+                    slot_it->second->MarkPublication();
                 }
             }
             block_results_.erase(result_it);
@@ -5897,11 +5904,10 @@ public:
                                        std::memory_order_relaxed);
                 slot->guest_hash.store(target_it->second.guest_hash,
                                        std::memory_order_relaxed);
-                slot->refresh_counter.store(kJitCacheInitialValidation,
-                                            std::memory_order_relaxed);
                 slot->chain_target.store(
                     target_it->second.chain_target,
                     std::memory_order_relaxed);
+                slot->MarkPublication();
                 slot->target.store(target_it->second.target,
                                    std::memory_order_release);
             }
@@ -5931,8 +5937,7 @@ public:
             slot_it->second->chain_target.store(nullptr, std::memory_order_release);
             slot_it->second->guest_size.store(0, std::memory_order_relaxed);
             slot_it->second->guest_hash.store(0, std::memory_order_relaxed);
-            slot_it->second->refresh_counter.store(kJitCacheInitialValidation,
-                                                   std::memory_order_relaxed);
+            slot_it->second->MarkPublication();
         }
     }
 
@@ -5956,9 +5961,8 @@ public:
         }
         slot->guest_size.store(guest_size, std::memory_order_relaxed);
         slot->guest_hash.store(guest_hash, std::memory_order_relaxed);
-        slot->refresh_counter.store(kJitCacheInitialValidation,
-                                    std::memory_order_relaxed);
         slot->chain_target.store(chain_target, std::memory_order_relaxed);
+        slot->MarkPublication();
         slot->target.store(target, std::memory_order_release);
     }
 
@@ -7070,7 +7074,7 @@ void RetireRejectedDirectTarget(ChainPatchCell& cell, const Arm64BlockEntry cand
     if (cell.target.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
         cell.chain_target.store(nullptr, std::memory_order_release);
-        cell.refresh_counter.store(kJitCacheInitialValidation, std::memory_order_relaxed);
+        cell.MarkPublication();
         if (cell.execution_cache_epoch != nullptr) {
             cell.execution_cache_epoch->fetch_add(1, std::memory_order_release);
         }
@@ -7101,7 +7105,7 @@ Arm64BlockEntry AuditDirectTarget(ChainPatchCell* const slot,
         if (JitGuestHotSamplerEnabled()) {
             SampleJitGuestRip(slot->guest_rip);
         }
-        if (!ShouldHashObservedDirectTarget(slot, candidate)) {
+        if (!ShouldInspectDirectTarget(slot)) {
             return slot->target.load(std::memory_order_acquire) == candidate
                        ? candidate
                        : nullptr;
@@ -14400,8 +14404,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 // Keep the most reused guest GPRs in dedicated host registers for the lifetime of
                 // a scalar block. The generic emitter otherwise reloads and
                 // rewrites LsxMachineImage for every x86 instruction, which dominates arithmetic and
-                // pointer-walk loops even after all instructions have native lowerings. x6-x8 are
-                // caller-saved; x23-x27 are preserved by the generic frame when selected.
+                // pointer-walk loops even after all instructions have native lowerings. Put the
+                // hottest values in the callee-saved bank already owned by the shared chain frame;
+                // the caller-saved tail is used only after that bank is full.
                 //
                 // Helper calls, implicit-register instructions and dynamic control flow remain
                 // barriers. Guest-memory blocks are admitted: dirty GPRs are published immediately
@@ -14409,7 +14414,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 constexpr std::uint32_t kNoCachedGprOffset =
                     std::numeric_limits<std::uint32_t>::max();
                 constexpr std::array<std::uint32_t, 8>
-                    kGenericCachedGprHostRegisters{6, 7, 8, 23, 24, 25, 26, 27};
+                    kGenericCachedGprHostRegisters{23, 24, 25, 26, 27, 6, 7, 8};
                 std::array<std::uint32_t, 8> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                 std::array<bool, 8> generic_cached_gpr_dirty{};
@@ -14881,11 +14886,18 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 // to use only x6-x8. This is one save/restore per bounded chain, not per block.
                 const bool generic_frame_preserves_extended_gpr_cache =
                     generic_chain_abi ||
-                    std::any_of(generic_cached_gpr_offsets.begin() + 3,
-                                generic_cached_gpr_offsets.end(),
-                                [&](const std::uint32_t offset) {
-                                    return offset != kNoCachedGprOffset;
-                                });
+                    [&]() {
+                        for (std::size_t cache_index = 0;
+                             cache_index < generic_cached_gpr_offsets.size();
+                             ++cache_index) {
+                            if (generic_cached_gpr_offsets[cache_index] !=
+                                    kNoCachedGprOffset &&
+                                kGenericCachedGprHostRegisters[cache_index] >= 19u) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }();
                 const std::uint32_t generic_frame_size =
                     generic_chain_abi
                         ? kGenericSharedChainFrameSize
@@ -14901,6 +14913,17 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             state_offset) {
                             return static_cast<int>(
                                 kGenericCachedGprHostRegisters[cache_index]);
+                        }
+                    }
+                    return -1;
+                };
+                const auto cached_gpr_cache_index =
+                    [&](const std::uint32_t state_offset) -> int {
+                    for (std::size_t cache_index = 0;
+                         cache_index < generic_cached_gpr_offsets.size();
+                         ++cache_index) {
+                        if (generic_cached_gpr_offsets[cache_index] == state_offset) {
+                            return static_cast<int>(cache_index);
                         }
                     }
                     return -1;
@@ -14932,6 +14955,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 // deliberately monotonic: publishing state does not invalidate or reload the live
                 // q16-q23 values, and keeping a bit set is safe across generated local branches.
                 std::uint32_t generic_vector_cache_written_mask = 0;
+                std::uint32_t generic_gpr_cache_written_mask = 0;
                 const auto mark_cached_vector_half_written =
                     [&](const int host_index) {
                     if (cached_vector_half_is_writeback(host_index)) {
@@ -14982,7 +15006,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         const std::uint32_t state_offset =
                             generic_cached_gpr_offsets[cache_index];
                         if (state_offset == kNoCachedGprOffset ||
-                            !generic_cached_gpr_dirty[cache_index]) {
+                            !generic_cached_gpr_dirty[cache_index] ||
+                            (generic_gpr_cache_written_mask &
+                             (std::uint32_t{1} << cache_index)) == 0) {
                             continue;
                         }
                         code->str(
@@ -14991,18 +15017,20 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
-                const auto emit_reload_gpr_cache = [&]() {
+                const auto emit_reload_gpr_cache = [&](const bool caller_saved_only = false) {
                     for (std::size_t cache_index = 0;
                          cache_index < generic_cached_gpr_offsets.size();
                          ++cache_index) {
                         const std::uint32_t state_offset =
                             generic_cached_gpr_offsets[cache_index];
-                        if (state_offset == kNoCachedGprOffset) {
+                        const std::uint32_t host_register =
+                            kGenericCachedGprHostRegisters[cache_index];
+                        if (state_offset == kNoCachedGprOffset ||
+                            (caller_saved_only && host_register >= 19u)) {
                             continue;
                         }
                         code->ldr(
-                            XReg(static_cast<std::uint32_t>(
-                                kGenericCachedGprHostRegisters[cache_index])),
+                            XReg(host_register),
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
@@ -15010,8 +15038,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     emit_flush_vector_cache();
                     emit_flush_gpr_cache();
                 };
-                const auto emit_reload_register_caches = [&]() {
-                    emit_reload_gpr_cache();
+                const auto emit_reload_register_caches =
+                    [&](const bool after_abi_call = false) {
+                    // x23-x27 survive an AAPCS64 call. Reconstruct only x6-x8 after helpers;
+                    // initial block entry still loads every selected architectural value.
+                    emit_reload_gpr_cache(after_abi_call);
                     emit_reload_vector_cache();
                 };
                 const auto emit_epilogue_restore = [&]() {
@@ -15063,7 +15094,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     if (JitLiveCheckedNativeEnabled() || edge_slot == nullptr) {
                         return false;
                     }
-                    Xbyak_aarch64::Label budget_ready;
+                    Xbyak_aarch64::Label refill_chain_budget;
                     Xbyak_aarch64::Label validate;
                     Xbyak_aarch64::Label chain;
                     Xbyak_aarch64::Label fallback;
@@ -15085,33 +15116,24 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->ldrh(code->w11,
                                Xbyak_aarch64::ptr(code->x19,
                                                  kStateDispatchChainBudgetOffset));
-                    code->cbnz(code->w11, budget_ready);
-                    code->mov(code->w11, kDirectChainBudget);
-                    code->L(budget_ready);
+                    code->cbz(code->w11, refill_chain_budget);
                     code->subs(code->w11, code->w11, 1);
                     code->strh(code->w11,
                                Xbyak_aarch64::ptr(code->x19,
                                                  kStateDispatchChainBudgetOffset));
-                    code->cbz(code->w11, validate);
-                    // Committed code is never reclaimed while an engine is live. A second target
-                    // acquire here could still race retirement immediately after the load and
-                    // therefore added latency without strengthening correctness. The bounded
-                    // hash safepoint below is the authoritative SMC/retirement check.
-                    code->b(chain);
+                    code->bne(chain);
 
                     code->L(validate);
                     // A dispatcher return is a cheap scheduling boundary. Only every Nth such
                     // boundary performs the substantially more expensive executable-byte hash.
                     // The first counter is therefore free to be tuned for responsiveness without
                     // forcing the SMC cadence to the same value.
-                    Xbyak_aarch64::Label validation_budget_ready;
+                    Xbyak_aarch64::Label refill_validation_budget;
                     Xbyak_aarch64::Label dispatch_only;
                     code->ldrh(code->w12,
                                Xbyak_aarch64::ptr(code->x19,
                                                  kStateCodeValidationBudgetOffset));
-                    code->cbnz(code->w12, validation_budget_ready);
-                    code->mov(code->w12, kDirectValidationSliceBudget);
-                    code->L(validation_budget_ready);
+                    code->cbz(code->w12, refill_validation_budget);
                     code->subs(code->w12, code->w12, 1);
                     code->strh(code->w12,
                                Xbyak_aarch64::ptr(code->x19,
@@ -15132,7 +15154,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                 ? &ValidateObservedDirectChainTargetAtSafepoint
                                 : &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
-                    emit_reload_register_caches();
+                    emit_reload_register_caches(true);
                     code->mov(code->x16, code->x0);
                     code->cbz(code->x16, fallback);
                     // Validation is also the finite-chain scheduling boundary. Returning through
@@ -15141,8 +15163,18 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // "uninitialized" and "continue" silently restarted the budget on every edge
                     // and turned the supposedly bounded chain into an unbounded one.
                     code->b(fallback);
+                    code->L(refill_validation_budget);
+                    code->mov(code->w12, kDirectValidationSliceBudget - 1u);
+                    code->strh(code->w12,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateCodeValidationBudgetOffset));
                     code->L(dispatch_only);
                     code->b(fallback);
+                    code->L(refill_chain_budget);
+                    code->mov(code->w11, kDirectChainBudget - 1u);
+                    code->strh(code->w11,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateDispatchChainBudgetOffset));
                     code->L(chain);
                     // Raw generated targets use the Arm64BlockEntry ABI (x0 = LsxMachineImage*).
                     // The old helper path restored x0 after its C++ call; the inline fast path
@@ -15186,7 +15218,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     Xbyak_aarch64::Label next_way;
                     Xbyak_aarch64::Label bind;
                     Xbyak_aarch64::Label have_slot;
-                    Xbyak_aarch64::Label budget_ready;
+                    Xbyak_aarch64::Label refill_chain_budget;
                     Xbyak_aarch64::Label validate;
                     Xbyak_aarch64::Label chain;
                     Xbyak_aarch64::Label fallback;
@@ -15243,7 +15275,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         *code, code->x16,
                         reinterpret_cast<std::uint64_t>(&BindPolymorphicChainSite));
                     code->blr(code->x16);
-                    emit_reload_register_caches();
+                    emit_reload_register_caches(true);
                     code->mov(code->x13, code->x0);
                     code->cbz(code->x13, fallback);
 
@@ -15256,25 +15288,20 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->ldrh(code->w11,
                                Xbyak_aarch64::ptr(code->x19,
                                                  kStateDispatchChainBudgetOffset));
-                    code->cbnz(code->w11, budget_ready);
-                    code->mov(code->w11, kDirectChainBudget);
-                    code->L(budget_ready);
+                    code->cbz(code->w11, refill_chain_budget);
                     code->subs(code->w11, code->w11, 1);
                     code->strh(code->w11,
                                Xbyak_aarch64::ptr(code->x19,
                                                  kStateDispatchChainBudgetOffset));
-                    code->cbz(code->w11, validate);
-                    code->b(chain);
+                    code->bne(chain);
 
                     code->L(validate);
-                    Xbyak_aarch64::Label validation_budget_ready;
+                    Xbyak_aarch64::Label refill_validation_budget;
                     Xbyak_aarch64::Label dispatch_only;
                     code->ldrh(code->w12,
                                Xbyak_aarch64::ptr(code->x19,
                                                  kStateCodeValidationBudgetOffset));
-                    code->cbnz(code->w12, validation_budget_ready);
-                    code->mov(code->w12, kDirectValidationSliceBudget);
-                    code->L(validation_budget_ready);
+                    code->cbz(code->w12, refill_validation_budget);
                     code->subs(code->w12, code->w12, 1);
                     code->strh(code->w12,
                                Xbyak_aarch64::ptr(code->x19,
@@ -15288,11 +15315,21 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         reinterpret_cast<std::uint64_t>(
                             &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
-                    emit_reload_register_caches();
+                    emit_reload_register_caches(true);
                     code->b(fallback);
+                    code->L(refill_validation_budget);
+                    code->mov(code->w12, kDirectValidationSliceBudget - 1u);
+                    code->strh(code->w12,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateCodeValidationBudgetOffset));
                     code->L(dispatch_only);
                     code->b(fallback);
 
+                    code->L(refill_chain_budget);
+                    code->mov(code->w11, kDirectChainBudget - 1u);
+                    code->strh(code->w11,
+                               Xbyak_aarch64::ptr(code->x19,
+                                                 kStateDispatchChainBudgetOffset));
                     code->L(chain);
                     // Source/title retirement disables the whole PIC and must remain an immediate
                     // guard. Target code itself is lifetime-stable; byte/epoch validation remains
@@ -15687,6 +15724,15 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         const int cached_host_index =
                             cached_gpr_host_index(state_offset);
                         if (cached_host_index >= 0) {
+                            const int cache_index =
+                                cached_gpr_cache_index(state_offset);
+                            if (cache_index >= 0 &&
+                                generic_cached_gpr_dirty[
+                                    static_cast<std::size_t>(cache_index)]) {
+                                generic_gpr_cache_written_mask |=
+                                    std::uint32_t{1} <<
+                                    static_cast<std::uint32_t>(cache_index);
+                            }
                             const XReg cached{
                                 static_cast<std::uint32_t>(cached_host_index)};
                             if (size_bits == 8) {
@@ -20867,9 +20913,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         if (outgoing_direct_slot == nullptr) {
             return false;
         }
-        Xbyak_aarch64::Label budget_ready;
+        Xbyak_aarch64::Label refill_chain_budget;
         Xbyak_aarch64::Label scheduling_boundary;
-        Xbyak_aarch64::Label validation_budget_ready;
+        Xbyak_aarch64::Label refill_validation_budget;
         Xbyak_aarch64::Label chain;
         Xbyak_aarch64::Label fallback;
         EmitJitRelocatablePointer(
@@ -20884,23 +20930,18 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         code.ldrh(code.w11,
                   Xbyak_aarch64::ptr(code.x0,
                                     kStateDispatchChainBudgetOffset));
-        code.cbnz(code.w11, budget_ready);
-        code.mov(code.w11, kDirectChainBudget);
-        code.L(budget_ready);
+        code.cbz(code.w11, refill_chain_budget);
         code.subs(code.w11, code.w11, 1);
         code.strh(code.w11,
                   Xbyak_aarch64::ptr(code.x0,
                                     kStateDispatchChainBudgetOffset));
-        code.cbz(code.w11, scheduling_boundary);
-        code.b(chain);
+        code.bne(chain);
 
         code.L(scheduling_boundary);
         code.ldrh(code.w12,
                   Xbyak_aarch64::ptr(code.x0,
                                     kStateCodeValidationBudgetOffset));
-        code.cbnz(code.w12, validation_budget_ready);
-        code.mov(code.w12, kDirectValidationSliceBudget);
-        code.L(validation_budget_ready);
+        code.cbz(code.w12, refill_validation_budget);
         code.subs(code.w12, code.w12, 1);
         code.strh(code.w12,
                   Xbyak_aarch64::ptr(code.x0,
@@ -20931,6 +20972,18 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         // scheduling boundary. It observes the authoritative cache epoch before re-entry.
         code.b(fallback);
 
+        code.L(refill_validation_budget);
+        code.mov(code.w12, kDirectValidationSliceBudget - 1u);
+        code.strh(code.w12,
+                  Xbyak_aarch64::ptr(code.x0,
+                                    kStateCodeValidationBudgetOffset));
+        code.b(fallback);
+
+        code.L(refill_chain_budget);
+        code.mov(code.w11, kDirectChainBudget - 1u);
+        code.strh(code.w11,
+                  Xbyak_aarch64::ptr(code.x0,
+                                    kStateDispatchChainBudgetOffset));
         code.L(chain);
         // The tail target bypasses RunGuest's next loop iteration.  Publish its
         // static guest RIP before BR so a fault in the linked entry maps to the
@@ -36763,10 +36816,9 @@ std::string ExerciseTranslationEngineJson() {
                 slot.guest_size.store(1, std::memory_order_relaxed);
                 slot.guest_hash.store(HashGuestCodeWindow(slot.guest_rip, 1),
                                       std::memory_order_relaxed);
-                slot.refresh_counter.store(kJitCacheInitialValidation,
-                                           std::memory_order_relaxed);
                 slot.chain_target.store(chain_target,
                                         std::memory_order_relaxed);
+                slot.MarkPublication();
                 slot.target.store(target, std::memory_order_release);
             };
             arm_slot(taken_slot, taken_marker, taken_chain_marker);
@@ -36891,8 +36943,6 @@ std::string ExerciseTranslationEngineJson() {
                 for (std::size_t index = 0; index + 1 < kBlockCount; ++index) {
                     chain_slots[index]->chain_target.store(nullptr,
                                                            std::memory_order_relaxed);
-                    chain_slots[index]->refresh_counter.store(0,
-                                                               std::memory_order_relaxed);
                 }
                 const auto begin = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < kIterations; ++iteration) {
@@ -36911,8 +36961,6 @@ std::string ExerciseTranslationEngineJson() {
                 for (std::size_t index = 0; index + 1 < kBlockCount; ++index) {
                     chain_slots[index]->chain_target.store(
                         chain_bodies[index + 1], std::memory_order_relaxed);
-                    chain_slots[index]->refresh_counter.store(0,
-                                                               std::memory_order_relaxed);
                 }
                 const auto begin = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < kIterations; ++iteration) {
@@ -36987,8 +37035,7 @@ std::string ExerciseTranslationEngineJson() {
                                      const std::uint64_t guest_hash = 0) {
                 slot.guest_size.store(guest_size, std::memory_order_relaxed);
                 slot.guest_hash.store(guest_hash, std::memory_order_relaxed);
-                slot.refresh_counter.store(kJitCacheInitialValidation,
-                                           std::memory_order_relaxed);
+                slot.MarkPublication();
                 slot.target.store(target, std::memory_order_release);
             };
 
@@ -37468,8 +37515,8 @@ std::string ExerciseTranslationEngineJson() {
                 : nullptr;
         const bool chain_patch_first_use_armed =
             direct_slot_precompile != nullptr &&
-            direct_slot_precompile->refresh_counter.load(std::memory_order_relaxed) ==
-                kJitCacheInitialValidation;
+            direct_slot_precompile->publication_generation.load(
+                std::memory_order_acquire) != 1;
 
         // A newly published slot must hash before its first direct execution. Keep this
         // independent from the larger generated-consumer test so changing that test's number
@@ -37488,8 +37535,7 @@ std::string ExerciseTranslationEngineJson() {
             HashGuestCodeWindow(direct_first_validation_slot.guest_rip,
                            static_cast<std::uint32_t>(direct_first_validation_code.size())),
             std::memory_order_relaxed);
-        direct_first_validation_slot.refresh_counter.store(
-            kJitCacheInitialValidation, std::memory_order_relaxed);
+        direct_first_validation_slot.MarkPublication();
         direct_first_validation_slot.target.store(direct_published_entry,
                                                   std::memory_order_release);
         direct_first_validation_code[0] = 0xcc;
@@ -37500,8 +37546,8 @@ std::string ExerciseTranslationEngineJson() {
             direct_published_entry != nullptr &&
             direct_first_validation_result == nullptr &&
             direct_first_validation_slot.target.load(std::memory_order_acquire) == nullptr &&
-            direct_first_validation_slot.refresh_counter.load(std::memory_order_relaxed) ==
-                kJitCacheInitialValidation &&
+            direct_first_validation_slot.publication_generation.load(
+                std::memory_order_acquire) >= 3 &&
             direct_first_validation_epoch.load(std::memory_order_acquire) == 8;
         LsxEntryPacket direct_execute_ctx{};
         const std::uint64_t direct_tls_before_mutation =
@@ -37652,8 +37698,7 @@ std::string ExerciseTranslationEngineJson() {
         // mutation at a validation boundary so the end-to-end test still proves invalidation
         // before stale generated code can execute.
         if (direct_slot_precompile != nullptr) {
-            direct_slot_precompile->refresh_counter.store(
-                kJitCacheInitialValidation, std::memory_order_relaxed);
+            direct_slot_precompile->MarkPublication();
         }
         chain_patch_code[kDirectTargetOffset + 1] = static_cast<std::uint8_t>(
             kDirectMutatedCalleeOffset - (kDirectTargetOffset + 2));
