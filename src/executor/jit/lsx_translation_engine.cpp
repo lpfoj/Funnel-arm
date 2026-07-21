@@ -3405,7 +3405,12 @@ struct PublishedDestination {
 
 Arm64BlockEntry SelectDestinationEntry(const PublishedDestination& destination,
                                        const OutboundEdgeState& edge) noexcept {
-    if (edge.enters_resident_frame && destination.resident_entry != nullptr) {
+    if (edge.enters_resident_frame) {
+        // A resident edge branches while its source's shared frame is still live.  An ordinary
+        // external entry cannot consume that frame: publishing it as a fallback would either
+        // strand the source frame or restore a frame it never created.  Keep this source-private
+        // edge cold until a resident-compatible destination is available; generated code then
+        // takes its normal epilogue and returns the guest RIP to the dispatcher.
         return destination.resident_entry;
     }
     return destination.external_entry;
@@ -36785,6 +36790,54 @@ std::string ExerciseTranslationEngineJson() {
             conditional_two_edge_semantic_ok &&
             conditional_two_edge_safepoint_ok && conditional_two_edge_smc_ok;
 
+        // A source that already owns the shared frame may only branch to a resident body.  An
+        // external-only destination must leave its source-private edge cold so the generated
+        // fallback restores the frame before returning to the dispatcher.
+        bool resident_to_external_boundary_ok = false;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            alignas(16) std::array<std::uint8_t, 4> source_code = {
+                0x48, 0x83, 0xc0, 0x01, // add rax,1
+            };
+            const std::uint64_t source_rip =
+                reinterpret_cast<std::uint64_t>(source_code.data());
+            const std::uint64_t external_only_rip = source_rip + source_code.size();
+            constexpr std::uint64_t kExternalOnlyMarker = 0x4c5358344652414dull;
+            Arm64BlockEntry external_only_entry =
+                arena.EmitReturnImmediateBlock(kExternalOnlyMarker);
+            OutboundEdgeState resident_edge(external_only_rip);
+            resident_edge.enters_resident_frame = true;
+            const PublishedDestination external_only_destination{
+                external_only_entry, nullptr, nullptr};
+            const Arm64BlockEntry selected_resident_entry =
+                SelectDestinationEntry(external_only_destination, resident_edge);
+            resident_edge.target.store(selected_resident_entry,
+                                       std::memory_order_release);
+
+            LsxDecodedRegion source_block = DecodeGuestBasicRegion(source_rip, 1);
+            Arm64BlockEntry source_direct = nullptr;
+            Arm64BlockEntry source_resident = nullptr;
+            bool source_chain_abi = false;
+            Arm64BlockEntry source_entry = arena.EmitNativeControlFlowBlock(
+                source_block, &resident_edge, &source_direct, nullptr, nullptr,
+                nullptr, &source_chain_abi, &source_resident);
+            LsxMachineImage source_state{};
+            source_state.native_edge_phase = 2;
+            const std::uint64_t source_result =
+                source_direct != nullptr ? source_direct(&source_state) : 0;
+
+            OutboundEdgeState external_edge(external_only_rip);
+            const Arm64BlockEntry selected_external_entry =
+                SelectDestinationEntry(external_only_destination, external_edge);
+            resident_to_external_boundary_ok =
+                external_only_entry != nullptr && source_entry != nullptr &&
+                source_direct == source_entry && source_resident != nullptr &&
+                source_chain_abi && selected_resident_entry == nullptr &&
+                selected_external_entry == external_only_entry &&
+                source_result == external_only_rip &&
+                ReadGuestGpr64(source_state, LsxGpr::Rax) == 1;
+        }
+
         // Device-side throughput gate for the shared-frame ABI.  Build one identical linear
         // scalar workload, then execute it first through one ordinary Arm64BlockEntry entry per x86
         // block and again as one native chain.  The unchained side intentionally excludes decode,
@@ -45437,6 +45490,7 @@ std::string ExerciseTranslationEngineJson() {
                              cache_public_hash_abi_ok &&
                              persistent_ir_derived_recompute_ok && edge_e2e_ok &&
                              conditional_two_edge_direct_ok &&
+                             resident_to_external_boundary_ok &&
                              direct_fault_target_fallback_ok &&
                              direct_fault_synthetic_resume_ok &&
                              divide_error_delivery_ok &&
@@ -45555,6 +45609,8 @@ std::string ExerciseTranslationEngineJson() {
             << (conditional_two_edge_safepoint_ok ? "true" : "false") << ","
             << R"("conditionalTwoEdgeSmcOk":)"
             << (conditional_two_edge_smc_ok ? "true" : "false") << ","
+            << R"("residentToExternalBoundaryOk":)"
+            << (resident_to_external_boundary_ok ? "true" : "false") << ","
             << R"("sharedChainThroughputOk":)"
             << (shared_chain_throughput_ok ? "true" : "false") << ","
             << R"("sharedChainSpeedup":)" << shared_chain_speedup << ","
