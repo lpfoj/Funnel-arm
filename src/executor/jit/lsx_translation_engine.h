@@ -46,48 +46,48 @@ static_assert(GprSlot(LsxGpr::Rsp) == 4);
 static_assert(GprSlot(LsxGpr::R15) == 15);
 
 enum class AluOp : std::uint8_t {
-    Add = 0,
-    Sub = 1,
-    Cmp = 2,
-    And = 3,
-    Or = 4,
-    Xor = 5,
-    Test = 6,
+    Add = 0x41,
+    Sub = 0x16,
+    Cmp = 0x73,
+    And = 0x2c,
+    Or = 0x58,
+    Xor = 0x0d,
+    Test = 0x65,
 };
 
 enum class ShiftOp : std::uint8_t {
-    Shl = 0,
-    Shr = 1,
-    Sar = 2,
+    Shl = 0x52,
+    Shr = 0x19,
+    Sar = 0x6b,
 };
 
 enum class IncDecOp : std::uint8_t {
-    Dec = 0,
-    Inc = 1,
+    Dec = 0x35,
+    Inc = 0x6e,
 };
 
 enum class BitTestOp : std::uint8_t {
-    Test = 0,
-    Set = 1,
-    Reset = 2,
-    Complement = 3,
+    Test = 0x4a,
+    Set = 0x71,
+    Reset = 0x23,
+    Complement = 0x5c,
 };
 
 enum class VectorLogicOp : std::uint8_t {
-    Xor = 0,
-    And = 1,
-    Or = 2,
-    AndNot = 3,
+    Xor = 0x67,
+    And = 0x14,
+    Or = 0x49,
+    AndNot = 0x2e,
 };
 
 enum class ScalarArithOp : std::uint8_t {
-    Add = 0,
-    Sub = 1,
-    Mul = 2,
-    Div = 3,
-    Min = 4,
-    Max = 5,
-    AddSub = 6,
+    Add = 0x37,
+    Sub = 0x64,
+    Mul = 0x12,
+    Div = 0x7b,
+    Min = 0x29,
+    Max = 0x50,
+    AddSub = 0x0e,
 };
 
 inline constexpr std::size_t kLsxInstructionByteLimit = 15;
@@ -488,204 +488,204 @@ bool QualifiesForInitialLowering(const LsxDecodedRegion& block);
 
 // Scalar precision-conversion contract: x0=dst xmm, x1=old dst xmm,
 // x2=src scalar, x3=direction.
-void Alu(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand, AluOp op,
+void ExecuteIntegerArithmetic(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand, AluOp op,
          std::uint32_t size_bits, std::uint32_t shift_bits);
-std::uint64_t AluMem(LsxMachineImage& state, std::uint64_t mem_value, std::uint64_t operand,
+std::uint64_t ExecuteIntegerArithmeticMemory(LsxMachineImage& state, std::uint64_t mem_value, std::uint64_t operand,
                      AluOp op, std::uint32_t size_bits);
-std::uint64_t AluMemLocked(LsxMachineImage& state, void* target, std::uint64_t operand,
+std::uint64_t ExecuteIntegerArithmeticAtomic(LsxMachineImage& state, void* target, std::uint64_t operand,
                            AluOp op, std::uint32_t size_bits);
-void MovbeLoad(LsxMachineImage& state, const void* src, std::size_t state_offset, std::uint32_t size_bits);
-void MovbeStore(const LsxMachineImage& state, void* dst, std::size_t state_offset, std::uint32_t size_bits);
-void MovN(void* dst, const void* src, std::size_t size);
+void LoadReversedEndian(LsxMachineImage& state, const void* src, std::size_t state_offset, std::uint32_t size_bits);
+void StoreReversedEndian(const LsxMachineImage& state, void* dst, std::size_t state_offset, std::uint32_t size_bits);
+void CopyFixedWidthValue(void* dst, const void* src, std::size_t size);
 bool TestCondition(const LsxMachineImage& state, LsxMnemonicCode mnemonic);
-std::uint64_t EvalCond(const LsxMachineImage& state, LsxMnemonicCode mnemonic,
+std::uint64_t ResolveConditionCode(const LsxMachineImage& state, LsxMnemonicCode mnemonic,
                        std::uint64_t true_value, std::uint64_t false_value);
-void Setcc(LsxMachineImage& state, std::size_t state_offset, LsxMnemonicCode mnemonic);
-void SetccMem(const LsxMachineImage& state, void* dst, LsxMnemonicCode mnemonic);
-void Cmov(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void WriteConditionToRegister(LsxMachineImage& state, std::size_t state_offset, LsxMnemonicCode mnemonic);
+void WriteConditionToMemory(const LsxMachineImage& state, void* dst, LsxMnemonicCode mnemonic);
+void SelectRegisterConditionally(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
           LsxMnemonicCode mnemonic, std::uint32_t size_bits);
-void Shift(LsxMachineImage& state, std::size_t state_offset, std::uint64_t count,
+void ShiftRegisterOperand(LsxMachineImage& state, std::size_t state_offset, std::uint64_t count,
            ShiftOp op, std::uint32_t size_bits);
-void ShiftMem(LsxMachineImage& state, void* target, std::uint64_t count, ShiftOp op,
+void ShiftMemoryOperand(LsxMachineImage& state, void* target, std::uint64_t count, ShiftOp op,
               std::uint32_t size_bits);
 void Shld(LsxMachineImage& state, std::size_t state_offset, std::uint64_t source,
           std::uint64_t count, std::uint32_t size_bits);
 void ShldMem(LsxMachineImage& state, void* target, std::uint64_t source,
              std::uint64_t count, std::uint32_t size_bits);
-void Rotate(LsxMachineImage& state, std::size_t state_offset, std::uint64_t count,
+void RotateRegisterOperand(LsxMachineImage& state, std::size_t state_offset, std::uint64_t count,
             bool rotate_right, std::uint32_t size_bits);
 void RotateMem(LsxMachineImage& state, void* target, std::uint64_t count,
                bool rotate_right, std::uint32_t size_bits);
-void IncDec(LsxMachineImage& state, std::size_t state_offset, IncDecOp op, std::uint32_t size_bits);
-void IncDecMem(LsxMachineImage& state, void* target, IncDecOp op, std::uint32_t size_bits);
-void IncDecMemLocked(LsxMachineImage& state, void* target, IncDecOp op, std::uint32_t size_bits);
-void Neg(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
-void NegMem(LsxMachineImage& state, void* target, std::uint32_t size_bits);
-void NegMemLocked(LsxMachineImage& state, void* target, std::uint32_t size_bits);
+void AdjustRegisterByOne(LsxMachineImage& state, std::size_t state_offset, IncDecOp op, std::uint32_t size_bits);
+void AdjustMemoryByOne(LsxMachineImage& state, void* target, IncDecOp op, std::uint32_t size_bits);
+void AdjustAtomicMemoryByOne(LsxMachineImage& state, void* target, IncDecOp op, std::uint32_t size_bits);
+void NegateRegisterOperand(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
+void NegateMemoryOperand(LsxMachineImage& state, void* target, std::uint32_t size_bits);
+void NegateAtomicMemoryOperand(LsxMachineImage& state, void* target, std::uint32_t size_bits);
 void NotMemLocked(LsxMachineImage& state, void* target, std::uint32_t size_bits);
-void MulOne(LsxMachineImage& state, std::uint64_t operand, std::uint32_t size_bits, bool is_signed);
-void DivOne(LsxMachineImage& state, std::uint64_t divisor, std::uint32_t size_bits, bool is_signed);
-void AdcSbb(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand,
+void MultiplyAccumulatorPair(LsxMachineImage& state, std::uint64_t operand, std::uint32_t size_bits, bool is_signed);
+void DivideAccumulatorPair(LsxMachineImage& state, std::uint64_t divisor, std::uint32_t size_bits, bool is_signed);
+void ExecuteCarryArithmetic(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand,
             bool subtract, std::uint32_t size_bits);
-void AdcSbbMem(LsxMachineImage& state, void* target, std::uint64_t operand, bool subtract,
+void ExecuteCarryArithmeticMemory(LsxMachineImage& state, void* target, std::uint64_t operand, bool subtract,
                std::uint32_t size_bits);
-void AdcSbbMemLocked(LsxMachineImage& state, void* target, std::uint64_t operand, bool subtract,
+void ExecuteCarryArithmeticAtomic(LsxMachineImage& state, void* target, std::uint64_t operand, bool subtract,
                      std::uint32_t size_bits);
-void Andn(LsxMachineImage& state, std::size_t state_offset, std::uint64_t lhs_not,
+void ComputeAndWithInvertedSource(LsxMachineImage& state, std::size_t state_offset, std::uint64_t lhs_not,
           std::uint64_t rhs, std::uint32_t size_bits);
-void Blsi(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void IsolateLeastSignificantSetBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
           std::uint32_t size_bits);
-void SetDirectionFlag(LsxMachineImage& state, bool set);
-void Movs(LsxMachineImage& state, std::uint64_t element_size, bool repeat);
-void Stos(LsxMachineImage& state, std::uint64_t element_size, bool repeat);
-void Cmps(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
+void ChangeStringTraversalDirection(LsxMachineImage& state, bool set);
+void CopyStringUnit(LsxMachineImage& state, std::uint64_t element_size, bool repeat);
+void FillStringUnit(LsxMachineImage& state, std::uint64_t element_size, bool repeat);
+void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
           bool repeat_not_equal);
-void Cmpxchg(LsxMachineImage& state, void* target, bool target_is_register_lane, std::uint32_t target_shift,
+void CompareExchangeValue(LsxMachineImage& state, void* target, bool target_is_register_lane, std::uint32_t target_shift,
              std::size_t src_state_offset, std::uint32_t src_shift, std::uint32_t size_bits);
-void CmpxchgLocked(LsxMachineImage& state, void* target, bool target_is_register_lane,
+void CompareExchangeMemoryAtomic(LsxMachineImage& state, void* target, bool target_is_register_lane,
                    std::uint32_t target_shift, std::size_t src_state_offset,
                    std::uint32_t src_shift, std::uint32_t size_bits);
-void Bextr(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void ExtractContiguousBits(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
            std::uint32_t control, std::uint32_t size_bits);
-void Blsr(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void ClearLeastSignificantSetBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
           std::uint32_t size_bits);
-void BtReg(LsxMachineImage& state, std::size_t state_offset, std::uint64_t bit_index,
+void ProbeRegisterBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t bit_index,
            std::uint32_t size_bits);
-void BitTest(LsxMachineImage& state, std::uintptr_t state_offset_or_mem_ptr, bool target_is_memory,
+void ModifyRegisterBit(LsxMachineImage& state, std::uintptr_t state_offset_or_mem_ptr, bool target_is_memory,
              std::uint64_t bit_index, bool unsigned_memory_index, std::uint32_t size_bits,
              BitTestOp op);
-void BitTestLocked(LsxMachineImage& state, std::uintptr_t state_offset_or_mem_ptr, bool target_is_memory,
+void ModifyAtomicMemoryBit(LsxMachineImage& state, std::uintptr_t state_offset_or_mem_ptr, bool target_is_memory,
                    std::uint64_t bit_index, bool unsigned_memory_index, std::uint32_t size_bits,
                    BitTestOp op);
-void BitScan(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void LocateSetBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
              bool reverse, std::uint32_t size_bits);
-void Xadd(LsxMachineImage& state, std::size_t dst_state_offset, std::size_t src_state_offset,
+void ExchangeAddRegister(LsxMachineImage& state, std::size_t dst_state_offset, std::size_t src_state_offset,
           std::uint32_t size_bits);
-void XaddMem(LsxMachineImage& state, void* target, std::size_t src_state_offset, std::uint32_t size_bits);
-void XaddMemLocked(LsxMachineImage& state, void* target, std::size_t src_state_offset,
+void ExchangeAddMemory(LsxMachineImage& state, void* target, std::size_t src_state_offset, std::uint32_t size_bits);
+void ExchangeAddMemoryAtomic(LsxMachineImage& state, void* target, std::size_t src_state_offset,
                    std::uint32_t size_bits);
-void Popcnt(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void CountSetBits(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
             std::uint32_t src_size_bits, std::uint32_t dst_size_bits);
-void Lzcnt(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void CountLeadingZeroes(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
            std::uint32_t src_size_bits, std::uint32_t dst_size_bits);
-void Tzcnt(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
+void CountTrailingZeroes(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
            std::uint32_t src_size_bits, std::uint32_t dst_size_bits);
-void Bswap(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
-void NotMem(void* target, std::uint32_t size_bits);
-void Imul(LsxMachineImage& state, std::size_t state_offset, std::uint64_t lhs, std::uint64_t rhs,
+void ReverseRegisterByteOrder(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
+void ComplementMemoryOperand(void* target, std::uint32_t size_bits);
+void MultiplySignedOperands(LsxMachineImage& state, std::size_t state_offset, std::uint64_t lhs, std::uint64_t rhs,
           std::uint32_t size_bits);
-void VMov(void* dst, const void* src, std::size_t size, bool zero_upper_ymm);
-void Movdq(void* vector, void* other, std::size_t size, std::uint32_t mode);
-void Movlhps64(void* dst, const void* old_dst_or_src, const void* src, bool high_qword,
+void TransferVectorValue(void* dst, const void* src, std::size_t size, bool zero_upper_ymm);
+void TransferScalarVectorBits(void* vector, void* other, std::size_t size, std::uint32_t mode);
+void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src, const void* src, bool high_qword,
                std::uint32_t mode);
-void Movlhlps(void* dst, const void* lhs, const void* rhs, bool high_selector,
+void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs, bool high_selector,
               bool full_vector);
-void SseLogic(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
+void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
               VectorLogicOp op);
-void VLogic(void* dst, const void* lhs, const void* rhs, VectorLogicOp op, std::size_t size);
-void VPackedTest(LsxMachineImage& state, const void* lhs, const void* rhs, std::size_t size);
-void VMoveSingleDuplicate(void* dst, const void* src, bool high_source_elements, std::size_t size);
-void VMoveDoubleDuplicate(void* dst, const void* src, std::size_t size, bool zero_upper_ymm);
-void VBroadcastScalar(void* dst, const void* src, std::size_t element_size, std::size_t total_size);
-void VBroadcast128(void* dst, const void* src);
-std::uint64_t VMoveMask(const void* src, std::size_t lane_bytes, std::size_t total_size);
-void VExtractDword(void* dst, const void* src, std::uint32_t index, bool store_qword);
-void VExtractElement(void* dst, const void* src, std::uint32_t index, bool store_qword,
+void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, VectorLogicOp op, std::size_t size);
+void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, std::size_t size);
+void DuplicatePackedSingleLanes(void* dst, const void* src, bool high_source_elements, std::size_t size);
+void DuplicatePackedDoubleLanes(void* dst, const void* src, std::size_t size, bool zero_upper_ymm);
+void BroadcastScalarLane(void* dst, const void* src, std::size_t element_size, std::size_t total_size);
+void BroadcastVectorHalf(void* dst, const void* src);
+std::uint64_t CollectVectorSignBits(const void* src, std::size_t lane_bytes, std::size_t total_size);
+void ExtractVectorDword(void* dst, const void* src, std::uint32_t index, bool store_qword);
+void ExtractVectorLane(void* dst, const void* src, std::uint32_t index, bool store_qword,
                      std::size_t element_size);
-void VInsertPs(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
+void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
                bool src_is_memory);
-void VPinsr(void* dst, const void* old_dst, std::uint64_t value, std::uint32_t index,
+void InsertVectorIntegerLane(void* dst, const void* old_dst, std::uint64_t value, std::uint32_t index,
             std::size_t element_size);
-void VInsertF128(void* dst, const void* old_dst, const void* src, std::uint32_t half_index);
-void VExtractF128(void* dst, const void* src, std::uint32_t half_index, bool zero_upper_ymm);
-void VPerm2F128(void* dst, const void* lhs, const void* rhs, std::uint32_t imm);
-void VBlendImm(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
+void InsertVectorHalf(void* dst, const void* old_dst, const void* src, std::uint32_t half_index);
+void ExtractVectorHalf(void* dst, const void* src, std::uint32_t half_index, bool zero_upper_ymm);
+void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, std::uint32_t imm);
+void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
                std::size_t lane_bytes, std::size_t total_size,
                bool repeat_mask_per_128 = false);
-void VBlendVar(void* dst, const void* lhs, const void* rhs, const void* mask,
+void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
                std::size_t lane_bytes, std::size_t total_size);
-void VPBlendVB(void* dst, const void* lhs, const void* rhs, const void* mask,
+void BlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
                std::size_t total_size);
-void VPBlendW(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
+void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
               std::size_t total_size);
-void Pshufb(void* dst, const void* src, const void* mask, std::size_t total_size);
-void Punpck(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
+void PermuteBytesFromMask(void* dst, const void* src, const void* mask, std::size_t total_size);
+void InterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
             bool high_half, std::size_t total_size);
-void VPunpck(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
+void InterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
              bool high_half, std::size_t total_size);
-void VMovScalarMerge(void* dst, const void* old_dst, const void* scalar_src,
+void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
                      std::size_t scalar_size);
-void Pshufd(void* dst, const void* src, std::uint8_t imm);
-void VPshufw(void* dst, const void* src, std::uint8_t imm, std::size_t total_size,
+void PermuteDwordsFromImmediate(void* dst, const void* src, std::uint8_t imm);
+void PermutePackedWords(void* dst, const void* src, std::uint8_t imm, std::size_t total_size,
              bool high_half);
-void Shufps(void* dst, const void* lhs, const void* rhs, std::uint8_t imm);
-void VShuf(void* dst, const void* lhs, const void* rhs, std::uint8_t imm,
+void PermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, std::uint8_t imm);
+void PermuteVectorPairs(void* dst, const void* lhs, const void* rhs, std::uint8_t imm,
            std::size_t total_size, bool double_lane);
-void VPackedZeroExtend(void* dst, const void* src, std::size_t src_element_size,
+void ExtendPackedUnsignedLanes(void* dst, const void* src, std::size_t src_element_size,
                        std::size_t dst_element_size, std::size_t total_size);
-void VPackedSignExtend(void* dst, const void* src, std::size_t src_element_size,
+void ExtendPackedSignedLanes(void* dst, const void* src, std::size_t src_element_size,
                        std::size_t dst_element_size, std::size_t total_size);
-void VCvtsi2Scalar(void* dst, const void* old_dst, std::uint64_t value,
+void ConvertIntegerToScalar(void* dst, const void* old_dst, std::uint64_t value,
                    std::uint32_t source_size_bits, bool integer_to_double);
-void VCvtScalarToInt(LsxMachineImage& state, std::size_t state_offset, const void* scalar_src,
+void ConvertScalarToInteger(LsxMachineImage& state, std::size_t state_offset, const void* scalar_src,
                      std::uint32_t dst_size_bits, bool source_is_double,
                      bool use_current_rounding);
-void Comi(LsxMachineImage& state, const void* lhs, const void* rhs, bool compare_double);
-void VScalarArith(void* dst, const void* lhs_old_dst, const void* rhs, ScalarArithOp op,
+void CompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void* rhs, bool compare_double);
+void ComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, ScalarArithOp op,
                   bool operate_double);
-void VScalarSqrt(void* dst, const void* old_dst, const void* src, bool operate_double);
-void VScalarRound(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
+void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, bool operate_double);
+void RoundScalarFloating(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
                   bool operate_double, std::uint32_t mxcsr);
-void VPackedAddSub(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
+void AddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
                    bool subtract, std::size_t total_size);
-void VPackuswb(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void VPackusdw(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void VPackedQShift(void* dst, const void* src, std::uint64_t count, bool left,
+void SaturateWordToUnsignedByte(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
+void SaturateDwordToUnsignedWord(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
+void ShiftPackedQuadwords(void* dst, const void* src, std::uint64_t count, bool left,
                    std::size_t total_size);
-void VPackedWordShift(void* dst, const void* src, std::uint64_t count,
+void ShiftPackedWordGroups(void* dst, const void* src, std::uint64_t count,
                       std::size_t element_bytes, bool left, bool arithmetic_right,
                       std::size_t total_size);
-void VPackedByteShift(void* dst, const void* src, std::size_t shift, bool left,
+void ShiftWholeVectorBytes(void* dst, const void* src, std::size_t shift, bool left,
                       std::size_t total_size);
-void PsImm(void* dst, const void* src, std::uint64_t count, std::size_t element_bytes,
+void ShiftPackedLegacyImmediate(void* dst, const void* src, std::uint64_t count, std::size_t element_bytes,
            bool left, bool arithmetic_right, std::size_t total_size);
-void VPsImm(void* dst, const void* src, std::uint64_t count, std::size_t element_bytes,
+void ShiftPackedVectorImmediate(void* dst, const void* src, std::uint64_t count, std::size_t element_bytes,
             bool left, bool arithmetic_right, std::size_t total_size);
-void VPackedMultiply(void* dst, const void* lhs, const void* rhs, std::uint32_t mode,
+void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, std::uint32_t mode,
                      std::size_t total_size);
-void VPackedMinMax(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
+void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
                    bool compare_signed, bool select_max, std::size_t total_size);
-void VPackedCompare(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
+void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
                     bool signed_greater_than, std::size_t total_size);
-void VPackedFloatArith(void* dst, const void* lhs, const void* rhs, ScalarArithOp op,
+void ComputePackedFloating(void* dst, const void* lhs, const void* rhs, ScalarArithOp op,
                        bool operate_double, std::size_t total_size);
-void VPackedSqrt(void* dst, const void* src, bool operate_double, std::size_t total_size,
+void SquareRootPackedFloating(void* dst, const void* src, bool operate_double, std::size_t total_size,
                  bool zero_upper_ymm);
-void VPackedFloatCompare(void* dst, const void* lhs, const void* rhs, std::uint32_t predicate,
+void ComparePackedFloating(void* dst, const void* lhs, const void* rhs, std::uint32_t predicate,
                          bool operate_double, std::size_t total_size);
-void VPackedReciprocalEstimate(void* dst, const void* src, bool reciprocal_sqrt,
+void EstimatePackedReciprocal(void* dst, const void* src, bool reciprocal_sqrt,
                                std::size_t total_size, bool zero_upper_ymm);
-void VPackedRound(void* dst, const void* src, std::uint32_t imm, bool operate_double,
+void RoundPackedFloating(void* dst, const void* src, std::uint32_t imm, bool operate_double,
                   std::size_t total_size, bool zero_upper_ymm, std::uint32_t mxcsr);
-void VPackedHorizontalAddFloat(void* dst, const void* lhs, const void* rhs, bool double_lane,
+void AddHorizontalPackedFloating(void* dst, const void* lhs, const void* rhs, bool double_lane,
                                bool subtract, std::size_t total_size, bool zero_upper_ymm);
-void VPhaddd(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void VPhminposuw(void* dst, const void* src, bool zero_upper_ymm);
-void VDpps(void* dst, const void* lhs, const void* rhs, std::uint8_t imm,
+void AddHorizontalPackedDwords(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
+void FindMinimumUnsignedWord(void* dst, const void* src, bool zero_upper_ymm);
+void DotProductPackedSingle(void* dst, const void* lhs, const void* rhs, std::uint8_t imm,
            std::size_t total_size, bool zero_upper_ymm);
-void VPackedDqPsConvert(void* dst, const void* src, bool int_to_float, bool truncate,
+void ConvertPackedIntegerFloat(void* dst, const void* src, bool int_to_float, bool truncate,
                         std::size_t total_size, std::uint32_t mxcsr);
-void VScalarCompare(void* dst, const void* old_dst, const void* lhs, const void* rhs,
+void CompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* lhs, const void* rhs,
                     std::uint32_t predicate, bool operate_double);
-void VPermil(void* dst, const void* src, const void* control, std::uint8_t imm,
+void PermuteVectorLanes(void* dst, const void* src, const void* control, std::uint8_t imm,
              std::size_t total_size, bool double_lane, bool immediate_control);
-void VMaskMov(void* vector, const void* mask, void* other, std::size_t total_size,
+void TransferVectorBySignMask(void* vector, const void* mask, void* other, std::size_t total_size,
               std::size_t lane_bytes, bool store_direction);
-void VcvtScalarPrecision(std::array<std::uint8_t, 32>& dst,
+void ConvertScalarFormatLocal(std::array<std::uint8_t, 32>& dst,
                          const std::array<std::uint8_t, 16>& old_dst,
                          const void* src_scalar, bool single_to_double);
-void FxsaveRestore(LsxMachineImage& state, std::uint64_t address, bool save,
+void TransferLegacyFpEnvironment(LsxMachineImage& state, std::uint64_t address, bool save,
                    bool is_64_bit_image = false);
-void Cmpxchg16bLocked(LsxMachineImage& state, std::uint64_t address);
+void CompareExchangeWideAtomic(LsxMachineImage& state, std::uint64_t address);
 
 } // namespace Executor::Jit

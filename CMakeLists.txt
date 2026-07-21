@@ -1249,6 +1249,16 @@ target_link_options(lsx4_executor_android PRIVATE
 set_property(TARGET lsx4_executor_android APPEND PROPERTY
     LINK_DEPENDS "${LSX4_EXECUTOR_ANDROID_EXPORT_MAP}")
 
+# Android packages do not need the static symbol table or DWARF payload. Keeping only the
+# dynamic surface also prevents private implementation names from becoming part of shipped
+# artifacts while leaving code, relocations and the stable dlsym ABI untouched.
+if(CMAKE_STRIP AND CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+    add_custom_command(TARGET lsx4_executor_android POST_BUILD
+        COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:lsx4_executor_android>"
+        COMMENT "Stripping private symbols from liblsx4_executor_android.so"
+        VERBATIM)
+endif()
+
 create_target_directory_groups(lsx4_executor_android)
 add_dependencies(lsx4_executor_android lsx_iced_decoder_build)
 
