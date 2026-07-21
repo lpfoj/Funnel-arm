@@ -7230,8 +7230,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         return offset == pattern_size;
     };
 
-    constexpr std::uint32_t kStateRspOffset =
-        offsetof(LsxMachineImage, gpr) + (7 * sizeof(std::uint64_t));
+    constexpr auto gpr_state_offset = [](const LsxGpr reg) constexpr {
+        return static_cast<std::uint32_t>(offsetof(LsxMachineImage, gpr) +
+                                          GprSlot(reg) * sizeof(std::uint64_t));
+    };
+    constexpr std::uint32_t kStateRspOffset = gpr_state_offset(LsxGpr::Rsp);
     constexpr std::uint32_t kStateRipOffset = offsetof(LsxMachineImage, rip_or_exit);
     constexpr std::uint32_t kStateRflagsOffset = offsetof(LsxMachineImage, rflags);
     // Non-architectural per-execution direct-chain budget. This lives in the ABI-reserved
@@ -7244,21 +7247,21 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     // frame state from leaking across guest control-flow edges.
     constexpr bool kUseSharedFrameStaticLinks = false;
     constexpr std::uint32_t kStateFaultIrSlotOffset = 0x340;
-    constexpr std::uint32_t kStateRaxOffset = 0x00;
-    constexpr std::uint32_t kStateRbxOffset = 0x08;
-    constexpr std::uint32_t kStateRcxOffset = 0x10;
-    constexpr std::uint32_t kStateRdxOffset = 0x18;
-    constexpr std::uint32_t kStateRsiOffset = 0x20;
-    constexpr std::uint32_t kStateRdiOffset = 0x28;
-    constexpr std::uint32_t kStateRbpOffset = 0x30;
-    constexpr std::uint32_t kStateR8Offset = 0x40;
-    constexpr std::uint32_t kStateR9Offset = 0x48;
-    constexpr std::uint32_t kStateR10Offset = 0x50;
-    constexpr std::uint32_t kStateR11Offset = 0x58;
-    constexpr std::uint32_t kStateR12Offset = 0x60;
-    constexpr std::uint32_t kStateR13Offset = 0x68;
-    constexpr std::uint32_t kStateR14Offset = 0x70;
-    constexpr std::uint32_t kStateR15Offset = 0x78;
+    constexpr std::uint32_t kStateRaxOffset = gpr_state_offset(LsxGpr::Rax);
+    constexpr std::uint32_t kStateRbxOffset = gpr_state_offset(LsxGpr::Rbx);
+    constexpr std::uint32_t kStateRcxOffset = gpr_state_offset(LsxGpr::Rcx);
+    constexpr std::uint32_t kStateRdxOffset = gpr_state_offset(LsxGpr::Rdx);
+    constexpr std::uint32_t kStateRsiOffset = gpr_state_offset(LsxGpr::Rsi);
+    constexpr std::uint32_t kStateRdiOffset = gpr_state_offset(LsxGpr::Rdi);
+    constexpr std::uint32_t kStateRbpOffset = gpr_state_offset(LsxGpr::Rbp);
+    constexpr std::uint32_t kStateR8Offset = gpr_state_offset(LsxGpr::R8);
+    constexpr std::uint32_t kStateR9Offset = gpr_state_offset(LsxGpr::R9);
+    constexpr std::uint32_t kStateR10Offset = gpr_state_offset(LsxGpr::R10);
+    constexpr std::uint32_t kStateR11Offset = gpr_state_offset(LsxGpr::R11);
+    constexpr std::uint32_t kStateR12Offset = gpr_state_offset(LsxGpr::R12);
+    constexpr std::uint32_t kStateR13Offset = gpr_state_offset(LsxGpr::R13);
+    constexpr std::uint32_t kStateR14Offset = gpr_state_offset(LsxGpr::R14);
+    constexpr std::uint32_t kStateR15Offset = gpr_state_offset(LsxGpr::R15);
     constexpr std::uint32_t kStateYmm0Offset = 0x140;
     constexpr std::uint32_t kCfBit = 0;
     constexpr std::uint32_t kPfBit = 2;
@@ -7271,11 +7274,13 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         (std::uint64_t{1} << kAfBit) | (std::uint64_t{1} << kZfBit) |
         (std::uint64_t{1} << kSfBit) | (std::uint64_t{1} << kOfBit);
     static_assert(offsetof(LsxMachineImage, gpr) == 0x00);
-    static_assert(offsetof(LsxMachineImage, gpr) + (1 * sizeof(std::uint64_t)) == kStateRbxOffset);
-    static_assert(offsetof(LsxMachineImage, gpr) + (4 * sizeof(std::uint64_t)) == kStateRsiOffset);
-    static_assert(offsetof(LsxMachineImage, gpr) + (5 * sizeof(std::uint64_t)) == kStateRdiOffset);
-    static_assert(offsetof(LsxMachineImage, gpr) + (6 * sizeof(std::uint64_t)) == kStateRbpOffset);
-    static_assert(offsetof(LsxMachineImage, gpr) + (7 * sizeof(std::uint64_t)) == kStateRspOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (1 * sizeof(std::uint64_t)) == kStateRcxOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (2 * sizeof(std::uint64_t)) == kStateRdxOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (3 * sizeof(std::uint64_t)) == kStateRbxOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (4 * sizeof(std::uint64_t)) == kStateRspOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (5 * sizeof(std::uint64_t)) == kStateRbpOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (6 * sizeof(std::uint64_t)) == kStateRsiOffset);
+    static_assert(offsetof(LsxMachineImage, gpr) + (7 * sizeof(std::uint64_t)) == kStateRdiOffset);
     static_assert(offsetof(LsxMachineImage, gpr) + (8 * sizeof(std::uint64_t)) == kStateR8Offset);
     static_assert(offsetof(LsxMachineImage, gpr) + (9 * sizeof(std::uint64_t)) == kStateR9Offset);
     static_assert(offsetof(LsxMachineImage, gpr) + (10 * sizeof(std::uint64_t)) == kStateR10Offset);
@@ -7294,37 +7299,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
     const auto gpr_ordinal_to_state_offset = [](const std::uint32_t ordinal,
                                                 std::uint32_t& state_offset) {
-        std::uint32_t physical = 0;
-        switch (ordinal & 0xfu) {
-        case 0:
-            physical = 0; // RAX
-            break;
-        case 1:
-            physical = 2; // RCX
-            break;
-        case 2:
-            physical = 3; // RDX
-            break;
-        case 3:
-            physical = 1; // RBX
-            break;
-        case 4:
-            physical = 7; // RSP
-            break;
-        case 5:
-            physical = 6; // RBP
-            break;
-        case 6:
-            physical = 4; // RSI
-            break;
-        case 7:
-            physical = 5; // RDI
-            break;
-        default:
-            physical = ordinal & 0xfu; // R8..R15 are linear in the physical state.
-            break;
-        }
-        state_offset = static_cast<std::uint32_t>(physical * sizeof(std::uint64_t));
+        state_offset = static_cast<std::uint32_t>((ordinal & 0xfu) * sizeof(std::uint64_t));
         return true;
     };
 
@@ -20470,44 +20445,6 @@ Arm64BlockEntry Aarch64CodeArena::EmitInterpreterBridge(const LsxDecodedRegion& 
     return entry;
 }
 
-std::size_t PhysicalGprIndex(const LsxGpr reg) {
-    switch (reg) {
-    case LsxGpr::Rax:
-        return 0;
-    case LsxGpr::Rbx:
-        return 1;
-    case LsxGpr::Rcx:
-        return 2;
-    case LsxGpr::Rdx:
-        return 3;
-    case LsxGpr::Rsi:
-        return 4;
-    case LsxGpr::Rdi:
-        return 5;
-    case LsxGpr::Rbp:
-        return 6;
-    case LsxGpr::Rsp:
-        return 7;
-    case LsxGpr::R8:
-        return 8;
-    case LsxGpr::R9:
-        return 9;
-    case LsxGpr::R10:
-        return 10;
-    case LsxGpr::R11:
-        return 11;
-    case LsxGpr::R12:
-        return 12;
-    case LsxGpr::R13:
-        return 13;
-    case LsxGpr::R14:
-        return 14;
-    case LsxGpr::R15:
-        return 15;
-    }
-    return 0;
-}
-
 std::uint32_t JitHostTid() {
 #ifdef __ANDROID__
     return static_cast<std::uint32_t>(syscall(SYS_gettid));
@@ -20548,18 +20485,18 @@ void RecordJitThreadSnapshot(const char* phase, const std::uint64_t executed_blo
     snapshot.rip = rip;
     snapshot.next = next_rip;
     snapshot.result = result;
-    snapshot.rax = state.gpr[PhysicalGprIndex(LsxGpr::Rax)];
-    snapshot.rbx = state.gpr[PhysicalGprIndex(LsxGpr::Rbx)];
-    snapshot.rcx = state.gpr[PhysicalGprIndex(LsxGpr::Rcx)];
-    snapshot.rdx = state.gpr[PhysicalGprIndex(LsxGpr::Rdx)];
-    snapshot.rsi = state.gpr[PhysicalGprIndex(LsxGpr::Rsi)];
-    snapshot.rdi = state.gpr[PhysicalGprIndex(LsxGpr::Rdi)];
-    snapshot.rsp = state.gpr[PhysicalGprIndex(LsxGpr::Rsp)];
-    snapshot.rbp = state.gpr[PhysicalGprIndex(LsxGpr::Rbp)];
-    snapshot.r12 = state.gpr[PhysicalGprIndex(LsxGpr::R12)];
-    snapshot.r13 = state.gpr[PhysicalGprIndex(LsxGpr::R13)];
-    snapshot.r14 = state.gpr[PhysicalGprIndex(LsxGpr::R14)];
-    snapshot.r15 = state.gpr[PhysicalGprIndex(LsxGpr::R15)];
+    snapshot.rax = state.gpr[GprSlot(LsxGpr::Rax)];
+    snapshot.rbx = state.gpr[GprSlot(LsxGpr::Rbx)];
+    snapshot.rcx = state.gpr[GprSlot(LsxGpr::Rcx)];
+    snapshot.rdx = state.gpr[GprSlot(LsxGpr::Rdx)];
+    snapshot.rsi = state.gpr[GprSlot(LsxGpr::Rsi)];
+    snapshot.rdi = state.gpr[GprSlot(LsxGpr::Rdi)];
+    snapshot.rsp = state.gpr[GprSlot(LsxGpr::Rsp)];
+    snapshot.rbp = state.gpr[GprSlot(LsxGpr::Rbp)];
+    snapshot.r12 = state.gpr[GprSlot(LsxGpr::R12)];
+    snapshot.r13 = state.gpr[GprSlot(LsxGpr::R13)];
+    snapshot.r14 = state.gpr[GprSlot(LsxGpr::R14)];
+    snapshot.r15 = state.gpr[GprSlot(LsxGpr::R15)];
     snapshot.fsbase = JitStateQwordAt(state, kFsBaseStateOffset);
     snapshot.tid = JitHostTid();
     std::snprintf(snapshot.phase, sizeof(snapshot.phase), "%s", phase ? phase : "?");
@@ -20835,11 +20772,11 @@ std::uint64_t RunArm64Translation(const std::uint64_t guest_rip, const LsxEntryP
 }
 
 std::uint64_t GetGpr64(const LsxMachineImage& state, const LsxGpr reg) {
-    return state.gpr[PhysicalGprIndex(reg)];
+    return state.gpr[GprSlot(reg)];
 }
 
 void SetGpr64(LsxMachineImage& state, const LsxGpr reg, const std::uint64_t value) {
-    state.gpr[PhysicalGprIndex(reg)] = value;
+    state.gpr[GprSlot(reg)] = value;
 }
 
 std::uint32_t GetGpr32(const LsxMachineImage& state, const LsxGpr reg) {
@@ -20855,7 +20792,7 @@ std::uint16_t GetGpr16(const LsxMachineImage& state, const LsxGpr reg) {
 }
 
 void SetGpr16(LsxMachineImage& state, const LsxGpr reg, const std::uint16_t value) {
-    auto& slot = state.gpr[PhysicalGprIndex(reg)];
+    auto& slot = state.gpr[GprSlot(reg)];
     slot = (slot & ~std::uint64_t{0xffff}) | value;
 }
 
@@ -20865,7 +20802,7 @@ std::uint8_t GetGpr8(const LsxMachineImage& state, const LsxGpr reg, const bool 
 }
 
 void SetGpr8(LsxMachineImage& state, const LsxGpr reg, const std::uint8_t value, const bool high8) {
-    auto& slot = state.gpr[PhysicalGprIndex(reg)];
+    auto& slot = state.gpr[GprSlot(reg)];
     if (high8) {
         slot = (slot & ~std::uint64_t{0xff00}) | (std::uint64_t{value} << 8);
     } else {
@@ -21410,10 +21347,10 @@ int CopyJitLiveThreadState(const JitLiveThreadState& live, std::uint64_t* rip,
         *rip = live.machine->rip_or_exit;
     }
     if (rsp != nullptr) {
-        *rsp = live.machine->gpr[PhysicalGprIndex(LsxGpr::Rsp)];
+        *rsp = live.machine->gpr[GprSlot(LsxGpr::Rsp)];
     }
     if (rbp != nullptr) {
-        *rbp = live.machine->gpr[PhysicalGprIndex(LsxGpr::Rbp)];
+        *rbp = live.machine->gpr[GprSlot(LsxGpr::Rbp)];
     }
     if (tid != nullptr) {
         *tid = static_cast<long>(live.host_tid);
@@ -22785,7 +22722,7 @@ bool TryGetRegisterStateOffset(const LsxOperandRecord& operand, std::size_t& sta
     if (!DecodeGprRegister(operand.reg.value, reg) || reg.high8) {
         return false;
     }
-    state_offset = offsetof(LsxMachineImage, gpr) + (PhysicalGprIndex(reg.reg) * sizeof(std::uint64_t));
+    state_offset = offsetof(LsxMachineImage, gpr) + (GprSlot(reg.reg) * sizeof(std::uint64_t));
     return true;
 }
 
@@ -41055,7 +40992,7 @@ std::string LsxEngineSelfTestJson() {
                  0xdeadbeef80000000ull);
         Shld(generic_shld_semantic_state,
              offsetof(LsxMachineImage, gpr) +
-                 PhysicalGprIndex(LsxGpr::R12) * sizeof(std::uint64_t),
+                 GprSlot(LsxGpr::R12) * sizeof(std::uint64_t),
              1u, 1u, 32u);
         const std::uint64_t generic_shld_expected_flags =
             MergeStatusFlags(0x602u, kFlagCf | kFlagPf | kFlagZf | kFlagOf);

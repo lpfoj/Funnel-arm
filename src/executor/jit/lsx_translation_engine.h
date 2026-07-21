@@ -34,6 +34,17 @@ enum class LsxGpr : std::uint8_t {
     R15 = 15,
 };
 
+// The state bank follows the architectural register encoding directly.  Keeping one canonical
+// index avoids a private storage ABI and lets decoders, diagnostics and generated code exchange
+// register ordinals without a translation table.
+constexpr std::size_t GprSlot(const LsxGpr reg) noexcept {
+    return static_cast<std::size_t>(reg);
+}
+
+static_assert(GprSlot(LsxGpr::Rax) == 0);
+static_assert(GprSlot(LsxGpr::Rsp) == 4);
+static_assert(GprSlot(LsxGpr::R15) == 15);
+
 enum class AluOp : std::uint8_t {
     Add = 0,
     Sub = 1,
@@ -90,7 +101,8 @@ struct alignas(32) LsxMachineImage {
     // Shared execution image for translated code, fallback semantics, signal recovery and HLE.
     // Keep this layout byte-exact: generated AArch64 and the signal dispatcher address fields by
     // fixed offset while guest handlers observe the same state object.
-    // Physical order is RAX,RBX,RCX,RDX,RSI,RDI,RBP,RSP,R8,R9,R10,R11,R12,R13,R14,R15.
+    // Slots use the x86 encoding order declared by LsxGpr: RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,
+    // R8,R9,R10,R11,R12,R13,R14,R15.
     std::array<std::uint64_t, 16> gpr{};
     std::uint64_t rip_or_exit = 0;
     // Generated code derives these displacements from the type itself. Keeping segment bases

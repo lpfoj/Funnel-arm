@@ -560,17 +560,15 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                     static_cast<unsigned long long>(guest_rip),
                     static_cast<unsigned long long>(active_rip), instruction_meta & 0x00ffffffu,
                     instruction_meta >> 24u, static_cast<unsigned long long>(instruction),
-                    // LsxMachineImage::gpr uses the physical-state order
-                    // RAX,RBX,RCX,RDX,RSI,RDI,RBP,RSP rather than the x86
-                    // encoding order used by the human-readable line above.
+                    // The fault-state register bank uses the x86 encoding order shown above.
                     static_cast<unsigned long long>(fault_gpr(0)),
+                    static_cast<unsigned long long>(fault_gpr(1)),
                     static_cast<unsigned long long>(fault_gpr(2)),
                     static_cast<unsigned long long>(fault_gpr(3)),
-                    static_cast<unsigned long long>(fault_gpr(1)),
-                    static_cast<unsigned long long>(fault_gpr(7)),
-                    static_cast<unsigned long long>(fault_gpr(6)),
                     static_cast<unsigned long long>(fault_gpr(4)),
-                    static_cast<unsigned long long>(fault_gpr(5)));
+                    static_cast<unsigned long long>(fault_gpr(5)),
+                    static_cast<unsigned long long>(fault_gpr(6)),
+                    static_cast<unsigned long long>(fault_gpr(7)));
                 for (u32 index = 0; index < recent_count && n > 0 &&
                                     static_cast<size_t>(n) < sizeof(line); ++index) {
                     n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),

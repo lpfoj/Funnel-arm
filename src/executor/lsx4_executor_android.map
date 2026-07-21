@@ -1,0 +1,8 @@
+LSX4_RUNTIME_1.0 {
+    global:
+        executor_*;
+        Executor*;
+        LsxProbe*;
+    local:
+        *;
+};

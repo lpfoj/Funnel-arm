@@ -1239,6 +1239,16 @@ set_target_properties(lsx4_executor_android PROPERTIES
     OUTPUT_NAME lsx4_executor_android
 )
 
+# The runtime bridge discovers the stable C surface through dlsym. Keep implementation details,
+# third-party static-library symbols and C++ JIT helpers local to the shared object so the internal
+# execution ABI can evolve without becoming an accidental Android ABI.
+set(LSX4_EXECUTOR_ANDROID_EXPORT_MAP
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/lsx4_executor_android.map")
+target_link_options(lsx4_executor_android PRIVATE
+    "LINKER:--version-script=${LSX4_EXECUTOR_ANDROID_EXPORT_MAP}")
+set_property(TARGET lsx4_executor_android APPEND PROPERTY
+    LINK_DEPENDS "${LSX4_EXECUTOR_ANDROID_EXPORT_MAP}")
+
 create_target_directory_groups(lsx4_executor_android)
 add_dependencies(lsx4_executor_android lsx_iced_decoder_build)
 
