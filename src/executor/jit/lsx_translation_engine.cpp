@@ -2712,10 +2712,10 @@ private:
     // iced-x86's implicit [R/E]DI destination. Cached IR from the prior epoch
     // contains three operands and must not cross this semantic boundary.
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    // v8: generic static edges use the shared-frame chain body, a 64-block safepoint cadence and
-    // direct taken/fallthrough Jcc links. The generated tail embeds all three contracts, so old
-    // native payloads must be re-emitted. Decoded IR remains reusable.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210001ull;
+    // v9: semantic-leaf calls reconstruct caller-saved register caches. Native payloads emitted
+    // by v8 can retain a helper-clobbered guest base and must never be restored; decoded IR remains
+    // reusable and will be lowered again without discarding the expensive decode cache.
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210002ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -16086,6 +16086,13 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         code->str(code->x9,
                                   Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                     }
+                    // Semantic leaves follow AAPCS and may clobber x6-x8/q16-q23. A memory block
+                    // can legitimately cache a stable base in one of those registers across a
+                    // locked/rare instruction lowered through this leaf. Publish dirty values
+                    // before the call and reconstruct every selected cache afterwards; otherwise
+                    // the next direct memory operand can use a helper-clobbered guest base while
+                    // LsxMachineImage still contains the correct architectural value.
+                    emit_flush_register_caches();
                     code->mov(code->x0, code->x19);
                     EmitJitRelocatablePointer(
                         *code, code->x1, reinterpret_cast<std::uint64_t>(&ir));
@@ -16094,6 +16101,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         reinterpret_cast<std::uint64_t>(
                             &ExecuteNativeScalarSemanticInstruction));
                     code->blr(code->x16);
+                    emit_reload_register_caches();
                     Xbyak_aarch64::Label semantic_continue;
                     code->cbz(code->x0, semantic_continue);
                     code->mov(code->x20, code->x0);
@@ -44448,6 +44456,78 @@ std::string ExerciseTranslationEngineJson() {
             generic_memory_write_widths_ok &&
             generic_memory_write_no_double_ok && generic_memory_fault_rip_ok;
 
+        // A locked semantic leaf is an AAPCS call in the middle of this block. R12 is read often
+        // enough to occupy the first (caller-saved) GPR-cache slot, so the final store proves that
+        // helper-call cache reconstruction preserves the base instead of using clobbered x6-x8.
+        const std::array<std::uint8_t, 14> generic_cached_base_call_program = {
+            0x49, 0x8b, 0x5c, 0x24, 0x40,       // mov rbx,[r12+0x40]
+            0xf0, 0xff, 0x43, 0x10,             // lock inc dword [rbx+0x10]
+            0x4d, 0x89, 0x74, 0x24, 0x48,       // mov [r12+0x48],r14
+        };
+        LsxDecodedRegion generic_cached_base_call_block = DecodeGuestBasicRegion(
+            reinterpret_cast<std::uint64_t>(generic_cached_base_call_program.data()), 3);
+        Arm64BlockEntry generic_cached_base_call_direct = nullptr;
+        Arm64BlockEntry generic_cached_base_call_entry = arena.EmitNativeControlFlowBlock(
+            generic_cached_base_call_block, nullptr, &generic_cached_base_call_direct);
+        alignas(16) std::array<std::uint8_t, 128> cached_base_interpreter_outer{};
+        alignas(16) std::array<std::uint8_t, 128> cached_base_native_outer{};
+        alignas(16) std::array<std::uint8_t, 64> cached_base_interpreter_inner{};
+        alignas(16) std::array<std::uint8_t, 64> cached_base_native_inner{};
+        StoreUnaligned<std::uint64_t>(
+            cached_base_interpreter_outer.data() + 0x40,
+            reinterpret_cast<std::uint64_t>(cached_base_interpreter_inner.data()));
+        StoreUnaligned<std::uint64_t>(
+            cached_base_native_outer.data() + 0x40,
+            reinterpret_cast<std::uint64_t>(cached_base_native_inner.data()));
+        StoreUnaligned<std::uint32_t>(cached_base_interpreter_inner.data() + 0x10, 7u);
+        StoreUnaligned<std::uint32_t>(cached_base_native_inner.data() + 0x10, 7u);
+        constexpr std::uint64_t kCachedBaseMarker = 0xa17e5afe91c04b2dull;
+        LsxMachineImage cached_base_interpreter_state{};
+        LsxMachineImage cached_base_native_state{};
+        WriteGuestGpr64(cached_base_interpreter_state, LsxGpr::R12,
+                        reinterpret_cast<std::uint64_t>(
+                            cached_base_interpreter_outer.data()));
+        WriteGuestGpr64(cached_base_native_state, LsxGpr::R12,
+                        reinterpret_cast<std::uint64_t>(cached_base_native_outer.data()));
+        WriteGuestGpr64(cached_base_interpreter_state, LsxGpr::R14,
+                        kCachedBaseMarker);
+        WriteGuestGpr64(cached_base_native_state, LsxGpr::R14, kCachedBaseMarker);
+        const std::uint64_t cached_base_interpreter_result = InterpretDecodedRegion(
+            &cached_base_interpreter_state, &generic_cached_base_call_block);
+        g_current_fault_state = nullptr;
+        g_current_fault_ir = nullptr;
+        const std::uint64_t cached_base_native_result =
+            generic_cached_base_call_entry != nullptr
+                ? generic_cached_base_call_entry(&cached_base_native_state)
+                : 0;
+        const bool cached_base_fault_slot_retired =
+            g_current_fault_ir == nullptr &&
+            cached_base_native_state.native_fault_ir == 0;
+        g_current_fault_state = nullptr;
+        g_current_fault_ir = nullptr;
+        WriteGuestGpr64(cached_base_interpreter_state, LsxGpr::R12, 0);
+        WriteGuestGpr64(cached_base_native_state, LsxGpr::R12, 0);
+        WriteGuestGpr64(cached_base_interpreter_state, LsxGpr::Rbx, 0);
+        WriteGuestGpr64(cached_base_native_state, LsxGpr::Rbx, 0);
+        const bool generic_cached_base_call_native_ok =
+            !generic_cached_base_call_block.HasDecodeFailure() &&
+            generic_cached_base_call_block.SupportsInitialNativeTier() &&
+            generic_cached_base_call_block.instructions.size() == 3 &&
+            generic_cached_base_call_entry != nullptr &&
+            generic_cached_base_call_direct != nullptr &&
+            generic_cached_base_call_entry != generic_cached_base_call_direct &&
+            cached_base_interpreter_result == generic_cached_base_call_block.end_rip &&
+            cached_base_native_result == generic_cached_base_call_block.end_rip &&
+            LoadUnaligned<std::uint32_t>(cached_base_interpreter_inner.data() + 0x10) == 8u &&
+            LoadUnaligned<std::uint32_t>(cached_base_native_inner.data() + 0x10) == 8u &&
+            LoadUnaligned<std::uint64_t>(cached_base_interpreter_outer.data() + 0x48) ==
+                kCachedBaseMarker &&
+            LoadUnaligned<std::uint64_t>(cached_base_native_outer.data() + 0x48) ==
+                kCachedBaseMarker &&
+            CheckedNativeStateMatches(cached_base_native_state,
+                                      cached_base_interpreter_state) &&
+            cached_base_fault_slot_retired;
+
         // GENERIC_MEMORY_RMW_NATIVE_DIFFERENTIAL_GATE
         // Sonic's hot host-synchronization poll is exactly:
         //   inc dword [rbp-0x54] ; cmp dword [rcx],0 ; jne block_start
@@ -44642,6 +44722,7 @@ std::string ExerciseTranslationEngineJson() {
                               generic_memory_read_direct_native_ok &&
                               generic_memory_byte_cmp_jnz_native_ok &&
                               generic_memory_write_native_ok &&
+                              generic_cached_base_call_native_ok &&
                               generic_memory_rmw_native_ok &&
                               hle_fp_bridge_ok &&
                              decoder_cap_contract_ok && rep_stos_short_bulk_ok;
@@ -45427,6 +45508,8 @@ std::string ExerciseTranslationEngineJson() {
             << (generic_memory_write_no_double_ok ? "true" : "false") << ","
             << R"("genericMemoryFaultRipOk":)"
             << (generic_memory_fault_rip_ok ? "true" : "false") << ","
+            << R"("genericCachedBaseCallNativeOk":)"
+            << (generic_cached_base_call_native_ok ? "true" : "false") << ","
             << R"("genericMemoryRmwNativeOk":)"
             << (generic_memory_rmw_native_ok ? "true" : "false") << ","
             << R"("decoderCapContractOk":)"
