@@ -39,8 +39,17 @@ static std::unique_ptr<AudioOutBackend> audio;
 static std::atomic<int> lazy_init{0};
 static std::atomic_bool host_output_enabled{true};
 
+#ifdef __ANDROID__
+static void AndroidAudioOutLog(const char* format, ...);
+#endif
+
 void SetHostOutputEnabled(const bool enabled) {
-    host_output_enabled.store(enabled, std::memory_order_release);
+    const bool previous = host_output_enabled.exchange(enabled, std::memory_order_acq_rel);
+#ifdef __ANDROID__
+    if (previous != enabled) {
+        AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=host_output enabled=%d", enabled ? 1 : 0);
+    }
+#endif
 }
 
 bool IsHostOutputEnabled() {
@@ -291,6 +300,10 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
                 audio = std::make_unique<SDLAudioOut>();
             }
         }
+#ifdef __ANDROID__
+        AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=init repeated=1 backend=%s",
+                           ExecutorLiveNullAudioEnabled() ? "null" : "sdl");
+#endif
         return ORBIS_OK;
     }
 
@@ -309,6 +322,11 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
         audio = std::make_unique<SDLAudioOut>();
     }
 
+#ifdef __ANDROID__
+    AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=init repeated=0 backend=%s sdl_audio=%d",
+                       ExecutorLiveNullAudioEnabled() ? "null" : "sdl",
+                       (SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) != 0 ? 1 : 0);
+#endif
     LOG_INFO(Lib_AudioOut, "Audio system initialized");
     return ORBIS_OK;
 }
@@ -461,6 +479,14 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
 
     // Create handle
     s32 handle = (_type << 16) | port_id | 0x20000000;
+#ifdef __ANDROID__
+    AndroidAudioOutLog(
+        "[LSX4_AUDIO_STATE] op=open handle=0x%x port=%d type=%d frames=%u rate=%u channels=%u "
+        "format=%u volume0=%d host_output=%d",
+        handle, port_id, _type, port->buffer_frames, port->sample_rate,
+        port->format_info.num_channels, static_cast<u32>(param_type.data_format.Value()),
+        port->volume[0], IsHostOutputEnabled() ? 1 : 0);
+#endif
     return handle;
 }
 
@@ -860,6 +886,17 @@ s32 PS4_SYSV_ABI sceAudioOutSetVolume(s32 handle, s32 flag, s32* vol) {
         LOG_ERROR(Lib_AudioOut, "Invalid volume");
         return ORBIS_AUDIO_OUT_ERROR_INVALID_VOLUME;
     }
+
+#ifdef __ANDROID__
+    static std::atomic<u32> volume_log_count{0};
+    const u32 volume_call = volume_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (volume_call <= 64) {
+        AndroidAudioOutLog(
+            "[LSX4_AUDIO_VOLUME] call=%u handle=0x%x flag=0x%x requested=%d,%d,%d,%d,%d,%d,%d,%d",
+            volume_call, handle, flag, vol[0], vol[1], vol[2], vol[3], vol[4], vol[5], vol[6],
+            vol[7]);
+    }
+#endif
 
     // Get port with shared lock (read-only access to table)
     std::shared_ptr<PortOut> port;

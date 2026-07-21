@@ -1100,9 +1100,20 @@ void Instance::CollectPhysicalMemoryInfo() {
     physical_device.getMemoryProperties2(&props);
     const auto& memory_props = props.memoryProperties;
     const size_t num_props = memory_props.memoryHeapCount;
+    std::vector<bool> heap_has_unprotected_type(num_props, false);
+    for (u32 i = 0; i < memory_props.memoryTypeCount; ++i) {
+        const auto& type = memory_props.memoryTypes[i];
+        const bool is_protected =
+            (type.propertyFlags & vk::MemoryPropertyFlagBits::eProtected) !=
+            vk::MemoryPropertyFlags{};
+        if (!is_protected) {
+            heap_has_unprotected_type[type.heapIndex] = true;
+        }
+    }
+
+    valid_heaps.clear();
     total_memory_budget = 0;
     u64 device_initial_usage = 0;
-    u64 local_memory = 0;
     for (size_t i = 0; i < num_props; ++i) {
         const bool is_device_local =
             (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
@@ -1111,10 +1122,13 @@ void Instance::CollectPhysicalMemoryInfo() {
             // Ignore non-device local memory on discrete GPUs.
             continue;
         }
-        valid_heaps.push_back(i);
-        if (is_device_local) {
-            local_memory += memory_props.memoryHeaps[i].size;
+        if (!heap_has_unprotected_type[i]) {
+            // A protected-only heap cannot back ordinary renderer allocations. Some mobile
+            // drivers expose it alongside the shared system heap; counting both inflates the
+            // budget and delays cache eviction until Android kills the process.
+            continue;
         }
+        valid_heaps.push_back(i);
         if (supports_memory_budget) {
             device_initial_usage += budget.heapUsage[i];
             total_memory_budget += budget.heapBudget[i];
@@ -1129,10 +1143,21 @@ void Instance::CollectPhysicalMemoryInfo() {
         total_memory_budget -= system_memory;
         return;
     }
-    // Leave at least 8 GB for the system on integrated GPUs.
-    const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
-    total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(local_memory)));
+
+    // Integrated GPUs share RAM with Android and the guest. Reserve up to 8 GiB for them while
+    // keeping at least one quarter (and, when available, 1 GiB) for renderer allocations.
+    // The old local-memory floor expanded this back to the entire shared heap, so cache GC did
+    // not begin before the low-memory killer intervened.
+    const u64 allocatable_memory =
+        total_memory_budget > device_initial_usage ? total_memory_budget - device_initial_usage
+                                                   : total_memory_budget;
+    const u64 system_reserve = std::min<u64>(8_GB, allocatable_memory * 3 / 4);
+    const u64 renderer_floor = std::min<u64>(1_GB, allocatable_memory);
+    total_memory_budget = std::max(allocatable_memory - system_reserve, renderer_floor);
+    LOG_INFO(Render_Vulkan,
+             "Integrated GPU memory: renderer budget={} MiB, initial usage={} MiB, heaps=[{}]",
+             total_memory_budget / 1_MB, device_initial_usage / 1_MB,
+             fmt::join(valid_heaps, ", "));
 }
 
 void Instance::CollectImageFormatInfo() {

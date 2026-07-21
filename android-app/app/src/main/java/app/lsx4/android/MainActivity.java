@@ -4445,7 +4445,8 @@ public class MainActivity extends Activity {
      * latch the checkbox or save a later black frame as its evidence.
      */
     private void requestTinyGuestFrameProbe() {
-        if (frameCaught || frameDetectionInFlight || !runtimeLoaded) {
+        if (frameCaught || frameDetectionInFlight || !runtimeLoaded ||
+                !hasNativeGuestPresent()) {
             return;
         }
         SurfaceView surfaceView = renderSurfaceView;
@@ -4573,7 +4574,7 @@ public class MainActivity extends Activity {
 
     /** One full-resolution copy verifies the stable tiny-probe candidate and becomes its evidence. */
     private void requestVerifiedCaughtGuestFrameEvidence() {
-        if (frameCaught || frameDetectionInFlight) {
+        if (frameCaught || frameDetectionInFlight || !hasNativeGuestPresent()) {
             return;
         }
         SurfaceView surfaceView = renderSurfaceView;
@@ -4618,6 +4619,16 @@ public class MainActivity extends Activity {
             frameProbeAcceptedStreak = 0;
             runtimeHudEvent = "stable frame verification error=" + t.getClass().getSimpleName();
         }
+    }
+
+    /**
+     * PixelCopy can observe stale compositor contents or a driver-created surface artifact before
+     * the guest has ever presented. Native telemetry is the authoritative boundary between
+     * shader/prewarm work and a real guest frame, so image scoring must not run before it.
+     */
+    private boolean hasNativeGuestPresent() {
+        long[] stats = runtimeHudCurrentStats;
+        return stats != null && stats.length > 10 && stats[10] > 0;
     }
 
     private void requestSurfacePixelCopy(String reason) {

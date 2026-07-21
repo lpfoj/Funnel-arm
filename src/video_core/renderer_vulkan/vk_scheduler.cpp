@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -1029,6 +1030,37 @@ void Scheduler::Finish(const ExecutorFinishReason reason) {
     if (master_semaphore.IsDeviceLost()) {
         return;
     }
+#ifdef __ANDROID__
+    const auto executor_finish_begin = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        const u64 elapsed_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - executor_finish_begin)
+                .count());
+        const std::size_t reason_index = static_cast<std::size_t>(reason);
+        ++executor_finish_wait_counts[reason_index];
+        executor_finish_wait_ns[reason_index] += elapsed_ns;
+        executor_finish_wait_max_ns[reason_index] =
+            std::max(executor_finish_wait_max_ns[reason_index], elapsed_ns);
+        const u64 ordinal = ++executor_finish_wait_total;
+        if ((ordinal & 63u) == 0u) {
+            const std::size_t wave_index =
+                static_cast<std::size_t>(ExecutorFinishReason::BufferReadbackWave);
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_VK_FINISH_WAIT] total=%llu reason=%u reasonCount=%llu "
+                "reasonMs=%.3f reasonMaxMs=%.3f bufferWaveCount=%llu bufferWaveMs=%.3f "
+                "bufferWaveMaxMs=%.3f",
+                static_cast<unsigned long long>(ordinal), static_cast<unsigned>(reason),
+                static_cast<unsigned long long>(executor_finish_wait_counts[reason_index]),
+                static_cast<double>(executor_finish_wait_ns[reason_index]) / 1'000'000.0,
+                static_cast<double>(executor_finish_wait_max_ns[reason_index]) / 1'000'000.0,
+                static_cast<unsigned long long>(executor_finish_wait_counts[wave_index]),
+                static_cast<double>(executor_finish_wait_ns[wave_index]) / 1'000'000.0,
+                static_cast<double>(executor_finish_wait_max_ns[wave_index]) / 1'000'000.0);
+        }
+    };
+#endif
     // Flush() may have submitted the real guest work immediately before Finish(). In that case the
     // newly allocated command buffer is still empty: wait for the preceding timeline value instead
     // of ending and queue-submitting an empty buffer merely to obtain another value.

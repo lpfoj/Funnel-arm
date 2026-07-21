@@ -29,6 +29,14 @@
 
 namespace Vulkan {
 
+namespace {
+std::atomic<u64> g_executor_live_present_count{0};
+}
+
+u64 ExecutorGetLivePresentCount() noexcept {
+    return g_executor_live_present_count.load(std::memory_order_relaxed);
+}
+
 #if defined(__ANDROID__)
 static void ExecutorLiveDirectPresentStats(bool present_ok, u32 src_width, u32 src_height,
                                            u32 dst_width, u32 dst_height, u32 target) {
@@ -48,6 +56,7 @@ static void ExecutorLiveDirectPresentStats(bool present_ok, u32 src_width, u32 s
     ++total;
     if (present_ok) {
         ++ok;
+        g_executor_live_present_count.fetch_add(1, std::memory_order_relaxed);
     } else {
         ++fail;
     }
@@ -1148,12 +1157,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
 
     // Present to swapchain.
     std::scoped_lock submit_lock{Scheduler::submit_mutex};
-    if (!swapchain.Present()) {
+    const bool present_ok = swapchain.Present();
+    if (!present_ok) {
         if (swapchain.IsTerminal()) {
             MarkTerminal(swapchain.TerminalResult(), "videoout_queue_present");
         } else {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+    } else {
+        g_executor_live_present_count.fetch_add(1, std::memory_order_relaxed);
     }
 
     free_frame();

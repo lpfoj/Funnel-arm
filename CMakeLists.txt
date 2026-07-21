@@ -1260,7 +1260,7 @@ if(TARGET xbyak_aarch64::xbyak_aarch64)
     target_link_libraries(lsx4_executor_android PRIVATE xbyak_aarch64::xbyak_aarch64)
 endif()
 if(ANDROID)
-    target_link_libraries(lsx4_executor_android PRIVATE android aaudio dl log EGL GLESv3)
+    target_link_libraries(lsx4_executor_android PRIVATE android aaudio mediandk dl log EGL GLESv3)
     target_link_options(lsx4_executor_android PRIVATE
         -Wl,--wrap=exit
         -Wl,--wrap=_exit

@@ -455,6 +455,11 @@ LsxStackLease AcquireLsxStackLease(LsxMachineImage* state);
 void ReleaseLsxStackLease(const LsxStackLease& frame);
 LsxMachineImage* CurrentMachineImage();
 LsxMachineImage* SwapDiagnosticMachineImage(LsxMachineImage* state);
+// Returns the architectural state at the continuation after the currently executing HLE call.
+// Bridge markers temporarily repurpose guest registers for their sideband protocol, so code that
+// suspends execution from inside an HLE must capture this normalized image instead of the raw
+// marker image returned by CurrentMachineImage().
+bool CaptureCurrentGuestPostHleState(LsxMachineImage& destination);
 // HLE implementations that perform an architectural context switch can replace the live machine
 // image and mark it authoritative. The bridge then skips its ordinary function-return epilogue,
 // which would otherwise overwrite the resumed RIP/RSP and callee-saved registers.
@@ -505,6 +510,7 @@ void IncDecMemLocked(LsxMachineImage& state, void* target, IncDecOp op, std::uin
 void Neg(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
 void NegMem(LsxMachineImage& state, void* target, std::uint32_t size_bits);
 void NegMemLocked(LsxMachineImage& state, void* target, std::uint32_t size_bits);
+void NotMemLocked(LsxMachineImage& state, void* target, std::uint32_t size_bits);
 void MulOne(LsxMachineImage& state, std::uint64_t operand, std::uint32_t size_bits, bool is_signed);
 void DivOne(LsxMachineImage& state, std::uint64_t divisor, std::uint32_t size_bits, bool is_signed);
 void AdcSbb(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand,

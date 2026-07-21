@@ -318,7 +318,10 @@ static bool IsLiveInterestingThreadName(const std::string& name) {
          name.find("Audio") != std::string::npos)) {
         return false;
     }
-    return IsLiveRenderThreadName(name) || name.find("FMOD") != std::string::npos ||
+    return IsLiveRenderThreadName(name) ||
+           name.find("Gamedata_Worker") != std::string::npos ||
+           name.find("Task_Bagger") != std::string::npos ||
+           name.find("FMOD") != std::string::npos ||
            name.find("mono") != std::string::npos || name.find("Mono") != std::string::npos ||
            name.find("Finalizer") != std::string::npos ||
            name.find("Thread Pool") != std::string::npos;
@@ -1516,7 +1519,10 @@ public:
                     std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
                 lk.lock();
                 if (was_signaled) {
-                    *timeout -= time;
+                    // sceKernelWaitSema reports a relative timeout. Host scheduling can resume a
+                    // signaled waiter just after its nominal deadline, so saturate instead of
+                    // wrapping the unsigned remainder into a multi-hour guest timeout.
+                    *timeout = time >= *timeout ? 0 : *timeout - static_cast<u32>(time);
                 } else {
                     *timeout = 0;
                 }
@@ -2205,9 +2211,14 @@ s32 PS4_SYSV_ABI scePthreadSemTrywait(PthreadSem** sem) {
 }
 
 s32 PS4_SYSV_ABI scePthreadSemTimedwait(PthreadSem** sem, u32 usec) {
+    OrbisKernelTimespec now{};
+    sceKernelClockGettime(ORBIS_CLOCK_REALTIME, &now);
+    const u64 total_nsec = static_cast<u64>(now.tv_nsec) +
+                           static_cast<u64>(usec % 1000000) * 1000ULL;
+
     OrbisKernelTimespec time{};
-    time.tv_sec = usec / 1000000;
-    time.tv_nsec = (usec % 1000000) * 1000;
+    time.tv_sec = now.tv_sec + usec / 1000000 + total_nsec / 1000000000ULL;
+    time.tv_nsec = total_nsec % 1000000000ULL;
 
     s32 ret = posix_sem_timedwait(sem, &time);
     if (ret != 0) {

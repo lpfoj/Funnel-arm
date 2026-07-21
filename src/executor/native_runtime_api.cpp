@@ -33,6 +33,7 @@
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -5541,6 +5542,74 @@ extern "C" int executor_live_get_current_hle_guest_rsp(std::uint64_t* guest_rsp)
     return -1;
 }
 
+extern "C" void executor_live_log_fiber_transition(
+    const char* operation, const char* phase, const std::int32_t result,
+    const void* subject, const void* current_fiber, const void* tcb_fiber,
+    const std::uint64_t guest_rip, const std::uint64_t guest_rsp,
+    const std::uint64_t guest_return) {
+    // GetSelf is the scheduler's normal outside-a-fiber probe and may execute thousands of
+    // times before the first useful transition.  Letting it consume this diagnostic budget hid
+    // the Run -> Return sequence that matters when a fiber context is lost.
+    if (operation != nullptr && std::strcmp(operation, "GetSelf") == 0) {
+        return;
+    }
+
+    static std::atomic_int budget{16384};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    const auto tid = static_cast<std::uint32_t>(syscall(SYS_gettid));
+    NativeLog(
+        ANDROID_LOG_INFO,
+        "[EXECUTOR_FIBER_TRANSITION] tid=%u op=%s phase=%s result=0x%08x subject=%p "
+        "current=%p tcbFiber=%p guestRip=%p guestRsp=%p guestReturn=%p",
+        tid, operation ? operation : "<unknown>", phase ? phase : "<unknown>",
+        static_cast<std::uint32_t>(result), subject, current_fiber, tcb_fiber,
+        reinterpret_cast<void*>(guest_rip), reinterpret_cast<void*>(guest_rsp),
+        reinterpret_cast<void*>(guest_return));
+
+    // Logcat is intentionally small on Android devices and a long title-screen load can rotate
+    // the decisive transition out before the failure is inspected.  Persist the same bounded
+    // diagnostic stream while the explicit fiber marker is enabled.
+    static std::mutex trace_mutex;
+    std::lock_guard trace_lock{trace_mutex};
+    if (std::FILE* trace = std::fopen(
+            "/data/data/app.lsx4.android/files/lsx4-home/fiber-transitions.txt", "a");
+        trace != nullptr) {
+        std::fprintf(
+            trace,
+            "tid=%u op=%s phase=%s result=0x%08x subject=%p current=%p tcbFiber=%p "
+            "guestRip=0x%llx guestRsp=0x%llx guestReturn=0x%llx\n",
+            tid, operation ? operation : "<unknown>", phase ? phase : "<unknown>",
+            static_cast<std::uint32_t>(result), subject, current_fiber, tcb_fiber,
+            static_cast<unsigned long long>(guest_rip),
+            static_cast<unsigned long long>(guest_rsp),
+            static_cast<unsigned long long>(guest_return));
+        if (result != 0) {
+            std::uint64_t guest_rbp = 0;
+            if (const auto* machine = Executor::Jit::CurrentMachineImage();
+                machine != nullptr) {
+                guest_rbp = Executor::Jit::GetGpr64(
+                    *machine, Executor::Jit::LsxGpr::Rbp);
+            }
+            std::fprintf(trace, "  failureStack rbp=0x%llx",
+                         static_cast<unsigned long long>(guest_rbp));
+            std::lock_guard probe_lock{g_box64_boundary_probe_lock};
+            for (std::uint64_t offset = 0; offset != 0x100; offset += sizeof(std::uint64_t)) {
+                std::uint64_t value = 0;
+                const bool readable =
+                    GuestReadQwordCheckedLocked(guest_rsp + offset, value);
+                std::fprintf(trace, " sp%+03llx=%s0x%llx",
+                             static_cast<unsigned long long>(offset),
+                             readable ? "" : "?",
+                             static_cast<unsigned long long>(value));
+            }
+            std::fprintf(trace, "\n");
+        }
+        std::fclose(trace);
+    }
+}
+
 extern "C" void executor_live_dump_current_hle_context(const char* reason,
                                                        const std::uint64_t focus) {
     const auto tid = static_cast<std::uint32_t>(syscall(SYS_gettid));
@@ -6102,6 +6171,12 @@ enum class ExecutorHleFpAbi : std::uint8_t {
     VideoOutGamma,
 };
 
+enum class ExecutorHleStackAbi : std::uint8_t {
+    None = 0,
+    FiberInitialize,
+    FiberInitializeImpl,
+};
+
 bool HleNameMatchesAnyNid(const char* name,
                           const std::initializer_list<const char*> nids) {
     return std::any_of(nids.begin(), nids.end(), [&](const char* nid) {
@@ -6199,6 +6274,7 @@ struct ExecutorHleTargetMetadata {
     bool light_oracle_hle_flight_target = false;
     bool audio_out_target = false;
     ExecutorHleFpAbi fp_abi = ExecutorHleFpAbi::None;
+    ExecutorHleStackAbi stack_abi = ExecutorHleStackAbi::None;
     bool gl_uniform1f = false;
     bool gl_uniform2f = false;
     bool gl_uniform4f = false;
@@ -6280,6 +6356,15 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "sceAudioOutOutput", "QOQtbeDqsT4") ||
         SymbolNameContains(symbol_name, "sceAudioOutOutput");
     metadata.fp_abi = ClassifyLibcMathHleAbi(native_function, name);
+    if (HleNameMatches(name, "sceFiberInitialize", "hVYD7Ou2pCQ") ||
+        SymbolNameContains(symbol_name, "sceFiberInitializeE")) {
+        metadata.stack_abi = ExecutorHleStackAbi::FiberInitialize;
+    } else if (HleNameMatches(name, "_sceFiberInitializeWithInternalOptionImpl",
+                              "7+OJIpko9RY") ||
+               SymbolNameContains(symbol_name, "TraceFiberInitializeImpl") ||
+               SymbolNameContains(symbol_name, "sceFiberInitializeImpl")) {
+        metadata.stack_abi = ExecutorHleStackAbi::FiberInitializeImpl;
+    }
     metadata.gl_uniform1f = HleNameMatches(name, "glUniform1f", "POq8+5-inHY");
     metadata.gl_uniform2f = HleNameMatches(name, "glUniform2f", "e5HOpV5feq8");
     metadata.gl_uniform4f = HleNameMatches(name, "glUniform4f", "H8Dp8lwh8QQ");
@@ -6793,6 +6878,33 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         return raw;
     }
     case ExecutorHleFpAbi::None:
+        break;
+    }
+    switch (target_metadata.stack_abi) {
+    case ExecutorHleStackAbi::FiberInitialize: {
+        using Fn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t);
+        const auto opt_param = GuestStackArg(guest_rsp, 0);
+        const auto build_version = GuestStackArg(guest_rsp, 1);
+        const auto result = reinterpret_cast<Fn>(native_function)(
+            arg0, arg1, arg2, arg3, arg4, arg5, opt_param, build_version);
+        record_hle_return(result);
+        return result;
+    }
+    case ExecutorHleStackAbi::FiberInitializeImpl: {
+        using Fn = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t, std::uint64_t,
+                                     std::uint64_t, std::uint64_t, std::uint64_t);
+        const auto opt_param = GuestStackArg(guest_rsp, 0);
+        const auto flags = GuestStackArg(guest_rsp, 1);
+        const auto build_version = GuestStackArg(guest_rsp, 2);
+        const auto result = reinterpret_cast<Fn>(native_function)(
+            arg0, arg1, arg2, arg3, arg4, arg5, opt_param, flags, build_version);
+        record_hle_return(result);
+        return result;
+    }
+    case ExecutorHleStackAbi::None:
         break;
     }
     if (target_metadata.system_service_load_exec_target) {
@@ -22792,6 +22904,7 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
 }
 
 extern "C" void executor_jit_dump_thread_states(const char* reason);
+extern "C" void executor_live_dump_kernel_sem_records(const char* reason);
 
 extern "C" __attribute__((visibility("default"), used)) void
 executor_lsx4_android_dump_box64_emu_states(const char* reason) {
@@ -23253,6 +23366,112 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
             NativeLog(ANDROID_LOG_ERROR,
                       "[EXECUTOR_FORCE_INTERPRET_RANGE] invalid source=%s lo=%s hi=%s",
                       force_interpret_range_sentinel.string().c_str(), lo.c_str(), hi.c_str());
+        }
+    }
+    // Generic guest-store provenance probe. File format:
+    //   <inclusive-lo> <exclusive-hi>
+    //   [object-vtable field-offset [alternate-field-offset]]
+    // The JIT emits the probe only when this marker is present, so normal builds keep the exact
+    // production code shape and cost. This is intentionally address-data driven: diagnostic guest
+    // addresses never become title-specific constants in the runtime.
+    const auto store_watch_range_sentinel =
+        std::filesystem::path(g_root) / "diag-store-watch-range";
+    if (std::filesystem::exists(store_watch_range_sentinel)) {
+        std::ifstream range_file(store_watch_range_sentinel);
+        std::string lo;
+        std::string hi;
+        std::string object_vtable;
+        std::string field_offset;
+        std::string alternate_field_offset;
+        range_file >> lo >> hi >> object_vtable >> field_offset >> alternate_field_offset;
+        const std::uint64_t lo_value = std::strtoull(lo.c_str(), nullptr, 0);
+        const std::uint64_t hi_value = std::strtoull(hi.c_str(), nullptr, 0);
+        if (lo_value != 0 && hi_value > lo_value) {
+            setenv("EXECUTOR_DIAG_STORE_WATCH_LO", lo.c_str(), 1);
+            setenv("EXECUTOR_DIAG_STORE_WATCH_HI", hi.c_str(), 1);
+            if (!object_vtable.empty() && !field_offset.empty()) {
+                setenv("EXECUTOR_DIAG_STORE_WATCH_OBJECT_VTABLE", object_vtable.c_str(), 1);
+                setenv("EXECUTOR_DIAG_STORE_WATCH_FIELD_OFFSET", field_offset.c_str(), 1);
+                if (!alternate_field_offset.empty()) {
+                    setenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET",
+                           alternate_field_offset.c_str(), 1);
+                } else {
+                    unsetenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET");
+                }
+            } else {
+                unsetenv("EXECUTOR_DIAG_STORE_WATCH_OBJECT_VTABLE");
+                unsetenv("EXECUTOR_DIAG_STORE_WATCH_FIELD_OFFSET");
+                unsetenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET");
+            }
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_DIAG_STORE_WATCH_RANGE] source=%s lo=%s hi=%s "
+                      "objectVtable=%s fieldOffset=%s alternateFieldOffset=%s",
+                      store_watch_range_sentinel.string().c_str(), lo.c_str(), hi.c_str(),
+                      object_vtable.empty() ? "any" : object_vtable.c_str(),
+                      field_offset.empty() ? "any" : field_offset.c_str(),
+                      alternate_field_offset.empty() ? "none"
+                                                     : alternate_field_offset.c_str());
+        } else {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_DIAG_STORE_WATCH_RANGE] invalid source=%s lo=%s hi=%s",
+                      store_watch_range_sentinel.string().c_str(), lo.c_str(), hi.c_str());
+        }
+    }
+    // Generic dispatcher-boundary probe. Each line contains a guest block RIP followed by an
+    // optional expected return RIP (zero accepts any caller):
+    //   <guest-rip> <expected-return-rip>
+    // Keeping both values in an external marker makes the probe reusable without embedding title
+    // addresses in the runtime. Unlike a generated store watch, this observes restored native
+    // cache entries without changing their code shape.
+    const auto jit_rip_probe_sentinel =
+        std::filesystem::path(g_root) / "diag-jit-rip-probe";
+    if (std::filesystem::exists(jit_rip_probe_sentinel)) {
+        std::ifstream probe_file(jit_rip_probe_sentinel);
+        std::ostringstream probe_spec;
+        probe_spec << probe_file.rdbuf();
+        const std::string spec = probe_spec.str();
+        if (!spec.empty()) {
+            setenv("EXECUTOR_DIAG_JIT_RIP_PROBE", spec.c_str(), 1);
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_DIAG_JIT_RIP_PROBE] source=%s bytes=%zu",
+                      jit_rip_probe_sentinel.string().c_str(), spec.size());
+        } else {
+            unsetenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_DIAG_JIT_RIP_PROBE] empty source=%s",
+                      jit_rip_probe_sentinel.string().c_str());
+        }
+    } else {
+        unsetenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+    }
+    const auto fiber_transition_sentinel =
+        std::filesystem::path(g_root) / "diag-fiber-transitions";
+    if (std::filesystem::exists(fiber_transition_sentinel)) {
+        setenv("EXECUTOR_DIAG_FIBER_TRANSITIONS", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FIBER_TRANSITION] diagnostics=enabled source=%s",
+                  fiber_transition_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_DIAG_FIBER_TRANSITIONS");
+    }
+    const auto jit_live_watchdog_sentinel =
+        std::filesystem::path(g_root) / "diag-jit-live-watchdog";
+    if (std::filesystem::exists(jit_live_watchdog_sentinel)) {
+        static std::atomic_bool watchdog_started{false};
+        if (!watchdog_started.exchange(true, std::memory_order_acq_rel)) {
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_JIT_LIVE_WATCHDOG] source=%s intervalSec=5 enabled=1",
+                      jit_live_watchdog_sentinel.string().c_str());
+            std::thread([] {
+                for (std::uint64_t sequence = 1;; ++sequence) {
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    char reason[64]{};
+                    std::snprintf(reason, sizeof(reason), "diag-watchdog-%llu",
+                                  static_cast<unsigned long long>(sequence));
+                    executor_jit_dump_thread_states(reason);
+                    executor_live_dump_kernel_sem_records(reason);
+                }
+            }).detach();
         }
     }
     const auto skip_rasterizer_finish_sentinel =
@@ -24522,7 +24741,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     values[7] = gpu.builder_shader;
     values[8] = gpu.submit_calls;
     values[9] = gpu.submit_done_calls;
-    values[10] = gpu.present_requests;
+    values[10] = Vulkan::ExecutorGetLivePresentCount();
     values[11] = cpu.persistent_ir_enabled;
     values[12] = cpu.persistent_ir_records_loaded;
     values[13] = cpu.persistent_ir_hits;

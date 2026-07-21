@@ -959,6 +959,9 @@ bool JitLiveCheckedNativeEnabled() {
 struct JitStoreWatchRange {
     std::uint64_t lo = 0;
     std::uint64_t hi = 0;
+    std::uint64_t object_vtable = 0;
+    std::uint32_t field_offset = 0;
+    std::uint32_t alternate_field_offset = 0;
 
     [[nodiscard]] bool Enabled() const noexcept {
         return hi > lo;
@@ -975,6 +978,20 @@ const JitStoreWatchRange& JitDiagnosticStoreWatchRange() {
             result.lo = std::strtoull(lo, nullptr, 0);
             result.hi = std::strtoull(hi, nullptr, 0);
         }
+        if (const char* object_vtable =
+                std::getenv("EXECUTOR_DIAG_STORE_WATCH_OBJECT_VTABLE")) {
+            result.object_vtable = std::strtoull(object_vtable, nullptr, 0);
+        }
+        if (const char* field_offset =
+                std::getenv("EXECUTOR_DIAG_STORE_WATCH_FIELD_OFFSET")) {
+            result.field_offset =
+                static_cast<std::uint32_t>(std::strtoul(field_offset, nullptr, 0));
+        }
+        if (const char* alternate_field_offset =
+                std::getenv("EXECUTOR_DIAG_STORE_WATCH_ALTERNATE_FIELD_OFFSET")) {
+            result.alternate_field_offset =
+                static_cast<std::uint32_t>(std::strtoul(alternate_field_offset, nullptr, 0));
+        }
 #endif
         return result;
     }();
@@ -982,7 +999,8 @@ const JitStoreWatchRange& JitDiagnosticStoreWatchRange() {
 }
 
 void JitReportWatchedStore(const std::uint64_t guest_rip, const std::uint64_t address,
-                                const std::uint64_t size_bytes) {
+                           const std::uint64_t size_bytes,
+                           const LsxMachineImage* const state) {
 #ifdef __ANDROID__
     static std::atomic<std::uint64_t> ordinal{0};
     const std::uint64_t current = ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -996,18 +1014,60 @@ void JitReportWatchedStore(const std::uint64_t guest_rip, const std::uint64_t ad
     std::uint64_t high = 0;
     std::memcpy(&low, bytes.data(), sizeof(low));
     std::memcpy(&high, bytes.data() + sizeof(low), sizeof(high));
+    std::uint64_t object_base = 0;
+    std::uint64_t object_parent = 0;
+    std::uint64_t object_resource = 0;
+    std::uint32_t object_resource_id = 0;
+    const std::uint64_t guest_rax =
+        state != nullptr ? GetGpr64(*state, LsxGpr::Rax) : 0;
+    const std::uint64_t guest_r14 =
+        state != nullptr ? GetGpr64(*state, LsxGpr::R14) : 0;
+    const std::uint64_t guest_r15 =
+        state != nullptr ? GetGpr64(*state, LsxGpr::R15) : 0;
+    const auto& watch = JitDiagnosticStoreWatchRange();
+    const auto try_object_base = [&](const std::uint32_t field_offset) {
+        if (address < field_offset) {
+            return false;
+        }
+        const std::uint64_t candidate = address - field_offset;
+        std::uint64_t vtable = 0;
+        std::memcpy(&vtable, reinterpret_cast<const void*>(candidate), sizeof(vtable));
+        if (vtable != watch.object_vtable) {
+            return false;
+        }
+        object_base = candidate;
+        std::memcpy(&object_parent, reinterpret_cast<const void*>(candidate + 0x60),
+                    sizeof(object_parent));
+        std::memcpy(&object_resource, reinterpret_cast<const void*>(candidate + 0x68),
+                    sizeof(object_resource));
+        std::memcpy(&object_resource_id, reinterpret_cast<const void*>(candidate + 0x70),
+                    sizeof(object_resource_id));
+        return true;
+    };
+    if (watch.object_vtable != 0 && !try_object_base(watch.field_offset) &&
+        watch.alternate_field_offset != watch.field_offset) {
+        try_object_base(watch.alternate_field_offset);
+    }
     JitLog("[EXECUTOR_JIT_STORE_WATCH] n=%llu rip=0x%llx addr=0x%llx bytes=%llu "
-                "valueLo=0x%016llx valueHi=0x%016llx",
+                "valueLo=0x%016llx valueHi=0x%016llx object=0x%llx parent=0x%llx "
+                "resource=0x%llx resourceId=0x%x rax=0x%llx r14=0x%llx r15=0x%llx",
                 static_cast<unsigned long long>(current),
                 static_cast<unsigned long long>(guest_rip),
                 static_cast<unsigned long long>(address),
                 static_cast<unsigned long long>(size_bytes),
                 static_cast<unsigned long long>(low),
-                static_cast<unsigned long long>(high));
+                static_cast<unsigned long long>(high),
+                static_cast<unsigned long long>(object_base),
+                static_cast<unsigned long long>(object_parent),
+                static_cast<unsigned long long>(object_resource), object_resource_id,
+                static_cast<unsigned long long>(guest_rax),
+                static_cast<unsigned long long>(guest_r14),
+                static_cast<unsigned long long>(guest_r15));
 #else
     (void)guest_rip;
     (void)address;
     (void)size_bytes;
+    (void)state;
 #endif
 }
 
@@ -1218,6 +1278,131 @@ bool IsVexPshufbMnemonic(X86Mnemonic mnemonic);
 bool IsVectorImmediateBlendMnemonic(X86Mnemonic mnemonic);
 bool IsVexVectorImmediateBlendMnemonic(X86Mnemonic mnemonic);
 std::size_t VectorImmediateBlendLaneBytes(X86Mnemonic mnemonic);
+
+struct JitRipProbeEntry {
+    std::uint64_t rip{};
+    std::uint64_t expected_return{};
+};
+
+const std::vector<JitRipProbeEntry>& JitDiagnosticRipProbes() {
+    static const std::vector<JitRipProbeEntry> probes = [] {
+        std::vector<JitRipProbeEntry> result;
+#ifdef __ANDROID__
+        const char* spec = std::getenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+        if (spec == nullptr || spec[0] == '\0') {
+            return result;
+        }
+        std::istringstream input{spec};
+        std::string rip_text;
+        std::string return_text;
+        while (result.size() < 32 && input >> rip_text >> return_text) {
+            const std::uint64_t rip = std::strtoull(rip_text.c_str(), nullptr, 0);
+            const std::uint64_t expected_return =
+                std::strtoull(return_text.c_str(), nullptr, 0);
+            if (rip != 0) {
+                result.push_back({rip, expected_return});
+            }
+        }
+#endif
+        return result;
+    }();
+    return probes;
+}
+
+bool JitIsRipProbeTarget(const std::uint64_t rip) {
+    const auto& probes = JitDiagnosticRipProbes();
+    return std::ranges::any_of(probes, [rip](const JitRipProbeEntry& probe) {
+        return probe.rip == rip;
+    });
+}
+
+void JitMaybeReportRipProbe(const std::uint64_t rip, const LsxMachineImage& state) {
+#ifdef __ANDROID__
+    const auto& probes = JitDiagnosticRipProbes();
+    if (probes.empty()) {
+        return;
+    }
+    // Reject unrelated blocks before touching guest memory. TraceQwordOrZero performs a guarded
+    // page query on Android; doing that before the RIP test turned an enabled, eleven-address
+    // diagnostic into one mincore syscall per dispatcher block across every guest thread.
+    const auto first_for_rip = std::find_if(
+        probes.begin(), probes.end(),
+        [rip](const JitRipProbeEntry& probe) { return probe.rip == rip; });
+    if (first_for_rip == probes.end()) {
+        return;
+    }
+
+    const std::uint64_t rsp = GetGpr64(state, LsxGpr::Rsp);
+    const bool accepts_any_return = std::any_of(
+        first_for_rip, probes.end(), [rip](const JitRipProbeEntry& probe) {
+            return probe.rip == rip && probe.expected_return == 0;
+        });
+    const std::uint64_t return_rip = accepts_any_return
+                                         ? 0
+                                         : TraceQwordOrZero(rsp);
+    const auto matched = std::find_if(
+        first_for_rip, probes.end(), [&](const JitRipProbeEntry& probe) {
+            return probe.rip == rip &&
+                   (probe.expected_return == 0 || probe.expected_return == return_rip);
+        });
+    if (matched == probes.end()) {
+        return;
+    }
+    static std::atomic<std::uint64_t> ordinal{0};
+    const std::uint64_t current = ordinal.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (current > 16384) {
+        return;
+    }
+    const std::uint64_t rbx = GetGpr64(state, LsxGpr::Rbx);
+    const std::uint64_t rdi = GetGpr64(state, LsxGpr::Rdi);
+    const std::uint64_t rsi = GetGpr64(state, LsxGpr::Rsi);
+    const std::uint64_t rbx_qword_00 = TraceQwordOrZero(rbx);
+    const std::uint64_t rbx_qword_18 =
+        rbx <= std::numeric_limits<std::uint64_t>::max() - 0x18
+            ? TraceQwordOrZero(rbx + 0x18)
+            : 0;
+    const std::uint64_t rbx_qword_20 =
+        rbx <= std::numeric_limits<std::uint64_t>::max() - 0x20
+            ? TraceQwordOrZero(rbx + 0x20)
+            : 0;
+    const std::uint64_t rbx_qword_28 =
+        rbx <= std::numeric_limits<std::uint64_t>::max() - 0x28
+            ? TraceQwordOrZero(rbx + 0x28)
+            : 0;
+    const std::string rdi_text = TraceCStringOrEmpty(rdi, 96);
+    const std::string rsi_text = TraceCStringOrEmpty(rsi, 96);
+    JitLog(
+        "[EXECUTOR_JIT_RIP_PROBE] n=%llu rip=0x%llx return=0x%llx "
+        "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx "
+        "r8=0x%llx r9=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx "
+        "rsp=0x%llx rbxQ00=0x%llx rbxQ18=0x%llx rbxQ20=0x%llx rbxQ28=0x%llx "
+        "rdiText=\"%s\" rsiText=\"%s\"",
+        static_cast<unsigned long long>(current),
+        static_cast<unsigned long long>(rip),
+        static_cast<unsigned long long>(return_rip),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rax)),
+        static_cast<unsigned long long>(rbx),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rcx)),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rdx)),
+        static_cast<unsigned long long>(rsi),
+        static_cast<unsigned long long>(rdi),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R8)),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R9)),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R12)),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R13)),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R14)),
+        static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R15)),
+        static_cast<unsigned long long>(rsp),
+        static_cast<unsigned long long>(rbx_qword_00),
+        static_cast<unsigned long long>(rbx_qword_18),
+        static_cast<unsigned long long>(rbx_qword_20),
+        static_cast<unsigned long long>(rbx_qword_28),
+        rdi_text.c_str(), rsi_text.c_str());
+#else
+    (void)rip;
+    (void)state;
+#endif
+}
 bool CanExecuteScalarFloatInstruction(const LsxDecodedOp& ir);
 bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
                                    bool classification_known = false);
@@ -1680,12 +1865,13 @@ public:
         std::ostringstream fingerprint_name;
         fingerprint_name << std::hex << std::setw(16) << std::setfill('0')
                          << executable_fingerprint;
-        // Native blocks already cross source hashes below when the semantic epoch is unchanged:
-        // all embedded process pointers are represented by validated logical relocations. Keep
-        // one directory for that same compatibility contract instead of creating a new 0.5-1 GB
-        // tree after every JIT diagnostic/performance edit. A lowering/relocation semantic
-        // change must bump this explicit epoch together with kPersistentIrAbiVersion.
-        const std::uint64_t native_abi_id = kPersistentNativeSemanticAbiVersion;
+        // Generated AArch64 must never cross a lowering-source boundary. Logical relocations make
+        // a payload independent of process addresses, but they cannot make an old instruction
+        // sequence compatible with changed register allocation, helper calls, safepoints, or
+        // memory semantics. The generated digest covers those sources, the compiler and Android
+        // ABI. Older directories remain useful as decoded-IR donors below, but their native
+        // payloads are deliberately discarded and rebuilt for this exact source ABI.
+        const std::uint64_t native_abi_id = kJitNativeCacheSourceAbiHash;
         if (native_abi_id == 0) {
             // Generated native records may only cross shared-object builds when CMake supplied
             // the digest of the exact JIT lowering/helper ABI.
@@ -1717,15 +1903,9 @@ public:
         }
         LoadNativeWarmProfile();
 
-        // IR is tied to guest bytes and the JIT IR ABI. Native payloads additionally use
-        // the generated source/toolchain ABI digest and stable logical helper relocations, so an
-        // unrelated HLE/GPU relink keeps this directory while a JIT change selects another.
-        // kPersistentIrAbiVersion is the explicit semantic compatibility epoch. Native payloads
-        // contain only position-independent instructions plus validated logical relocations, so
-        // a source digest change inside the same epoch is not by itself an incompatibility. This
-        // is what lets an instrumentation/optimization rebuild reuse the previous native cache;
-        // semantic lowering or IR-layout changes must bump kPersistentIrAbiVersion. Per-feature
-        // flags below still selectively re-emit blocks which need a newly introduced lowering.
+        // IR is tied to guest bytes and the explicit IR ABI. Native payloads are tied to the exact
+        // generated source/toolchain digest used in directory_ and identity_. This keeps normal
+        // launches fast while making a changed JIT rebuild native code automatically.
         std::uint64_t loaded_records = 0;
         const bool migration_complete = HasNativeMigrationMarker();
         // Load any partial stable migration first. Until its completion marker exists, legacy
@@ -1741,12 +1921,12 @@ public:
                  FindNewestCompatibleBuildDirectories(native_abi_id, 2)) {
                 const std::uint64_t source_loaded = LoadExistingShards(
                     compatible_directory,
-                    BuildIdentity(safe_title, executable_fingerprint, compatible_abi_id), true,
+                    BuildIdentity(safe_title, executable_fingerprint, compatible_abi_id), false,
                     true);
                 loaded_records += source_loaded;
                 JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_IR_REUSE] source=%s "
                             "sourceAbi=0x%llx targetAbi=0x%llx loaded=%llu "
-                            "native=relocatable-same-semantic-epoch migration=scheduled",
+                            "native=discarded-source-abi-mismatch migration=scheduled",
                             compatible_directory.string().c_str(),
                             static_cast<unsigned long long>(compatible_abi_id),
                             static_cast<unsigned long long>(native_abi_id),
@@ -2869,10 +3049,9 @@ struct alignas(16) ChainPatchCell {
     const std::uint64_t guest_rip = 0;
     std::atomic<std::uint64_t> guest_hash{0};
     std::atomic<std::uint32_t> guest_size{0};
-    // Match the execution-cache validation cadence: the published value arms
-    // the first observed use, then only every 2^19 tail links re-hashes guest
-    // bytes. This occupies the padding that already preceded the epoch pointer,
-    // so emitted consumers still see the same target-at-offset-zero ABI.
+    // Publication stores the mask to force a byte hash on the first observed use.
+    // Periodic sampling is thread-local: a shared fetch_add here made a hot guest
+    // loop bounce this cache line between cores on every direct tail link.
     std::atomic<std::uint32_t> refresh_counter{kJitExecutionCacheRefreshMask};
     std::atomic<std::uint64_t>* const execution_cache_epoch = nullptr;
 };
@@ -2883,6 +3062,46 @@ static_assert(offsetof(ChainPatchCell, guest_rip) == 0x10);
 static_assert(offsetof(ChainPatchCell, refresh_counter) == 0x24);
 static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
 static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
+
+struct DirectTargetRefreshWay {
+    ChainPatchCell* slot = nullptr;
+    Arm64BlockEntry observed = nullptr;
+    std::uint32_t counter = 0;
+};
+
+constexpr std::size_t kDirectTargetRefreshWayCount = 256;
+static_assert(std::has_single_bit(kDirectTargetRefreshWayCount));
+thread_local std::array<DirectTargetRefreshWay, kDirectTargetRefreshWayCount>
+    g_direct_target_refresh_ways{};
+
+bool ShouldHashObservedDirectTarget(ChainPatchCell* const slot,
+                                    const Arm64BlockEntry observed) noexcept {
+    // Only the first observer after publication performs the shared transition.
+    // Steady-state direct links execute one relaxed load and a thread-local increment,
+    // instead of a contended atomic read-modify-write.
+    std::uint32_t armed = slot->refresh_counter.load(std::memory_order_relaxed);
+    bool publication_refresh = false;
+    if (armed == kJitExecutionCacheRefreshMask) {
+        publication_refresh = slot->refresh_counter.compare_exchange_strong(
+            armed, 0, std::memory_order_relaxed, std::memory_order_relaxed);
+    }
+
+    const std::size_t index =
+        (reinterpret_cast<std::uintptr_t>(slot) >> 4u) &
+        (kDirectTargetRefreshWayCount - 1u);
+    auto& way = g_direct_target_refresh_ways[index];
+    if (way.slot != slot || way.observed != observed) {
+        way = {.slot = slot, .observed = observed, .counter = 0};
+        return true;
+    }
+    if (publication_refresh) {
+        way.counter = 0;
+        return true;
+    }
+
+    ++way.counter;
+    return (way.counter & kJitExecutionCacheRefreshMask) == 0;
+}
 
 // Cross-source cold PIC misses often resolve the same small set of computed targets.  Keep that
 // lookup off chain_patch_mutex_/unordered_map after the authoritative deny classifier has run.
@@ -3236,7 +3455,10 @@ bool TryResolveJitLeafHlePlt(const std::uint64_t plt_rip,
 }
 
 bool IsChainPatchDenied(const std::uint64_t guest_rip) {
-    return IsDirectHleBoundary(guest_rip) ||
+    // A configured probe must remain a dispatcher boundary even when an already compiled caller
+    // would otherwise link directly into it. This keeps diagnostics exact without changing the
+    // production chain shape when no probe marker is present.
+    return JitIsRipProbeTarget(guest_rip) || IsDirectHleBoundary(guest_rip) ||
            GuestBytesMatch(guest_rip, kChainPatchDenySignature1) ||
            GuestBytesMatch(guest_rip, kChainPatchDenySignature2) ||
            GuestBytesMatch(guest_rip, kChainPatchDenySignature3) ||
@@ -3762,6 +3984,7 @@ public:
             *active_block_rip_slot = rip;
             *active_block_slot = decoded_block;
             helper_fault_message_slot->clear();
+            JitMaybeReportRipProbe(rip, state);
             // One sample per 4096 dispatcher returns keeps diagnostic cost negligible while
             // exposing legal guest busy-loops that neither throw nor block in an HLE wait.
             if ((executed_blocks & 0xfffu) == 0) {
@@ -3878,6 +4101,36 @@ public:
                                 static_cast<unsigned long long>(TraceQwordOrZero(address + 8)),
                                 static_cast<unsigned long long>(TraceQwordOrZero(address + 16)),
                                 static_cast<unsigned long long>(TraceQwordOrZero(address + 24)));
+                        }
+                        // Follow a short frame-pointer chain and expose the saved non-volatile
+                        // registers around each caller. This is deliberately address-agnostic:
+                        // on optimized guest code, the object that produced a bad local field is
+                        // commonly retained in RBX/R12-R15 and is otherwise lost by the faulting
+                        // callee before the exception reaches this boundary.
+                        std::uint64_t frame = fault_rbp;
+                        for (std::uint32_t depth = 0; depth < 5 && frame >= 0x40; ++depth) {
+                            const std::uint64_t parent = TraceQwordOrZero(frame);
+                            const std::uint64_t return_rip = TraceQwordOrZero(frame + 8);
+                            JitLog(
+                                "[EXECUTOR_JIT_FAULT_CALLER] depth=%u frame=0x%llx "
+                                "parent=0x%llx return=0x%llx saveM40=0x%llx saveM38=0x%llx "
+                                "saveM30=0x%llx saveM28=0x%llx saveM20=0x%llx saveM18=0x%llx "
+                                "saveM10=0x%llx saveM08=0x%llx",
+                                depth, static_cast<unsigned long long>(frame),
+                                static_cast<unsigned long long>(parent),
+                                static_cast<unsigned long long>(return_rip),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x40)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x38)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x30)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x28)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x20)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x18)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x10)),
+                                static_cast<unsigned long long>(TraceQwordOrZero(frame - 0x08)));
+                            if (parent <= frame || parent - frame > 0x100000) {
+                                break;
+                            }
+                            frame = parent;
                         }
                         std::ostringstream error;
                         error << "JIT deferred guest signal handler failed rc=" << dispatch_rc
@@ -4316,6 +4569,26 @@ public:
                 continue;
             }
             LsxDecodedRegion& decoded = *stable.block;
+            if (JitDiagnosticStoreWatchRange().Enabled()) {
+                const bool writes_guest_memory = std::ranges::any_of(
+                    decoded.instructions, [](const LsxDecodedOp& instruction) {
+                        return std::ranges::any_of(
+                            instruction.operands.begin(),
+                            instruction.operands.begin() + instruction.operand_count,
+                            [](const LsxOperandRecord& operand) {
+                                return operand.type == X86_OPERAND_TYPE_MEMORY &&
+                                       (operand.actions &
+                                        X86_OPERAND_ACTION_MASK_WRITE) != 0;
+                            });
+                    });
+                if (writes_guest_memory) {
+                    // Stored native bodies do not contain the diagnostic call. Preserve normal
+                    // prewarm timing for read-only/control-flow blocks, but let writer blocks pass
+                    // through the live emitter so the externally configured watch cannot be
+                    // bypassed by the cache.
+                    continue;
+                }
+            }
             if (JitBlockUsesScalarFloatAddSubMul(decoded) &&
                 (stable.native_flags &
                  kJitNativeFlagScalarFloatDirectV1) == 0) {
@@ -4940,7 +5213,12 @@ public:
             vpslld_imm_direct_v15_candidate &&
             (stable.native_flags &
              kJitNativeFlagVpslldImmDirectV15) == 0;
-        const bool persistent_native_mode = !JitLiveCheckedNativeEnabled();
+        // Diagnostic store watches are emitted into the host block itself. Restoring a production
+        // native payload would silently bypass the probe, while persisting an instrumented payload
+        // would contaminate later normal runs. Keep IR-cache reuse, but re-emit and never capture
+        // native code while a watch is active.
+        const bool persistent_native_mode =
+            !JitLiveCheckedNativeEnabled() && !JitDiagnosticStoreWatchRange().Enabled();
         bool restored_persistent_native = false;
         if (decoded->can_jit_initial && !force_helper) {
             if (!decoded->instructions.empty()) {
@@ -5484,6 +5762,7 @@ private:
 LsxTranslationEngine g_lsx_translation_engine{};
 thread_local LsxStackReservoir g_lsx_stack_reservoir{};
 thread_local LsxMachineImage* g_current_guest_state = nullptr;
+thread_local const LsxMachineImage* g_current_post_hle_state = nullptr;
 struct JitLiveThreadState {
     std::uint32_t host_tid = 0;
     std::uintptr_t pthread_handle = 0;
@@ -5497,6 +5776,24 @@ thread_local bool g_guest_exit_requested = false;
 thread_local std::uint64_t g_guest_exit_result = 0;
 thread_local bool g_hle_guest_state_override = false;
 std::mutex g_locked_memory_mutex;
+
+class ScopedCurrentPostHleState {
+public:
+    explicit ScopedCurrentPostHleState(const LsxMachineImage& state)
+        : previous_{g_current_post_hle_state} {
+        g_current_post_hle_state = &state;
+    }
+
+    ~ScopedCurrentPostHleState() {
+        g_current_post_hle_state = previous_;
+    }
+
+    ScopedCurrentPostHleState(const ScopedCurrentPostHleState&) = delete;
+    ScopedCurrentPostHleState& operator=(const ScopedCurrentPostHleState&) = delete;
+
+private:
+    const LsxMachineImage* previous_;
+};
 
 ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
                                      const std::uint64_t guest_target) noexcept {
@@ -6493,9 +6790,10 @@ Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
         return nullptr;
     }
 
-    const std::uint32_t next_counter =
-        slot->refresh_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-    if ((next_counter & kJitExecutionCacheRefreshMask) != 0) {
+    if (JitGuestHotSamplerEnabled()) {
+        SampleJitGuestRip(slot->guest_rip);
+    }
+    if (!ShouldHashObservedDirectTarget(slot, observed)) {
         // Retirement publishes nullptr before changing the remaining metadata.
         // Re-read target so a concurrent retire cannot return the stale entry
         // from this no-hash path.
@@ -14811,13 +15109,55 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         // Preserve every generic-lowering temporary. This path exists only when a
                         // data-driven diagnostic range is active; production blocks emit none of it.
                         code->stp(code->x5, code->x6,
-                                  Xbyak_aarch64::pre_ptr(code->sp, -16));
+                                  Xbyak_aarch64::pre_ptr(code->sp, -32));
+                        code->str(code->x7,
+                                  Xbyak_aarch64::ptr(code->sp, 16));
+                        // The range/object predicates use CMP. Preserve host NZCV because a later
+                        // guest Jcc in the same native block may still consume flags materialized
+                        // by the instruction preceding this diagnostic-only store.
+                        code->mrs(code->x7, 3, 3, 4, 2, 0);
+                        code->str(code->x7,
+                                  Xbyak_aarch64::ptr(code->sp, 24));
                         code->mov(code->x5, watch.lo);
                         code->cmp(code->x14, code->x5);
                         code->b(Xbyak_aarch64::LO, skip);
                         code->mov(code->x6, watch.hi);
                         code->cmp(code->x14, code->x6);
                         code->b(Xbyak_aarch64::HS, skip);
+                        if (watch.object_vtable != 0) {
+                            // Optional object-field selector. It allows a broad guest-heap range
+                            // without calling the logger for every heap store: only stores whose
+                            // effective address is the requested field of the requested dynamic
+                            // object type pass. Both values come from the external diagnostic
+                            // marker; no title address is compiled into the runtime.
+                            Xbyak_aarch64::Label object_field_matches;
+                            code->mov(code->x5, watch.lo);
+                            code->add(code->x5, code->x5,
+                                      watch.field_offset);
+                            code->cmp(code->x14, code->x5);
+                            code->b(Xbyak_aarch64::LO, skip);
+                            code->sub(code->x5, code->x14, watch.field_offset);
+                            code->ldr(code->x5, Xbyak_aarch64::ptr(code->x5));
+                            code->mov(code->x6, watch.object_vtable);
+                            code->cmp(code->x5, code->x6);
+                            code->b(Xbyak_aarch64::EQ, object_field_matches);
+                            if (watch.alternate_field_offset != 0 &&
+                                watch.alternate_field_offset != watch.field_offset) {
+                                code->mov(code->x5, watch.lo);
+                                code->add(code->x5, code->x5,
+                                          watch.alternate_field_offset);
+                                code->cmp(code->x14, code->x5);
+                                code->b(Xbyak_aarch64::LO, skip);
+                                code->sub(code->x5, code->x14,
+                                          watch.alternate_field_offset);
+                                code->ldr(code->x5, Xbyak_aarch64::ptr(code->x5));
+                                code->cmp(code->x5, code->x6);
+                                code->b(Xbyak_aarch64::NE, skip);
+                            } else {
+                                code->b(skip);
+                            }
+                            code->L(object_field_matches);
+                        }
 
                         code->sub(code->sp, code->sp, 80);
                         code->stp(code->x9, code->x10,
@@ -14834,6 +15174,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         code->mov(code->x0, ir.guest_rip);
                         code->mov(code->x1, code->x14);
                         code->mov(code->x2, size_bytes);
+                        code->mov(code->x3, code->x19);
                         EmitJitRelocatablePointer(
                             *code, code->x16,
                             reinterpret_cast<std::uint64_t>(&JitReportWatchedStore));
@@ -14851,8 +15192,101 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         code->add(code->sp, code->sp, 80);
 
                         code->L(skip);
+                        code->ldr(code->x7,
+                                  Xbyak_aarch64::ptr(code->sp, 24));
+                        code->msr(3, 3, 4, 2, 0, code->x7);
+                        code->ldr(code->x7,
+                                  Xbyak_aarch64::ptr(code->sp, 16));
                         code->ldp(code->x5, code->x6,
-                                  Xbyak_aarch64::post_ptr(code->sp, 16));
+                                  Xbyak_aarch64::post_ptr(code->sp, 32));
+                    };
+                const auto emit_tso_scalar_load =
+                    [&](const std::uint32_t size_bits, const XReg& address,
+                        const XReg& dst) {
+                        const auto wdst = WReg(dst.getIdx());
+                        if (size_bits == 8) {
+                            code->ldarb(wdst, Xbyak_aarch64::ptr(address));
+                            return true;
+                        }
+
+                        Xbyak_aarch64::Label unaligned;
+                        Xbyak_aarch64::Label done;
+                        code->tbnz(address, 0, unaligned);
+                        if (size_bits >= 32) {
+                            code->tbnz(address, 1, unaligned);
+                        }
+                        if (size_bits >= 64) {
+                            code->tbnz(address, 2, unaligned);
+                        }
+                        if (size_bits == 16) {
+                            code->ldarh(wdst, Xbyak_aarch64::ptr(address));
+                        } else if (size_bits == 32) {
+                            code->ldar(wdst, Xbyak_aarch64::ptr(address));
+                        } else if (size_bits == 64) {
+                            code->ldar(dst, Xbyak_aarch64::ptr(address));
+                        } else {
+                            return false;
+                        }
+                        code->b(done);
+
+                        // x86 permits unaligned scalar accesses while AArch64 acquire/release
+                        // instructions require natural alignment. Preserve the same ordering
+                        // contract without taking a host SIGBUS: the rare unaligned path uses a
+                        // plain access bracketed by full inner-shareable barriers.
+                        code->L(unaligned);
+                        code->dmb(Xbyak_aarch64::ISH);
+                        if (size_bits == 16) {
+                            code->ldrh(wdst, Xbyak_aarch64::ptr(address));
+                        } else if (size_bits == 32) {
+                            code->ldr(wdst, Xbyak_aarch64::ptr(address));
+                        } else {
+                            code->ldr(dst, Xbyak_aarch64::ptr(address));
+                        }
+                        code->dmb(Xbyak_aarch64::ISH);
+                        code->L(done);
+                        return true;
+                    };
+                const auto emit_tso_scalar_store =
+                    [&](const std::uint32_t size_bits, const XReg& address,
+                        const XReg& src) {
+                        const auto wsrc = WReg(src.getIdx());
+                        if (size_bits == 8) {
+                            code->stlrb(wsrc, Xbyak_aarch64::ptr(address));
+                            return true;
+                        }
+
+                        Xbyak_aarch64::Label unaligned;
+                        Xbyak_aarch64::Label done;
+                        code->tbnz(address, 0, unaligned);
+                        if (size_bits >= 32) {
+                            code->tbnz(address, 1, unaligned);
+                        }
+                        if (size_bits >= 64) {
+                            code->tbnz(address, 2, unaligned);
+                        }
+                        if (size_bits == 16) {
+                            code->stlrh(wsrc, Xbyak_aarch64::ptr(address));
+                        } else if (size_bits == 32) {
+                            code->stlr(wsrc, Xbyak_aarch64::ptr(address));
+                        } else if (size_bits == 64) {
+                            code->stlr(src, Xbyak_aarch64::ptr(address));
+                        } else {
+                            return false;
+                        }
+                        code->b(done);
+
+                        code->L(unaligned);
+                        code->dmb(Xbyak_aarch64::ISH);
+                        if (size_bits == 16) {
+                            code->strh(wsrc, Xbyak_aarch64::ptr(address));
+                        } else if (size_bits == 32) {
+                            code->str(wsrc, Xbyak_aarch64::ptr(address));
+                        } else {
+                            code->str(src, Xbyak_aarch64::ptr(address));
+                        }
+                        code->dmb(Xbyak_aarch64::ISH);
+                        code->L(done);
+                        return true;
                     };
                 const auto emit_read_operand = [&](const LsxDecodedOp& ir,
                                                    const LsxOperandRecord& operand,
@@ -14865,17 +15299,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             return false;
                         }
                         emit_publish_fault_ir(ir);
-                        const auto wdst = WReg(dst.getIdx());
-                        if (operand.size == 8) {
-                            code->ldrb(wdst, Xbyak_aarch64::ptr(code->x14));
-                        } else if (operand.size == 16) {
-                            code->ldrh(wdst, Xbyak_aarch64::ptr(code->x14));
-                        } else if (operand.size == 32) {
-                            code->ldr(wdst, Xbyak_aarch64::ptr(code->x14));
-                        } else {
-                            code->ldr(dst, Xbyak_aarch64::ptr(code->x14));
-                        }
-                        return true;
+                        return emit_tso_scalar_load(operand.size, code->x14, dst);
                     }
                     case X86_OPERAND_TYPE_IMMEDIATE: {
                         const std::uint64_t value = operand.imm.is_signed
@@ -14939,15 +15363,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             return false;
                         }
                         emit_publish_fault_ir(ir);
-                        const auto wsrc = WReg(src.getIdx());
-                        if (operand.size == 8) {
-                            code->strb(wsrc, Xbyak_aarch64::ptr(code->x14));
-                        } else if (operand.size == 16) {
-                            code->strh(wsrc, Xbyak_aarch64::ptr(code->x14));
-                        } else if (operand.size == 32) {
-                            code->str(wsrc, Xbyak_aarch64::ptr(code->x14));
-                        } else {
-                            code->str(src, Xbyak_aarch64::ptr(code->x14));
+                        if (!emit_tso_scalar_store(operand.size, code->x14, src)) {
+                            return false;
                         }
                         emit_diagnostic_store_watch(ir, operand.size / 8);
                         return true;
@@ -14969,8 +15386,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             return false;
                         }
                         emit_publish_fault_ir(ir);
-                        code->ldr(dst, Xbyak_aarch64::ptr(code->x14));
-                        return true;
+                        return emit_tso_scalar_load(64, code->x14, dst);
                     }
                     return false;
                 };
@@ -20338,6 +20754,61 @@ extern "C" void executor_jit_dump_thread_states(const char* reason) {
                     static_cast<unsigned long long>(e.r15),
                     static_cast<unsigned long long>(e.fsbase));
     }
+
+#ifdef __ANDROID__
+    struct LiveSnapshot {
+        std::uint32_t host_tid = 0;
+        LsxMachineImage machine{};
+    };
+    std::array<LiveSnapshot, 128> live_snapshot{};
+    std::size_t live_count = 0;
+    {
+        // The map owns only pointers to thread-local machine images. Copy each image while its
+        // registration is protected so the diagnostic thread never retains a pointer after a
+        // guest thread unregisters.
+        std::lock_guard lock{g_jit_live_thread_mutex};
+        for (const auto& [host_tid, live] : g_jit_live_threads) {
+            if (live.machine == nullptr || live_count == live_snapshot.size()) {
+                continue;
+            }
+            live_snapshot[live_count++] = LiveSnapshot{
+                .host_tid = host_tid,
+                .machine = *live.machine,
+            };
+        }
+    }
+    JitLog("[EXECUTOR_JIT_LIVE_DUMP] reason=%s count=%zu",
+           reason && reason[0] ? reason : "<none>", live_count);
+    for (std::size_t i = 0; i < live_count; ++i) {
+        const auto& live = live_snapshot[i];
+        const auto& state = live.machine;
+        JitLog(
+            "[EXECUTOR_JIT_LIVE_THREAD] reason=%s tid=%u rip=0x%llx "
+            "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
+            "rdi=0x%llx rsi=0x%llx rsp=0x%llx rbp=0x%llx "
+            "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "
+            "r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx fs=0x%llx",
+            reason && reason[0] ? reason : "<none>", live.host_tid,
+            static_cast<unsigned long long>(state.rip_or_exit),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rax)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rbx)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rcx)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rdx)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rdi)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rsi)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rsp)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::Rbp)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R8)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R9)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R10)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R11)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R12)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R13)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R14)),
+            static_cast<unsigned long long>(GetGpr64(state, LsxGpr::R15)),
+            static_cast<unsigned long long>(state.fs_base));
+    }
+#endif
 }
 
 extern "C" void executor_jit_record_current_thread_state(const char* reason) {
@@ -20900,6 +21371,14 @@ LsxMachineImage* CurrentMachineImage() {
     return g_current_guest_state;
 }
 
+bool CaptureCurrentGuestPostHleState(LsxMachineImage& destination) {
+    if (g_current_post_hle_state == nullptr) {
+        return false;
+    }
+    destination = *g_current_post_hle_state;
+    return true;
+}
+
 LsxMachineImage* SwapDiagnosticMachineImage(LsxMachineImage* state) {
     auto* previous = g_current_guest_state;
     g_current_guest_state = state;
@@ -20993,12 +21472,33 @@ bool MarkCurrentGuestStateOverride() {
         return false;
     }
     g_hle_guest_state_override = true;
+#ifdef __ANDROID__
+    if (std::getenv("EXECUTOR_DIAG_FIBER_TRANSITIONS") != nullptr) {
+        JitLog("[EXECUTOR_FIBER_OVERRIDE] phase=mark rip=0x%llx rsp=0x%llx",
+               static_cast<unsigned long long>(g_current_guest_state->rip_or_exit),
+               static_cast<unsigned long long>(
+                   GetGpr64(*g_current_guest_state, LsxGpr::Rsp)));
+    }
+#endif
     return true;
 }
 
 bool ConsumeCurrentGuestStateOverride() {
     const bool requested = g_hle_guest_state_override;
     g_hle_guest_state_override = false;
+#ifdef __ANDROID__
+    if (requested && std::getenv("EXECUTOR_DIAG_FIBER_TRANSITIONS") != nullptr) {
+        JitLog("[EXECUTOR_FIBER_OVERRIDE] phase=consume rip=0x%llx rsp=0x%llx",
+               static_cast<unsigned long long>(
+                   g_current_guest_state != nullptr
+                       ? g_current_guest_state->rip_or_exit
+                       : 0),
+               static_cast<unsigned long long>(
+                   g_current_guest_state != nullptr
+                       ? GetGpr64(*g_current_guest_state, LsxGpr::Rsp)
+                       : 0));
+    }
+#endif
     return requested;
 }
 
@@ -28899,9 +29399,34 @@ std::uint64_t ExecuteJitHleBridgeMarker(LsxMachineImage& state, const std::uint6
         RecordJitThreadSnapshot("hle_marker", 0, marker_rip, return_rip, native_function,
                                      state);
     }
-    const std::uint64_t result = ExecutorJitHleBridgeCallback(
-        native_function, arg0, arg1, arg2, arg3, arg4, arg5, original_guest_rsp,
-        xmm0, xmm1, xmm2, xmm3);
+    // The marker stub uses RDI for its sideband pointer and carries callee-saved guest registers
+    // in that sideband. An HLE such as sceFiberRun/ReturnToThread can suspend the call before the
+    // ordinary epilogue below restores them. Publish the architectural post-call continuation
+    // while the native HLE runs; copying the raw marker image here corrupts RBX/RBP/R12-R15 and
+    // eventually sends resumed virtual dispatch through an unrelated object.
+    LsxMachineImage post_hle_state = state;
+    SetGpr64(post_hle_state, LsxGpr::R11, ReadMemory(sideband + 0x48, 8));
+    SetGpr64(post_hle_state, LsxGpr::Rbx, ReadMemory(sideband + 0x50, 8));
+    SetGpr64(post_hle_state, LsxGpr::Rbp, ReadMemory(sideband + 0x58, 8));
+    SetGpr64(post_hle_state, LsxGpr::R12, ReadMemory(sideband + 0x60, 8));
+    SetGpr64(post_hle_state, LsxGpr::R13, ReadMemory(sideband + 0x68, 8));
+    SetGpr64(post_hle_state, LsxGpr::R14, ReadMemory(sideband + 0x70, 8));
+    SetGpr64(post_hle_state, LsxGpr::R15, ReadMemory(sideband + 0x78, 8));
+    if (original_guest_rsp != 0 && guest_return_after_hle != 0) {
+        SetGpr64(post_hle_state, LsxGpr::Rsp, original_guest_rsp + 8);
+        post_hle_state.rip_or_exit = guest_return_after_hle;
+    } else {
+        SetGpr64(post_hle_state, LsxGpr::Rsp, call_rsp + 8);
+        post_hle_state.rip_or_exit =
+            return_rip != 0 ? return_rip : marker_rip + kJitHleMarkerLength;
+    }
+    std::uint64_t result = 0;
+    {
+        const ScopedCurrentPostHleState post_hle_scope{post_hle_state};
+        result = ExecutorJitHleBridgeCallback(
+            native_function, arg0, arg1, arg2, arg3, arg4, arg5, original_guest_rsp,
+            xmm0, xmm1, xmm2, xmm3);
+    }
     if (ConsumeCurrentGuestStateOverride()) {
         return state.rip_or_exit;
     }
@@ -29021,9 +29546,16 @@ bool TryExecuteJitDirectHle(LsxMachineImage& state, const std::uint64_t thunk,
     if (trace_stall_thread_dump) {
         RecordJitThreadSnapshot("hle_direct", 0, thunk, return_rip, native_function, state);
     }
-    const std::uint64_t result = ExecutorJitHleBridgeCallback(
-        native_function, arg0, arg1, arg2, arg3, arg4, arg5, guest_rsp,
-        xmm0, xmm1, xmm2, xmm3);
+    LsxMachineImage post_hle_state = state;
+    SetGpr64(post_hle_state, LsxGpr::Rsp, final_rsp);
+    post_hle_state.rip_or_exit = return_rip;
+    std::uint64_t result = 0;
+    {
+        const ScopedCurrentPostHleState post_hle_scope{post_hle_state};
+        result = ExecutorJitHleBridgeCallback(
+            native_function, arg0, arg1, arg2, arg3, arg4, arg5, guest_rsp,
+            xmm0, xmm1, xmm2, xmm3);
+    }
     if (ConsumeCurrentGuestStateOverride()) {
         return true;
     }
@@ -29998,8 +30530,31 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
             };
             if ((ir->decoded.attributes & X86_ATTRIB_HAS_LOCK) != 0 &&
                 ir->operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-                std::lock_guard lock{g_locked_memory_mutex};
-                execute_alu();
+                auto* target = reinterpret_cast<void*>(
+                    CalculateMemoryAddress(*state, ir->decoded, ir->operands[0]));
+                const std::uint32_t size_bits = ir->operands[0].size;
+                const std::uint64_t rhs =
+                    LoadOperandValue(*state, ir->decoded, ir->operands[1], false);
+                if (mnemonic == X86_MNEMONIC_ADC || mnemonic == X86_MNEMONIC_SBB) {
+                    AdcSbbMemLocked(*state, target, rhs, mnemonic == X86_MNEMONIC_SBB,
+                                    size_bits);
+                } else {
+                    AluOp op = AluOp::Add;
+                    if (mnemonic == X86_MNEMONIC_SUB) {
+                        op = AluOp::Sub;
+                    } else if (mnemonic == X86_MNEMONIC_CMP) {
+                        op = AluOp::Cmp;
+                    } else if (mnemonic == X86_MNEMONIC_AND) {
+                        op = AluOp::And;
+                    } else if (mnemonic == X86_MNEMONIC_TEST) {
+                        op = AluOp::Test;
+                    } else if (mnemonic == X86_MNEMONIC_OR) {
+                        op = AluOp::Or;
+                    } else if (mnemonic == X86_MNEMONIC_XOR) {
+                        op = AluOp::Xor;
+                    }
+                    AluMemLocked(*state, target, rhs, op, size_bits);
+                }
             } else {
                 execute_alu();
             }
@@ -30025,8 +30580,12 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
             };
             if ((ir->decoded.attributes & X86_ATTRIB_HAS_LOCK) != 0 &&
                 ir->operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-                std::lock_guard lock{g_locked_memory_mutex};
-                execute_incdec();
+                auto* target = reinterpret_cast<void*>(
+                    CalculateMemoryAddress(*state, ir->decoded, ir->operands[0]));
+                IncDecMemLocked(*state, target,
+                                mnemonic == X86_MNEMONIC_DEC ? IncDecOp::Dec
+                                                             : IncDecOp::Inc,
+                                ir->operands[0].size);
             } else {
                 execute_incdec();
             }
@@ -30043,8 +30602,9 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
             };
             if ((ir->decoded.attributes & X86_ATTRIB_HAS_LOCK) != 0 &&
                 ir->operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-                std::lock_guard lock{g_locked_memory_mutex};
-                execute_neg();
+                auto* target = reinterpret_cast<void*>(
+                    CalculateMemoryAddress(*state, ir->decoded, ir->operands[0]));
+                NegMemLocked(*state, target, ir->operands[0].size);
             } else {
                 execute_neg();
             }
@@ -30058,8 +30618,9 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
             };
             if ((ir->decoded.attributes & X86_ATTRIB_HAS_LOCK) != 0 &&
                 ir->operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-                std::lock_guard lock{g_locked_memory_mutex};
-                execute_not();
+                auto* target = reinterpret_cast<void*>(
+                    CalculateMemoryAddress(*state, ir->decoded, ir->operands[0]));
+                NotMemLocked(*state, target, ir->operands[0].size);
             } else {
                 execute_not();
             }
@@ -30133,8 +30694,18 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
             };
             if ((ir->decoded.attributes & X86_ATTRIB_HAS_LOCK) != 0 &&
                 ir->operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-                std::lock_guard lock{g_locked_memory_mutex};
-                execute_cmpxchg();
+                std::size_t src_state_offset = 0;
+                if (TryGetRegisterStateOffset(ir->operands[1], src_state_offset)) {
+                    auto* target = reinterpret_cast<void*>(
+                        CalculateMemoryAddress(*state, ir->decoded, ir->operands[0]));
+                    CmpxchgLocked(*state, target, false, 0, src_state_offset, 0,
+                                  ir->operands[0].size);
+                } else {
+                    // High-byte source registers cannot be represented by a plain state lane.
+                    // Keep that rare form serialized and use the full operand decoder.
+                    std::lock_guard lock{g_locked_memory_mutex};
+                    execute_cmpxchg();
+                }
             } else {
                 execute_cmpxchg();
             }
@@ -30443,7 +31014,12 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
         }
         const std::uint64_t target = ResolveDynamicTarget(*state, *ir);
         if (TryExecuteJitDirectHleCall(*state, target, next_rip)) {
-            return next_rip;
+            // Most HLE calls return to next_rip, but context-switching APIs (fibers today,
+            // signal/ucontext-style services in the future) replace the complete guest state.
+            // TryExecuteJitDirectHleCall has already consumed that override and published its
+            // continuation in state. Returning the static fallthrough here would combine the
+            // restored stack with the abandoned call site's RIP and execute both continuations.
+            return state->rip_or_exit;
         }
         Push64(*state, next_rip);
         state->rip_or_exit = target;
@@ -31244,20 +31820,144 @@ std::uint64_t AluMem(LsxMachineImage& state, const std::uint64_t mem_value, cons
     return result;
 }
 
+namespace {
+
+template <typename T, typename Transform>
+bool AtomicReadModifyWriteTyped(void* target, Transform&& transform,
+                                std::uint64_t& previous, std::uint64_t& result) {
+    auto* typed_target = reinterpret_cast<T*>(target);
+    T expected = __atomic_load_n(typed_target, __ATOMIC_SEQ_CST);
+    for (;;) {
+        const T desired = static_cast<T>(transform(static_cast<std::uint64_t>(expected)));
+        if (__atomic_compare_exchange_n(typed_target, &expected, desired, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            previous = static_cast<std::uint64_t>(expected);
+            result = static_cast<std::uint64_t>(desired);
+            return true;
+        }
+    }
+}
+
+template <typename Transform>
+bool AtomicReadModifyWrite(void* target, const std::uint32_t size_bits,
+                           Transform&& transform, std::uint64_t& previous,
+                           std::uint64_t& result) {
+    if (target == nullptr ||
+        (size_bits != 8 && size_bits != 16 && size_bits != 32 && size_bits != 64)) {
+        return false;
+    }
+    const std::uint32_t size_bytes = size_bits / 8;
+    if ((reinterpret_cast<std::uintptr_t>(target) & (size_bytes - 1u)) != 0) {
+        return false;
+    }
+    switch (size_bits) {
+    case 8:
+        return AtomicReadModifyWriteTyped<std::uint8_t>(
+            target, std::forward<Transform>(transform), previous, result);
+    case 16:
+        return AtomicReadModifyWriteTyped<std::uint16_t>(
+            target, std::forward<Transform>(transform), previous, result);
+    case 32:
+        return AtomicReadModifyWriteTyped<std::uint32_t>(
+            target, std::forward<Transform>(transform), previous, result);
+    case 64:
+        return AtomicReadModifyWriteTyped<std::uint64_t>(
+            target, std::forward<Transform>(transform), previous, result);
+    default:
+        return false;
+    }
+}
+
+template <typename T>
+std::uint64_t AtomicLoadTyped(const void* target) {
+    return __atomic_load_n(reinterpret_cast<const T*>(target), __ATOMIC_SEQ_CST);
+}
+
+bool AtomicLoad(const void* target, const std::uint32_t size_bits,
+                std::uint64_t& value) {
+    if (target == nullptr ||
+        (size_bits != 8 && size_bits != 16 && size_bits != 32 && size_bits != 64)) {
+        return false;
+    }
+    const std::uint32_t size_bytes = size_bits / 8;
+    if ((reinterpret_cast<std::uintptr_t>(target) & (size_bytes - 1u)) != 0) {
+        return false;
+    }
+    switch (size_bits) {
+    case 8:
+        value = AtomicLoadTyped<std::uint8_t>(target);
+        return true;
+    case 16:
+        value = AtomicLoadTyped<std::uint16_t>(target);
+        return true;
+    case 32:
+        value = AtomicLoadTyped<std::uint32_t>(target);
+        return true;
+    case 64:
+        value = AtomicLoadTyped<std::uint64_t>(target);
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::uint64_t ApplyAluOperation(const std::uint64_t lhs,
+                                const std::uint64_t rhs, const AluOp op,
+                                const std::uint32_t size_bits) {
+    switch (op) {
+    case AluOp::Add:
+        return MaskToSize(lhs + rhs, size_bits);
+    case AluOp::Sub:
+    case AluOp::Cmp:
+        return MaskToSize(lhs - rhs, size_bits);
+    case AluOp::And:
+    case AluOp::Test:
+        return MaskToSize(lhs & rhs, size_bits);
+    case AluOp::Or:
+        return MaskToSize(lhs | rhs, size_bits);
+    case AluOp::Xor:
+        return MaskToSize(lhs ^ rhs, size_bits);
+    }
+    return MaskToSize(lhs, size_bits);
+}
+
+} // namespace
+
 std::uint64_t AluMemLocked(LsxMachineImage& state, void* target, const std::uint64_t operand,
                            const AluOp op, const std::uint32_t size_bits) {
     if (target == nullptr || size_bits == 0) {
         return 0;
     }
 
-    std::lock_guard lock{g_locked_memory_mutex};
     const std::uint32_t size_bytes = size_bits / 8;
-    std::uint64_t mem_value = 0;
-    std::memcpy(&mem_value, target, size_bytes);
-    const std::uint64_t result = AluMem(state, mem_value, operand, op, size_bits);
-    if (op != AluOp::Cmp && op != AluOp::Test) {
+    const std::uint64_t mask = MaskToSize(~std::uint64_t{0}, size_bits);
+    const std::uint64_t rhs = operand & mask;
+    std::uint64_t previous = 0;
+    std::uint64_t result = 0;
+
+    if (op == AluOp::Cmp || op == AluOp::Test) {
+        if (!AtomicLoad(target, size_bits, previous)) {
+            std::lock_guard lock{g_locked_memory_mutex};
+            std::memcpy(&previous, target, size_bytes);
+        }
+        return AluMem(state, previous, rhs, op, size_bits);
+    }
+
+    if (!AtomicReadModifyWrite(
+            target, size_bits,
+            [rhs, op, size_bits](const std::uint64_t observed) {
+                return ApplyAluOperation(observed, rhs, op, size_bits);
+            },
+            previous, result)) {
+        // X86 permits split locked operands, while AArch64 atomics require natural alignment.
+        std::lock_guard lock{g_locked_memory_mutex};
+        std::memcpy(&previous, target, size_bytes);
+        result = ApplyAluOperation(previous, rhs, op, size_bits);
         std::memcpy(target, &result, size_bytes);
     }
+    // Commit flags only after the successful CAS so they describe the value this operation
+    // actually replaced, not an observation lost to a concurrent writer.
+    AluMem(state, previous, rhs, op, size_bits);
     return result;
 }
 
@@ -31627,8 +32327,33 @@ void IncDecMem(LsxMachineImage& state, void* target, const IncDecOp op, const st
 }
 
 void IncDecMemLocked(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits) {
-    std::lock_guard lock{g_locked_memory_mutex};
-    IncDecMem(state, target, op, size_bits);
+    if (target == nullptr || size_bits == 0) {
+        return;
+    }
+    const std::uint64_t mask = MaskToSize(~std::uint64_t{0}, size_bits);
+    std::uint64_t previous = 0;
+    std::uint64_t result = 0;
+    if (!AtomicReadModifyWrite(
+            target, size_bits,
+            [op, mask](const std::uint64_t observed) {
+                return op == IncDecOp::Dec ? ((observed - 1u) & mask)
+                                           : ((observed + 1u) & mask);
+            },
+            previous, result)) {
+        std::lock_guard lock{g_locked_memory_mutex};
+        const std::uint32_t size_bytes = size_bits / 8;
+        std::memcpy(&previous, target, size_bytes);
+        result = op == IncDecOp::Dec ? MaskToSize(previous - 1u, size_bits)
+                                     : MaskToSize(previous + 1u, size_bits);
+        std::memcpy(target, &result, size_bytes);
+    }
+    const std::uint64_t old_cf = state.rflags & kFlagCf;
+    if (op == IncDecOp::Dec) {
+        CommitSubtractFlags(state, previous, 1u, result, size_bits);
+    } else {
+        CommitAddFlags(state, previous, 1u, result, size_bits);
+    }
+    state.rflags = (state.rflags & ~kFlagCf) | old_cf;
 }
 
 void Neg(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits) {
@@ -31645,8 +32370,45 @@ void NegMem(LsxMachineImage& state, void* target, const std::uint32_t size_bits)
 }
 
 void NegMemLocked(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
-    std::lock_guard lock{g_locked_memory_mutex};
-    NegMem(state, target, size_bits);
+    if (target == nullptr || size_bits == 0) {
+        return;
+    }
+    std::uint64_t previous = 0;
+    std::uint64_t result = 0;
+    if (!AtomicReadModifyWrite(
+            target, size_bits,
+            [size_bits](const std::uint64_t observed) {
+                return MaskToSize(0u - observed, size_bits);
+            },
+            previous, result)) {
+        std::lock_guard lock{g_locked_memory_mutex};
+        const std::uint32_t size_bytes = size_bits / 8;
+        std::memcpy(&previous, target, size_bytes);
+        result = MaskToSize(0u - previous, size_bits);
+        std::memcpy(target, &result, size_bytes);
+    }
+    CommitSubtractFlags(state, 0u, previous, result, size_bits);
+}
+
+void NotMemLocked(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
+    (void)state;
+    if (target == nullptr || size_bits == 0) {
+        return;
+    }
+    std::uint64_t previous = 0;
+    std::uint64_t result = 0;
+    if (!AtomicReadModifyWrite(
+            target, size_bits,
+            [size_bits](const std::uint64_t observed) {
+                return MaskToSize(~observed, size_bits);
+            },
+            previous, result)) {
+        std::lock_guard lock{g_locked_memory_mutex};
+        const std::uint32_t size_bytes = size_bits / 8;
+        std::memcpy(&previous, target, size_bytes);
+        result = MaskToSize(~previous, size_bits);
+        std::memcpy(target, &result, size_bytes);
+    }
 }
 
 void MulOne(LsxMachineImage& state, const std::uint64_t operand, const std::uint32_t size_bits,
@@ -31873,8 +32635,33 @@ void AdcSbbMem(LsxMachineImage& state, void* target, const std::uint64_t operand
 
 void AdcSbbMemLocked(LsxMachineImage& state, void* target, const std::uint64_t operand,
                      const bool subtract, const std::uint32_t size_bits) {
-    std::lock_guard lock{g_locked_memory_mutex};
-    AdcSbbMem(state, target, operand, subtract, size_bits);
+    if (target == nullptr || size_bits == 0) {
+        return;
+    }
+    const bool carry = (state.rflags & kFlagCf) != 0;
+    const std::uint64_t mask = MaskToSize(~std::uint64_t{0}, size_bits);
+    const std::uint64_t rhs = operand & mask;
+    std::uint64_t previous = 0;
+    std::uint64_t result = 0;
+    if (!AtomicReadModifyWrite(
+            target, size_bits,
+            [subtract, carry, rhs, mask](const std::uint64_t observed) {
+                return subtract ? ((observed - rhs - (carry ? 1u : 0u)) & mask)
+                                : ((observed + rhs + (carry ? 1u : 0u)) & mask);
+            },
+            previous, result)) {
+        std::lock_guard lock{g_locked_memory_mutex};
+        const std::uint32_t size_bytes = size_bits / 8;
+        std::memcpy(&previous, target, size_bytes);
+        result = subtract ? MaskToSize(previous - rhs - (carry ? 1u : 0u), size_bits)
+                          : MaskToSize(previous + rhs + (carry ? 1u : 0u), size_bits);
+        std::memcpy(target, &result, size_bytes);
+    }
+    if (subtract) {
+        CommitBorrowSubtractFlags(state, previous, rhs, carry, result, size_bits);
+    } else {
+        CommitCarryAddFlags(state, previous, rhs, carry, result, size_bits);
+    }
 }
 
 void Andn(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs_not,
@@ -32451,9 +33238,57 @@ void BitTestLocked(LsxMachineImage& state, const std::uintptr_t state_offset_or_
                    const bool target_is_memory, const std::uint64_t bit_index,
                    const bool unsigned_memory_index, const std::uint32_t size_bits,
                    const BitTestOp op) {
-    std::lock_guard lock{g_locked_memory_mutex};
-    BitTest(state, state_offset_or_mem_ptr, target_is_memory, bit_index, unsigned_memory_index,
-            size_bits, op);
+    if (!target_is_memory || state_offset_or_mem_ptr == 0 || size_bits == 0) {
+        BitTest(state, state_offset_or_mem_ptr, target_is_memory, bit_index,
+                unsigned_memory_index, size_bits, op);
+        return;
+    }
+
+    const std::uint32_t size_bytes = size_bits / 8;
+    auto* base = reinterpret_cast<std::uint8_t*>(state_offset_or_mem_ptr);
+    std::uint64_t local_bit = 0;
+    void* mem_target = nullptr;
+    if (unsigned_memory_index) {
+        const std::uint64_t element_index = bit_index / size_bits;
+        local_bit = bit_index - element_index * size_bits;
+        mem_target = base + element_index * size_bytes;
+    } else {
+        const auto signed_index = static_cast<std::int64_t>(bit_index);
+        std::int64_t element_index = signed_index / static_cast<std::int64_t>(size_bits);
+        std::int64_t signed_bit = signed_index % static_cast<std::int64_t>(size_bits);
+        if (signed_bit < 0) {
+            --element_index;
+            signed_bit += static_cast<std::int64_t>(size_bits);
+        }
+        local_bit = static_cast<std::uint64_t>(signed_bit);
+        mem_target = base + element_index * static_cast<std::int64_t>(size_bytes);
+    }
+
+    const std::uint64_t bit_mask = std::uint64_t{1} << local_bit;
+    std::uint64_t previous = 0;
+    std::uint64_t result = 0;
+    bool completed = false;
+    if (op == BitTestOp::Test) {
+        completed = AtomicLoad(mem_target, size_bits, previous);
+        result = previous;
+    } else {
+        completed = AtomicReadModifyWrite(
+            mem_target, size_bits,
+            [bit_mask, op](const std::uint64_t observed) {
+                return ApplyBitTestOp(observed, bit_mask, op);
+            },
+            previous, result);
+    }
+    if (!completed) {
+        std::lock_guard lock{g_locked_memory_mutex};
+        std::memcpy(&previous, mem_target, size_bytes);
+        result = ApplyBitTestOp(previous, bit_mask, op);
+        if (op != BitTestOp::Test) {
+            std::memcpy(mem_target, &result, size_bytes);
+        }
+    }
+    state.rflags = (state.rflags & ~kFlagCf) |
+                   ((previous >> local_bit) & 1u);
 }
 
 void BitScan(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,

@@ -624,6 +624,13 @@ private:
         executor_submit_kind_counts{};
     std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
         executor_finish_reason_counts{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_wait_counts{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_wait_ns{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_wait_max_ns{};
+    u64 executor_finish_wait_total{};
     u64 executor_submit_kind_total{};
 #endif
     RenderState render_state;

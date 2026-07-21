@@ -314,12 +314,15 @@ private:
     void RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& state, Pm4Engine engine,
                                           VAddr address, u64 value, u32 num_bytes,
                                           u64 gpu_tick);
-    void CompletePendingCompletionWriteForExecutor(VAddr address, u32 num_bytes, u64 gpu_tick);
+    void CompletePendingCompletionWriteForExecutor(VAddr address, u64 value, Pm4Engine engine,
+                                                   u32 num_bytes, u64 gpu_tick);
     [[nodiscard]] u64 ConsumeCompletionWaitForExecutor(
         const Pm4SubmissionStatePtr& state, Pm4Engine engine,
-        const PM4CmdWaitRegMem& wait) const;
+        const PM4CmdWaitRegMem& wait);
     [[nodiscard]] bool SynchronizeUntrackedMemoryWaitForExecutor(
         const PM4CmdWaitRegMem& wait, u32& value);
+    void ParkMemoryWaitForExecutor(u32 queue_id, const PM4CmdWaitRegMem& wait);
+    void RefreshParkedMemoryWaitsForExecutor();
 #endif
     void SnapshotCpuIndirectGraph(Pm4Engine engine, std::span<const u32> stream,
                                   const Pm4SubmissionStatePtr& state, u32 depth = 0) const;
@@ -420,6 +423,20 @@ private:
     // MPSC link becomes visible; the sole consumer clears it only after retiring the last node.
     // This avoids scanning all 57 mapped queue slots for every small PM4 coroutine resume.
     std::atomic<u64> submit_ready_mask{};
+#ifdef __ANDROID__
+    struct ExecutorParkedMemoryWait {
+        VAddr address{};
+        u32 function{};
+        u32 reference{};
+        u32 mask{};
+        bool active{};
+    };
+    std::array<ExecutorParkedMemoryWait, NumTotalQueues> executor_parked_memory_waits{};
+    // Owned exclusively by the Liverpool consumer thread. Producers continue to publish queue
+    // nodes through submit_ready_mask; a parked front task keeps its queue out of that ready set.
+    u64 executor_parked_memory_wait_mask{};
+    u32 executor_parked_wait_poll_counter{};
+#endif
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
@@ -452,12 +469,15 @@ private:
 #ifdef __ANDROID__
     struct ExecutorPendingCompletionWrite {
         VAddr address{};
+        u64 value{};
         u64 gpu_tick{};
         u32 num_bytes{};
+        Pm4Engine engine{};
 
         bool operator<(const ExecutorPendingCompletionWrite& other) const noexcept {
-            return std::tie(gpu_tick, address, num_bytes) <
-                   std::tie(other.gpu_tick, other.address, other.num_bytes);
+            return std::tie(address, gpu_tick, num_bytes, value, engine) <
+                   std::tie(other.address, other.gpu_tick, other.num_bytes, other.value,
+                            other.engine);
         }
     };
     std::mutex executor_pending_completion_mutex;
@@ -483,6 +503,17 @@ private:
     u64 executor_metrics_last_scheduler_tick{1};
     u64 executor_metrics_wait_flushes{};
     u64 executor_metrics_last_wait_flushes{};
+    u64 executor_untracked_wait_stalls{};
+    u64 executor_untracked_wait_stall_ns{};
+    u64 executor_untracked_wait_stall_max_ns{};
+    u64 executor_metrics_last_untracked_wait_stalls{};
+    u64 executor_metrics_last_untracked_wait_stall_ns{};
+    u64 executor_parked_wait_count{};
+    u64 executor_parked_wait_wake_count{};
+    u64 executor_parked_wait_poll_count{};
+    u64 executor_metrics_last_parked_wait_count{};
+    u64 executor_metrics_last_parked_wait_wake_count{};
+    u64 executor_metrics_last_parked_wait_poll_count{};
     u64 executor_completion_wait_stalls{};
     u64 executor_completion_wait_stall_ns{};
     u64 executor_metrics_last_completion_wait_stalls{};
