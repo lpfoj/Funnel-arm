@@ -2951,19 +2951,23 @@ struct CachedTranslationRecord {
     const LsxDecodedRegion* decoded = nullptr;
 };
 
-// Fast-cache geometry used by the LSX translation engine:
-// two 0x30-byte ways selected from RIP * golden ratio, with alternating replacement. The original
-// 4096 buckets covered short startup loops, but a large Unity title reaches a 164k-block resident
-// set before its first scene. A device profile at that frontier put 25.5% of Game:Main in the
-// authoritative unordered-map lookup. 16384 buckets keep a 32k-block per-thread working window;
-// dynamic Android TLS allocates it only for translated guest threads, while avoiding the two
-// pointer-chasing hash-table walks that otherwise dominate scene loading.
+// The per-thread translation cache uses a two-way table.  Address-bit folding feeds low-order
+// instruction alignment and high-order module placement into the selected bucket without a
+// large immediate multiply in the dispatcher hot path.  A non-power-of-two validation cadence
+// prevents unrelated cache ways from synchronizing their code-byte checks after long runs.
 constexpr std::size_t kJitExecutionCacheBucketCount = 16384;
-constexpr std::uint32_t kJitExecutionCacheRefreshMask = 0x7ffffu;
-constexpr std::uint64_t kJitExecutionCacheHashMultiplier = 0x9e3779b97f4a7c15ull;
+constexpr std::uint32_t kJitCacheValidationPeriod = 524309u;
+constexpr std::uint32_t kJitCacheInitialValidation =
+    std::numeric_limits<std::uint32_t>::max();
 static_assert(std::has_single_bit(kJitExecutionCacheBucketCount));
 constexpr unsigned kJitExecutionCacheBucketBits =
     std::countr_zero(kJitExecutionCacheBucketCount);
+
+constexpr std::uint64_t FoldJitCacheAddress(const std::uint64_t address) noexcept {
+    std::uint64_t mixed = address ^ std::rotl(address, 25);
+    mixed ^= std::rotr(mixed, 11);
+    return mixed ^ (mixed >> 23u);
+}
 
 struct JitExecutionCacheWay {
     std::uint64_t guest_rip = 0;
@@ -3058,10 +3062,10 @@ struct alignas(16) ChainPatchCell {
     const std::uint64_t guest_rip = 0;
     std::atomic<std::uint64_t> guest_hash{0};
     std::atomic<std::uint32_t> guest_size{0};
-    // Publication stores the mask to force a byte hash on the first observed use.
+    // Publication stores a dedicated sentinel to force a byte hash on the first observed use.
     // Periodic sampling is thread-local: a shared fetch_add here made a hot guest
     // loop bounce this cache line between cores on every direct tail link.
-    std::atomic<std::uint32_t> refresh_counter{kJitExecutionCacheRefreshMask};
+    std::atomic<std::uint32_t> refresh_counter{kJitCacheInitialValidation};
     std::atomic<std::uint64_t>* const execution_cache_epoch = nullptr;
 };
 
@@ -3090,7 +3094,7 @@ bool ShouldHashObservedDirectTarget(ChainPatchCell* const slot,
     // instead of a contended atomic read-modify-write.
     std::uint32_t armed = slot->refresh_counter.load(std::memory_order_relaxed);
     bool publication_refresh = false;
-    if (armed == kJitExecutionCacheRefreshMask) {
+    if (armed == kJitCacheInitialValidation) {
         publication_refresh = slot->refresh_counter.compare_exchange_strong(
             armed, 0, std::memory_order_relaxed, std::memory_order_relaxed);
     }
@@ -3108,8 +3112,11 @@ bool ShouldHashObservedDirectTarget(ChainPatchCell* const slot,
         return true;
     }
 
-    ++way.counter;
-    return (way.counter & kJitExecutionCacheRefreshMask) == 0;
+    if (++way.counter >= kJitCacheValidationPeriod) {
+        way.counter = 0;
+        return true;
+    }
+    return false;
 }
 
 // Cross-source cold PIC misses often resolve the same small set of computed targets.  Keep that
@@ -3158,7 +3165,7 @@ struct alignas(64) JitThreadChainPatchCache {
 
     static std::size_t SetIndex(const std::uint64_t guest_target) noexcept {
         return static_cast<std::size_t>(
-            (guest_target * kJitExecutionCacheHashMultiplier) >>
+            FoldJitCacheAddress(guest_target) >>
             (64u - std::countr_zero(kJitChainPatchTlsSetCount)));
     }
 
@@ -4324,7 +4331,7 @@ public:
                                              std::memory_order_release);
                     slot->guest_size.store(0, std::memory_order_relaxed);
                     slot->guest_hash.store(0, std::memory_order_relaxed);
-                    slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
+                    slot->refresh_counter.store(kJitCacheInitialValidation,
                                                 std::memory_order_relaxed);
                 }
             }
@@ -4892,7 +4899,7 @@ public:
                                            std::memory_order_relaxed);
                     slot->guest_hash.store(plan.result.guest_hash,
                                            std::memory_order_relaxed);
-                    slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
+                    slot->refresh_counter.store(kJitCacheInitialValidation,
                                                 std::memory_order_relaxed);
                     slot->chain_target.store(
                         plan.chain_abi ? plan.direct : nullptr,
@@ -4947,7 +4954,7 @@ public:
         }
 
         const std::size_t bucket_index = static_cast<std::size_t>(
-            (guest_rip * kJitExecutionCacheHashMultiplier) >>
+            FoldJitCacheAddress(guest_rip) >>
             (64u - kJitExecutionCacheBucketBits));
         auto& bucket = cache.buckets[bucket_index];
         for (std::size_t way_index = 0; way_index < bucket.ways.size(); ++way_index) {
@@ -4956,17 +4963,20 @@ public:
                 continue;
             }
 
-            const std::uint32_t next_counter = way.refresh_counter + 1;
-            way.refresh_counter = next_counter;
-            if ((next_counter & kJitExecutionCacheRefreshMask) != 0) {
+            const bool first_validation =
+                way.refresh_counter == kJitCacheInitialValidation;
+            const std::uint32_t next_counter =
+                first_validation ? 0u : way.refresh_counter + 1u;
+            const bool periodic_validation =
+                !first_validation && next_counter >= kJitCacheValidationPeriod;
+            if (!first_validation && !periodic_validation) {
+                way.refresh_counter = next_counter;
                 return way.Lookup(cache.decoded_sidecar[bucket_index][way_index]);
             }
+            way.refresh_counter = 0;
 
-            const JitExecutionLookup previous =
-                way.Lookup(cache.decoded_sidecar[bucket_index][way_index]);
-
-            // The interpreter validates on the first reuse of a newly inserted way, then every
-            // 2^19 hits. Re-enter the authoritative cache path so a hash mismatch atomically
+            // Validate on the first reuse of a newly inserted way, then at the independent
+            // periodic cadence. Re-enter the authoritative cache path so a hash mismatch atomically
             // retires all RIP-keyed views and bumps the cross-thread cache epoch.
             const JitExecutionLookup refreshed = ResolveExecutableRegion(guest_rip);
             epoch = execution_cache_epoch_.load(std::memory_order_acquire);
@@ -4988,13 +4998,8 @@ public:
             } else {
                 refreshed_way_index = refreshed_bucket.replacement++ & 1u;
             }
-            const bool unchanged = refreshed.block.entry == previous.block.entry &&
-                                   refreshed.block.guest_size == previous.block.guest_size &&
-                                   refreshed.block.guest_hash == previous.block.guest_hash &&
-                                   refreshed.block.flags == previous.block.flags &&
-                                   refreshed.decoded == previous.decoded;
             refreshed_bucket.ways[refreshed_way_index].Store(
-                guest_rip, refreshed, unchanged ? next_counter : 0);
+                guest_rip, refreshed, 0);
             cache.decoded_sidecar[bucket_index][refreshed_way_index] = refreshed.decoded;
             return refreshed;
         }
@@ -5014,7 +5019,7 @@ public:
             fill_way_index = fill_bucket.replacement++ & 1u;
         }
         fill_bucket.ways[fill_way_index].Store(
-            guest_rip, execution, kJitExecutionCacheRefreshMask);
+            guest_rip, execution, kJitCacheInitialValidation);
         cache.decoded_sidecar[bucket_index][fill_way_index] = execution.decoded;
         return execution;
     }
@@ -5057,7 +5062,7 @@ public:
                     slot_it != chain_patch_slots_.end() && slot_it->second) {
                     slot_it->second->target.store(nullptr, std::memory_order_release);
                     slot_it->second->refresh_counter.store(
-                        kJitExecutionCacheRefreshMask,
+                        kJitCacheInitialValidation,
                         std::memory_order_relaxed);
                 }
             }
@@ -5644,7 +5649,7 @@ public:
                                        std::memory_order_relaxed);
                 slot->guest_hash.store(target_it->second.guest_hash,
                                        std::memory_order_relaxed);
-                slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
+                slot->refresh_counter.store(kJitCacheInitialValidation,
                                             std::memory_order_relaxed);
                 slot->chain_target.store(
                     target_it->second.chain_target,
@@ -5678,7 +5683,7 @@ public:
             slot_it->second->chain_target.store(nullptr, std::memory_order_release);
             slot_it->second->guest_size.store(0, std::memory_order_relaxed);
             slot_it->second->guest_hash.store(0, std::memory_order_relaxed);
-            slot_it->second->refresh_counter.store(kJitExecutionCacheRefreshMask,
+            slot_it->second->refresh_counter.store(kJitCacheInitialValidation,
                                                    std::memory_order_relaxed);
         }
     }
@@ -5703,7 +5708,7 @@ public:
         }
         slot->guest_size.store(guest_size, std::memory_order_relaxed);
         slot->guest_hash.store(guest_hash, std::memory_order_relaxed);
-        slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
+        slot->refresh_counter.store(kJitCacheInitialValidation,
                                     std::memory_order_relaxed);
         slot->chain_target.store(chain_target, std::memory_order_relaxed);
         slot->target.store(target, std::memory_order_release);
@@ -6811,7 +6816,7 @@ Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
             expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
         if (cleared) {
             slot->chain_target.store(nullptr, std::memory_order_release);
-            slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
+            slot->refresh_counter.store(kJitCacheInitialValidation,
                                         std::memory_order_relaxed);
             if (slot->execution_cache_epoch != nullptr) {
                 // The generated direct consumer falls back to the dispatcher after this store.
@@ -6868,7 +6873,7 @@ Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(ChainPatchCell* slot,
                 expected, nullptr, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
             slot->chain_target.store(nullptr, std::memory_order_release);
-            slot->refresh_counter.store(kJitExecutionCacheRefreshMask,
+            slot->refresh_counter.store(kJitCacheInitialValidation,
                                         std::memory_order_relaxed);
             if (slot->execution_cache_epoch != nullptr) {
                 slot->execution_cache_epoch->fetch_add(1, std::memory_order_release);
@@ -22684,9 +22689,8 @@ bool IsPlausibleHleGuestReturn(const std::uint64_t target) {
         std::uint64_t target = 0;
     };
     static thread_local std::array<ReturnRipEntry, 512> return_rip_cache{};
-    constexpr std::uint64_t GoldenRatio = 0x9e3779b97f4a7c15ull;
     const std::size_t cache_slot =
-        static_cast<std::size_t>(((target ^ (target >> 33u)) * GoldenRatio) >> (64u - 9u));
+        static_cast<std::size_t>(FoldJitCacheAddress(target) >> (64u - 9u));
     if (return_rip_cache[cache_slot].target == target) {
         return true;
     }
@@ -35683,7 +35687,7 @@ std::string LsxEngineSelfTestJson() {
                 slot.guest_size.store(1, std::memory_order_relaxed);
                 slot.guest_hash.store(FingerprintCodeSpan(slot.guest_rip, 1),
                                       std::memory_order_relaxed);
-                slot.refresh_counter.store(kJitExecutionCacheRefreshMask,
+                slot.refresh_counter.store(kJitCacheInitialValidation,
                                            std::memory_order_relaxed);
                 slot.chain_target.store(chain_target,
                                         std::memory_order_relaxed);
@@ -35861,7 +35865,7 @@ std::string LsxEngineSelfTestJson() {
                                      const std::uint64_t guest_hash = 0) {
                 slot.guest_size.store(guest_size, std::memory_order_relaxed);
                 slot.guest_hash.store(guest_hash, std::memory_order_relaxed);
-                slot.refresh_counter.store(kJitExecutionCacheRefreshMask,
+                slot.refresh_counter.store(kJitCacheInitialValidation,
                                            std::memory_order_relaxed);
                 slot.target.store(target, std::memory_order_release);
             };
@@ -36342,7 +36346,7 @@ std::string LsxEngineSelfTestJson() {
         const bool chain_patch_first_use_armed =
             direct_slot_precompile != nullptr &&
             direct_slot_precompile->refresh_counter.load(std::memory_order_relaxed) ==
-                kJitExecutionCacheRefreshMask;
+                kJitCacheInitialValidation;
 
         // A newly published slot must hash before its first direct execution. Keep this
         // independent from the larger generated-consumer test so changing that test's number
@@ -36362,7 +36366,7 @@ std::string LsxEngineSelfTestJson() {
                            static_cast<std::uint32_t>(direct_first_validation_code.size())),
             std::memory_order_relaxed);
         direct_first_validation_slot.refresh_counter.store(
-            kJitExecutionCacheRefreshMask, std::memory_order_relaxed);
+            kJitCacheInitialValidation, std::memory_order_relaxed);
         direct_first_validation_slot.target.store(direct_published_entry,
                                                   std::memory_order_release);
         direct_first_validation_code[0] = 0xcc;
@@ -36374,7 +36378,7 @@ std::string LsxEngineSelfTestJson() {
             direct_first_validation_result == nullptr &&
             direct_first_validation_slot.target.load(std::memory_order_acquire) == nullptr &&
             direct_first_validation_slot.refresh_counter.load(std::memory_order_relaxed) ==
-                kJitExecutionCacheRefreshMask &&
+                kJitCacheInitialValidation &&
             direct_first_validation_epoch.load(std::memory_order_acquire) == 8;
         LsxEntryPacket direct_execute_ctx{};
         const std::uint64_t direct_tls_before_mutation =
@@ -36526,7 +36530,7 @@ std::string LsxEngineSelfTestJson() {
         // before stale generated code can execute.
         if (direct_slot_precompile != nullptr) {
             direct_slot_precompile->refresh_counter.store(
-                kJitExecutionCacheRefreshMask, std::memory_order_relaxed);
+                kJitCacheInitialValidation, std::memory_order_relaxed);
         }
         chain_patch_code[kDirectTargetOffset + 1] = static_cast<std::uint8_t>(
             kDirectMutatedCalleeOffset - (kDirectTargetOffset + 2));
@@ -40626,14 +40630,14 @@ std::string LsxEngineSelfTestJson() {
                 0x7fffffffull, 0x80000000ull, 0xffffffffull,
                 0x7fffffffffffffffull, 0x8000000000000000ull,
                 0xffffffffffffffffull, 0x0full, 0xf0ull,
-                0x9e3779b97f4a7c15ull,
+                0x6c8e9cf570932bd5ull,
             };
             const std::uint64_t lhs = edges[iteration % edges.size()] ^
                 (0xd1b54a32d192ed03ull * iteration);
             const std::uint64_t rhs = edges[(iteration * 7u + 5u) % edges.size()] ^
                 (0x94d049bb133111ebull * (iteration + 1u));
             state.rflags = (0xa5a55a5af0f00f02ull ^
-                            (0x9e3779b97f4a7c15ull * iteration));
+                            (0x6c8e9cf570932bd5ull * iteration));
             SetGpr64(state, LsxGpr::Rax, lhs);
             SetGpr64(state, LsxGpr::Rcx, rhs);
         };
