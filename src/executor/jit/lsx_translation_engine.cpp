@@ -1390,6 +1390,18 @@ LsxEngineReport QueryTranslationEngine() {
     };
 }
 
+bool JitDirectSemanticLoweringEnabled() {
+#ifdef __ANDROID__
+    static const bool enabled = [] {
+        const char* value = std::getenv("EXECUTOR_DISABLE_DIRECT_SEMANTIC_LOWERING");
+        return value == nullptr || value[0] == '\0' || value[0] == '0';
+    }();
+    return enabled;
+#else
+    return true;
+#endif
+}
+
 constexpr std::uint64_t kJitGuestCodeHashSeed = 0x6c7378344a495431ull;
 
 void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
@@ -1452,6 +1464,9 @@ bool PackedSaturatingAddSubSigned(X86Mnemonic mnemonic);
 std::size_t PackedSaturatingAddSubElementBytes(X86Mnemonic mnemonic);
 bool IsPackedFloatCompareMnemonic(X86Mnemonic mnemonic);
 bool IsVexPackedFloatCompareMnemonic(X86Mnemonic mnemonic);
+bool IsScalarFloatCompareMnemonic(X86Mnemonic mnemonic);
+bool IsVexScalarFloatCompareMnemonic(X86Mnemonic mnemonic);
+bool ScalarFloatCompareDoubleLane(X86Mnemonic mnemonic);
 bool IsPackedCompareMnemonic(X86Mnemonic mnemonic);
 bool IsVexPackedCompareMnemonic(X86Mnemonic mnemonic);
 bool PackedCompareSignedGreaterThan(X86Mnemonic mnemonic);
@@ -7617,6 +7632,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 (ir.operands[1].type == X86_OPERAND_TYPE_MEMORY &&
                  ir.operands[1].size == 32));
     };
+    const auto is_native_scalar_float_predicate = [](const LsxDecodedOp& ir) {
+        if (!JitDirectSemanticLoweringEnabled() || !ir.can_execute_scalar_float) {
+            return false;
+        }
+        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+        if (!IsScalarFloatCompareMnemonic(mnemonic)) {
+            return false;
+        }
+        const bool vex = IsVexScalarFloatCompareMnemonic(mnemonic);
+        const bool double_lane = ScalarFloatCompareDoubleLane(mnemonic);
+        const std::uint8_t merge_index = vex ? 1u : 0u;
+        const std::uint8_t rhs_index = vex ? 2u : 1u;
+        const std::uint8_t immediate_index = vex ? 3u : 2u;
+        if (ir.operand_count != (vex ? 4u : 3u) ||
+            !IsXmmOperand(ir.operands[0]) ||
+            !IsXmmOperand(ir.operands[merge_index]) ||
+            ir.operands[immediate_index].type != X86_OPERAND_TYPE_IMMEDIATE) {
+            return false;
+        }
+        const auto& rhs = ir.operands[rhs_index];
+        return IsXmmOperand(rhs) ||
+               (rhs.type == X86_OPERAND_TYPE_MEMORY &&
+                rhs.size == (double_lane ? 64u : 32u));
+    };
     const auto is_native_scalar_int_to_float = [&](const LsxDecodedOp& ir) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
         const bool vex = mnemonic == X86_MNEMONIC_VCVTSI2SS ||
@@ -8281,6 +8320,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             return true;
         }
         if (is_native_scalar_float_compare_flags(ir) ||
+            is_native_scalar_float_predicate(ir) ||
             is_native_scalar_int_to_float(ir) ||
             is_native_scalar_precision_convert(ir) ||
             is_native_trunc_scalar_float_to_int(ir) ||
@@ -16741,6 +16781,157 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->orr(code->x9, code->x9, code->x11);
                         code->str(code->x9,
                                   Xbyak_aarch64::ptr(code->x19, kStateRflagsOffset));
+                        ++emitted_simd_fast;
+                        continue;
+                    }
+                    if (is_native_scalar_float_predicate(ir)) {
+                        const bool vex = IsVexScalarFloatCompareMnemonic(mnemonic);
+                        const bool double_lane = ScalarFloatCompareDoubleLane(mnemonic);
+                        const std::uint8_t merge_index = vex ? 1u : 0u;
+                        const std::uint8_t rhs_index = vex ? 2u : 1u;
+                        const std::uint8_t immediate_index = vex ? 3u : 2u;
+                        std::uint32_t destination_offset = 0;
+                        std::uint32_t destination_width = 0;
+                        std::uint32_t merge_offset = 0;
+                        std::uint32_t merge_width = 0;
+                        emitted = vector_register_state_offset(
+                                      ir.operands[0].reg.value, destination_offset,
+                                      destination_width) &&
+                                  vector_register_state_offset(
+                                      ir.operands[merge_index].reg.value, merge_offset,
+                                      merge_width) &&
+                                  destination_width == 16 && merge_width == 16;
+                        if (!emitted) {
+                            continue;
+                        }
+
+                        // Preserve the complete merge source, then replace only lane zero.
+                        code->ldr(code->q4,
+                                  Xbyak_aarch64::ptr(code->x19, merge_offset));
+                        const auto& rhs = ir.operands[rhs_index];
+                        if (rhs.type == X86_OPERAND_TYPE_REGISTER) {
+                            std::uint32_t rhs_offset = 0;
+                            std::uint32_t rhs_width = 0;
+                            emitted = vector_register_state_offset(
+                                          rhs.reg.value, rhs_offset, rhs_width) &&
+                                      rhs_width == 16;
+                            if (emitted) {
+                                if (double_lane) {
+                                    code->ldr(code->d2,
+                                              Xbyak_aarch64::ptr(code->x19, rhs_offset));
+                                } else {
+                                    code->ldr(code->s2,
+                                              Xbyak_aarch64::ptr(code->x19, rhs_offset));
+                                }
+                            }
+                        } else {
+                            emitted = emit_memory_address(ir, rhs, code->x14);
+                            if (emitted) {
+                                emit_publish_fault_ir(ir);
+                                if (double_lane) {
+                                    code->ldr(code->d2, Xbyak_aarch64::ptr(code->x14));
+                                } else {
+                                    code->ldr(code->s2, Xbyak_aarch64::ptr(code->x14));
+                                }
+                            }
+                        }
+                        if (!emitted) {
+                            continue;
+                        }
+
+                        const std::uint32_t predicate = static_cast<std::uint32_t>(
+                            ir.operands[immediate_index].imm.value.u) & 0xfu;
+                        const auto emit_predicate = [&](const auto& output,
+                                                        const auto& lhs,
+                                                        const auto& rhs_lane,
+                                                        const auto& temporary0,
+                                                        const auto& temporary1) {
+                            const VReg16B output_bytes{output.getIdx()};
+                            const VReg16B temporary0_bytes{temporary0.getIdx()};
+                            const VReg16B temporary1_bytes{temporary1.getIdx()};
+                            const auto emit_ordered = [&] {
+                                code->fcmeq(temporary0, lhs, lhs);
+                                code->fcmeq(temporary1, rhs_lane, rhs_lane);
+                                code->and_(temporary0_bytes, temporary0_bytes,
+                                           temporary1_bytes);
+                            };
+                            const auto emit_unordered = [&] {
+                                emit_ordered();
+                                code->not_(temporary0_bytes, temporary0_bytes);
+                            };
+                            switch (predicate) {
+                            case 0x0: code->fcmeq(output, lhs, rhs_lane); break;
+                            case 0x1: code->fcmgt(output, rhs_lane, lhs); break;
+                            case 0x2: code->fcmge(output, rhs_lane, lhs); break;
+                            case 0x3:
+                                emit_unordered();
+                                code->orr(output_bytes, temporary0_bytes, temporary0_bytes);
+                                break;
+                            case 0x4:
+                                code->fcmeq(output, lhs, rhs_lane);
+                                code->not_(output_bytes, output_bytes);
+                                break;
+                            case 0x5:
+                                code->fcmgt(output, rhs_lane, lhs);
+                                code->not_(output_bytes, output_bytes);
+                                break;
+                            case 0x6:
+                                code->fcmge(output, rhs_lane, lhs);
+                                code->not_(output_bytes, output_bytes);
+                                break;
+                            case 0x7:
+                                emit_ordered();
+                                code->orr(output_bytes, temporary0_bytes, temporary0_bytes);
+                                break;
+                            case 0x8:
+                                code->fcmeq(output, lhs, rhs_lane);
+                                emit_unordered();
+                                code->orr(output_bytes, output_bytes, temporary0_bytes);
+                                break;
+                            case 0x9:
+                                code->fcmgt(output, rhs_lane, lhs);
+                                emit_unordered();
+                                code->orr(output_bytes, output_bytes, temporary0_bytes);
+                                break;
+                            case 0xa:
+                                code->fcmge(output, rhs_lane, lhs);
+                                emit_unordered();
+                                code->orr(output_bytes, output_bytes, temporary0_bytes);
+                                break;
+                            case 0xb:
+                                code->eor(output_bytes, output_bytes, output_bytes);
+                                break;
+                            case 0xc:
+                                code->fcmeq(output, lhs, rhs_lane);
+                                code->not_(output_bytes, output_bytes);
+                                emit_ordered();
+                                code->and_(output_bytes, output_bytes, temporary0_bytes);
+                                break;
+                            case 0xd: code->fcmge(output, lhs, rhs_lane); break;
+                            case 0xe: code->fcmgt(output, lhs, rhs_lane); break;
+                            default:
+                                code->eor(output_bytes, output_bytes, output_bytes);
+                                code->not_(output_bytes, output_bytes);
+                                break;
+                            }
+                        };
+                        if (double_lane) {
+                            emit_predicate(code->v5.d2, code->v4.d2, code->v2.d2,
+                                           code->v6.d2, code->v7.d2);
+                            code->ins(code->v4.d2[0], code->v5.d2[0]);
+                        } else {
+                            emit_predicate(code->v5.s4, code->v4.s4, code->v2.s4,
+                                           code->v6.s4, code->v7.s4);
+                            code->ins(code->v4.s4[0], code->v5.s4[0]);
+                        }
+                        code->str(code->q4,
+                                  Xbyak_aarch64::ptr(code->x19, destination_offset));
+                        if (vex) {
+                            code->eor(code->v31.b16, code->v31.b16, code->v31.b16);
+                            code->str(code->q31,
+                                      Xbyak_aarch64::ptr(code->x19,
+                                                        destination_offset + 16));
+                        }
                         ++emitted_simd_fast;
                         continue;
                     }
@@ -42689,6 +42880,53 @@ std::string ExerciseTranslationEngineJson() {
                 fully_direct_blocks_before + 1u;
         const bool generic_vector_kernel_native_ok =
             generic_vector_kernel_result_ok && generic_vector_kernel_counter_ok;
+
+        // SCALAR_COMPARE_PREDICATE_DIRECT_GATE: cover ordered, less-than, unordered/NaN and
+        // negated predicates. The final store makes native publication non-idempotent and the
+        // whole-machine comparison also verifies VEX.128 upper-half clearing and merge bytes.
+        const std::uint64_t scalar_predicate_fast_before =
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
+        const std::uint64_t scalar_predicate_semantic_before =
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+        const std::array<std::uint8_t, 26> generic_scalar_predicates = {
+            0xc5, 0xf2, 0xc2, 0xda, 0x00, // vcmpss xmm3,xmm1,xmm2,eq
+            0xc5, 0xf2, 0xc2, 0xe2, 0x01, // vcmpss xmm4,xmm1,xmm2,lt
+            0xc5, 0xf2, 0xc2, 0xef, 0x03, // vcmpss xmm5,xmm1,xmm7,unordered
+            0xc5, 0xf2, 0xc2, 0xf2, 0x04, // vcmpss xmm6,xmm1,xmm2,neq
+            0xc5, 0xfa, 0x7f, 0x30,       // vmovdqu [rax],xmm6
+            0xeb, 0x00,
+        };
+        const bool generic_scalar_predicate_result_ok = run_generic_simd_case(
+            generic_scalar_predicates, 6, 4,
+            [](LsxMachineImage& state, std::array<std::uint8_t, 128>& memory) {
+                state.rflags = 0xad7u;
+                state.mxcsr = 0x1f80u;
+                WriteGuestGpr64(state, LsxGpr::Rax,
+                                reinterpret_cast<std::uint64_t>(memory.data()));
+                for (std::size_t reg = 1; reg <= 7; ++reg) {
+                    for (std::size_t byte = 0; byte < 32; ++byte) {
+                        state.ymm[reg][byte] = static_cast<std::uint8_t>(
+                            reg * 23u + byte);
+                    }
+                }
+                StoreUnaligned<float>(state.ymm[1].data(), 1.0f);
+                StoreUnaligned<float>(state.ymm[2].data(), 2.0f);
+                StoreUnaligned<std::uint32_t>(state.ymm[7].data(), 0x7fc12345u);
+            },
+            [](const LsxMachineImage& state,
+               const std::array<std::uint8_t, 128>& memory) {
+                return LoadUnaligned<std::uint32_t>(state.ymm[3].data()) == 0u &&
+                       LoadUnaligned<std::uint32_t>(state.ymm[4].data()) == UINT32_MAX &&
+                       LoadUnaligned<std::uint32_t>(state.ymm[5].data()) == UINT32_MAX &&
+                       LoadUnaligned<std::uint32_t>(state.ymm[6].data()) == UINT32_MAX &&
+                       std::memcmp(memory.data(), state.ymm[6].data(), 16) == 0;
+            });
+        const bool generic_scalar_predicate_native_ok =
+            generic_scalar_predicate_result_ok &&
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+                scalar_predicate_fast_before + 5u &&
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
+                scalar_predicate_semantic_before;
         std::uint64_t vector_kernel_semantic_ns = 0;
         std::uint64_t vector_kernel_native_ns = 0;
         std::uint64_t vector_kernel_speedup_milli = 0;
@@ -44259,7 +44497,7 @@ std::string ExerciseTranslationEngineJson() {
             g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 simd_semantic_before;
         const bool generic_simd_native_ok = generic_simd_ymm_native_ok &&
-            generic_vector_kernel_native_ok &&
+            generic_vector_kernel_native_ok && generic_scalar_predicate_native_ok &&
             generic_lddqu_vlddqu_native_ok && generic_maskmovdqu_native_ok &&
             generic_psadbw_vpsadbw_native_ok &&
             generic_saturating_packed_native_ok && generic_simd_xmm_fp_native_ok &&
@@ -45989,6 +46227,8 @@ std::string ExerciseTranslationEngineJson() {
             << (generic_simd_ymm_native_ok ? "true" : "false") << ","
             << R"("genericVectorKernelNativeOk":)"
             << (generic_vector_kernel_native_ok ? "true" : "false") << ","
+            << R"("genericScalarPredicateNativeOk":)"
+            << (generic_scalar_predicate_native_ok ? "true" : "false") << ","
             << R"("genericVectorKernelResultOk":)"
             << (generic_vector_kernel_result_ok ? "true" : "false") << ","
             << R"("genericVectorKernelCounterOk":)"
