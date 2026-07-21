@@ -17,10 +17,18 @@ This list includes only games that have been tested. The broader set of supporte
 | Game | Playable | Notes |
 | --- | :---: | --- |
 | Bloodborne | ✅ | Gameplay is temporarily limited to 7 FPS. |
-| Deltarune Chapter 1&2 | ✅ | |
+| Deltarune Chapters 1 & 2 | ✅ | |
 | Downwell | ✅ | |
+| Hotline Miami 2: Wrong Number | ✅ | |
+| Hyper Light Drifter | ✅ | |
+| Just Shapes & Beats | ✅ | |
+| Limbo | ✅ | |
 | Minit | ✅ | |
 | Nidhogg | ✅ | |
+| Nidhogg 2 | ✅ | |
+| Owlboy | ✅ | |
+| Rain World | ✅ | |
+| Shovel Knight | ✅ | |
 | Sonic Mania | ✅ | |
 | Undertale | ✅ | |
 
