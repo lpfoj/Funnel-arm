@@ -123,6 +123,10 @@ extern "C" int executor_lsx4_android_dispatch_deferred_guest_signal(
     std::int32_t native_sig, std::int32_t si_code, std::int32_t si_errno,
     std::int32_t source_pid, std::uint32_t source_uid, std::uint64_t fault_addr,
     std::uint64_t guest_rip, std::int32_t is_write);
+extern "C" int executor_jit_defer_synchronous_guest_fault(
+    std::int32_t native_sig, std::int32_t si_code, std::int32_t si_errno,
+    std::int32_t source_pid, std::uint32_t source_uid, std::uint64_t fault_addr,
+    std::int32_t is_write);
 #endif
 
 namespace Executor::Jit {
@@ -3258,35 +3262,6 @@ Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(ChainPatchCell* slot,
 Arm64BlockEntry ValidateObservedDirectChainTargetAtSafepoint(
     ChainPatchCell* slot, Arm64BlockEntry observed) noexcept;
 
-// Byte-exact chain-patch deny signatures are checked before either cache.
-constexpr std::array<std::uint8_t, 17> kChainPatchDenySignature1 = {
-    0x39, 0x34, 0x91, 0x74, 0x1b, 0x48, 0xff, 0xc2, 0x39,
-    0xc2, 0x72, 0xf4, 0xe9, 0x98, 0x00, 0x00, 0x00,
-};
-constexpr std::array<std::uint8_t, 15> kChainPatchDenySignature2 = {
-    0x41, 0x39, 0x14, 0x8b, 0x74, 0x0a, 0x48, 0xff,
-    0xc1, 0x39, 0xd9, 0x72, 0xf3, 0xeb, 0x51,
-};
-constexpr std::array<std::uint8_t, 35> kChainPatchDenySignature3 = {
-    0x0f, 0xb6, 0x07, 0x41, 0x0f, 0xb6, 0x14, 0x00, 0x0f,
-    0xb6, 0x06, 0x41, 0x0f, 0xb6, 0x0c, 0x00, 0x89, 0xd0,
-    0x29, 0xc8, 0x75, 0x0c, 0x48, 0xff, 0xc6, 0x48, 0xff,
-    0xc7, 0x31, 0xc0, 0x84, 0xd2, 0x75, 0xde, 0xc3,
-};
-constexpr std::array<std::uint8_t, 58> kChainPatchDenySignature4 = {
-    0x48, 0x8d, 0x0c, 0x38, 0xf6, 0xc3, 0x01, 0x74, 0x1a, 0x49,
-    0x8b, 0x9c, 0x24, 0xd0, 0x00, 0x00, 0x00, 0x48, 0x89, 0x0c,
-    0xf3, 0x48, 0xff, 0xc6, 0x4c, 0x39, 0xc6, 0x0f, 0x87, 0xb7,
-    0x00, 0x00, 0x00, 0x31, 0xdb, 0x0f, 0xb6, 0x11, 0x83, 0xfa,
-    0x0a,
-    0x75, 0x05, 0xb3, 0x01, 0xc6, 0x01, 0x00, 0x48, 0xff, 0xc7,
-    0x4c, 0x39, 0xcf, 0x72, 0xc8, 0xeb, 0x05,
-};
-constexpr std::array<std::uint8_t, 14> kChainPatchDenySignature5 = {
-    0xff, 0x45, 0xe4, 0x8b, 0x83, 0xf8, 0x1e,
-    0x03, 0x00, 0x83, 0xf8, 0x02, 0x7c, 0xf2,
-};
-
 template <std::size_t N>
 bool GuestBytesMatch(const std::uint64_t guest_rip,
                      const std::array<std::uint8_t, N>& signature) {
@@ -3463,12 +3438,7 @@ bool IsChainPatchDenied(const std::uint64_t guest_rip) {
     // A configured probe must remain a dispatcher boundary even when an already compiled caller
     // would otherwise link directly into it. This keeps diagnostics exact without changing the
     // production chain shape when no probe marker is present.
-    return JitIsRipProbeTarget(guest_rip) || IsDirectHleBoundary(guest_rip) ||
-           GuestBytesMatch(guest_rip, kChainPatchDenySignature1) ||
-           GuestBytesMatch(guest_rip, kChainPatchDenySignature2) ||
-           GuestBytesMatch(guest_rip, kChainPatchDenySignature3) ||
-           GuestBytesMatch(guest_rip, kChainPatchDenySignature4) ||
-           GuestBytesMatch(guest_rip, kChainPatchDenySignature5);
+    return JitIsRipProbeTarget(guest_rip) || IsDirectHleBoundary(guest_rip);
 }
 
 constexpr std::array<std::uint8_t, 32> kJitHleThunkHash = {
@@ -10811,7 +10781,23 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             code->ldr(code->x12,
                       Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
             code->cbnz(code->w11, divisor_nonzero);
-            // DivideAccumulatorPair's reconstructed zero-divisor policy leaves EAX unchanged and EDX zero.
+            // The fast path cannot synthesize x86 #DE with AArch64 UDIV (which returns zero).
+            // Keep the common nonzero case inline and enter the architectural helper only for
+            // the exceptional divisor.  Preserve the leaf's state pointer and return address in
+            // case a standalone probe invokes the block without an armed guest-fault frame.
+            code->stp(code->x0, code->x30,
+                      Xbyak_aarch64::pre_ptr(code->sp, -16));
+            code->mov(code->x1, 0);
+            code->mov(code->x2, 32);
+            code->mov(code->x3, 0);
+            EmitJitRelocatablePointer(
+                *code, code->x16,
+                reinterpret_cast<std::uint64_t>(&DivideAccumulatorPair));
+            code->blr(code->x16);
+            code->ldp(code->x0, code->x30,
+                      Xbyak_aarch64::post_ptr(code->sp, 16));
+            code->ldr(code->x12,
+                      Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
             code->mov(code->w13, 0);
             code->b(division_done);
             code->L(divisor_nonzero);
@@ -32618,55 +32604,83 @@ void MultiplyAccumulatorPair(LsxMachineImage& state, const std::uint64_t operand
 
 void DivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, const std::uint32_t size_bits,
             const bool is_signed) {
-    if (divisor == 0) {
-        return;
-    }
+    const auto divide_error = [] {
+#ifdef __ANDROID__
+        // x86 reports both a zero divisor and an out-of-range quotient through #DE.  Route that
+        // architectural event through the same deferred guest-signal path used by native memory
+        // faults; the helper returns only when invoked without an active guest frame (unit probes).
+        (void)executor_jit_defer_synchronous_guest_fault(
+            SIGFPE, FPE_INTDIV, 0, 0, 0, 0, 0);
+#endif
+    };
 
     switch (size_bits) {
     case 8: {
-        std::uint64_t rax = GetGpr64(state, LsxGpr::Rax);
-        std::uint8_t quotient = 0;
-        std::uint8_t remainder = 0;
+        const std::uint64_t rax = GetGpr64(state, LsxGpr::Rax);
         if (is_signed) {
-            const auto dividend = static_cast<std::int16_t>(rax & 0xffff);
-            const auto rhs = static_cast<std::int8_t>(divisor & 0xff);
-            quotient = static_cast<std::uint8_t>(dividend / rhs);
-            remainder = static_cast<std::uint8_t>(dividend % rhs);
-        } else {
-            const auto dividend = static_cast<std::uint16_t>(rax & 0xffff);
-            const auto rhs = static_cast<std::uint8_t>(divisor & 0xff);
+            const std::int32_t dividend = static_cast<std::int16_t>(rax & 0xffffu);
+            const std::int32_t rhs = static_cast<std::int8_t>(divisor & 0xffu);
             if (rhs == 0) {
+                divide_error();
                 return;
             }
-            quotient = static_cast<std::uint8_t>(dividend / rhs);
-            remainder = static_cast<std::uint8_t>(dividend % rhs);
+            const std::int32_t quotient = dividend / rhs;
+            if (quotient < INT8_MIN || quotient > INT8_MAX) {
+                divide_error();
+                return;
+            }
+            const std::int32_t remainder = dividend % rhs;
+            SetGpr16(state, LsxGpr::Rax,
+                     static_cast<std::uint16_t>(static_cast<std::uint8_t>(quotient)) |
+                         (static_cast<std::uint16_t>(static_cast<std::uint8_t>(remainder)) << 8u));
+        } else {
+            const std::uint32_t dividend = static_cast<std::uint16_t>(rax & 0xffffu);
+            const std::uint32_t rhs = static_cast<std::uint8_t>(divisor & 0xffu);
+            if (rhs == 0) {
+                divide_error();
+                return;
+            }
+            const std::uint32_t quotient = dividend / rhs;
+            if (quotient > UINT8_MAX) {
+                divide_error();
+                return;
+            }
+            const std::uint32_t remainder = dividend % rhs;
+            SetGpr16(state, LsxGpr::Rax,
+                     static_cast<std::uint16_t>(quotient | (remainder << 8u)));
         }
-        rax = (rax & ~std::uint64_t{0xffff}) | quotient | (std::uint64_t{remainder} << 8);
-        SetGpr64(state, LsxGpr::Rax, rax);
         break;
     }
     case 16: {
         const std::uint32_t dividend = (static_cast<std::uint32_t>(GetGpr16(state, LsxGpr::Rdx)) << 16) |
                                        GetGpr16(state, LsxGpr::Rax);
         if (is_signed) {
-            const auto signed_dividend = static_cast<std::int32_t>(dividend);
-            const auto rhs = static_cast<std::int16_t>(divisor & 0xffff);
+            const std::int64_t signed_dividend = static_cast<std::int32_t>(dividend);
+            const std::int64_t rhs = static_cast<std::int16_t>(divisor & 0xffffu);
             if (rhs == 0) {
+                divide_error();
                 return;
             }
-            if (signed_dividend == INT32_MIN && rhs == -1) {
-                SetGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(INT32_MIN));
-                SetGpr16(state, LsxGpr::Rdx, 0);
-            } else {
-                SetGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(signed_dividend / rhs));
-                SetGpr16(state, LsxGpr::Rdx, static_cast<std::uint16_t>(signed_dividend % rhs));
+            const std::int64_t quotient = signed_dividend / rhs;
+            if (quotient < INT16_MIN || quotient > INT16_MAX) {
+                divide_error();
+                return;
             }
+            SetGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(quotient));
+            SetGpr16(state, LsxGpr::Rdx,
+                     static_cast<std::uint16_t>(signed_dividend % rhs));
         } else {
-            const auto rhs = static_cast<std::uint16_t>(divisor & 0xffff);
+            const std::uint32_t rhs = static_cast<std::uint16_t>(divisor & 0xffffu);
             if (rhs == 0) {
+                divide_error();
                 return;
             }
-            SetGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(dividend / rhs));
+            const std::uint32_t quotient = dividend / rhs;
+            if (quotient > UINT16_MAX) {
+                divide_error();
+                return;
+            }
+            SetGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(quotient));
             SetGpr16(state, LsxGpr::Rdx, static_cast<std::uint16_t>(dividend % rhs));
         }
         break;
@@ -32675,50 +32689,77 @@ void DivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, 
         const std::uint64_t dividend = (static_cast<std::uint64_t>(GetGpr32(state, LsxGpr::Rdx)) << 32) |
                                        GetGpr32(state, LsxGpr::Rax);
         if (is_signed) {
-            const auto signed_dividend = static_cast<std::int64_t>(dividend);
-            const auto rhs = static_cast<std::int32_t>(divisor & 0xffffffffu);
+            const __int128_t signed_dividend = static_cast<std::int64_t>(dividend);
+            const __int128_t rhs = static_cast<std::int32_t>(divisor & 0xffffffffu);
             if (rhs == 0) {
+                divide_error();
                 return;
             }
-            if (signed_dividend == INT64_MIN && rhs == -1) {
-                SetGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(INT64_MIN));
-                SetGpr32(state, LsxGpr::Rdx, 0);
-            } else {
-                SetGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(signed_dividend / rhs));
-                SetGpr32(state, LsxGpr::Rdx, static_cast<std::uint32_t>(signed_dividend % rhs));
+            const __int128_t quotient = signed_dividend / rhs;
+            if (quotient < INT32_MIN || quotient > INT32_MAX) {
+                divide_error();
+                return;
             }
+            SetGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(quotient));
+            SetGpr32(state, LsxGpr::Rdx,
+                     static_cast<std::uint32_t>(signed_dividend % rhs));
         } else {
-            const auto rhs = static_cast<std::uint32_t>(divisor & 0xffffffffu);
+            const std::uint64_t rhs = static_cast<std::uint32_t>(divisor & 0xffffffffu);
             if (rhs == 0) {
+                divide_error();
                 return;
             }
-            SetGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(dividend / rhs));
+            const std::uint64_t quotient = dividend / rhs;
+            if (quotient > UINT32_MAX) {
+                divide_error();
+                return;
+            }
+            SetGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(quotient));
             SetGpr32(state, LsxGpr::Rdx, static_cast<std::uint32_t>(dividend % rhs));
         }
         break;
     }
     case 64: {
         if (is_signed) {
-            const auto high = static_cast<__int128_t>(static_cast<std::int64_t>(GetGpr64(state, LsxGpr::Rdx)));
-            const auto low = static_cast<__int128_t>(GetGpr64(state, LsxGpr::Rax));
-            const __int128_t dividend = (high << 64) | low;
-            const auto rhs = static_cast<__int128_t>(static_cast<std::int64_t>(divisor));
+            const std::uint64_t low = GetGpr64(state, LsxGpr::Rax);
+            const std::int64_t high = static_cast<std::int64_t>(GetGpr64(state, LsxGpr::Rdx));
+            const std::int64_t divisor64 = static_cast<std::int64_t>(divisor);
+            const __int128_t rhs = divisor64;
             if (rhs == 0) {
+                divide_error();
                 return;
             }
-            if (GetGpr64(state, LsxGpr::Rdx) == 0x8000000000000000ull &&
-                GetGpr64(state, LsxGpr::Rax) == 0 && divisor == 0xffffffffffffffffull) {
-                SetGpr64(state, LsxGpr::Rax, 0x8000000000000000ull);
-                SetGpr64(state, LsxGpr::Rdx, 0);
-            } else {
-                SetGpr64(state, LsxGpr::Rax, static_cast<std::uint64_t>(dividend / rhs));
-                SetGpr64(state, LsxGpr::Rdx, static_cast<std::uint64_t>(dividend % rhs));
+            if (high == INT64_MIN && low == 0 && divisor64 == -1) {
+                divide_error();
+                return;
             }
+            const __int128_t dividend =
+                static_cast<__int128_t>(high) *
+                    (static_cast<__int128_t>(1) << 64u) +
+                static_cast<__int128_t>(low);
+            const __int128_t quotient = dividend / rhs;
+            if (quotient < static_cast<__int128_t>(INT64_MIN) ||
+                quotient > static_cast<__int128_t>(INT64_MAX)) {
+                divide_error();
+                return;
+            }
+            SetGpr64(state, LsxGpr::Rax, static_cast<std::uint64_t>(quotient));
+            SetGpr64(state, LsxGpr::Rdx,
+                     static_cast<std::uint64_t>(dividend % rhs));
         } else {
             const auto dividend = (static_cast<__uint128_t>(GetGpr64(state, LsxGpr::Rdx)) << 64) |
                                   static_cast<__uint128_t>(GetGpr64(state, LsxGpr::Rax));
             const auto rhs = static_cast<__uint128_t>(divisor);
-            SetGpr64(state, LsxGpr::Rax, static_cast<std::uint64_t>(dividend / rhs));
+            if (rhs == 0) {
+                divide_error();
+                return;
+            }
+            const __uint128_t quotient = dividend / rhs;
+            if (quotient > UINT64_MAX) {
+                divide_error();
+                return;
+            }
+            SetGpr64(state, LsxGpr::Rax, static_cast<std::uint64_t>(quotient));
             SetGpr64(state, LsxGpr::Rdx, static_cast<std::uint64_t>(dividend % rhs));
         }
         break;
@@ -33811,8 +33852,6 @@ std::string LsxEngineStatusJson() {
         << R"("coverage":{)"
         << R"("machineContractFunctions":)" << st.machine_contract_functions << ","
         << R"("translationManifestFunctions":)" << st.translation_manifest_functions << ","
-        << R"("instructionHandlers":)" << st.instruction_handlers << ","
-        << R"("implementedHandlers":)" << st.implemented_handlers << ","
         << R"("implementedCoreHelpers":)" << st.implemented_core_helpers << ","
         << R"("compilerFunctions":)" << st.compiler_functions << ","
         << R"("decodeFunctions":)" << st.decode_functions << ","
@@ -36587,6 +36626,7 @@ std::string LsxEngineSelfTestJson() {
             (direct_fault_target_lookup.flags & 8u) == 0;
 
         bool direct_fault_synthetic_resume_ok = true;
+        bool divide_error_delivery_ok = true;
 #if defined(__ANDROID__) && defined(__aarch64__)
         constexpr std::uint64_t kSyntheticFaultRecoveryRip =
             0xfeedface01234567ull;
@@ -36614,25 +36654,52 @@ std::string LsxEngineSelfTestJson() {
             GetGpr64(synthetic_fault_state, LsxGpr::Rax) ==
                 kSyntheticGuestHandlerResult &&
             g_jit_fault_resume_frame == nullptr;
-#endif
 
-        LsxTranslationEngine deny_backend;
-        const auto verify_chain_patch_deny = [&deny_backend](const auto& signature) {
-            std::array<std::uint8_t, kChainPatchDenySignature4.size()> probe{};
-            std::memcpy(probe.data(), signature.data(), signature.size());
-            const auto guest_rip = reinterpret_cast<std::uint64_t>(probe.data());
-            const bool exact_denied = deny_backend.AcquireChainPatchCell(guest_rip) == nullptr;
-            probe[signature.size() - 1] ^= 0x01;
-            const bool one_byte_variant_allowed =
-                deny_backend.AcquireChainPatchCell(guest_rip) != nullptr;
-            return exact_denied && one_byte_variant_allowed;
+        const auto run_divide_fault_probe = [](
+            LsxMachineImage& state, Arm64BlockEntry entry,
+            const std::uint64_t expected_rip) {
+            const LsxMachineImage before = state;
+            LsxMachineImage* const previous_state = SwapDiagnosticMachineImage(&state);
+            std::uint64_t result = ~std::uint64_t{0};
+            JitDeferredGuestFault fault{};
+            const bool resumed = ExecuteHostBlockWithSynchronousFaultResume(
+                entry, &state, result, &fault, &g_jit_fault_resume_frame,
+                &g_jit_deferred_guest_fault);
+            SwapDiagnosticMachineImage(previous_state);
+            return resumed && result == 0 && fault.valid != 0 &&
+                   fault.native_sig == SIGFPE && fault.si_code == FPE_INTDIV &&
+                   fault.guest_rip == expected_rip &&
+                   std::memcmp(state.gpr.data(), before.gpr.data(),
+                               sizeof(state.gpr)) == 0 &&
+                   g_jit_fault_resume_frame == nullptr;
         };
-        const bool chain_patch_deny_signatures_ok =
-            verify_chain_patch_deny(kChainPatchDenySignature1) &&
-            verify_chain_patch_deny(kChainPatchDenySignature2) &&
-            verify_chain_patch_deny(kChainPatchDenySignature3) &&
-            verify_chain_patch_deny(kChainPatchDenySignature4) &&
-            verify_chain_patch_deny(kChainPatchDenySignature5);
+
+        LsxMachineImage zero_divide_state{};
+        zero_divide_state.rip_or_exit = 0x1234'0000ull;
+        SetGpr64(zero_divide_state, LsxGpr::Rax, 0x1122'3344ull);
+        SetGpr64(zero_divide_state, LsxGpr::Rdx, 0x5566'7788ull);
+        const bool zero_divide_fault_ok = run_divide_fault_probe(
+            zero_divide_state,
+            +[](LsxMachineImage* state) -> std::uint64_t {
+                DivideAccumulatorPair(*state, 0, 32, false);
+                return kRunStopMarker;
+            },
+            zero_divide_state.rip_or_exit);
+
+        LsxMachineImage overflow_divide_state{};
+        overflow_divide_state.rip_or_exit = 0x1234'1000ull;
+        SetGpr32(overflow_divide_state, LsxGpr::Rax, 0);
+        SetGpr32(overflow_divide_state, LsxGpr::Rdx, 0x8000'0000u);
+        const bool overflow_divide_fault_ok = run_divide_fault_probe(
+            overflow_divide_state,
+            +[](LsxMachineImage* state) -> std::uint64_t {
+                DivideAccumulatorPair(*state, 0xffff'ffffu, 32, true);
+                return kRunStopMarker;
+            },
+            overflow_divide_state.rip_or_exit);
+        divide_error_delivery_ok =
+            zero_divide_fault_ok && overflow_divide_fault_ok;
+#endif
 
         LsxMachineImage fpu_a{};
         LsxMachineImage fpu_b{};
@@ -44117,7 +44184,7 @@ std::string LsxEngineSelfTestJson() {
                              conditional_two_edge_direct_ok &&
                              direct_fault_target_fallback_ok &&
                              direct_fault_synthetic_resume_ok &&
-                             chain_patch_deny_signatures_ok &&
+                             divide_error_delivery_ok &&
                              fpu_state_isolation_ok && x87_sqrt_contract_ok &&
                              interpreter_compiler_smoke_ok &&
                              partial_packed_move_native_ok &&
@@ -44276,8 +44343,8 @@ std::string LsxEngineSelfTestJson() {
             << direct_backward_multi_jmp_consumer_lookup.flags << std::dec << R"(",)"
             << R"("directLinkMutationResult":"0x)" << std::hex
             << direct_mutation_result << std::dec << R"(",)"
-            << R"("directLinkDenySignaturesOk":)"
-            << (chain_patch_deny_signatures_ok ? "true" : "false") << ","
+            << R"("divideErrorDeliveryOk":)"
+            << (divide_error_delivery_ok ? "true" : "false") << ","
             << R"("fpuStateIsolationOk":)"
             << (fpu_state_isolation_ok ? "true" : "false") << ","
             << R"("x87SqrtContractOk":)"

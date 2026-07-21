@@ -375,8 +375,6 @@ struct LsxEngineReport {
     bool executable = false;
     std::uint32_t machine_contract_functions = 243;
     std::uint32_t translation_manifest_functions = 148;
-    std::uint32_t instruction_handlers = 114;
-    std::uint32_t implemented_handlers = 114;
     std::uint32_t implemented_core_helpers = 31;
     std::uint32_t compiler_functions = 8;
     std::uint32_t decode_functions = 3;
