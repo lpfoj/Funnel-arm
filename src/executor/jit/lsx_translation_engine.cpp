@@ -14,6 +14,7 @@
 #include "common/x86_decoder.h"
 #include <xbyak_aarch64/xbyak_aarch64.h>
 #include <nlohmann/json.hpp>
+#include <tsl/robin_map.h>
 #include <xxhash.h>
 
 #include <algorithm>
@@ -35,6 +36,7 @@
 #include <filesystem>
 #include <functional>
 #include <iomanip>
+#include <memory_resource>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -1109,7 +1111,7 @@ bool JitDiagAlwaysCheckEnabled() {
 // thread-local override is used only by ExerciseTranslationEngineJson so its publication/trust checks stay
 // deterministic without imposing the live interpreter on a normal game run.
 thread_local bool g_jit_selftest_differential_active = false;
-// A focused direct-link gate nests inside the differential self-test. It must compile the exact
+// A focused native-edge gate nests inside the differential self-test. It must compile the exact
 // production tail-link epilogue while the surrounding interpreter continues to request checked-native
 // wrappers. This override is thread-local and never participates in a game run.
 thread_local bool g_jit_selftest_production_direct_active = false;
@@ -1389,49 +1391,6 @@ LsxEngineReport QueryTranslationEngine() {
 }
 
 constexpr std::uint64_t kJitGuestCodeHashSeed = 0x6c7378344a495431ull;
-
-std::uint64_t HashGuestCodeWindow(const std::uint64_t guest_va,
-                                  const std::uint32_t size_bytes) {
-    // A decoded x86 block is capped at 128 instructions, so a 2 KiB slab covers the
-    // normal 15-byte/instruction ceiling in one guarded kernel read. Keep it uninitialized:
-    // every byte passed to the fingerprint is filled by the reader first. Besides avoiding a
-    // 2 KiB clear, this replaces the former four process_vm_readv calls for a maximal block with
-    // one while preserving the exact, chunk-independent fingerprint contract.
-    std::array<std::uint8_t, 2048> slab;
-    std::uint32_t consumed = 0;
-    if (size_bytes <= slab.size()) {
-        if (!ReadGuestBytesChecked(guest_va, slab.data(), size_bytes)) {
-            std::ostringstream message;
-            message << "guest code digest cannot read va=0x" << std::hex << guest_va
-                    << " length=0x" << size_bytes << " consumed=0x0";
-            throw std::runtime_error(message.str());
-        }
-        return XXH3_64bits_withSeed(slab.data(), size_bytes,
-                                    kJitGuestCodeHashSeed);
-    }
-
-    std::unique_ptr<XXH3_state_t, decltype(&XXH3_freeState)> digest{
-        XXH3_createState(), &XXH3_freeState};
-    if (!digest ||
-        XXH3_64bits_reset_withSeed(digest.get(), kJitGuestCodeHashSeed) != XXH_OK) {
-        throw std::runtime_error("guest code digest initialization failed");
-    }
-    while (consumed != size_bytes) {
-        const auto count = static_cast<std::uint32_t>(
-            std::min<std::size_t>(slab.size(), size_bytes - consumed));
-        if (!ReadGuestBytesChecked(guest_va + consumed, slab.data(), count)) {
-            std::ostringstream message;
-            message << "guest code digest cannot read va=0x" << std::hex << guest_va
-                    << " length=0x" << size_bytes << " consumed=0x" << consumed;
-            throw std::runtime_error(message.str());
-        }
-        if (XXH3_64bits_update(digest.get(), slab.data(), count) != XXH_OK) {
-            throw std::runtime_error("guest code digest update failed");
-        }
-        consumed += count;
-    }
-    return XXH3_64bits_digest(digest.get());
-}
 
 void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
           bool repeat_not_equal);
@@ -1907,7 +1866,7 @@ bool IsIndirectPicTerminator(const LsxDecodedOp& ir) {
     // every imported tail call to return through RunGuest's C++ dispatcher.  In hot render/audio
     // threads that stacked HLE lookup, sigsetjmp and TLS cost on every mutex/time/libc crossing.
     // The generated lowering already computes and fault-publishes the memory target before this
-    // epilogue, so the same bounded/validated indirect-link contract is safe here.
+    // epilogue, so the same bounded/validated innative-edge contract is safe here.
     return target.type == X86_OPERAND_TYPE_MEMORY && target.size == 64;
 }
 
@@ -2017,7 +1976,6 @@ std::atomic<std::uint64_t> g_jit_native_scalar_shift_inline_instructions{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_imul_inline_instructions{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_dead_flag_elisions{0};
 std::atomic<std::uint64_t> g_jit_native_control_semantic_terminators{0};
-std::atomic<std::uint64_t> g_jit_execution_cache_identity{1};
 std::atomic<std::uint32_t> g_jit_control_jmp_miss_log_count{0};
 std::atomic<std::uint32_t> g_jit_control_call_miss_log_count{0};
 std::atomic<std::uint32_t> g_jit_control_ret_miss_log_count{0};
@@ -2073,6 +2031,7 @@ struct StableDecodedBlock {
 };
 
 bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_out) noexcept;
+bool GuestBytesMatchDecoded(const LsxDecodedRegion& block) noexcept;
 bool ClassifyJitStableExternal(std::uint64_t value,
                                     JitNativeRelocation& relocation) noexcept;
 bool ResolveJitStableExternal(std::uint32_t target_index,
@@ -2239,15 +2198,7 @@ public:
                     std::numeric_limits<std::uint32_t>::max()) {
                 continue;
             }
-            const auto guest_size =
-                static_cast<std::uint32_t>(block.end_rip - block.start_rip);
-            std::uint64_t live_hash = 0;
-            try {
-                live_hash = HashGuestCodeWindow(guest_rip, guest_size);
-            } catch (...) {
-                continue;
-            }
-            if (live_hash != candidate.guest_hash) {
+            if (!GuestBytesMatchDecoded(block)) {
                 continue;
             }
 
@@ -2279,7 +2230,8 @@ public:
                 JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_HIT] hits=%llu rip=0x%llx "
                             "size=0x%x",
                             static_cast<unsigned long long>(hits),
-                            static_cast<unsigned long long>(guest_rip), guest_size);
+                            static_cast<unsigned long long>(guest_rip),
+                            static_cast<unsigned>(decoded->end_rip - decoded->start_rip));
             }
             return {std::move(decoded), stored_hash, std::move(native_segments),
                     entry_segment_index, direct_segment_index, native_flags, true,
@@ -2323,18 +2275,8 @@ public:
                         std::numeric_limits<std::uint32_t>::max()) {
                     continue;
                 }
-                bool live_bytes_match = !validate_live_bytes;
-                if (validate_live_bytes) {
-                    try {
-                        live_bytes_match =
-                            HashGuestCodeWindow(
-                                guest_rip,
-                                static_cast<std::uint32_t>(block.end_rip - block.start_rip)) ==
-                            candidate.guest_hash;
-                    } catch (...) {
-                        live_bytes_match = false;
-                    }
-                }
+                const bool live_bytes_match =
+                    !validate_live_bytes || GuestBytesMatchDecoded(block);
                 if (live_bytes_match) {
                     const auto rank_it = hot_rank.find(guest_rip);
                     selections.push_back({guest_rip, candidate.guest_hash, block.end_rip,
@@ -2746,9 +2688,9 @@ private:
     // iced-x86's implicit [R/E]DI destination. Cached IR from the prior epoch
     // contains three operands and must not cross this semantic boundary.
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    // v10: direct-link countdown layout and cache-register allocation changed. Native payloads
+    // v10: native-edge metadata and cache-register allocation changed. Native payloads
     // emitted by v9 must be lowered again; decoded IR remains reusable.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210007ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210008ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -3194,27 +3136,104 @@ private:
     std::uint64_t next_loaded_order_ = 1;
 };
 
+struct PublishedCodeWitness {
+    explicit PublishedCodeWitness(const LsxDecodedRegion* region) : decoded(region) {}
+
+    const LsxDecodedRegion* const decoded = nullptr;
+    mutable std::atomic<std::uint32_t> revision{1};
+};
+
 struct JitExecutionLookup {
     TranslationRecord block{};
     const LsxDecodedRegion* decoded = nullptr;
+    const PublishedCodeWitness* witness = nullptr;
 };
 
 struct CachedTranslationRecord {
     TranslationRecord block{};
     const LsxDecodedRegion* decoded = nullptr;
+    PublishedCodeWitness* witness = nullptr;
 };
 
-// The per-thread translation cache uses a two-way table.  Address-bit folding feeds low-order
-// instruction alignment and high-order module placement into the selected bucket without a
-// large immediate multiply in the dispatcher hot path.  A non-power-of-two validation cadence
-// prevents unrelated cache ways from synchronizing their code-byte checks after long runs.
-constexpr std::size_t kJitExecutionCacheBucketCount = 16384;
-constexpr std::uint32_t kJitCacheValidationPeriod = 524309u;
-constexpr std::uint32_t kJitCacheInitialValidation =
-    std::numeric_limits<std::uint32_t>::max();
-static_assert(std::has_single_bit(kJitExecutionCacheBucketCount));
-constexpr unsigned kJitExecutionCacheBucketBits =
-    std::countr_zero(kJitExecutionCacheBucketCount);
+class GuestRegionDirectory {
+public:
+    void ReserveRecords(const std::size_t expected_records) {
+        pages_.reserve(std::max<std::size_t>(expected_records / 64u, 64u));
+    }
+
+    [[nodiscard]] bool Contains(const std::uint64_t rip) const {
+        return Find(rip) != nullptr;
+    }
+
+    CachedTranslationRecord* Find(const std::uint64_t rip) {
+        auto page = pages_.find(PageNumber(rip));
+        if (page == pages_.end()) {
+            return nullptr;
+        }
+        auto record = page.value().records.find(PageOffset(rip));
+        return record == page.value().records.end() ? nullptr : &record.value();
+    }
+
+    const CachedTranslationRecord* Find(const std::uint64_t rip) const {
+        auto page = pages_.find(PageNumber(rip));
+        if (page == pages_.end()) {
+            return nullptr;
+        }
+        auto record = page.value().records.find(PageOffset(rip));
+        return record == page.value().records.end() ? nullptr : &record.value();
+    }
+
+    CachedTranslationRecord& Install(const std::uint64_t rip,
+                                     CachedTranslationRecord record) {
+        auto& records = pages_[PageNumber(rip)].records;
+        records[PageOffset(rip)] = std::move(record);
+        return records[PageOffset(rip)];
+    }
+
+    void Erase(const std::uint64_t rip) {
+        auto page = pages_.find(PageNumber(rip));
+        if (page == pages_.end()) {
+            return;
+        }
+        page.value().records.erase(PageOffset(rip));
+        if (page.value().records.empty()) {
+            pages_.erase(page);
+        }
+    }
+
+    void Clear() { pages_.clear(); }
+
+    template <typename Visitor>
+    void VisitRecords(Visitor&& visitor) {
+        for (auto page = pages_.begin(); page != pages_.end(); ++page) {
+            for (auto record = page.value().records.begin();
+                 record != page.value().records.end(); ++record) {
+                visitor(record.value());
+            }
+        }
+    }
+
+private:
+    struct Page {
+        tsl::robin_map<std::uint16_t, CachedTranslationRecord> records{};
+    };
+
+    static constexpr std::uint64_t PageNumber(const std::uint64_t rip) noexcept {
+        return rip >> 16u;
+    }
+    static constexpr std::uint16_t PageOffset(const std::uint64_t rip) noexcept {
+        return static_cast<std::uint16_t>(rip);
+    }
+
+    tsl::robin_map<std::uint64_t, Page> pages_{};
+};
+
+// The thread-local dispatch memo uses two independently indexed banks rather than colocated ways.
+// The large near bank captures straight-line locality; the smaller alternate bank absorbs aliases
+// without paying bucket padding or a replacement-byte load on a hit.
+constexpr std::size_t kJitExecutionNearBankCount = 12289;
+constexpr std::size_t kJitExecutionAlternateBankCount = 4099;
+constexpr std::uint32_t kJitInspectionSampleThreshold = 8192u;
 
 constexpr std::uint64_t FoldJitCacheAddress(const std::uint64_t address) noexcept {
     std::uint64_t mixed = address ^ std::rotl(address, 25);
@@ -3225,252 +3244,131 @@ constexpr std::uint64_t FoldJitCacheAddress(const std::uint64_t address) noexcep
 struct JitExecutionCacheWay {
     std::uint64_t guest_rip = 0;
     Arm64BlockEntry entry = nullptr;
+    const PublishedCodeWitness* witness = nullptr;
     std::uint32_t guest_size = 0;
-    std::uint32_t reserved_14 = 0;
-    std::uint64_t guest_hash = 0;
     std::uint32_t flags = 0;
-    std::uint32_t reserved_24 = 0;
-    std::uint32_t refresh_counter = 0;
-    std::uint8_t special_type = 0;
+    std::uint32_t observed_revision = 0;
+    std::uint8_t needs_initial_inspection = 0;
     std::uint8_t valid = 0;
-    std::array<std::uint8_t, 2> reserved{};
+    std::array<std::uint8_t, 10> reserved{};
 
-    JitExecutionLookup Lookup(const LsxDecodedRegion* decoded) const {
+    JitExecutionLookup Lookup() const {
         TranslationRecord result{};
         result.entry = entry;
         result.guest_size = guest_size;
-        result.guest_hash = guest_hash;
         result.flags = flags;
-        return {result, decoded};
+        return {result, witness != nullptr ? witness->decoded : nullptr, witness};
     }
 
     void Store(const std::uint64_t rip, const JitExecutionLookup& execution,
-               const std::uint32_t counter) {
+               const bool inspect_on_first_reuse) {
         valid = 0;
         guest_rip = rip;
         entry = execution.block.entry;
+        witness = execution.witness;
         guest_size = execution.block.guest_size;
         flags = execution.block.flags;
-        guest_hash = execution.block.guest_hash;
-        refresh_counter = counter;
-        special_type = 0;
+        observed_revision = witness != nullptr
+            ? witness->revision.load(std::memory_order_acquire)
+            : 0;
+        needs_initial_inspection = inspect_on_first_reuse ? 1 : 0;
         valid = 1;
     }
 };
 
 static_assert(offsetof(JitExecutionCacheWay, entry) == 0x08);
-static_assert(offsetof(JitExecutionCacheWay, guest_size) == 0x10);
-static_assert(offsetof(JitExecutionCacheWay, guest_hash) == 0x18);
-static_assert(offsetof(JitExecutionCacheWay, flags) == 0x20);
-static_assert(offsetof(JitExecutionCacheWay, refresh_counter) == 0x28);
-static_assert(offsetof(JitExecutionCacheWay, special_type) == 0x2c);
-static_assert(offsetof(JitExecutionCacheWay, valid) == 0x2d);
+static_assert(offsetof(JitExecutionCacheWay, witness) == 0x10);
+static_assert(offsetof(JitExecutionCacheWay, guest_size) == 0x18);
+static_assert(offsetof(JitExecutionCacheWay, flags) == 0x1c);
+static_assert(offsetof(JitExecutionCacheWay, observed_revision) == 0x20);
+static_assert(offsetof(JitExecutionCacheWay, needs_initial_inspection) == 0x24);
+static_assert(offsetof(JitExecutionCacheWay, valid) == 0x25);
 static_assert(sizeof(JitExecutionCacheWay) == 0x30);
-
-struct JitExecutionCacheBucket {
-    std::array<JitExecutionCacheWay, 2> ways{};
-    std::uint8_t replacement = 0;
-    std::array<std::uint8_t, 7> reserved{};
-};
-
-static_assert(offsetof(JitExecutionCacheBucket, replacement) == 0x60);
-static_assert(sizeof(JitExecutionCacheBucket) == 0x68);
-
-struct alignas(64) JitThreadExecutionCache {
-    std::uint64_t backend_identity = 0;
-    std::uint64_t epoch = 0;
-    std::array<JitExecutionCacheBucket, kJitExecutionCacheBucketCount> buckets{};
-    std::array<std::array<const LsxDecodedRegion*, 2>, kJitExecutionCacheBucketCount>
-        decoded_sidecar{};
-
-    void Reset(const std::uint64_t identity, const std::uint64_t new_epoch) {
-        backend_identity = identity;
-        epoch = new_epoch;
-        // Do not assign value-initialized std::array temporaries here.  Clang inlines Reset into
-        // RunGuest and materializes the large bucket array on the native stack before copying it
-        // into TLS. A nested guest callback (notably Mono's signal-30 handler) then enters RunGuest
-        // again on a small pthread stack and faults in the function prologue.
-        // Both arrays contain only trivially copyable cache metadata, so clear their TLS storage
-        // directly without a giant automatic object.
-        std::memset(buckets.data(), 0, sizeof(buckets));
-        std::memset(decoded_sidecar.data(), 0, sizeof(decoded_sidecar));
-    }
-};
-
-static_assert(std::is_trivially_copyable_v<JitExecutionCacheBucket>);
-
-thread_local JitThreadExecutionCache g_jit_thread_execution_cache{};
-
-struct alignas(16) ChainPatchCell {
-    ChainPatchCell(const std::uint64_t rip, std::atomic<std::uint64_t>* cache_epoch)
-        : guest_rip(rip), execution_cache_epoch(cache_epoch) {}
-
-    // Keep target first: emitted consumers perform an AArch64 LDAR directly
-    // from the stable slot address before entering the hash validator.
-    std::atomic<Arm64BlockEntry> target{nullptr};
-    // Optional entry for generic blocks already executing inside the shared native-chain
-    // frame. Ordinary/special blocks always use target; a generic chain uses this only when the
-    // destination was emitted with the same frame/register-cache ABI.
-    std::atomic<Arm64BlockEntry> chain_target{nullptr};
-    const std::uint64_t guest_rip = 0;
-    std::atomic<std::uint64_t> guest_hash{0};
-    std::atomic<std::uint32_t> guest_size{0};
-    // Publishers advance a generation once after replacing the slot metadata. Readers compare
-    // it with a private observation ticket, so publication never requires a contended CAS.
-    std::atomic<std::uint32_t> publication_generation{1};
-    std::atomic<std::uint64_t>* const execution_cache_epoch = nullptr;
-
-    void MarkPublication() noexcept {
-        publication_generation.fetch_add(1, std::memory_order_release);
-    }
-};
-
-static_assert(offsetof(ChainPatchCell, target) == 0);
-static_assert(offsetof(ChainPatchCell, chain_target) == 0x08);
-static_assert(offsetof(ChainPatchCell, guest_rip) == 0x10);
-static_assert(offsetof(ChainPatchCell, publication_generation) == 0x24);
-static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
-static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
-
-struct DirectTargetRefreshWay {
-    ChainPatchCell* slot = nullptr;
-    std::uint32_t generation = 0;
-    std::uint32_t countdown = kJitCacheValidationPeriod;
-};
-
-constexpr std::size_t kDirectTargetRefreshWayCount = 256;
-static_assert(std::has_single_bit(kDirectTargetRefreshWayCount));
-thread_local std::array<DirectTargetRefreshWay, kDirectTargetRefreshWayCount>
-    g_direct_target_refresh_ways{};
-
-bool ShouldInspectDirectTarget(ChainPatchCell* const slot) noexcept {
-    const std::size_t index =
-        (reinterpret_cast<std::uintptr_t>(slot) >> 4u) &
-        (kDirectTargetRefreshWayCount - 1u);
-    auto& way = g_direct_target_refresh_ways[index];
-    const std::uint32_t generation =
-        slot->publication_generation.load(std::memory_order_acquire);
-    if (way.slot != slot || way.generation != generation) {
-        way = {.slot = slot,
-               .generation = generation,
-               .countdown = kJitCacheValidationPeriod};
-        return true;
-    }
-    if (--way.countdown == 0) {
-        way.countdown = kJitCacheValidationPeriod;
-        return true;
-    }
-    return false;
-}
-
-// Cross-source cold PIC misses often resolve the same small set of computed targets.  Keep that
-// lookup off chain_patch_mutex_/unordered_map after the authoritative deny classifier has run.
-// ChainPatchCell addresses remain stable across ordinary retirement/SMC; the atomics inside the
-// slot carry those state changes.  A title reset is different because it clears the RIP->slot map
-// and may allocate a new stable slot for the same RIP, so each entry is also tied to the slot-map
-// epoch captured under chain_patch_mutex_.  Backend identity prevents a stale TLS pointer from
-// being reused after an LsxTranslationEngine is destroyed and another is created at the same
-// address.
-constexpr std::size_t kJitChainPatchTlsSetCount = 128;
-constexpr std::size_t kJitChainPatchTlsWayCount = 2;
-
-struct JitThreadChainPatchCacheWay {
-    std::uint64_t guest_target = 0;
-    ChainPatchCell* slot = nullptr;
-};
-
-struct alignas(64) JitThreadChainPatchCache {
-    std::uint64_t backend_identity = 0;
-    std::uint64_t slot_map_epoch = 0;
-    std::array<std::array<JitThreadChainPatchCacheWay,
-                          kJitChainPatchTlsWayCount>,
-               kJitChainPatchTlsSetCount>
-        sets{};
-    std::array<std::uint8_t, kJitChainPatchTlsSetCount> replacement{};
-    // TLS-local counters make the focused contract test observable without adding atomics to the
-    // production miss path.
-    std::uint64_t hits = 0;
-    std::uint64_t misses = 0;
-
-    void Synchronize(const std::uint64_t identity,
-                     const std::uint64_t epoch) noexcept {
-        if (backend_identity == identity && slot_map_epoch == epoch) {
-            return;
-        }
-        // Publish the new identity only after stale pointers are gone.  This also makes a nested
-        // same-thread guest callback during reset see either the old identity (and at worst a
-        // partially empty old cache) or the fully cleared new cache, never stale entries carrying
-        // new metadata.
-        std::memset(sets.data(), 0, sizeof(sets));
-        std::memset(replacement.data(), 0, sizeof(replacement));
-        backend_identity = identity;
-        slot_map_epoch = epoch;
-    }
-
-    static std::size_t SetIndex(const std::uint64_t guest_target) noexcept {
-        return static_cast<std::size_t>(
-            FoldJitCacheAddress(guest_target) >>
-            (64u - std::countr_zero(kJitChainPatchTlsSetCount)));
-    }
-
-    ChainPatchCell* Lookup(const std::uint64_t guest_target) noexcept {
-        const auto& set = sets[SetIndex(guest_target)];
-        for (const auto& way : set) {
-            if (way.slot != nullptr && way.guest_target == guest_target) {
-                ++hits;
-                return way.slot;
-            }
-        }
-        ++misses;
-        return nullptr;
-    }
-
-    void Store(const std::uint64_t guest_target, ChainPatchCell* const slot) noexcept {
-        if (slot == nullptr) {
-            return;
-        }
-        const std::size_t set_index = SetIndex(guest_target);
-        auto& set = sets[set_index];
-        for (auto& way : set) {
-            if (way.slot != nullptr && way.guest_target == guest_target) {
-                way.slot = slot;
-                return;
-            }
-        }
-        for (auto& way : set) {
-            if (way.slot == nullptr) {
-                way = {guest_target, slot};
-                return;
-            }
-        }
-        const std::size_t way_index =
-            replacement[set_index]++ & (kJitChainPatchTlsWayCount - 1u);
-        set[way_index] = {guest_target, slot};
-    }
-};
-
-static_assert(std::has_single_bit(kJitChainPatchTlsSetCount));
-static_assert(std::has_single_bit(kJitChainPatchTlsWayCount));
-static_assert(std::is_trivially_copyable_v<JitThreadChainPatchCacheWay>);
-
-thread_local JitThreadChainPatchCache g_jit_thread_chain_patch_cache{};
 
 class LsxTranslationEngine;
 
+struct alignas(64) JitThreadExecutionCache {
+    const LsxTranslationEngine* backend = nullptr;
+    std::uint32_t sampling_state = 1;
+    std::uint32_t placement_cursor = 0;
+    std::array<JitExecutionCacheWay, kJitExecutionNearBankCount> near_bank{};
+    std::array<JitExecutionCacheWay, kJitExecutionAlternateBankCount> alternate_bank{};
+
+    void Reset(const LsxTranslationEngine* const owner) {
+        backend = owner;
+        sampling_state = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(owner)) | 1u;
+        placement_cursor = 0;
+        std::memset(near_bank.data(), 0, sizeof(near_bank));
+        std::memset(alternate_bank.data(), 0, sizeof(alternate_bank));
+    }
+};
+
+static_assert(std::is_trivially_copyable_v<JitExecutionCacheWay>);
+
+thread_local JitThreadExecutionCache g_jit_thread_execution_cache{};
+
+struct alignas(16) OutboundEdgeState {
+    explicit OutboundEdgeState(const std::uint64_t rip,
+                            LsxTranslationEngine* edge_owner = nullptr)
+        : guest_rip(rip), owner(edge_owner) {}
+
+    // Keep target first: emitted consumers perform one AArch64 LDAR directly
+    // from the source-owned edge address before entering snapshot validation.
+    // Each source chooses its entry convention before the source block becomes visible, so an
+    // edge never needs a second atomically published address.
+    std::atomic<Arm64BlockEntry> target{nullptr};
+    const std::uint64_t guest_rip = 0;
+    // Immutable IR owns the exact byte snapshot used to compile the destination. Publication of
+    // target release-orders this pointer, allowing validation to compare bytes without hashing.
+    std::atomic<const PublishedCodeWitness*> code_witness{nullptr};
+    LsxTranslationEngine* const owner = nullptr;
+    bool enters_resident_frame = false;
+    std::atomic<std::uint8_t> inspection_pending{1};
+};
+
+static_assert(offsetof(OutboundEdgeState, target) == 0);
+static_assert(offsetof(OutboundEdgeState, guest_rip) == 0x08);
+static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
+static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
+
+thread_local std::uint32_t g_direct_target_sampling_state = 1;
+
+bool SelectSparseInspection(std::uint32_t& state, const std::uintptr_t salt) noexcept {
+    // Sampling is shared by the thread and naturally dephases unrelated edges.
+    state = state * 1664525u + 1013904223u +
+            static_cast<std::uint32_t>(salt >> 4u);
+    return state < kJitInspectionSampleThreshold;
+}
+
+bool ShouldInspectDirectTarget(OutboundEdgeState* const slot) noexcept {
+    if (slot->inspection_pending.load(std::memory_order_relaxed) != 0) {
+        std::uint8_t pending = 1;
+        if (slot->inspection_pending.compare_exchange_strong(
+                pending, 0, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return SelectSparseInspection(
+        g_direct_target_sampling_state,
+        reinterpret_cast<std::uintptr_t>(slot));
+}
+
 // Per-source cache for computed guest control. Register-indirect JMP/CALL sites retain eight
 // targets: C++ vtables, FMOD DSP dispatch and task queues routinely use 3-6 targets at one source
-// RIP, so a two-way cache ping-ponged through the locked global ChainPatchCell map.
+// RIP, so a smaller polymorphic cache churned through the cold binder.
 // RET/RET imm16 sites retain sixteen return targets; real guest functions commonly have more than
 // two stable callers and a two-way return cache merely ping-pongs through the C++ binder.  Ways
-// retain stable ChainPatchCell addresses rather than raw Arm64BlockEntry values, so target publication,
-// SMC retirement and hash validation remain owned by the same contract as static direct links.
+// retain stable OutboundEdgeState addresses rather than raw Arm64BlockEntry values, so target publication,
+// SMC retirement and snapshot validation remain owned by the same contract as static native edges.
 // Objects are never freed while generated code can still contain their address; source retirement
 // only makes them inert.
-struct alignas(64) PolymorphicChainSite {
+struct alignas(64) IndirectEdgeFanout {
     static constexpr std::uint32_t kJumpWayCount = 8;
     static constexpr std::uint32_t kReturnWayCount = 16;
 
-    PolymorphicChainSite(LsxTranslationEngine* backend, const std::uint64_t rip,
+    IndirectEdgeFanout(LsxTranslationEngine* backend, const std::uint64_t rip,
                      const bool return_site = false)
         : owner(backend), source_rip(rip),
           way_count(return_site ? kReturnWayCount : kJumpWayCount) {}
@@ -3485,33 +3383,125 @@ struct alignas(64) PolymorphicChainSite {
     LsxTranslationEngine* const owner = nullptr;
     const std::uint64_t source_rip = 0;
     const std::uint32_t way_count = kJumpWayCount;
-    std::array<std::atomic<ChainPatchCell*>, kReturnWayCount> ways{};
+    std::array<std::atomic<OutboundEdgeState*>, kReturnWayCount> ways{};
     std::atomic<std::uint32_t> replacement{0};
     std::atomic<std::uint32_t> active{1};
 };
 
-static_assert(offsetof(PolymorphicChainSite, way_count) == 0x10);
-static_assert(offsetof(PolymorphicChainSite, ways) == 0x18);
-static_assert(offsetof(PolymorphicChainSite, replacement) == 0x98);
-static_assert(offsetof(PolymorphicChainSite, active) == 0x9c);
-static_assert(std::atomic<ChainPatchCell*>::is_always_lock_free);
+static_assert(offsetof(IndirectEdgeFanout, way_count) == 0x10);
+static_assert(offsetof(IndirectEdgeFanout, ways) == 0x18);
+static_assert(offsetof(IndirectEdgeFanout, replacement) == 0x98);
+static_assert(offsetof(IndirectEdgeFanout, active) == 0x9c);
+static_assert(std::atomic<OutboundEdgeState*>::is_always_lock_free);
 
-ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
+OutboundEdgeState* BindIndirectEdgeFanout(IndirectEdgeFanout* site,
                                      std::uint64_t guest_target) noexcept;
 
-struct ChainPatchRecord {
-    Arm64BlockEntry target = nullptr;
-    Arm64BlockEntry chain_target = nullptr;
-    std::uint64_t guest_hash = 0;
-    std::uint32_t guest_size = 0;
+struct PublishedDestination {
+    Arm64BlockEntry external_entry = nullptr;
+    Arm64BlockEntry resident_entry = nullptr;
+    const PublishedCodeWitness* code_witness = nullptr;
 };
 
-Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
+Arm64BlockEntry SelectDestinationEntry(const PublishedDestination& destination,
+                                       const OutboundEdgeState& edge) noexcept {
+    if (edge.enters_resident_frame && destination.resident_entry != nullptr) {
+        return destination.resident_entry;
+    }
+    return destination.external_entry;
+}
+
+class EdgeDestinationDirectory {
+public:
+    void ReserveDestinations(const std::size_t expected_destinations) {
+        pages_.reserve(std::max<std::size_t>(expected_destinations / 64u, 64u));
+    }
+
+    void Attach(const std::uint64_t rip, OutboundEdgeState* edge) {
+        pages_[PageNumber(rip)].nodes[PageOffset(rip)].incoming.push_back(edge);
+    }
+
+    const PublishedDestination* FindPublished(const std::uint64_t rip) const {
+        const Node* const node = FindNode(rip);
+        return node != nullptr && node->published ? &node->destination : nullptr;
+    }
+
+    void Publish(const std::uint64_t rip, PublishedDestination destination) {
+        Node& node = pages_[PageNumber(rip)].nodes[PageOffset(rip)];
+        node.destination = destination;
+        node.published = true;
+    }
+
+    void Withdraw(const std::uint64_t rip) {
+        if (Node* const node = FindNode(rip); node != nullptr) {
+            node->destination = {};
+            node->published = false;
+        }
+    }
+
+    template <typename Visitor>
+    void VisitIncoming(const std::uint64_t rip, Visitor&& visitor) {
+        if (Node* const node = FindNode(rip); node != nullptr) {
+            for (OutboundEdgeState* const edge : node->incoming) {
+                visitor(edge);
+            }
+        }
+    }
+
+    template <typename Visitor>
+    void Reset(Visitor&& visitor) {
+        for (auto page = pages_.begin(); page != pages_.end(); ++page) {
+            for (auto node = page.value().nodes.begin();
+                 node != page.value().nodes.end(); ++node) {
+                for (OutboundEdgeState* const edge : node.value().incoming) {
+                    visitor(edge);
+                }
+            }
+        }
+        pages_.clear();
+    }
+
+private:
+    struct Node {
+        PublishedDestination destination{};
+        std::vector<OutboundEdgeState*> incoming{};
+        bool published = false;
+    };
+    struct Page {
+        tsl::robin_map<std::uint16_t, Node> nodes{};
+    };
+
+    Node* FindNode(const std::uint64_t rip) {
+        auto page = pages_.find(PageNumber(rip));
+        if (page == pages_.end()) {
+            return nullptr;
+        }
+        auto node = page.value().nodes.find(PageOffset(rip));
+        return node == page.value().nodes.end() ? nullptr : &node.value();
+    }
+    const Node* FindNode(const std::uint64_t rip) const {
+        auto page = pages_.find(PageNumber(rip));
+        if (page == pages_.end()) {
+            return nullptr;
+        }
+        auto node = page.value().nodes.find(PageOffset(rip));
+        return node == page.value().nodes.end() ? nullptr : &node.value();
+    }
+
+    static constexpr std::uint64_t PageNumber(const std::uint64_t rip) noexcept {
+        return rip >> 16u;
+    }
+    static constexpr std::uint16_t PageOffset(const std::uint64_t rip) noexcept {
+        return static_cast<std::uint16_t>(rip);
+    }
+
+    tsl::robin_map<std::uint64_t, Page> pages_{};
+};
+
+Arm64BlockEntry ValidateObservedDirectTarget(OutboundEdgeState* slot,
                                          Arm64BlockEntry observed) noexcept;
-Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(ChainPatchCell* slot,
+Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(OutboundEdgeState* slot,
                                                     Arm64BlockEntry observed) noexcept;
-Arm64BlockEntry ValidateObservedDirectChainTargetAtSafepoint(
-    ChainPatchCell* slot, Arm64BlockEntry observed) noexcept;
 
 template <std::size_t N>
 bool GuestBytesMatch(const std::uint64_t guest_rip,
@@ -3619,7 +3609,7 @@ bool IsMonoScriptCacheTreeStrcmpTail(const std::uint64_t tail_rip,
 #endif
 
 bool IsDirectHleBoundary(const std::uint64_t guest_rip) {
-    // A direct link must never cross the dispatcher-owned HLE boundary.  In particular, a
+    // A native edge must never cross the dispatcher-owned HLE boundary.  In particular, a
     // module-local `jmp strcmp@plt` can otherwise link to an already-published PLT block and run
     // the imported tail call without TryExecuteJitDirectHleTail translating the mapped
     // frame's null return.  Compilation order then decides whether zero is seen as completion or
@@ -3685,13 +3675,6 @@ bool TryResolveJitLeafHlePlt(const std::uint64_t plt_rip,
     return true;
 }
 
-bool IsChainPatchDenied(const std::uint64_t guest_rip) {
-    // A configured probe must remain a dispatcher boundary even when an already compiled caller
-    // would otherwise link directly into it. This keeps diagnostics exact without changing the
-    // production chain shape when no probe marker is present.
-    return JitIsRipProbeTarget(guest_rip) || IsDirectHleBoundary(guest_rip);
-}
-
 constexpr std::array<std::uint8_t, 32> kJitHleThunkHash = {
     0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
     0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
@@ -3701,12 +3684,10 @@ constexpr std::array<std::uint8_t, 32> kJitHleThunkHash = {
 constexpr std::uint8_t kJitHleMarkerLength =
     static_cast<std::uint8_t>(2 + kJitHleThunkHash.size());
 
-bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_out) noexcept {
-    // Hash the exact instruction bytes consumed by X86.  A decoded basic block is contiguous;
-    // rejecting any gap/overlap here keeps the byte snapshot and the published guest span tied
-    // together even if guest code is being modified concurrently.
-    std::array<std::uint8_t, 2048> flattened;
-    std::size_t flattened_size = 0;
+bool FlattenDecodedBlockBytes(const LsxDecodedRegion& block,
+                              const std::span<std::uint8_t> flattened,
+                              std::size_t& flattened_size) noexcept {
+    flattened_size = 0;
     const auto append = [&](const std::span<const std::uint8_t> bytes) {
         if (bytes.size() > flattened.size() - flattened_size) {
             return false;
@@ -3724,7 +3705,7 @@ bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_ou
         if (IsJitHleBridgeMarkerInstruction(instruction)) {
             // The synthetic marker is 34 bytes while ordinary x86 instructions need at most the
             // 15-byte architectural buffer retained in IR.  Its full payload was already matched
-            // by IsJitHleBridgeMarkerAt during decode, so reconstruct those constexpr bytes
+            // by IsJitHleBridgeMarkerAt during decode, so materialize those constexpr bytes
             // here instead of overflowing/growing every LsxDecodedOp for this one sentinel.
             constexpr std::array marker_prefix{std::uint8_t{0x0f}, std::uint8_t{0x3f}};
             if (!append(marker_prefix) || !append(kJitHleThunkHash)) {
@@ -3742,6 +3723,29 @@ bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_ou
         expected_rip += instruction.length;
     }
     if (expected_rip != block.end_rip) {
+        return false;
+    }
+    return true;
+}
+
+bool GuestBytesMatchDecoded(const LsxDecodedRegion& block) noexcept {
+    std::array<std::uint8_t, 2048> expected;
+    std::size_t expected_size = 0;
+    if (!FlattenDecodedBlockBytes(block, expected, expected_size) ||
+        expected_size != block.end_rip - block.start_rip) {
+        return false;
+    }
+    std::array<std::uint8_t, 2048> observed;
+    return ReadGuestBytesChecked(block.start_rip, observed.data(), expected_size) &&
+           std::memcmp(expected.data(), observed.data(), expected_size) == 0;
+}
+
+bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_out) noexcept {
+    // Persistence needs a compact, address-independent identity. Runtime SMC checks compare the
+    // immutable decoded snapshot directly and avoid hashing the live bytes on every inspection.
+    std::array<std::uint8_t, 2048> flattened;
+    std::size_t flattened_size = 0;
+    if (!FlattenDecodedBlockBytes(block, flattened, flattened_size)) {
         return false;
     }
     hash_out = XXH3_64bits_withSeed(flattened.data(), flattened_size,
@@ -3930,12 +3934,8 @@ bool AddJitNativeRelocationAddend(const std::uint64_t base,
 
 StableDecodedBlock DecodeStableBlock(const std::uint64_t guest_rip,
                                      const std::uint32_t max_instructions) {
-    // The interpreter miss path decodes once and hashes the resulting span.  Preserve the stronger
-    // local SMC/TOCTOU contract without paying for a second X86 pass: compare a hash of the exact
-    // bytes retained in the IR with a fresh hash of the live guest span.  If code changed during
-    // decode, the hashes differ and the whole decode is retried.  ResolveExecutableRegion
-    // still performs its post-lowering hash before publication, so code changed while compiling
-    // also cannot escape into either the ordinary cache or a direct-link slot.
+    // Decode once, then compare the retained immutable byte snapshot with one guarded live read.
+    // Persistent identity is deliberately deferred until native lowering has completed.
     for (std::uint32_t attempt = 0; attempt < 8; ++attempt) {
         auto decoded = std::make_unique<LsxDecodedRegion>(
             DecodeGuestBasicRegion(guest_rip, max_instructions));
@@ -3944,16 +3944,10 @@ StableDecodedBlock DecodeStableBlock(const std::uint64_t guest_rip,
                 std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error("JIT decoder returned an inverted guest span");
         }
-        std::uint64_t decoded_hash = 0;
-        if (!HashDecodedBlockBytes(*decoded, decoded_hash)) {
+        if (!GuestBytesMatchDecoded(*decoded)) {
             continue;
         }
-        const auto decoded_size =
-            static_cast<std::uint32_t>(decoded->end_rip - decoded->start_rip);
-        const std::uint64_t live_hash = HashGuestCodeWindow(guest_rip, decoded_size);
-        if (decoded_hash == live_hash) {
-            return {std::move(decoded), live_hash};
-        }
+        return {std::move(decoded), 0};
     }
     std::ostringstream error;
     error << "JIT guest block changed repeatedly while decoding rip=0x" << std::hex
@@ -3961,33 +3955,33 @@ StableDecodedBlock DecodeStableBlock(const std::uint64_t guest_rip,
     throw std::runtime_error(error.str());
 }
 
-class Aarch64CodeArena {
+class NativeSegmentDepot {
 public:
-    Aarch64CodeArena() {
+    NativeSegmentDepot() {
         // A large PS4 executable reaches ~650k entry/direct segments. Reserving pointer-sized
         // metadata once prevents repeated multi-megabyte vector copies in the first-frame path;
         // executable pages themselves are still committed only on demand.
         code_ranges_.reserve(1u << 20);
     }
-    ~Aarch64CodeArena();
+    ~NativeSegmentDepot();
 
     Arm64BlockEntry EmitReturnImmediateBlock(std::uint64_t value);
     Arm64BlockEntry EmitSharedChainReturnImmediateBlock(std::uint64_t value);
     Arm64BlockEntry EmitNativeControlFlowBlock(const LsxDecodedRegion& block,
-                                           ChainPatchCell* outgoing_direct_slot = nullptr,
+                                           OutboundEdgeState* primary_outbound_edge = nullptr,
                                            Arm64BlockEntry* direct_target_out = nullptr,
-                                           ChainPatchCell* alternate_direct_slot = nullptr,
-                                           PolymorphicChainSite* inchain_patch_site = nullptr,
+                                           OutboundEdgeState* secondary_outbound_edge = nullptr,
+                                           IndirectEdgeFanout* indirect_edge_fanout = nullptr,
                                            bool* indirect_pic_used_out = nullptr,
                                            bool* chain_abi_out = nullptr,
-                                           Arm64BlockEntry* chain_target_out = nullptr);
+                                           Arm64BlockEntry* resident_entry_out = nullptr);
     Arm64BlockEntry EmitCheckedNativeBlock(const LsxDecodedRegion& block, Arm64BlockEntry native);
     Arm64BlockEntry EmitInterpreterBridge(const LsxDecodedRegion& block);
     bool CapturePersistentNativeBlock(Arm64BlockEntry entry, Arm64BlockEntry direct,
                                        const LsxDecodedRegion& block,
-                                       ChainPatchCell* outgoing_direct_slot,
-                                       ChainPatchCell* alternate_direct_slot,
-                                       PolymorphicChainSite* inchain_patch_site,
+                                       OutboundEdgeState* primary_outbound_edge,
+                                       OutboundEdgeState* secondary_outbound_edge,
+                                       IndirectEdgeFanout* indirect_edge_fanout,
                                        std::vector<JitNativeSegment>& segments,
                                        std::uint32_t& entry_segment_index,
                                        std::uint32_t& direct_segment_index) const;
@@ -3995,9 +3989,9 @@ public:
                                       std::uint32_t entry_segment_index,
                                        std::uint32_t direct_segment_index,
                                        const LsxDecodedRegion& block,
-                                       ChainPatchCell* outgoing_direct_slot,
-                                       ChainPatchCell* alternate_direct_slot,
-                                       PolymorphicChainSite* inchain_patch_site,
+                                       OutboundEdgeState* primary_outbound_edge,
+                                       OutboundEdgeState* secondary_outbound_edge,
+                                       IndirectEdgeFanout* indirect_edge_fanout,
                                        Arm64BlockEntry& entry, Arm64BlockEntry& direct);
     bool FindCodeRange(std::uint64_t host_pc, std::uint64_t* range_base,
                        std::uint64_t* range_size) const;
@@ -4015,9 +4009,12 @@ private:
 
 #ifdef __ANDROID__
     struct ExecutableSlab {
+        ExecutableSlab(std::uint8_t* mapping, const std::size_t mapping_size)
+            : base(mapping), size(mapping_size) {}
+
         std::uint8_t* base{};
         std::size_t size{};
-        std::size_t used{};
+        std::atomic<std::size_t> used{0};
     };
 #endif
 
@@ -4026,7 +4023,8 @@ private:
     const CommittedCodeRange* FindCommittedCodeRange(Arm64BlockEntry entry) const;
 #ifdef __ANDROID__
     std::uint8_t* AllocateCommittedCode(std::size_t size);
-    std::vector<ExecutableSlab> executable_slabs_;
+    std::vector<std::unique_ptr<ExecutableSlab>> executable_slabs_;
+    std::atomic<ExecutableSlab*> active_executable_slab_{nullptr};
     std::mutex executable_slabs_mutex_;
 #else
     // Desktop tests keep Xbyak ownership. Android copies finalized bytes into compact executable
@@ -4040,21 +4038,24 @@ private:
 
 class LsxTranslationEngine final {
 public:
-    LsxTranslationEngine()
-        : execution_cache_identity_(
-              g_jit_execution_cache_identity.fetch_add(1, std::memory_order_relaxed)) {
+    LsxTranslationEngine() {
         // AAA executables currently discover roughly 330k unique blocks before gameplay.
         // Pre-sizing above that production class removes repeated synchronous rehash walks from
         // the cache-miss/compile critical section. This reserves only bucket arrays; nodes and IR
         // are still allocated strictly on demand.
         constexpr std::size_t kExpectedStartupBlocks = 1u << 19;
-        chain_patch_targets_.reserve(kExpectedStartupBlocks);
-        chain_patch_slots_.reserve(kExpectedStartupBlocks);
-        inchain_patch_sites_.reserve(kExpectedStartupBlocks / 8u);
-        inchain_patch_site_storage_.reserve(kExpectedStartupBlocks / 8u);
+        edge_directory_.ReserveDestinations(kExpectedStartupBlocks);
+        indirect_edge_fanouts_.reserve(kExpectedStartupBlocks / 8u);
+        indirect_edge_fanout_storage_.reserve(kExpectedStartupBlocks / 8u);
         decoded_blocks_.reserve(kExpectedStartupBlocks);
-        block_results_.reserve(kExpectedStartupBlocks);
+        block_results_.ReserveRecords(kExpectedStartupBlocks);
         retired_decoded_blocks_.reserve(64);
+    }
+
+    ~LsxTranslationEngine() {
+        if (g_jit_thread_execution_cache.backend == this) {
+            g_jit_thread_execution_cache.Reset(nullptr);
+        }
     }
 
     const char* Name() const {
@@ -4235,7 +4236,7 @@ public:
             // when a synchronous host fault is raised inside emitted code.
             state.rip_or_exit = rip;
             try {
-                // A direct-linked chain may enter a memory block even when its first block is
+                // A native-edgeed chain may enter a memory block even when its first block is
                 // register-only. Keep one recovery frame around every dispatched chain so all
                 // linked memory accesses retain exact guest-fault delivery without forcing every
                 // basic block back through this C++ loop.
@@ -4427,7 +4428,7 @@ public:
                 cleanup();
                 throw std::runtime_error(error.str());
             }
-            // A direct-link chain can start in CALL/JMP and finish in a later RET.  In that case
+            // A native-edge chain can start in CALL/JMP and finish in a later RET.  In that case
             // `decoded_block` still describes the chain's first block, so inspecting its final
             // mnemonic cannot distinguish the canonical null root return from ordinary
             // fallthrough.  The x86 RET has, however, consumed our synthetic slot exactly: RSP is
@@ -4456,7 +4457,7 @@ public:
                 result = kRunStopMarker;
                 state.rip_or_exit = kRunStopMarker;
             }
-            // Native direct-link chains may publish the synthetic mapped-call return through
+            // Native native-edge chains may publish the synthetic mapped-call return through
             // LsxMachineImage while returning zero from the outer chain entry.  Test both
             // channels before selecting next_rip; otherwise the private stop token escapes into
             // executable-region lookup and a valid nested callback appears undecodable.
@@ -4566,39 +4567,28 @@ public:
         // This backend is process-global while Android can launch another title without
         // recreating the process.  RIP and even a short guest-byte sequence are not a title
         // identity, so no in-memory publication may survive a launch boundary.  Keep old IR and
-        // direct-link slots alive because a retiring guest thread can still hold embedded
-        // pointers to them; the epoch and nulled slots make every new lookup start cleanly.
-        execution_cache_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        for (auto& [rip, site] : inchain_patch_sites_) {
+        // native-edge edges alive because a retiring guest thread can still hold embedded
+        // pointers to them; nulled edges make every new lookup start cleanly.
+        block_results_.VisitRecords([](CachedTranslationRecord& record) {
+            if (record.witness != nullptr) {
+                record.witness->revision.fetch_add(1, std::memory_order_release);
+            }
+        });
+        for (auto& [rip, site] : indirect_edge_fanouts_) {
             (void)rip;
             if (site != nullptr) {
                 site->Retire();
             }
         }
-        inchain_patch_sites_.clear();
+        indirect_edge_fanouts_.clear();
         {
-            std::lock_guard direct_lock{chain_patch_mutex_};
-            // Odd means a map clear is in progress.  Cache readers compare the value before and
-            // after lookup; misses serialize on this mutex and can only fill under an even epoch.
-            chain_patch_slot_epoch_.fetch_add(1, std::memory_order_acq_rel);
-            chain_patch_targets_.clear();
-            for (auto& [rip, slot] : chain_patch_slots_) {
-                (void)rip;
-                if (slot) {
-                    slot->target.store(nullptr, std::memory_order_release);
-                    slot->chain_target.store(nullptr,
-                                             std::memory_order_release);
-                    slot->guest_size.store(0, std::memory_order_relaxed);
-                    slot->guest_hash.store(0, std::memory_order_relaxed);
-                    slot->MarkPublication();
+            std::lock_guard direct_lock{edge_graph_mutex_};
+            edge_directory_.Reset([](OutboundEdgeState* const edge) {
+                if (edge != nullptr) {
+                    edge->target.store(nullptr, std::memory_order_release);
+                    edge->code_witness.store(nullptr, std::memory_order_relaxed);
                 }
-            }
-            chain_patch_slots_.clear();
-            // Slot storage itself remains alive for retiring generated code, but a subsequent
-            // lookup for the same guest RIP is intentionally assigned a new slot.  Publish the
-            // map-generation change while holding the map mutex so a TLS fill can only describe
-            // the map state from before or after this clear, never both.
-            chain_patch_slot_epoch_.fetch_add(1, std::memory_order_release);
+                });
         }
         for (auto& [rip, decoded] : decoded_blocks_) {
             (void)rip;
@@ -4607,7 +4597,7 @@ public:
             }
         }
         decoded_blocks_.clear();
-        block_results_.clear();
+        block_results_.Clear();
         persistent_ir_cache_.Configure(root_dir, title_id, executable_fingerprint, enabled);
 #ifdef __ANDROID__
         persistent_native_prewarm_pending_ = enabled;
@@ -4785,17 +4775,16 @@ public:
             std::uint64_t guest_rip = 0;
             std::uint64_t outgoing_rip = 0;
             std::uint64_t alternate_rip = 0;
-            ChainPatchCell* outgoing_slot = nullptr;
-            ChainPatchCell* alternate_slot = nullptr;
-            std::unique_ptr<PolymorphicChainSite> inchain_patch_site{};
+            OutboundEdgeState* outgoing_slot = nullptr;
+            OutboundEdgeState* alternate_slot = nullptr;
+            std::unique_ptr<IndirectEdgeFanout> indirect_edge_fanout{};
             Arm64BlockEntry entry = nullptr;
             Arm64BlockEntry direct = nullptr;
+            PublishedCodeWitness* witness = nullptr;
             bool chain_abi = false;
             TranslationRecord result{};
         };
         std::vector<WarmPlan> plans(warm_set.size());
-        std::vector<std::uint64_t> link_targets;
-        link_targets.reserve(warm_set.size() * 2u);
 
         for (std::size_t index = 0; index < warm_set.size(); ++index) {
             if ((index & 0xfffu) == 0 && stop_token.stop_requested()) {
@@ -4911,20 +4900,20 @@ public:
                  kJitNativeFlagSharedChainAbiV13) != 0;
             plan.eligible = true;
             plan.guest_rip = decoded.start_rip;
-            const bool requires_inchain_patch_site = std::ranges::any_of(
+            const bool requires_indirect_edge_fanout = std::ranges::any_of(
                 stable.native_segments, [](const JitNativeSegment& segment) {
                     return std::ranges::any_of(
                         segment.relocs, [](const JitNativeRelocation& relocation) {
                             return relocation.kind ==
-                                   JitNativeRelocationKind::PolymorphicChainSite;
+                                   JitNativeRelocationKind::IndirectEdgeFanout;
                         });
                 });
-            if (requires_inchain_patch_site) {
+            if (requires_indirect_edge_fanout) {
                 if (!IsIndirectPicTerminator(terminator)) {
                     plan.eligible = false;
                     continue;
                 }
-                plan.inchain_patch_site = std::make_unique<PolymorphicChainSite>(
+                plan.indirect_edge_fanout = std::make_unique<IndirectEdgeFanout>(
                     this, decoded.start_rip, mnemonic == X86_MNEMONIC_RET);
             }
             std::uint64_t static_target = 0;
@@ -4953,39 +4942,23 @@ public:
             if (!plan.eligible) {
                 continue;
             }
-            if (plan.outgoing_rip != 0 && !IsChainPatchDenied(plan.outgoing_rip)) {
-                link_targets.push_back(plan.outgoing_rip);
-            }
-            if (plan.alternate_rip != 0 && !IsChainPatchDenied(plan.alternate_rip)) {
-                link_targets.push_back(plan.alternate_rip);
-            }
         }
 
-        std::sort(link_targets.begin(), link_targets.end());
-        link_targets.erase(std::unique(link_targets.begin(), link_targets.end()),
-                           link_targets.end());
         {
-            // Create stable slot addresses once. Workers only read these pointers while copying
-            // and relocating code, avoiding one contended mutex acquisition per block edge.
-            std::lock_guard direct_lock{chain_patch_mutex_};
-            for (const std::uint64_t target : link_targets) {
-                auto& slot = chain_patch_slots_[target];
-                if (!slot) {
-                    chain_patch_slot_storage_.emplace_back(target, &execution_cache_epoch_);
-                    slot = &chain_patch_slot_storage_.back();
-                }
-            }
+            // Pre-allocate one private edge for each emitted branch. Workers only consume these
+            // pointers while copying code, so no worker contends on the publication mutex.
+            std::lock_guard direct_lock{edge_graph_mutex_};
             for (WarmPlan& plan : plans) {
                 if (!plan.eligible) {
                     continue;
                 }
-                if (const auto it = chain_patch_slots_.find(plan.outgoing_rip);
-                    it != chain_patch_slots_.end()) {
-                    plan.outgoing_slot = it->second;
+                if (plan.outgoing_rip != 0 &&
+                    !JitIsRipProbeTarget(plan.outgoing_rip)) {
+                    plan.outgoing_slot = AllocateOutboundEdgeLocked(plan.outgoing_rip);
                 }
-                if (const auto it = chain_patch_slots_.find(plan.alternate_rip);
-                    it != chain_patch_slots_.end()) {
-                    plan.alternate_slot = it->second;
+                if (plan.alternate_rip != 0 &&
+                    !JitIsRipProbeTarget(plan.alternate_rip)) {
+                    plan.alternate_slot = AllocateOutboundEdgeLocked(plan.alternate_rip);
                 }
             }
         }
@@ -5013,11 +4986,11 @@ public:
                 }
                 Arm64BlockEntry entry = nullptr;
                 Arm64BlockEntry direct = nullptr;
-                if (!code_arena_.RestorePersistentNativeBlock(
+                if (!native_depot_.RestorePersistentNativeBlock(
                         stable.native_segments, stable.entry_segment_index,
                         stable.direct_segment_index, *stable.block,
                         plan.outgoing_slot, plan.alternate_slot,
-                        plan.inchain_patch_site.get(), entry, direct) ||
+                        plan.indirect_edge_fanout.get(), entry, direct) ||
                     entry == nullptr) {
                     continue;
                 }
@@ -5031,7 +5004,8 @@ public:
                 if (BlockNeedsSynchronousFaultResume(*stable.block)) {
                     result.flags |= 0x10u;
                 }
-                if (BlockRequiresDispatcherBoundary(*stable.block)) {
+                if (BlockRequiresDispatcherBoundary(*stable.block) ||
+                    IsDirectHleBoundary(stable.block->start_rip)) {
                     result.flags |= 0x20u;
                     direct = nullptr;
                 }
@@ -5052,6 +5026,16 @@ public:
         restore(0);
         for (auto& worker : workers) {
             worker.join();
+        }
+
+        // Restored source blocks are still invisible here. Select the sole destination entry
+        // each embedded edge will consume before any source can execute it.
+        for (WarmPlan& plan : plans) {
+            if (!plan.restored) {
+                continue;
+            }
+            ConfigureOutboundEdgeEntryConvention(plan.outgoing_slot, plan.chain_abi);
+            ConfigureOutboundEdgeEntryConvention(plan.alternate_slot, plan.chain_abi);
         }
 
         if (stop_token.stop_requested()) {
@@ -5092,20 +5076,12 @@ public:
                         continue;
                     }
                     const std::uint64_t guest_rip = stable.block->start_rip;
-                    if (block_results_.contains(guest_rip)) {
+                    if (block_results_.Contains(guest_rip)) {
                         ++duplicate_blocks;
                         duplicate_guest_rips.push_back(guest_rip);
                         continue;
                     }
-                    bool live_bytes_match = false;
-                    try {
-                        live_bytes_match =
-                            HashGuestCodeWindow(guest_rip, plan.result.guest_size) ==
-                            stable.guest_hash;
-                    } catch (...) {
-                        live_bytes_match = false;
-                    }
-                    if (!live_bytes_match) {
+                    if (!GuestBytesMatchDecoded(*stable.block)) {
                         ++stale_blocks;
                         continue;
                     }
@@ -5122,48 +5098,47 @@ public:
                         migrated.loaded_ir_validated = true;
                         migrated_records.push_back(std::move(migrated));
                     }
-                    if (plan.inchain_patch_site) {
-                        RetirePolymorphicChainSite(guest_rip);
-                        inchain_patch_sites_[guest_rip] = plan.inchain_patch_site.get();
-                        inchain_patch_site_storage_.push_back(
-                            std::move(plan.inchain_patch_site));
+                    if (plan.indirect_edge_fanout) {
+                        RetireIndirectEdgeFanout(guest_rip);
+                        indirect_edge_fanouts_[guest_rip] = plan.indirect_edge_fanout.get();
+                        indirect_edge_fanout_storage_.push_back(
+                            std::move(plan.indirect_edge_fanout));
                     }
                     const LsxDecodedRegion* const decoded_ptr = stable.block.get();
                     decoded_blocks_[guest_rip] = std::move(stable.block);
-                    block_results_[guest_rip] = {plan.result, decoded_ptr};
+                    PublishedCodeWitness* const witness =
+                        AllocateCodeWitness(decoded_ptr);
+                    plan.witness = witness;
+                    block_results_.Install(
+                        guest_rip, {plan.result, decoded_ptr, witness});
                     plan.published = true;
                     ++restored;
                 }
 
-                // Publish direct-link slots only for records made visible in this same batch.
-                std::lock_guard direct_lock{chain_patch_mutex_};
+                // Publish native-edge slots only for records made visible in this same batch.
+                std::lock_guard direct_lock{edge_graph_mutex_};
                 for (std::size_t index = batch_begin; index < batch_end; ++index) {
                     const WarmPlan& plan = plans[index];
                     if (!plan.published || plan.direct == nullptr) {
                         continue;
                     }
                     const std::uint64_t guest_rip = plan.guest_rip;
-                    chain_patch_targets_[guest_rip] = {
+                    edge_directory_.Publish(guest_rip, {
                         plan.chain_abi ? plan.entry : plan.direct,
                         plan.chain_abi ? plan.direct : nullptr,
-                        plan.result.guest_hash, plan.result.guest_size};
-                    auto& slot = chain_patch_slots_[guest_rip];
-                    if (!slot) {
-                        chain_patch_slot_storage_.emplace_back(
-                            guest_rip, &execution_cache_epoch_);
-                        slot = &chain_patch_slot_storage_.back();
-                    }
-                    slot->guest_size.store(plan.result.guest_size,
-                                           std::memory_order_relaxed);
-                    slot->guest_hash.store(plan.result.guest_hash,
-                                           std::memory_order_relaxed);
-                    slot->chain_target.store(
-                        plan.chain_abi ? plan.direct : nullptr,
-                        std::memory_order_relaxed);
-                    slot->MarkPublication();
-                    slot->target.store(
-                        plan.chain_abi ? plan.entry : plan.direct,
-                        std::memory_order_release);
+                        plan.witness});
+                    edge_directory_.VisitIncoming(
+                        guest_rip, [&](OutboundEdgeState* const edge) {
+                            edge->code_witness.store(
+                                plan.witness,
+                                std::memory_order_relaxed);
+                            edge->inspection_pending.store(
+                                1, std::memory_order_relaxed);
+                            edge->target.store(
+                                SelectDestinationEntry(
+                                    *edge_directory_.FindPublished(guest_rip), *edge),
+                                std::memory_order_release);
+                        });
                 }
             }
             if (background && batch_end < warm_set.size()) {
@@ -5200,128 +5175,118 @@ public:
                                 std::uint64_t* range_base,
                                 std::uint64_t* range_size) {
         std::lock_guard lock{block_cache_mutex_};
-        return code_arena_.FindCodeRange(host_pc, range_base, range_size);
+        return native_depot_.FindCodeRange(host_pc, range_base, range_size);
     }
 
     JitExecutionLookup ResolveExecutableRegionCached(const std::uint64_t guest_rip) {
         auto& cache = g_jit_thread_execution_cache;
-        std::uint64_t epoch = execution_cache_epoch_.load(std::memory_order_acquire);
-        if (cache.backend_identity != execution_cache_identity_ || cache.epoch != epoch) {
-            cache.Reset(execution_cache_identity_, epoch);
+        if (cache.backend != this) {
+            cache.Reset(this);
         }
 
-        const std::size_t bucket_index = static_cast<std::size_t>(
-            FoldJitCacheAddress(guest_rip) >>
-            (64u - kJitExecutionCacheBucketBits));
-        auto& bucket = cache.buckets[bucket_index];
-        for (std::size_t way_index = 0; way_index < bucket.ways.size(); ++way_index) {
-            auto& way = bucket.ways[way_index];
-            if (way.valid == 0 || way.guest_rip != guest_rip) {
+        const std::uint64_t folded = FoldJitCacheAddress(guest_rip);
+        const std::size_t near_index = static_cast<std::size_t>(
+            folded % kJitExecutionNearBankCount);
+        const std::size_t alternate_index = static_cast<std::size_t>(
+            (std::rotl(folded, 29) ^ (guest_rip >> 4u)) %
+            kJitExecutionAlternateBankCount);
+        const auto store_result = [&](const JitExecutionLookup& execution,
+                                      const bool inspect_on_first_reuse) {
+            auto& near = cache.near_bank[near_index];
+            auto& alternate = cache.alternate_bank[alternate_index];
+            JitExecutionCacheWay* destination = nullptr;
+            if (near.valid != 0 && near.guest_rip == guest_rip) {
+                destination = &near;
+            } else if (alternate.valid != 0 && alternate.guest_rip == guest_rip) {
+                destination = &alternate;
+            } else if (near.valid == 0) {
+                destination = &near;
+            } else if (alternate.valid == 0) {
+                destination = &alternate;
+            } else {
+                // Preserve the banks' 3:1 capacity ratio under sustained aliasing.
+                destination = ((cache.placement_cursor++ & 3u) == 3u)
+                    ? &alternate
+                    : &near;
+            }
+            destination->Store(guest_rip, execution, inspect_on_first_reuse);
+        };
+
+        std::array<JitExecutionCacheWay*, 2> candidates = {
+            &cache.near_bank[near_index],
+            &cache.alternate_bank[alternate_index],
+        };
+        for (JitExecutionCacheWay* const way : candidates) {
+            if (way->valid == 0 || way->guest_rip != guest_rip) {
+                continue;
+            }
+            if (way->witness == nullptr ||
+                way->witness->revision.load(std::memory_order_acquire) !=
+                    way->observed_revision) {
+                way->valid = 0;
                 continue;
             }
 
-            const bool first_validation =
-                way.refresh_counter == kJitCacheInitialValidation;
-            const std::uint32_t next_counter =
-                first_validation ? 0u : way.refresh_counter + 1u;
-            const bool periodic_validation =
-                !first_validation && next_counter >= kJitCacheValidationPeriod;
-            if (!first_validation && !periodic_validation) {
-                way.refresh_counter = next_counter;
-                return way.Lookup(cache.decoded_sidecar[bucket_index][way_index]);
+            const bool inspection_due = way->needs_initial_inspection != 0 ||
+                SelectSparseInspection(cache.sampling_state,
+                                       static_cast<std::uintptr_t>(guest_rip));
+            if (!inspection_due) {
+                return way->Lookup();
             }
-            way.refresh_counter = 0;
+            way->needs_initial_inspection = 0;
 
-            // Validate on the first reuse of a newly inserted way, then at the independent
-            // periodic cadence. Re-enter the authoritative cache path so a hash mismatch atomically
-            // retires all RIP-keyed views and bumps the cross-thread cache epoch.
+            // Re-enter the authoritative directory so a byte mismatch retires the affected
+            // version and every incoming edge without flushing unrelated translations.
             const JitExecutionLookup refreshed = ResolveExecutableRegion(guest_rip);
-            epoch = execution_cache_epoch_.load(std::memory_order_acquire);
-            if (cache.backend_identity != execution_cache_identity_ || cache.epoch != epoch) {
-                cache.Reset(execution_cache_identity_, epoch);
-            }
-            auto& refreshed_bucket = cache.buckets[bucket_index];
-            std::size_t refreshed_way_index = 0;
-            if (refreshed_bucket.ways[0].valid != 0 &&
-                refreshed_bucket.ways[0].guest_rip == guest_rip) {
-                refreshed_way_index = 0;
-            } else if (refreshed_bucket.ways[1].valid != 0 &&
-                       refreshed_bucket.ways[1].guest_rip == guest_rip) {
-                refreshed_way_index = 1;
-            } else if (refreshed_bucket.ways[0].valid == 0) {
-                refreshed_way_index = 0;
-            } else if (refreshed_bucket.ways[1].valid == 0) {
-                refreshed_way_index = 1;
-            } else {
-                refreshed_way_index = refreshed_bucket.replacement++ & 1u;
-            }
-            refreshed_bucket.ways[refreshed_way_index].Store(
-                guest_rip, refreshed, 0);
-            cache.decoded_sidecar[bucket_index][refreshed_way_index] = refreshed.decoded;
+            store_result(refreshed, false);
             return refreshed;
         }
 
         const JitExecutionLookup execution = ResolveExecutableRegion(guest_rip);
-        epoch = execution_cache_epoch_.load(std::memory_order_acquire);
-        if (cache.backend_identity != execution_cache_identity_ || cache.epoch != epoch) {
-            cache.Reset(execution_cache_identity_, epoch);
-        }
-        auto& fill_bucket = cache.buckets[bucket_index];
-        std::size_t fill_way_index = 0;
-        if (fill_bucket.ways[0].valid == 0) {
-            fill_way_index = 0;
-        } else if (fill_bucket.ways[1].valid == 0) {
-            fill_way_index = 1;
-        } else {
-            fill_way_index = fill_bucket.replacement++ & 1u;
-        }
-        fill_bucket.ways[fill_way_index].Store(
-            guest_rip, execution, kJitCacheInitialValidation);
-        cache.decoded_sidecar[bucket_index][fill_way_index] = execution.decoded;
+        store_result(execution, true);
         return execution;
     }
 
     JitExecutionLookup ResolveExecutableRegion(const std::uint64_t guest_rip) {
         std::unique_lock lock{block_cache_mutex_};
-        auto result_it = block_results_.find(guest_rip);
-        if (result_it != block_results_.end()) {
-            const std::uint64_t live_hash =
-                HashGuestCodeWindow(guest_rip, result_it->second.block.guest_size);
-            if (result_it->second.block.guest_hash == live_hash) {
+        CachedTranslationRecord* cached_ptr = block_results_.Find(guest_rip);
+        if (cached_ptr != nullptr) {
+            CachedTranslationRecord& cached = *cached_ptr;
+            if (cached.decoded != nullptr &&
+                GuestBytesMatchDecoded(*cached.decoded)) {
                 g_jit_cache_hash_hits.fetch_add(1, std::memory_order_relaxed);
-                if ((result_it->second.block.flags & (0x20u | 8u)) == (0x20u | 8u)) {
+                if ((cached.block.flags & (0x20u | 8u)) == (0x20u | 8u)) {
                     // Raw direct entries bypass ExecuteHostBlockWithSynchronousFaultResume.
                     // Heal an explicitly published legacy/in-flight result once. New unsafe
                     // results never set bit 8, so normal flags&0x10 cache hits stay lock-free.
-                    RetireChainPatchTarget(guest_rip);
-                    result_it->second.block.flags &= ~8u;
+                    WithdrawPublishedDestination(guest_rip);
+                    cached.block.flags &= ~8u;
                 }
-                return {result_it->second.block, result_it->second.decoded};
+                return {cached.block, cached.decoded, cached.witness};
             }
 
             // The interpreter re-reads guest bytes before reusing a cached block.
             // Retire every RIP-keyed view together so neither the normal cache
-            // nor an already-created direct-link slot can execute stale code.
-            const std::uint64_t old_hash = result_it->second.block.guest_hash;
-            execution_cache_epoch_.fetch_add(1, std::memory_order_release);
-            g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
-            RetirePolymorphicChainSite(guest_rip);
-            JitLog("[EXECUTOR_JIT_SMC_INVALIDATE] rip=0x%llx size=0x%x "
-                        "oldHash=0x%llx newHash=0x%llx",
-                        static_cast<unsigned long long>(guest_rip),
-                        result_it->second.block.guest_size,
-                        static_cast<unsigned long long>(old_hash),
-                        static_cast<unsigned long long>(live_hash));
-            {
-                std::lock_guard direct_lock{chain_patch_mutex_};
-                chain_patch_targets_.erase(guest_rip);
-                if (auto slot_it = chain_patch_slots_.find(guest_rip);
-                    slot_it != chain_patch_slots_.end() && slot_it->second) {
-                    slot_it->second->target.store(nullptr, std::memory_order_release);
-                    slot_it->second->MarkPublication();
-                }
+            // nor an already-created native-edge slot can execute stale code.
+            if (cached.witness != nullptr) {
+                cached.witness->revision.fetch_add(
+                    1, std::memory_order_release);
             }
-            block_results_.erase(result_it);
+            g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
+            RetireIndirectEdgeFanout(guest_rip);
+            JitLog("[EXECUTOR_JIT_SMC_INVALIDATE] rip=0x%llx size=0x%x",
+                        static_cast<unsigned long long>(guest_rip),
+                        cached.block.guest_size);
+            {
+                std::lock_guard direct_lock{edge_graph_mutex_};
+                edge_directory_.Withdraw(guest_rip);
+                edge_directory_.VisitIncoming(
+                    guest_rip, [](OutboundEdgeState* const edge) {
+                        edge->target.store(nullptr, std::memory_order_release);
+                        edge->code_witness.store(nullptr, std::memory_order_relaxed);
+                    });
+            }
+            block_results_.Erase(guest_rip);
             if (auto decoded_it = decoded_blocks_.find(guest_rip);
                 decoded_it != decoded_blocks_.end()) {
                 // Emitted helper and checked-native stubs embed an LsxDecodedRegion*.
@@ -5345,7 +5310,7 @@ public:
         // target. Helper/checked wrappers are not valid direct targets. Keep
         // this null until an emitted block exposes the proven fast-entry ABI.
         Arm64BlockEntry direct_target = nullptr;
-        Arm64BlockEntry chain_target = nullptr;
+        Arm64BlockEntry resident_entry = nullptr;
         bool compiled_chain_abi = false;
         bool compiled_native = false;
         // Thread-scoped interpreter ranges are decided when a block is first published. Guest
@@ -5354,10 +5319,10 @@ public:
         // This also prevents persistent-native restoration for the selected block.
         const bool force_helper = JitForceHelperEnabled() ||
                                   JitForceInterpretRip(guest_rip);
-        ChainPatchCell* outgoing_direct_slot = nullptr;
-        ChainPatchCell* alternate_direct_slot = nullptr;
-        std::unique_ptr<PolymorphicChainSite> pending_inchain_patch_site;
-        PolymorphicChainSite* inchain_patch_site = nullptr;
+        OutboundEdgeState* primary_outbound_edge = nullptr;
+        OutboundEdgeState* secondary_outbound_edge = nullptr;
+        std::unique_ptr<IndirectEdgeFanout> pending_indirect_edge_fanout;
+        IndirectEdgeFanout* indirect_edge_fanout = nullptr;
         bool indirect_pic_candidate = false;
         bool indirect_pic_used = false;
         bool persistent_native_uses_indirect_pic = false;
@@ -5470,20 +5435,20 @@ public:
                                 segment.relocs,
                                 [](const JitNativeRelocation& relocation) {
                                     return relocation.kind ==
-                                           JitNativeRelocationKind::PolymorphicChainSite;
+                                           JitNativeRelocationKind::IndirectEdgeFanout;
                                 });
                         });
                 if (indirect_pic_candidate) {
-                    pending_inchain_patch_site =
-                        std::make_unique<PolymorphicChainSite>(
+                    pending_indirect_edge_fanout =
+                        std::make_unique<IndirectEdgeFanout>(
                             this, guest_rip, mnemonic == X86_MNEMONIC_RET);
-                    inchain_patch_site = pending_inchain_patch_site.get();
+                    indirect_edge_fanout = pending_indirect_edge_fanout.get();
                 }
                 std::uint64_t static_target = 0;
                 if ((mnemonic == X86_MNEMONIC_JMP ||
                      mnemonic == X86_MNEMONIC_CALL) &&
                     TryResolveBranchTarget(terminator, static_target)) {
-                    outgoing_direct_slot = AcquireChainPatchCell(static_target);
+                    primary_outbound_edge = CreateOutboundEdge(static_target);
                     if (mnemonic == X86_MNEMONIC_CALL) {
                         JitLeafHlePltTarget leaf_target{};
                         leaf_hle_requires_reemit =
@@ -5498,14 +5463,14 @@ public:
                     // between a hot taken edge and a hot fallthrough edge. Keep both outcomes in
                     // the native chain; each slot retains the same publication, SMC validation
                     // and finite-chain safepoint contract as an unconditional edge.
-                    outgoing_direct_slot = AcquireChainPatchCell(static_target);
+                    primary_outbound_edge = CreateOutboundEdge(static_target);
                     if (fallthrough_target != static_target) {
-                        alternate_direct_slot = AcquireChainPatchCell(fallthrough_target);
+                        secondary_outbound_edge = CreateOutboundEdge(fallthrough_target);
                     }
                 } else if (!IsConditionalBranchMnemonic(mnemonic) &&
                            mnemonic != X86_MNEMONIC_RET) {
                     // Straight-line fallthrough is also a statically known edge.
-                    outgoing_direct_slot = AcquireChainPatchCell(decoded->end_rip);
+                    primary_outbound_edge = CreateOutboundEdge(decoded->end_rip);
                 }
             }
             if (persistent_native_mode && stable.HasNativeCode() &&
@@ -5526,18 +5491,18 @@ public:
                 !direct_lse_xchg_v12_requires_reemit &&
                 !scalar_logic_direct_v14_requires_reemit &&
                 !vpslld_imm_direct_v15_requires_reemit) {
-                restored_persistent_native = code_arena_.RestorePersistentNativeBlock(
+                restored_persistent_native = native_depot_.RestorePersistentNativeBlock(
                     stable.native_segments, stable.entry_segment_index,
-                    stable.direct_segment_index, *decoded, outgoing_direct_slot,
-                    alternate_direct_slot,
-                    persistent_native_uses_indirect_pic ? inchain_patch_site : nullptr,
+                    stable.direct_segment_index, *decoded, primary_outbound_edge,
+                    secondary_outbound_edge,
+                    persistent_native_uses_indirect_pic ? indirect_edge_fanout : nullptr,
                     compiled_entry, direct_target);
                 if (restored_persistent_native) {
                     compiled_chain_abi =
                         (stable.native_flags &
                          kJitNativeFlagSharedChainAbiV13) != 0;
                     if (compiled_chain_abi) {
-                        chain_target = direct_target;
+                        resident_entry = direct_target;
                         direct_target = compiled_entry;
                     }
                     indirect_pic_used = persistent_native_uses_indirect_pic;
@@ -5559,12 +5524,16 @@ public:
                 }
             }
             if (!restored_persistent_native) {
-                compiled_entry = code_arena_.EmitNativeControlFlowBlock(
-                    *decoded, outgoing_direct_slot, &direct_target,
-                    alternate_direct_slot, inchain_patch_site,
+                compiled_entry = native_depot_.EmitNativeControlFlowBlock(
+                    *decoded, primary_outbound_edge, &direct_target,
+                    secondary_outbound_edge, indirect_edge_fanout,
                     &indirect_pic_used, &compiled_chain_abi,
-                    &chain_target);
+                    &resident_entry);
             }
+            ConfigureOutboundEdgeEntryConvention(
+                primary_outbound_edge, compiled_chain_abi);
+            ConfigureOutboundEdgeEntryConvention(
+                secondary_outbound_edge, compiled_chain_abi);
             compiled_native = compiled_entry != nullptr;
         } else if (!decoded->instructions.empty()) {
             const auto first_mnemonic =
@@ -5674,7 +5643,7 @@ public:
                         }
                     }
                 }
-                compiled_entry = code_arena_.EmitInterpreterBridge(*decoded);
+                compiled_entry = native_depot_.EmitInterpreterBridge(*decoded);
             }
         }
         if ((decoded_count & 0x3ffull) == 0) {
@@ -5688,7 +5657,7 @@ public:
                             g_jit_blocks_helper.load(std::memory_order_relaxed)),
                         static_cast<unsigned long long>(
                             g_jit_blocks_unsupported.load(std::memory_order_relaxed)),
-                        code_arena_.BlockCount(),
+                        native_depot_.BlockCount(),
                         static_cast<unsigned long long>(guest_rip),
                         compiled_native ? 1 : 0,
                         CanInterpretRegion(*decoded) ? 1 : 0,
@@ -5698,14 +5667,15 @@ public:
         TranslationRecord result{};
         result.entry = compiled_entry;
         // Preserve the generated body for persistence even when this particular block must not
-        // publish a raw direct-link target because its dispatcher owns fault recovery.
+        // publish a raw native-edge target because its dispatcher owns fault recovery.
         const Arm64BlockEntry persistent_native_direct_target = direct_target;
         result.guest_size = static_cast<std::uint32_t>(decoded->end_rip - decoded->start_rip);
         result.flags = decoded->SupportsInitialNativeTier() ? 1u : 0u;
         if (BlockNeedsSynchronousFaultResume(*decoded)) {
             result.flags |= 0x10u;
         }
-        if (BlockRequiresDispatcherBoundary(*decoded)) {
+        if (BlockRequiresDispatcherBoundary(*decoded) ||
+            IsDirectHleBoundary(guest_rip)) {
             result.flags |= 0x20u;
         }
         if ((result.flags & 0x20u) != 0) {
@@ -5713,23 +5683,25 @@ public:
             // remain direct targets: every emitted access publishes its exact IR through
             // state.fault_ir_slot, while RunGuest owns one sigsetjmp frame for the complete chain.
             direct_target = nullptr;
-            RetireChainPatchTarget(guest_rip);
+            WithdrawPublishedDestination(guest_rip);
         }
-        const std::uint64_t guest_hash = HashGuestCodeWindow(guest_rip, result.guest_size);
-        result.guest_hash = guest_hash;
-        if (guest_hash != stable.guest_hash) {
+        if (!GuestBytesMatchDecoded(*decoded)) {
             // The code changed during lowering. The generated host stub may
             // embed the IR pointer, so retain its lifetime but never publish it.
             retired_decoded_blocks_.push_back(std::move(decoded));
             g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
-            JitLog("[EXECUTOR_JIT_SMC_COMPILE_RETRY] rip=0x%llx size=0x%x "
-                        "decodedHash=0x%llx publishHash=0x%llx",
-                        static_cast<unsigned long long>(guest_rip), result.guest_size,
-                        static_cast<unsigned long long>(stable.guest_hash),
-                        static_cast<unsigned long long>(guest_hash));
+            JitLog("[EXECUTOR_JIT_SMC_COMPILE_RETRY] rip=0x%llx size=0x%x",
+                        static_cast<unsigned long long>(guest_rip), result.guest_size);
             lock.unlock();
             return ResolveExecutableRegion(guest_rip);
         }
+        if (stable.guest_hash == 0 &&
+            !HashDecodedBlockBytes(*decoded, stable.guest_hash)) {
+            retired_decoded_blocks_.push_back(std::move(decoded));
+            lock.unlock();
+            return ResolveExecutableRegion(guest_rip);
+        }
+        result.guest_hash = stable.guest_hash;
         std::vector<JitNativeSegment> native_segments_to_remember;
         std::uint32_t native_entry_segment = kJitNativeNoSegment;
         std::uint32_t native_direct_segment = kJitNativeNoSegment;
@@ -5738,13 +5710,13 @@ public:
             compiled_entry != nullptr;
         const bool captured_persistent_native =
             should_capture_persistent_native &&
-            code_arena_.CapturePersistentNativeBlock(
+            native_depot_.CapturePersistentNativeBlock(
                 compiled_entry,
-                compiled_chain_abi ? chain_target
+                compiled_chain_abi ? resident_entry
                                    : persistent_native_direct_target,
                 *decoded,
-                outgoing_direct_slot, alternate_direct_slot,
-                indirect_pic_used ? inchain_patch_site : nullptr,
+                primary_outbound_edge, secondary_outbound_edge,
+                indirect_pic_used ? indirect_edge_fanout : nullptr,
                 native_segments_to_remember,
                 native_entry_segment, native_direct_segment);
         if (captured_persistent_native) {
@@ -5786,14 +5758,17 @@ public:
             }
         }
         const LsxDecodedRegion* decoded_ptr = decoded.get();
-        if (indirect_pic_used && pending_inchain_patch_site) {
-            RetirePolymorphicChainSite(guest_rip);
-            inchain_patch_sites_[guest_rip] = pending_inchain_patch_site.get();
-            inchain_patch_site_storage_.push_back(
-                std::move(pending_inchain_patch_site));
+        if (indirect_pic_used && pending_indirect_edge_fanout) {
+            RetireIndirectEdgeFanout(guest_rip);
+            indirect_edge_fanouts_[guest_rip] = pending_indirect_edge_fanout.get();
+            indirect_edge_fanout_storage_.push_back(
+                std::move(pending_indirect_edge_fanout));
         }
         decoded_blocks_[guest_rip] = std::move(decoded);
-        block_results_[guest_rip] = {result, decoded_ptr};
+        PublishedCodeWitness* const published_witness =
+            AllocateCodeWitness(decoded_ptr);
+        block_results_.Install(
+            guest_rip, {result, decoded_ptr, published_witness});
         if (!decoded_from_persistent_cache || captured_persistent_native) {
             persistent_ir_cache_.Remember(
                 *decoded_ptr, result.guest_hash,
@@ -5852,137 +5827,133 @@ public:
                     : 0);
         }
         if (direct_target != nullptr) {
-            // AcquireChainPatchCell must observe an already-compiled target, while
+            // CreateOutboundEdge must observe an already-compiled target, while
             // slots obtained before compilation are patched by the same store.
-            PublishChainPatch(
+            InstallPublishedDestination(
                 guest_rip,
                 compiled_chain_abi ? compiled_entry : direct_target,
-                compiled_chain_abi ? chain_target : nullptr,
-                result.guest_size, result.guest_hash, result.flags);
+                compiled_chain_abi ? resident_entry : nullptr,
+                published_witness, result.flags);
         }
-        return {result, decoded_ptr};
+        return {result, decoded_ptr, published_witness};
     }
 
-    ChainPatchCell* AcquireChainPatchCell(const std::uint64_t guest_rip) {
-        // This classification can depend on live guest bytes/GOT contents and therefore remains
-        // authoritative even when the RIP has a positive TLS cache entry.
-        if (IsChainPatchDenied(guest_rip)) {
+    OutboundEdgeState* CreateOutboundEdge(const std::uint64_t guest_rip) {
+        if (JitIsRipProbeTarget(guest_rip)) {
             return nullptr;
         }
-
-        auto& cache = g_jit_thread_chain_patch_cache;
-        std::uint64_t slot_map_epoch =
-            chain_patch_slot_epoch_.load(std::memory_order_acquire);
-        if ((slot_map_epoch & 1u) == 0) {
-            cache.Synchronize(execution_cache_identity_, slot_map_epoch);
-        }
-        if ((slot_map_epoch & 1u) == 0) {
-            ChainPatchCell* const cached = cache.Lookup(guest_rip);
-            // ConfigurePersistentCache clears the map and advances this epoch under
-            // chain_patch_mutex_.  Recheck before returning so a concurrent clear cannot make a
-            // pre-clear entry look current to a later caller.
-            if (cached != nullptr &&
-                chain_patch_slot_epoch_.load(std::memory_order_acquire) ==
-                    slot_map_epoch) {
-                return cached;
-            }
-        }
-
-        std::lock_guard lock{chain_patch_mutex_};
-        slot_map_epoch =
-            chain_patch_slot_epoch_.load(std::memory_order_acquire);
-        auto& slot = chain_patch_slots_[guest_rip];
-        if (!slot) {
-            // ChainPatchCell contains atomics and its address is embedded into native blocks.
-            // A deque is a stable-address process-lifetime arena, removing one malloc/free pair
-            // for each of the ~330k startup targets while preserving the old retirement lifetime.
-            chain_patch_slot_storage_.emplace_back(guest_rip, &execution_cache_epoch_);
-            slot = &chain_patch_slot_storage_.back();
-            if (const auto target_it = chain_patch_targets_.find(guest_rip);
-                target_it != chain_patch_targets_.end()) {
-                slot->guest_size.store(target_it->second.guest_size,
-                                       std::memory_order_relaxed);
-                slot->guest_hash.store(target_it->second.guest_hash,
-                                       std::memory_order_relaxed);
-                slot->chain_target.store(
-                    target_it->second.chain_target,
-                    std::memory_order_relaxed);
-                slot->MarkPublication();
-                slot->target.store(target_it->second.target,
-                                   std::memory_order_release);
-            }
-        }
-        cache.Synchronize(execution_cache_identity_, slot_map_epoch);
-        cache.Store(guest_rip, slot);
-        return slot;
+        std::lock_guard lock{edge_graph_mutex_};
+        return AllocateOutboundEdgeLocked(guest_rip);
     }
 
-    void RetirePolymorphicChainSite(const std::uint64_t guest_rip) {
-        const auto it = inchain_patch_sites_.find(guest_rip);
-        if (it == inchain_patch_sites_.end()) {
+    OutboundEdgeState* AllocateOutboundEdgeLocked(const std::uint64_t guest_rip) {
+        // Every compiled source owns its edge state. Publication fans out only when a destination
+        // changes, while execution reads a source-private cache line and never aliases unrelated
+        // callers of the same target.
+        void* const storage = edge_lifetime_pool_.allocate(
+            sizeof(OutboundEdgeState), alignof(OutboundEdgeState));
+        OutboundEdgeState* const edge = std::construct_at(
+            static_cast<OutboundEdgeState*>(storage), guest_rip, this);
+        edge_directory_.Attach(guest_rip, edge);
+        if (const PublishedDestination* const destination =
+                edge_directory_.FindPublished(guest_rip);
+            destination != nullptr) {
+            edge->code_witness.store(destination->code_witness,
+                                     std::memory_order_relaxed);
+            edge->inspection_pending.store(1, std::memory_order_relaxed);
+            edge->target.store(SelectDestinationEntry(*destination, *edge),
+                               std::memory_order_release);
+        }
+        return edge;
+    }
+
+    void ConfigureOutboundEdgeEntryConvention(OutboundEdgeState* const edge,
+                                               const bool resident_frame) {
+        if (edge == nullptr) {
+            return;
+        }
+        std::lock_guard lock{edge_graph_mutex_};
+        edge->enters_resident_frame = resident_frame;
+        if (const PublishedDestination* const destination =
+                edge_directory_.FindPublished(edge->guest_rip);
+            destination != nullptr) {
+            edge->code_witness.store(destination->code_witness,
+                                     std::memory_order_relaxed);
+            edge->inspection_pending.store(1, std::memory_order_relaxed);
+            edge->target.store(SelectDestinationEntry(*destination, *edge),
+                               std::memory_order_release);
+        } else {
+            edge->target.store(nullptr, std::memory_order_release);
+            edge->code_witness.store(nullptr, std::memory_order_relaxed);
+        }
+    }
+
+    PublishedCodeWitness* AllocateCodeWitness(const LsxDecodedRegion* decoded) {
+        void* const storage = witness_lifetime_pool_.allocate(
+            sizeof(PublishedCodeWitness), alignof(PublishedCodeWitness));
+        return std::construct_at(
+            static_cast<PublishedCodeWitness*>(storage), decoded);
+    }
+
+    void RetireIndirectEdgeFanout(const std::uint64_t guest_rip) {
+        const auto it = indirect_edge_fanouts_.find(guest_rip);
+        if (it == indirect_edge_fanouts_.end()) {
             return;
         }
         if (it->second != nullptr) {
             it->second->Retire();
         }
-        inchain_patch_sites_.erase(it);
+        indirect_edge_fanouts_.erase(it);
     }
 
-    void RetireChainPatchTarget(const std::uint64_t guest_rip) {
-        std::lock_guard lock{chain_patch_mutex_};
-        chain_patch_targets_.erase(guest_rip);
-        if (const auto slot_it = chain_patch_slots_.find(guest_rip);
-            slot_it != chain_patch_slots_.end() && slot_it->second) {
-            slot_it->second->target.store(nullptr, std::memory_order_release);
-            slot_it->second->chain_target.store(nullptr, std::memory_order_release);
-            slot_it->second->guest_size.store(0, std::memory_order_relaxed);
-            slot_it->second->guest_hash.store(0, std::memory_order_relaxed);
-            slot_it->second->MarkPublication();
-        }
+    void WithdrawPublishedDestination(const std::uint64_t guest_rip) {
+        std::lock_guard lock{edge_graph_mutex_};
+        edge_directory_.Withdraw(guest_rip);
+        edge_directory_.VisitIncoming(
+            guest_rip, [](OutboundEdgeState* const edge) {
+                edge->target.store(nullptr, std::memory_order_release);
+                edge->code_witness.store(nullptr, std::memory_order_relaxed);
+            });
     }
 
-    void PublishChainPatch(const std::uint64_t guest_rip,
-                                 Arm64BlockEntry target,
-                                 Arm64BlockEntry chain_target,
-                                 const std::uint32_t guest_size,
-                                 const std::uint64_t guest_hash,
+    void InstallPublishedDestination(const std::uint64_t guest_rip,
+                                 Arm64BlockEntry external_entry,
+                                 Arm64BlockEntry resident_entry,
+                                 const PublishedCodeWitness* code_witness,
                                  const std::uint32_t block_flags) {
-        if (target == nullptr || (block_flags & 0x20u) != 0) {
-            RetireChainPatchTarget(guest_rip);
+        if (external_entry == nullptr || (block_flags & 0x20u) != 0) {
+            WithdrawPublishedDestination(guest_rip);
             return;
         }
-        std::lock_guard lock{chain_patch_mutex_};
-        chain_patch_targets_[guest_rip] = {
-            target, chain_target, guest_hash, guest_size};
-        auto& slot = chain_patch_slots_[guest_rip];
-        if (!slot) {
-            chain_patch_slot_storage_.emplace_back(guest_rip, &execution_cache_epoch_);
-            slot = &chain_patch_slot_storage_.back();
-        }
-        slot->guest_size.store(guest_size, std::memory_order_relaxed);
-        slot->guest_hash.store(guest_hash, std::memory_order_relaxed);
-        slot->chain_target.store(chain_target, std::memory_order_relaxed);
-        slot->MarkPublication();
-        slot->target.store(target, std::memory_order_release);
+        std::lock_guard lock{edge_graph_mutex_};
+        edge_directory_.Publish(
+            guest_rip, {external_entry, resident_entry, code_witness});
+        const PublishedDestination* const destination =
+            edge_directory_.FindPublished(guest_rip);
+        edge_directory_.VisitIncoming(
+            guest_rip, [&](OutboundEdgeState* const edge) {
+                edge->code_witness.store(code_witness, std::memory_order_relaxed);
+                edge->inspection_pending.store(1, std::memory_order_relaxed);
+                edge->target.store(SelectDestinationEntry(*destination, *edge),
+                                   std::memory_order_release);
+            });
     }
 
 private:
-    const std::uint64_t execution_cache_identity_;
-    std::atomic<std::uint64_t> execution_cache_epoch_{1};
-    // Even values are stable slot-map generations; odd values cover the title-reset clear.
-    std::atomic<std::uint64_t> chain_patch_slot_epoch_{2};
-    std::mutex chain_patch_mutex_;
+    std::mutex edge_graph_mutex_;
     std::mutex block_cache_mutex_;
     PersistentIrBlockCache persistent_ir_cache_;
-    Aarch64CodeArena code_arena_;
-    std::unordered_map<std::uint64_t, ChainPatchRecord> chain_patch_targets_;
-    std::unordered_map<std::uint64_t, ChainPatchCell*> chain_patch_slots_;
-    std::deque<ChainPatchCell> chain_patch_slot_storage_;
-    std::unordered_map<std::uint64_t, PolymorphicChainSite*> inchain_patch_sites_;
-    std::vector<std::unique_ptr<PolymorphicChainSite>> inchain_patch_site_storage_;
+    NativeSegmentDepot native_depot_;
+    EdgeDestinationDirectory edge_directory_;
+    // Generated code needs process-lifetime edge addresses. A monotonic pool allocates densely
+    // without deque nodes, per-edge frees, or allocator locks during block compilation.
+    std::pmr::monotonic_buffer_resource edge_lifetime_pool_{};
+    std::pmr::monotonic_buffer_resource witness_lifetime_pool_{};
+    tsl::robin_map<std::uint64_t, IndirectEdgeFanout*> indirect_edge_fanouts_;
+    std::vector<std::unique_ptr<IndirectEdgeFanout>> indirect_edge_fanout_storage_;
     std::unordered_map<std::uint64_t, std::unique_ptr<LsxDecodedRegion>> decoded_blocks_;
     std::vector<std::unique_ptr<LsxDecodedRegion>> retired_decoded_blocks_;
-    std::unordered_map<std::uint64_t, CachedTranslationRecord> block_results_;
+    GuestRegionDirectory block_results_;
 #ifdef __ANDROID__
     bool persistent_native_prewarm_pending_ = false;
     std::jthread persistent_native_prewarm_thread_{};
@@ -6034,10 +6005,10 @@ private:
     const LsxMachineImage* previous_;
 };
 
-ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
+OutboundEdgeState* BindIndirectEdgeFanout(IndirectEdgeFanout* site,
                                      const std::uint64_t guest_target) noexcept {
     // Ordinary PS4 user code lives below the 40-bit boundary in this runtime. Registered Android
-    // HLE stubs can also be numerically low, so AcquireChainPatchCell remains the authoritative
+    // HLE stubs can also be numerically low, so CreateOutboundEdge remains the authoritative
     // HLE/PLT/deny classifier after this cheap sentinel/host-address gate.
     if (site == nullptr || site->owner == nullptr || guest_target == 0 ||
         (guest_target >> 40u) != 0 ||
@@ -6045,23 +6016,23 @@ ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
         return nullptr;
     }
     const std::uint32_t way_count = site->way_count;
-    if (way_count != PolymorphicChainSite::kJumpWayCount &&
-        way_count != PolymorphicChainSite::kReturnWayCount) {
+    if (way_count != IndirectEdgeFanout::kJumpWayCount &&
+        way_count != IndirectEdgeFanout::kReturnWayCount) {
         return nullptr;
     }
 
     g_jit_indirect_pic_bind_calls.fetch_add(1, std::memory_order_relaxed);
     for (std::uint32_t index = 0; index < way_count; ++index) {
-        ChainPatchCell* const observed =
+        OutboundEdgeState* const observed =
             site->ways[index].load(std::memory_order_acquire);
         if (observed != nullptr && observed->guest_rip == guest_target) {
             return observed;
         }
     }
 
-    ChainPatchCell* resolved = nullptr;
+    OutboundEdgeState* resolved = nullptr;
     try {
-        resolved = site->owner->AcquireChainPatchCell(guest_target);
+        resolved = site->owner->CreateOutboundEdge(guest_target);
     } catch (...) {
         return nullptr;
     }
@@ -6073,14 +6044,14 @@ ChainPatchCell* BindPolymorphicChainSite(PolymorphicChainSite* site,
     // Another guest thread can fill this source site while the deny/slot lookup above runs.
     // Reuse its publication instead of consuming two ways with the same monomorphic target.
     for (std::uint32_t index = 0; index < way_count; ++index) {
-        ChainPatchCell* const observed =
+        OutboundEdgeState* const observed =
             site->ways[index].load(std::memory_order_acquire);
         if (observed != nullptr && observed->guest_rip == guest_target) {
             return observed;
         }
     }
     for (std::uint32_t index = 0; index < way_count; ++index) {
-        ChainPatchCell* empty = nullptr;
+        OutboundEdgeState* empty = nullptr;
         if (site->ways[index].compare_exchange_strong(
                 empty, resolved, std::memory_order_release,
                 std::memory_order_acquire)) {
@@ -6111,27 +6082,48 @@ static_assert(kGsBaseStateOffset + sizeof(std::uint64_t) <=
               offsetof(LsxMachineImage, x87_control_word));
 static_assert(kXmmStateOffset + (kXmmRegisterCount * kXmmRegisterBytes) <= sizeof(LsxMachineImage));
 
-Aarch64CodeArena::~Aarch64CodeArena() {
+NativeSegmentDepot::~NativeSegmentDepot() {
 #ifdef __ANDROID__
-    for (const ExecutableSlab& slab : executable_slabs_) {
-        if (slab.base != nullptr && slab.size != 0) {
-            munmap(slab.base, slab.size);
+    for (const auto& slab : executable_slabs_) {
+        if (slab && slab->base != nullptr && slab->size != 0) {
+            munmap(slab->base, slab->size);
         }
     }
 #endif
 }
 
 #ifdef __ANDROID__
-std::uint8_t* Aarch64CodeArena::AllocateCommittedCode(const std::size_t size) {
-    std::lock_guard allocation_lock{executable_slabs_mutex_};
+std::uint8_t* NativeSegmentDepot::AllocateCommittedCode(const std::size_t size) {
     constexpr std::size_t kCodeAlignment = 16;
     constexpr std::size_t kDefaultSlabSize = 16u * 1024u * 1024u;
     const std::size_t aligned_size =
         (std::max<std::size_t>(size, 1u) + kCodeAlignment - 1u) &
         ~(kCodeAlignment - 1u);
 
-    if (executable_slabs_.empty() ||
-        executable_slabs_.back().size - executable_slabs_.back().used < aligned_size) {
+    const auto claim = [aligned_size](ExecutableSlab* slab) -> std::uint8_t* {
+        if (slab == nullptr) {
+            return nullptr;
+        }
+        const std::size_t offset =
+            slab->used.fetch_add(aligned_size, std::memory_order_relaxed);
+        if (offset <= slab->size && aligned_size <= slab->size - offset) {
+            return slab->base + offset;
+        }
+        return nullptr;
+    };
+    if (std::uint8_t* const fast = claim(
+            active_executable_slab_.load(std::memory_order_acquire));
+        fast != nullptr) {
+        return fast;
+    }
+
+    std::lock_guard allocation_lock{executable_slabs_mutex_};
+    if (std::uint8_t* const raced = claim(
+            active_executable_slab_.load(std::memory_order_acquire));
+        raced != nullptr) {
+        return raced;
+    }
+    {
         const long page_query = sysconf(_SC_PAGESIZE);
         const std::size_t page_size = page_query > 0 ? static_cast<std::size_t>(page_query) : 4096u;
         const std::size_t minimum_size =
@@ -6143,18 +6135,22 @@ std::uint8_t* Aarch64CodeArena::AllocateCommittedCode(const std::size_t size) {
         if (mapping == MAP_FAILED) {
             throw std::bad_alloc{};
         }
-        executable_slabs_.push_back(
-            {static_cast<std::uint8_t*>(mapping), slab_size, 0});
+        auto slab = std::make_unique<ExecutableSlab>(
+            static_cast<std::uint8_t*>(mapping), slab_size);
+        ExecutableSlab* const published = slab.get();
+        executable_slabs_.push_back(std::move(slab));
+        active_executable_slab_.store(published, std::memory_order_release);
     }
-
-    ExecutableSlab& slab = executable_slabs_.back();
-    std::uint8_t* destination = slab.base + slab.used;
-    slab.used += aligned_size;
+    std::uint8_t* const destination = claim(
+        active_executable_slab_.load(std::memory_order_relaxed));
+    if (destination == nullptr) {
+        throw std::bad_alloc{};
+    }
     return destination;
 }
 #endif
 
-Arm64BlockEntry Aarch64CodeArena::CommitCode(
+Arm64BlockEntry NativeSegmentDepot::CommitCode(
     std::unique_ptr<Xbyak_aarch64::CodeGenerator> code) {
     if (!code || code->getSize() == 0) {
         return nullptr;
@@ -6186,8 +6182,8 @@ Arm64BlockEntry Aarch64CodeArena::CommitCode(
 #endif
 }
 
-const Aarch64CodeArena::CommittedCodeRange*
-Aarch64CodeArena::FindCommittedCodeRange(const Arm64BlockEntry entry) const {
+const NativeSegmentDepot::CommittedCodeRange*
+NativeSegmentDepot::FindCommittedCodeRange(const Arm64BlockEntry entry) const {
     if (entry == nullptr) {
         return nullptr;
     }
@@ -6202,11 +6198,11 @@ Aarch64CodeArena::FindCommittedCodeRange(const Arm64BlockEntry entry) const {
     return nullptr;
 }
 
-bool Aarch64CodeArena::CapturePersistentNativeBlock(
+bool NativeSegmentDepot::CapturePersistentNativeBlock(
     const Arm64BlockEntry entry, const Arm64BlockEntry direct, const LsxDecodedRegion& block,
-    ChainPatchCell* const outgoing_direct_slot,
-    ChainPatchCell* const alternate_direct_slot,
-    PolymorphicChainSite* const inchain_patch_site,
+    OutboundEdgeState* const primary_outbound_edge,
+    OutboundEdgeState* const secondary_outbound_edge,
+    IndirectEdgeFanout* const indirect_edge_fanout,
     std::vector<JitNativeSegment>& segments,
     std::uint32_t& entry_segment_index,
     std::uint32_t& direct_segment_index) const {
@@ -6254,11 +6250,11 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
         : reinterpret_cast<std::uint64_t>(block.instructions.data());
     const std::uint64_t instruction_bytes =
         block.instructions.size() * sizeof(LsxDecodedOp);
-    const std::array<ChainPatchCell*, 2> direct_slots = {
-        outgoing_direct_slot, alternate_direct_slot,
+    const std::array<OutboundEdgeState*, 2> static_edges = {
+        primary_outbound_edge, secondary_outbound_edge,
     };
-    const std::uint64_t inchain_patch_site_address =
-        reinterpret_cast<std::uint64_t>(inchain_patch_site);
+    const std::uint64_t indirect_edge_fanout_address =
+        reinterpret_cast<std::uint64_t>(indirect_edge_fanout);
 
     const auto classify_pointer = [&](const std::uint64_t value,
                                       JitNativeRelocation& relocation) {
@@ -6278,24 +6274,24 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
                 delta % sizeof(LsxDecodedOp));
             return true;
         }
-        if (inchain_patch_site != nullptr && value == inchain_patch_site_address) {
-            relocation.kind = JitNativeRelocationKind::PolymorphicChainSite;
+        if (indirect_edge_fanout != nullptr && value == indirect_edge_fanout_address) {
+            relocation.kind = JitNativeRelocationKind::IndirectEdgeFanout;
             relocation.target_index = 0;
             relocation.addend = 0;
             return true;
         }
-        for (std::size_t index = 0; index < direct_slots.size(); ++index) {
-            if (direct_slots[index] == nullptr) {
+        for (std::size_t index = 0; index < static_edges.size(); ++index) {
+            if (static_edges[index] == nullptr) {
                 continue;
             }
-            const std::uint64_t direct_slot_address =
-                reinterpret_cast<std::uint64_t>(direct_slots[index]);
-            if (value >= direct_slot_address &&
-                value - direct_slot_address < sizeof(ChainPatchCell)) {
-                relocation.kind = JitNativeRelocationKind::ChainPatchCell;
+            const std::uint64_t direct_edge_address =
+                reinterpret_cast<std::uint64_t>(static_edges[index]);
+            if (value >= direct_edge_address &&
+                value - direct_edge_address < sizeof(OutboundEdgeState)) {
+                relocation.kind = JitNativeRelocationKind::OutboundEdgeState;
                 relocation.target_index = static_cast<std::uint32_t>(index);
                 relocation.addend =
-                    static_cast<std::int64_t>(value - direct_slot_address);
+                    static_cast<std::int64_t>(value - direct_edge_address);
                 return true;
             }
         }
@@ -6342,7 +6338,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
             if (!classify_pointer(value, relocation)) {
                 // Fixed materializations are reserved exclusively for cache relocations. An
                 // unclassified one means the emitter acquired a new process-local target which
-                // this cache version does not know how to reconstruct.
+                // this cache version does not know how to restore.
                 return false;
             }
             if (!PatchJitRelocatablePointer(
@@ -6358,7 +6354,7 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
         }
 
         // Fail closed if a legacy variable-width MOVZ/MOVK chain still materializes a pointer
-        // into this module, the retained IR, a ChainPatchCell, or another generated segment. This
+        // into this module, the retained IR, a OutboundEdgeState, or another generated segment. This
         // makes omission of EmitJitRelocatablePointer a cache miss rather than stale-ASLR
         // execution. Ordinary guest immediates and guest virtual addresses do not classify here.
         for (std::size_t offset = 0; offset + 4u <= range->size; offset += 4u) {
@@ -6398,13 +6394,13 @@ bool Aarch64CodeArena::CapturePersistentNativeBlock(
     return true;
 }
 
-bool Aarch64CodeArena::RestorePersistentNativeBlock(
+bool NativeSegmentDepot::RestorePersistentNativeBlock(
     const std::vector<JitNativeSegment>& segments,
     const std::uint32_t entry_segment_index,
     const std::uint32_t direct_segment_index, const LsxDecodedRegion& block,
-    ChainPatchCell* const outgoing_direct_slot,
-    ChainPatchCell* const alternate_direct_slot,
-    PolymorphicChainSite* const inchain_patch_site, Arm64BlockEntry& entry,
+    OutboundEdgeState* const primary_outbound_edge,
+    OutboundEdgeState* const secondary_outbound_edge,
+    IndirectEdgeFanout* const indirect_edge_fanout, Arm64BlockEntry& entry,
     Arm64BlockEntry& direct) {
     entry = nullptr;
     direct = nullptr;
@@ -6417,8 +6413,8 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
     if (module_base == 0) {
         return false;
     }
-    const std::array<ChainPatchCell*, 2> direct_slots = {
-        outgoing_direct_slot, alternate_direct_slot,
+    const std::array<OutboundEdgeState*, 2> static_edges = {
+        primary_outbound_edge, secondary_outbound_edge,
     };
 
     // Validate the complete untrusted record before consuming executable-arena space. Once these
@@ -6459,12 +6455,12 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                     return false;
                 }
                 break;
-            case JitNativeRelocationKind::ChainPatchCell:
-                if (relocation.target_index >= direct_slots.size() ||
-                    direct_slots[relocation.target_index] == nullptr ||
+            case JitNativeRelocationKind::OutboundEdgeState:
+                if (relocation.target_index >= static_edges.size() ||
+                    static_edges[relocation.target_index] == nullptr ||
                     relocation.addend < 0 ||
                     static_cast<std::uint64_t>(relocation.addend) >=
-                        sizeof(ChainPatchCell)) {
+                        sizeof(OutboundEdgeState)) {
                     return false;
                 }
                 break;
@@ -6485,8 +6481,8 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                 }
                 break;
             }
-            case JitNativeRelocationKind::PolymorphicChainSite:
-                if (inchain_patch_site == nullptr || relocation.target_index != 0 ||
+            case JitNativeRelocationKind::IndirectEdgeFanout:
+                if (indirect_edge_fanout == nullptr || relocation.target_index != 0 ||
                     relocation.addend != 0) {
                     return false;
                 }
@@ -6551,9 +6547,9 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                 target = reinterpret_cast<std::uint64_t>(
                     &block.instructions[relocation.target_index]);
                 break;
-            case JitNativeRelocationKind::ChainPatchCell:
+            case JitNativeRelocationKind::OutboundEdgeState:
                 target = reinterpret_cast<std::uint64_t>(
-                    direct_slots[relocation.target_index]);
+                    static_edges[relocation.target_index]);
                 break;
             case JitNativeRelocationKind::SegmentAddress:
                 target = reinterpret_cast<std::uint64_t>(
@@ -6564,8 +6560,8 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
                     return false;
                 }
                 break;
-            case JitNativeRelocationKind::PolymorphicChainSite:
-                target = reinterpret_cast<std::uint64_t>(inchain_patch_site);
+            case JitNativeRelocationKind::IndirectEdgeFanout:
+                target = reinterpret_cast<std::uint64_t>(indirect_edge_fanout);
                 break;
             }
             if (!AddJitNativeRelocationAddend(target, relocation.addend, target) ||
@@ -6594,7 +6590,7 @@ bool Aarch64CodeArena::RestorePersistentNativeBlock(
     return entry != nullptr;
 }
 
-Arm64BlockEntry Aarch64CodeArena::EmitReturnImmediateBlock(const std::uint64_t value) {
+Arm64BlockEntry NativeSegmentDepot::EmitReturnImmediateBlock(const std::uint64_t value) {
     auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
     code->mov(code->x0, value);
     code->ret();
@@ -6603,7 +6599,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitReturnImmediateBlock(const std::uint64_t v
     return entry;
 }
 
-Arm64BlockEntry Aarch64CodeArena::EmitSharedChainReturnImmediateBlock(
+Arm64BlockEntry NativeSegmentDepot::EmitSharedChainReturnImmediateBlock(
     const std::uint64_t value) {
     auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
     code->mov(code->x0, value);
@@ -6625,7 +6621,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitSharedChainReturnImmediateBlock(
     return CommitCode(std::move(code));
 }
 
-bool Aarch64CodeArena::FindCodeRange(const std::uint64_t host_pc,
+bool NativeSegmentDepot::FindCodeRange(const std::uint64_t host_pc,
                                      std::uint64_t* range_base,
                                      std::uint64_t* range_size) const {
     if (host_pc == 0 || range_base == nullptr || range_size == nullptr) {
@@ -6646,7 +6642,7 @@ bool Aarch64CodeArena::FindCodeRange(const std::uint64_t host_pc,
     return false;
 }
 
-Arm64BlockEntry Aarch64CodeArena::EmitDistinctExecutionEntry(
+Arm64BlockEntry NativeSegmentDepot::EmitDistinctExecutionEntry(
     Arm64BlockEntry direct_target) {
     if (direct_target == nullptr) {
         return nullptr;
@@ -7043,40 +7039,43 @@ enum class DirectTargetAudit : std::uint8_t {
     Safepoint,
 };
 
-struct DirectTargetDigest {
+struct DirectTargetCheck {
     std::uint32_t guest_size{};
-    std::uint64_t expected{};
-    std::uint64_t observed{};
     bool matches{};
 };
 
-DirectTargetDigest InspectDirectTargetBytes(const ChainPatchCell& cell) noexcept {
-    DirectTargetDigest digest{
-        .guest_size = cell.guest_size.load(std::memory_order_acquire),
-        .expected = cell.guest_hash.load(std::memory_order_acquire),
+DirectTargetCheck InspectDirectTargetBytes(const OutboundEdgeState& cell) noexcept {
+    const PublishedCodeWitness* const witness =
+        cell.code_witness.load(std::memory_order_acquire);
+    if (witness == nullptr || witness->decoded == nullptr) {
+        // Synthetic/self-test publications do not describe guest memory and are immutable.
+        return {.guest_size = 0, .matches = true};
+    }
+    return {
+        .guest_size = static_cast<std::uint32_t>(
+            witness->decoded->end_rip - witness->decoded->start_rip),
+        .matches = witness->decoded->start_rip == cell.guest_rip &&
+                   GuestBytesMatchDecoded(*witness->decoded),
     };
-    if (digest.guest_size == 0) {
-        return digest;
-    }
-    try {
-        digest.observed = HashGuestCodeWindow(cell.guest_rip, digest.guest_size);
-        digest.matches = digest.observed == digest.expected;
-    } catch (...) {
-        digest.matches = false;
-    }
-    return digest;
 }
 
-void RetireRejectedDirectTarget(ChainPatchCell& cell, const Arm64BlockEntry candidate,
-                                const DirectTargetDigest& digest,
+void RetireRejectedDirectTarget(OutboundEdgeState& cell, const Arm64BlockEntry candidate,
+                                const DirectTargetCheck& check,
                                 const DirectTargetAudit audit) noexcept {
     Arm64BlockEntry expected = candidate;
     if (cell.target.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
-        cell.chain_target.store(nullptr, std::memory_order_release);
-        cell.MarkPublication();
-        if (cell.execution_cache_epoch != nullptr) {
-            cell.execution_cache_epoch->fetch_add(1, std::memory_order_release);
+        if (const PublishedCodeWitness* const witness =
+                cell.code_witness.load(std::memory_order_acquire);
+            witness != nullptr) {
+            witness->revision.fetch_add(1, std::memory_order_release);
+        }
+        if (cell.owner != nullptr) {
+            // One source edge discovering SMC retires the destination record and every sibling
+            // edge. A later bind cannot resurrect the stale address from publication metadata.
+            cell.owner->WithdrawPublishedDestination(cell.guest_rip);
+        } else {
+            cell.code_witness.store(nullptr, std::memory_order_relaxed);
         }
     }
     g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
@@ -7086,16 +7085,13 @@ void RetireRejectedDirectTarget(ChainPatchCell& cell, const Arm64BlockEntry cand
     if (ordinal >= 128) {
         return;
     }
-    JitLog("[EXECUTOR_JIT_EDGE_INVALIDATE] n=%u mode=%s rip=0x%llx size=0x%x "
-           "expectedHash=0x%llx observedHash=0x%llx",
+    JitLog("[EXECUTOR_JIT_EDGE_INVALIDATE] n=%u mode=%s rip=0x%llx size=0x%x",
            ordinal, audit == DirectTargetAudit::Safepoint ? "safepoint" : "scheduled",
-           static_cast<unsigned long long>(cell.guest_rip), digest.guest_size,
-           static_cast<unsigned long long>(digest.expected),
-           static_cast<unsigned long long>(digest.observed));
+           static_cast<unsigned long long>(cell.guest_rip), check.guest_size);
 }
 
 template <DirectTargetAudit Audit>
-Arm64BlockEntry AuditDirectTarget(ChainPatchCell* const slot,
+Arm64BlockEntry AuditDirectTarget(OutboundEdgeState* const slot,
                                   const Arm64BlockEntry candidate) noexcept {
     if (slot == nullptr || candidate == nullptr ||
         slot->target.load(std::memory_order_acquire) != candidate) {
@@ -7112,9 +7108,9 @@ Arm64BlockEntry AuditDirectTarget(ChainPatchCell* const slot,
         }
     }
 
-    const auto digest = InspectDirectTargetBytes(*slot);
-    if (!digest.matches) {
-        RetireRejectedDirectTarget(*slot, candidate, digest, Audit);
+    const auto check = InspectDirectTargetBytes(*slot);
+    if (!check.matches) {
+        RetireRejectedDirectTarget(*slot, candidate, check, Audit);
         return nullptr;
     }
     return slot->target.load(std::memory_order_acquire) == candidate
@@ -7122,30 +7118,14 @@ Arm64BlockEntry AuditDirectTarget(ChainPatchCell* const slot,
                : nullptr;
 }
 
-Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
+Arm64BlockEntry ValidateObservedDirectTarget(OutboundEdgeState* slot,
                                              Arm64BlockEntry observed) noexcept {
     return AuditDirectTarget<DirectTargetAudit::Scheduled>(slot, observed);
 }
 
-Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(ChainPatchCell* slot,
+Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(OutboundEdgeState* slot,
                                                         Arm64BlockEntry observed) noexcept {
     return AuditDirectTarget<DirectTargetAudit::Safepoint>(slot, observed);
-}
-
-Arm64BlockEntry ValidateObservedDirectChainTargetAtSafepoint(
-    ChainPatchCell* slot, Arm64BlockEntry observed) noexcept {
-    if (slot == nullptr || observed == nullptr ||
-        slot->chain_target.load(std::memory_order_acquire) != observed) {
-        return nullptr;
-    }
-    const auto normal = slot->target.load(std::memory_order_acquire);
-    if (AuditDirectTarget<DirectTargetAudit::Safepoint>(slot, normal) == nullptr) {
-        slot->chain_target.store(nullptr, std::memory_order_release);
-        return nullptr;
-    }
-    return slot->chain_target.load(std::memory_order_acquire) == observed
-               ? observed
-               : nullptr;
 }
 
 std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlockContext* context) {
@@ -7310,7 +7290,7 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
     return native_result;
 }
 
-Arm64BlockEntry Aarch64CodeArena::EmitCheckedNativeBlock(const LsxDecodedRegion& block, Arm64BlockEntry native) {
+Arm64BlockEntry NativeSegmentDepot::EmitCheckedNativeBlock(const LsxDecodedRegion& block, Arm64BlockEntry native) {
     auto context = std::make_unique<CheckedNativeBlockContext>();
     context->block = &block;
     context->native = native;
@@ -7416,11 +7396,11 @@ std::uint64_t ExecuteNativeScalarSemanticInstruction(LsxMachineImage* state,
     return InterpretDecodedInstructionScoped(state, ir, false);
 }
 
-Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
-    const LsxDecodedRegion& block, ChainPatchCell* outgoing_direct_slot,
-    Arm64BlockEntry* direct_target_out, ChainPatchCell* alternate_direct_slot,
-    PolymorphicChainSite* inchain_patch_site, bool* indirect_pic_used_out,
-    bool* chain_abi_out, Arm64BlockEntry* chain_target_out) {
+Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
+    const LsxDecodedRegion& block, OutboundEdgeState* primary_outbound_edge,
+    Arm64BlockEntry* direct_target_out, OutboundEdgeState* secondary_outbound_edge,
+    IndirectEdgeFanout* indirect_edge_fanout, bool* indirect_pic_used_out,
+    bool* chain_abi_out, Arm64BlockEntry* resident_entry_out) {
     if (direct_target_out != nullptr) {
         *direct_target_out = nullptr;
     }
@@ -7430,8 +7410,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     if (chain_abi_out != nullptr) {
         *chain_abi_out = false;
     }
-    if (chain_target_out != nullptr) {
-        *chain_target_out = nullptr;
+    if (resident_entry_out != nullptr) {
+        *resident_entry_out = nullptr;
     }
     const auto finish_direct_native = [&](Arm64BlockEntry direct_target) {
         if (direct_target_out != nullptr) {
@@ -7461,22 +7441,14 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     constexpr std::uint32_t kStateRspOffset = gpr_state_offset(LsxGpr::Rsp);
     constexpr std::uint32_t kStateRipOffset = offsetof(LsxMachineImage, rip_or_exit);
     constexpr std::uint32_t kStateRflagsOffset = offsetof(LsxMachineImage, rflags);
-    // Non-architectural per-execution direct-chain budget. This lives in the ABI-reserved
-    // padding rather than in a shared ChainPatchCell cache line, so threads executing the same
-    // guest library code never contend on an atomic increment.
-    constexpr std::uint32_t kStateDispatchChainBudgetOffset =
-        offsetof(LsxMachineImage, dispatch_chain_budget);
-    constexpr std::uint32_t kStateCodeValidationBudgetOffset =
-        offsetof(LsxMachineImage, code_validation_budget);
-    // Dispatcher admission and SMC validation have very different latency requirements. Return
-    // often enough for pending runtime work, but hash guest bytes only once per several slices.
-    // Both counters are thread-private, avoiding any shared cache-line RMW in hot loops.
-    constexpr std::uint32_t kDirectChainBudget = 1024;
-    constexpr std::uint32_t kDirectValidationSliceBudget = 4;
+    // A private finite window avoids shared cache-line RMWs. Expiration returns to the dispatcher
+    // and performs snapshot validation; HLE/signal blocks retain their unconditional boundaries.
+    constexpr std::uint32_t kStateNativeEdgePhaseOffset =
+        offsetof(LsxMachineImage, native_edge_phase);
+    constexpr std::uint32_t kNativeEdgeSchedulePeriod = 4096;
     // Every generic chain body uses the same shared-frame contract and flushes its block-local
     // caches before the edge. Enter the destination body directly so the root frame is created and
     // destroyed once per bounded chain instead of once per guest basic block.
-    constexpr bool kUseSharedFrameStaticLinks = true;
     constexpr std::uint32_t kStateFaultIrSlotOffset = 0x340;
     constexpr std::uint32_t kStateNativeFaultIrOffset = 0x348;
     constexpr std::uint32_t kStateRaxOffset = gpr_state_offset(LsxGpr::Rax);
@@ -7523,10 +7495,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     static_assert(offsetof(LsxMachineImage, gpr) + (15 * sizeof(std::uint64_t)) == kStateR15Offset);
     static_assert(offsetof(LsxMachineImage, rip_or_exit) == kStateRipOffset);
     static_assert(kStateRflagsOffset == 0x98);
-    static_assert(offsetof(LsxMachineImage, dispatch_chain_budget) ==
-                  kStateDispatchChainBudgetOffset);
-    static_assert(offsetof(LsxMachineImage, code_validation_budget) ==
-                  kStateCodeValidationBudgetOffset);
+    static_assert(offsetof(LsxMachineImage, native_edge_phase) ==
+                  kStateNativeEdgePhaseOffset);
     static_assert(offsetof(LsxMachineImage, ymm) == kStateYmm0Offset);
     static_assert(offsetof(LsxMachineImage, fault_ir_slot) ==
                   kStateFaultIrSlotOffset);
@@ -8881,7 +8851,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     // Lower it as one native block (no C++ interpreter-helper wrapper). Besides
     // being useful guest code, this proves the LsxMachineImage/RSP/return ABI of
     // the native entry/return contract against a known interpreter vector.
-    if (inchain_patch_site == nullptr && block.instructions.size() == 2) {
+    if (indirect_edge_fanout == nullptr && block.instructions.size() == 2) {
         const LsxDecodedOp& mov = block.instructions[0];
         const LsxDecodedOp& ret = block.instructions[1];
         if (static_cast<X86Mnemonic>(mov.mnemonic) == X86_MNEMONIC_MOV &&
@@ -14371,7 +14341,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     if (generic_scalar_native_allowed &&
         (generic_scalar_instruction_count != 0 || generic_has_counted_terminator ||
          generic_has_dynamic_control_terminator ||
-         (generic_has_ret_terminator && inchain_patch_site != nullptr)) &&
+         (generic_has_ret_terminator && indirect_edge_fanout != nullptr)) &&
         (!generic_has_guest_memory_write || generic_memory_writes_are_direct_safe)) {
         bool can_emit_native = true;
         for (std::size_t i = 0; i < block.instructions.size(); ++i) {
@@ -15040,7 +15010,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 };
                 const auto emit_reload_register_caches =
                     [&](const bool after_abi_call = false) {
-                    // x23-x27 survive an AAPCS64 call. Reconstruct only x6-x8 after helpers;
+                    // x23-x27 survive an AAPCS64 call. Reload only x6-x8 after helpers;
                     // initial block entry still loads every selected architectural value.
                     emit_reload_gpr_cache(after_abi_call);
                     emit_reload_vector_cache();
@@ -15079,17 +15049,17 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     emit_epilogue_restore();
                     code->ret();
                 };
-                const auto emit_epilogue_chain_patch = [&](const std::uint64_t target) {
+                const auto emit_static_edge_tail = [&](const std::uint64_t target) {
                     // Checked-native diagnostics deliberately compare one block at a time.
                     // Production entries execute once and may chain across register and memory
                     // blocks under RunGuest's chain-wide synchronous-fault recovery frame.
-                    ChainPatchCell* edge_slot = nullptr;
-                    if (outgoing_direct_slot != nullptr &&
-                        outgoing_direct_slot->guest_rip == target) {
-                        edge_slot = outgoing_direct_slot;
-                    } else if (alternate_direct_slot != nullptr &&
-                               alternate_direct_slot->guest_rip == target) {
-                        edge_slot = alternate_direct_slot;
+                    OutboundEdgeState* edge_slot = nullptr;
+                    if (primary_outbound_edge != nullptr &&
+                        primary_outbound_edge->guest_rip == target) {
+                        edge_slot = primary_outbound_edge;
+                    } else if (secondary_outbound_edge != nullptr &&
+                               secondary_outbound_edge->guest_rip == target) {
+                        edge_slot = secondary_outbound_edge;
                     }
                     if (JitLiveCheckedNativeEnabled() || edge_slot == nullptr) {
                         return false;
@@ -15100,45 +15070,27 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     Xbyak_aarch64::Label fallback;
                     EmitJitRelocatablePointer(
                         *code, code->x9,
-                        reinterpret_cast<std::uint64_t>(
-                            generic_chain_abi && kUseSharedFrameStaticLinks
-                                ? &edge_slot->chain_target
-                                : &edge_slot->target));
+                        reinterpret_cast<std::uint64_t>(&edge_slot->target));
                     code->ldar(code->x16, Xbyak_aarch64::ptr(code->x9));
                     code->cbz(code->x16, fallback);
 
                     // A shared atomic transition counter makes all guest threads running the
-                    // same library loop fight over one ChainPatchCell cache line. FMOD exposed
+                    // same library loop fight over one OutboundEdgeState cache line. FMOD exposed
                     // this dramatically: stream/mixer/bank threads spent most of their time in
                     // LDXR/STXR retries. Use the state object's reserved padding as a private
                     // chain budget. It is non-architectural and naturally unique per RunGuest.
                     // A zero value also makes standalone self-test states initialize safely.
-                    code->ldrh(code->w11,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateDispatchChainBudgetOffset));
+                    code->ldr(code->w11,
+                              Xbyak_aarch64::ptr(code->x19,
+                                                kStateNativeEdgePhaseOffset));
                     code->cbz(code->w11, refill_chain_budget);
                     code->subs(code->w11, code->w11, 1);
-                    code->strh(code->w11,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateDispatchChainBudgetOffset));
+                    code->str(code->w11,
+                              Xbyak_aarch64::ptr(code->x19,
+                                                kStateNativeEdgePhaseOffset));
                     code->bne(chain);
 
                     code->L(validate);
-                    // A dispatcher return is a cheap scheduling boundary. Only every Nth such
-                    // boundary performs the substantially more expensive executable-byte hash.
-                    // The first counter is therefore free to be tuned for responsiveness without
-                    // forcing the SMC cadence to the same value.
-                    Xbyak_aarch64::Label refill_validation_budget;
-                    Xbyak_aarch64::Label dispatch_only;
-                    code->ldrh(code->w12,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateCodeValidationBudgetOffset));
-                    code->cbz(code->w12, refill_validation_budget);
-                    code->subs(code->w12, code->w12, 1);
-                    code->strh(code->w12,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateCodeValidationBudgetOffset));
-                    code->cbnz(code->w12, dispatch_only);
                     // x6-x8 and q16-q23 may hold block-local guest state. Publish them before
                     // entering the safepoint callback, then restore both caches because all are
                     // intentionally caller-saved under the host ABI.
@@ -15150,9 +15102,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     EmitJitRelocatablePointer(
                         *code, code->x17,
                         reinterpret_cast<std::uint64_t>(
-                            generic_chain_abi && kUseSharedFrameStaticLinks
-                                ? &ValidateObservedDirectChainTargetAtSafepoint
-                                : &ValidateObservedDirectTargetAtSafepoint));
+                            &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
                     emit_reload_register_caches(true);
                     code->mov(code->x16, code->x0);
@@ -15163,18 +15113,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // "uninitialized" and "continue" silently restarted the budget on every edge
                     // and turned the supposedly bounded chain into an unbounded one.
                     code->b(fallback);
-                    code->L(refill_validation_budget);
-                    code->mov(code->w12, kDirectValidationSliceBudget - 1u);
-                    code->strh(code->w12,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateCodeValidationBudgetOffset));
-                    code->L(dispatch_only);
-                    code->b(fallback);
                     code->L(refill_chain_budget);
-                    code->mov(code->w11, kDirectChainBudget - 1u);
-                    code->strh(code->w11,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateDispatchChainBudgetOffset));
+                    code->mov(code->w11, kNativeEdgeSchedulePeriod - 1u);
+                    code->str(code->w11,
+                              Xbyak_aarch64::ptr(code->x19,
+                                                kStateNativeEdgePhaseOffset));
                     code->L(chain);
                     // Raw generated targets use the Arm64BlockEntry ABI (x0 = LsxMachineImage*).
                     // The old helper path restored x0 after its C++ call; the inline fast path
@@ -15184,7 +15127,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->mov(code->x9, target);
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                    if (generic_chain_abi && kUseSharedFrameStaticLinks) {
+                    if (generic_chain_abi) {
                         // The destination chain entry shares this root frame. Publish the
                         // block-local cache but keep x19/x20 and FP/LR live until a later
                         // dispatcher/special boundary owns the single restore.
@@ -15204,8 +15147,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     emit_epilogue_return(target);
                     return true;
                 };
-                const auto emit_epilogue_inchain_patch = [&](const XReg& target) {
-                    if (JitLiveCheckedNativeEnabled() || inchain_patch_site == nullptr) {
+                const auto emit_computed_edge_tail = [&](const XReg& target) {
+                    if (JitLiveCheckedNativeEnabled() || indirect_edge_fanout == nullptr) {
                         return false;
                     }
                     if (indirect_pic_used_out != nullptr) {
@@ -15229,16 +15172,16 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->mov(code->x20, target);
                     EmitJitRelocatablePointer(
                         *code, code->x9,
-                        reinterpret_cast<std::uint64_t>(inchain_patch_site));
+                        reinterpret_cast<std::uint64_t>(indirect_edge_fanout));
                     code->add(code->x12, code->x9,
                               static_cast<std::uint32_t>(
-                                  offsetof(PolymorphicChainSite, active)));
+                                  offsetof(IndirectEdgeFanout, active)));
                     code->ldar(code->w14, Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->w14, fallback);
 
                     code->add(code->x12, code->x9,
                               static_cast<std::uint32_t>(
-                                  offsetof(PolymorphicChainSite, ways)));
+                                  offsetof(IndirectEdgeFanout, ways)));
                     // Read the site capacity instead of baking the policy into every native
                     // block. Restored persistent code then follows future PIC tuning as well.
                     code->ldr(
@@ -15246,7 +15189,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         Xbyak_aarch64::ptr(
                             code->x9,
                             static_cast<std::uint32_t>(
-                                offsetof(PolymorphicChainSite, way_count))));
+                                offsetof(IndirectEdgeFanout, way_count))));
                     code->L(search_way);
                     code->ldar(code->x13, Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->x13, next_way);
@@ -15254,18 +15197,18 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                               Xbyak_aarch64::ptr(
                                   code->x13,
                                   static_cast<std::uint32_t>(
-                                      offsetof(ChainPatchCell, guest_rip))));
+                                      offsetof(OutboundEdgeState, guest_rip))));
                     code->cmp(code->x14, code->x20);
                     code->beq(have_slot);
 
                     code->L(next_way);
                     code->add(code->x12, code->x12,
                               static_cast<std::uint32_t>(
-                                  sizeof(std::atomic<ChainPatchCell*>)));
+                                  sizeof(std::atomic<OutboundEdgeState*>)));
                     code->subs(code->w15, code->w15, 1);
                     code->bne(search_way);
 
-                    // Misses alone cross into C++. The binder installs a stable ChainPatchCell;
+                    // Misses alone cross into C++. The binder installs a stable OutboundEdgeState;
                     // if its target was already compiled this very first miss can chain now.
                     code->L(bind);
                     emit_flush_register_caches();
@@ -15273,7 +15216,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->mov(code->x1, code->x20);
                     EmitJitRelocatablePointer(
                         *code, code->x16,
-                        reinterpret_cast<std::uint64_t>(&BindPolymorphicChainSite));
+                        reinterpret_cast<std::uint64_t>(&BindIndirectEdgeFanout));
                     code->blr(code->x16);
                     emit_reload_register_caches(true);
                     code->mov(code->x13, code->x0);
@@ -15283,30 +15226,19 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->ldar(code->x16, Xbyak_aarch64::ptr(code->x13));
                     code->cbz(code->x16, fallback);
 
-                    // Reuse the exact finite-chain budget and hash safepoint used by static direct
-                    // links. A valid safepoint deliberately returns to RunGuest after validation.
-                    code->ldrh(code->w11,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateDispatchChainBudgetOffset));
+                    // Reuse the same phase wheel as static edges. A completed cycle deliberately
+                    // returns to RunGuest after validating the destination snapshot.
+                    code->ldr(code->w11,
+                              Xbyak_aarch64::ptr(code->x19,
+                                                kStateNativeEdgePhaseOffset));
                     code->cbz(code->w11, refill_chain_budget);
                     code->subs(code->w11, code->w11, 1);
-                    code->strh(code->w11,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateDispatchChainBudgetOffset));
+                    code->str(code->w11,
+                              Xbyak_aarch64::ptr(code->x19,
+                                                kStateNativeEdgePhaseOffset));
                     code->bne(chain);
 
                     code->L(validate);
-                    Xbyak_aarch64::Label refill_validation_budget;
-                    Xbyak_aarch64::Label dispatch_only;
-                    code->ldrh(code->w12,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateCodeValidationBudgetOffset));
-                    code->cbz(code->w12, refill_validation_budget);
-                    code->subs(code->w12, code->w12, 1);
-                    code->strh(code->w12,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateCodeValidationBudgetOffset));
-                    code->cbnz(code->w12, dispatch_only);
                     emit_flush_register_caches();
                     code->mov(code->x0, code->x13);
                     code->mov(code->x1, code->x16);
@@ -15317,29 +15249,22 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     code->blr(code->x17);
                     emit_reload_register_caches(true);
                     code->b(fallback);
-                    code->L(refill_validation_budget);
-                    code->mov(code->w12, kDirectValidationSliceBudget - 1u);
-                    code->strh(code->w12,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateCodeValidationBudgetOffset));
-                    code->L(dispatch_only);
-                    code->b(fallback);
 
                     code->L(refill_chain_budget);
-                    code->mov(code->w11, kDirectChainBudget - 1u);
-                    code->strh(code->w11,
-                               Xbyak_aarch64::ptr(code->x19,
-                                                 kStateDispatchChainBudgetOffset));
+                    code->mov(code->w11, kNativeEdgeSchedulePeriod - 1u);
+                    code->str(code->w11,
+                              Xbyak_aarch64::ptr(code->x19,
+                                                kStateNativeEdgePhaseOffset));
                     code->L(chain);
                     // Source/title retirement disables the whole PIC and must remain an immediate
                     // guard. Target code itself is lifetime-stable; byte/epoch validation remains
                     // bounded by the same safepoint as static links.
                     EmitJitRelocatablePointer(
                         *code, code->x9,
-                        reinterpret_cast<std::uint64_t>(inchain_patch_site));
+                        reinterpret_cast<std::uint64_t>(indirect_edge_fanout));
                     code->add(code->x12, code->x9,
                               static_cast<std::uint32_t>(
-                                  offsetof(PolymorphicChainSite, active)));
+                                  offsetof(IndirectEdgeFanout, active)));
                     code->ldar(code->w17, Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->w17, fallback);
                     code->mov(code->x0, code->x19);
@@ -16243,7 +16168,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                     // Semantic leaves follow AAPCS and may clobber x6-x8/q16-q23. A memory block
                     // can legitimately cache a stable base in one of those registers across a
                     // locked/rare instruction lowered through this leaf. Publish dirty values
-                    // before the call and reconstruct every selected cache afterwards; otherwise
+                    // before the call and reload every selected cache afterwards; otherwise
                     // the next direct memory operand can use a helper-clobbered guest base while
                     // LsxMachineImage still contains the correct architectural value.
                     emit_flush_register_caches();
@@ -20381,7 +20306,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->str(code->x0,
                                       Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
                             if (generic_has_call_terminator) {
-                                if (!emit_epilogue_chain_patch(fallthrough)) {
+                                if (!emit_static_edge_tail(fallthrough)) {
                                     emit_epilogue_return(fallthrough);
                                 }
                             } else {
@@ -20394,7 +20319,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                                 code->str(code->x11,
                                           Xbyak_aarch64::ptr(code->x19,
                                                             kStateRspOffset));
-                                if (!emit_epilogue_inchain_patch(code->x10)) {
+                                if (!emit_computed_edge_tail(code->x10)) {
                                     emit_epilogue_return_reg(code->x10);
                                 }
                             }
@@ -20462,7 +20387,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             code->dmb(Xbyak_aarch64::ISH);
                             code->str(code->x0,
                                       Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
-                            if (!emit_epilogue_chain_patch(fallthrough)) {
+                            if (!emit_static_edge_tail(fallthrough)) {
                                 emit_epilogue_return(fallthrough);
                             }
                             code->L(leaf_hle_fallback);
@@ -20502,11 +20427,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                 if (emitted) {
                     if (generic_has_conditional_terminator) {
                         code->L(skip);
-                        if (!emit_epilogue_chain_patch(fallthrough)) {
+                        if (!emit_static_edge_tail(fallthrough)) {
                             emit_epilogue_return(fallthrough);
                         }
                         code->L(take);
-                        if (!emit_epilogue_chain_patch(branch_target)) {
+                        if (!emit_static_edge_tail(branch_target)) {
                             emit_epilogue_return(branch_target);
                         }
                     } else if (generic_has_jump_terminator ||
@@ -20518,18 +20443,18 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             emit_epilogue_return_reg(code->x10);
                         } else if (generic_has_dynamic_control_terminator &&
                             generic_has_jump_terminator &&
-                            emit_epilogue_inchain_patch(code->x10)) {
+                            emit_computed_edge_tail(code->x10)) {
                             // Both the hit and miss paths own a complete terminal epilogue.
                         } else if (generic_has_dynamic_control_terminator ||
-                                   !emit_epilogue_chain_patch(branch_target)) {
+                                   !emit_static_edge_tail(branch_target)) {
                             emit_epilogue_return_reg(code->x10);
                         }
                     } else if (generic_has_ret_terminator) {
-                        if (!emit_epilogue_inchain_patch(code->x10)) {
+                        if (!emit_computed_edge_tail(code->x10)) {
                             emit_epilogue_return_reg(code->x10);
                         }
                     } else {
-                        if (!emit_epilogue_chain_patch(fallthrough)) {
+                        if (!emit_static_edge_tail(fallthrough)) {
                             emit_epilogue_return(fallthrough);
                         }
                     }
@@ -20634,8 +20559,8 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         if (direct_target_out != nullptr) {
                             *direct_target_out = normal_entry;
                         }
-                        if (chain_target_out != nullptr) {
-                            *chain_target_out = entry;
+                        if (resident_entry_out != nullptr) {
+                            *resident_entry_out = entry;
                         }
                         if (chain_abi_out != nullptr) {
                             *chain_abi_out = true;
@@ -20907,48 +20832,35 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         return true;
     };
 
-    const auto emit_chain_patch_consumer = [&](
+    const auto emit_outbound_edge_consumer = [&](
         Xbyak_aarch64::CodeGenerator& code,
         const std::uint64_t fallback_guest_target) {
-        if (outgoing_direct_slot == nullptr) {
+        if (primary_outbound_edge == nullptr) {
             return false;
         }
         Xbyak_aarch64::Label refill_chain_budget;
         Xbyak_aarch64::Label scheduling_boundary;
-        Xbyak_aarch64::Label refill_validation_budget;
         Xbyak_aarch64::Label chain;
         Xbyak_aarch64::Label fallback;
         EmitJitRelocatablePointer(
             code, code.x9,
-            reinterpret_cast<std::uint64_t>(&outgoing_direct_slot->target));
-        // Stable slots are published with release stores. The steady-state edge consists only of
-        // this acquire, two private-counter operations and the tail branch; C++ is reserved for
-        // the sparse SMC validation boundary.
+            reinterpret_cast<std::uint64_t>(&primary_outbound_edge->target));
+        // The steady-state edge consists of one acquire, one private phase update and the tail
+        // branch; C++ is reserved for the sparse SMC validation boundary.
         code.ldar(code.x16, Xbyak_aarch64::ptr(code.x9));
         code.cbz(code.x16, fallback);
 
-        code.ldrh(code.w11,
-                  Xbyak_aarch64::ptr(code.x0,
-                                    kStateDispatchChainBudgetOffset));
+        code.ldr(code.w11,
+                 Xbyak_aarch64::ptr(code.x0,
+                                   kStateNativeEdgePhaseOffset));
         code.cbz(code.w11, refill_chain_budget);
         code.subs(code.w11, code.w11, 1);
-        code.strh(code.w11,
-                  Xbyak_aarch64::ptr(code.x0,
-                                    kStateDispatchChainBudgetOffset));
+        code.str(code.w11,
+                 Xbyak_aarch64::ptr(code.x0,
+                                   kStateNativeEdgePhaseOffset));
         code.bne(chain);
 
         code.L(scheduling_boundary);
-        code.ldrh(code.w12,
-                  Xbyak_aarch64::ptr(code.x0,
-                                    kStateCodeValidationBudgetOffset));
-        code.cbz(code.w12, refill_validation_budget);
-        code.subs(code.w12, code.w12, 1);
-        code.strh(code.w12,
-                  Xbyak_aarch64::ptr(code.x0,
-                                    kStateCodeValidationBudgetOffset));
-        // Most scheduling boundaries return immediately; no frame and no validator call.
-        code.cbnz(code.w12, fallback);
-
         code.stp(code.x29, code.x30,
                  Xbyak_aarch64::pre_ptr(code.sp, -32));
         code.stp(code.x19, code.x20, Xbyak_aarch64::ptr(code.sp, 16));
@@ -20957,7 +20869,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         code.mov(code.x20, code.x16);
         EmitJitRelocatablePointer(
             code, code.x0,
-            reinterpret_cast<std::uint64_t>(outgoing_direct_slot));
+            reinterpret_cast<std::uint64_t>(primary_outbound_edge));
         code.mov(code.x1, code.x20);
         EmitJitRelocatablePointer(
             code, code.x17,
@@ -20972,18 +20884,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         // scheduling boundary. It observes the authoritative cache epoch before re-entry.
         code.b(fallback);
 
-        code.L(refill_validation_budget);
-        code.mov(code.w12, kDirectValidationSliceBudget - 1u);
-        code.strh(code.w12,
-                  Xbyak_aarch64::ptr(code.x0,
-                                    kStateCodeValidationBudgetOffset));
-        code.b(fallback);
-
         code.L(refill_chain_budget);
-        code.mov(code.w11, kDirectChainBudget - 1u);
-        code.strh(code.w11,
-                  Xbyak_aarch64::ptr(code.x0,
-                                    kStateDispatchChainBudgetOffset));
+        code.mov(code.w11, kNativeEdgeSchedulePeriod - 1u);
+        code.str(code.w11,
+                 Xbyak_aarch64::ptr(code.x0,
+                                   kStateNativeEdgePhaseOffset));
         code.L(chain);
         // The tail target bypasses RunGuest's next loop iteration.  Publish its
         // static guest RIP before BR so a fault in the linked entry maps to the
@@ -21175,7 +21080,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         }
         std::uint64_t static_target = 0;
         if (!TryResolveBranchTarget(ir, static_target) ||
-            !emit_chain_patch_consumer(*code, static_target)) {
+            !emit_outbound_edge_consumer(*code, static_target)) {
             code->mov(code->x0, code->x10);
             code->ret();
         }
@@ -21202,7 +21107,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
         code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRspOffset));
         std::uint64_t static_target = 0;
         if (!TryResolveBranchTarget(ir, static_target) ||
-            !emit_chain_patch_consumer(*code, static_target)) {
+            !emit_outbound_edge_consumer(*code, static_target)) {
             code->mov(code->x0, code->x10);
             code->ret();
         }
@@ -21235,7 +21140,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
     return nullptr;
 }
 
-Arm64BlockEntry Aarch64CodeArena::EmitInterpreterBridge(const LsxDecodedRegion& block) {
+Arm64BlockEntry NativeSegmentDepot::EmitInterpreterBridge(const LsxDecodedRegion& block) {
     auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
 
     code->stp(code->x29, code->x30, Xbyak_aarch64::pre_ptr(code->sp, -32));
@@ -21350,7 +21255,7 @@ enum class JitStableNativeTargetId : std::uint32_t {
     RotateMem = 22,
     ValidateDirectTarget = 23,
     ValidateDirectTargetAtSafepoint = 24,
-    BindPolymorphicChainSite = 25,
+    BindIndirectEdgeFanout = 25,
     ReservedDiagnostic26 = 26,
     ReservedDiagnostic27 = 27,
     ReservedDiagnostic28 = 28,
@@ -21422,8 +21327,8 @@ std::span<const JitStableNativeTarget> JitStableNativeTargets() noexcept {
             reinterpret_cast<std::uint64_t>(&ValidateObservedDirectTarget)},
         JitStableNativeTarget{JitStableNativeTargetId::ValidateDirectTargetAtSafepoint,
             reinterpret_cast<std::uint64_t>(&ValidateObservedDirectTargetAtSafepoint)},
-        JitStableNativeTarget{JitStableNativeTargetId::BindPolymorphicChainSite,
-            reinterpret_cast<std::uint64_t>(&BindPolymorphicChainSite)},
+        JitStableNativeTarget{JitStableNativeTargetId::BindIndirectEdgeFanout,
+            reinterpret_cast<std::uint64_t>(&BindIndirectEdgeFanout)},
         JitStableNativeTarget{JitStableNativeTargetId::TryLeafHleThunk,
             reinterpret_cast<std::uint64_t>(&ExecutorJitTryLeafHleThunkCallback)},
         JitStableNativeTarget{JitStableNativeTargetId::CompareExchangeValue,
@@ -36528,7 +36433,7 @@ std::string ExerciseTranslationEngineJson() {
     std::ostringstream out;
     try {
         const ScopedJitSelfTestDifferential selftest_differential_scope;
-        Aarch64CodeArena arena;
+        NativeSegmentDepot arena;
         auto* ret_block = arena.EmitReturnImmediateBlock(0x123456789abcdef0ull);
         const std::uint64_t ret_value = ret_block(nullptr);
 
@@ -36719,7 +36624,7 @@ std::string ExerciseTranslationEngineJson() {
         std::uint64_t direct_zero_chain_result = 0;
         bool direct_zero_root_chain_ok = false;
         try {
-            // Publish the forward target before compiling the wrapper so AcquireChainPatchCell sees
+            // Publish the forward target before compiling the wrapper so CreateOutboundEdge sees
             // the exact already-compiled chain that used to make the bug order-dependent.
             direct_zero_target_result = DispatchGuestOnArm64(direct_zero_root_target, {});
             direct_zero_chain_result = DispatchGuestOnArm64(direct_zero_root_rip, {});
@@ -36736,42 +36641,40 @@ std::string ExerciseTranslationEngineJson() {
         LsxTranslationEngine smc_backend;
         const std::uint64_t smc_rip =
             reinterpret_cast<std::uint64_t>(mapped_entry.data());
-        const std::uint64_t hash_before =
-            HashGuestCodeWindow(smc_rip, static_cast<std::uint32_t>(mapped_entry.size()));
         const std::uint64_t mismatch_before =
             g_jit_cache_hash_misses.load(std::memory_order_relaxed);
         const std::uint64_t smc_first = smc_backend.RunGuest(smc_rip, ctx);
         const TranslationRecord cache_result_before =
             smc_backend.ResolveTranslation(smc_rip);
-        const std::uint64_t direct_slot_tls_hits_before =
-            g_jit_thread_chain_patch_cache.hits;
-        auto* cache_direct_slot_before = smc_backend.AcquireChainPatchCell(smc_rip);
-        auto* cache_direct_slot_repeat = smc_backend.AcquireChainPatchCell(smc_rip);
-        const bool direct_slot_tls_lookup_ok =
-            cache_direct_slot_before != nullptr &&
-            cache_direct_slot_repeat == cache_direct_slot_before &&
-            g_jit_thread_chain_patch_cache.hits >
-                direct_slot_tls_hits_before;
+        const std::uint64_t hash_before = cache_result_before.guest_hash;
+        auto* cache_direct_edge_before = smc_backend.CreateOutboundEdge(smc_rip);
+        auto* cache_direct_edge_repeat = smc_backend.CreateOutboundEdge(smc_rip);
+        const bool direct_edge_ownership_ok =
+            cache_direct_edge_before != nullptr &&
+            cache_direct_edge_repeat != nullptr &&
+            cache_direct_edge_repeat != cache_direct_edge_before;
         const Arm64BlockEntry cache_direct_entry_before =
-            cache_direct_slot_before->target.load(std::memory_order_acquire);
+            cache_direct_edge_before->target.load(std::memory_order_acquire);
         mapped_entry[6] = 0x06; // add rax,6 instead of add rax,5
-        const std::uint64_t hash_after =
-            HashGuestCodeWindow(smc_rip, static_cast<std::uint32_t>(mapped_entry.size()));
         const std::uint64_t smc_second = smc_backend.RunGuest(smc_rip, ctx);
         const TranslationRecord cache_result_after =
             smc_backend.ResolveTranslation(smc_rip);
-        auto* cache_direct_slot_after = smc_backend.AcquireChainPatchCell(smc_rip);
+        const std::uint64_t hash_after = cache_result_after.guest_hash;
+        auto* cache_direct_edge_after = smc_backend.CreateOutboundEdge(smc_rip);
         const Arm64BlockEntry cache_direct_entry_after =
-            cache_direct_slot_after->target.load(std::memory_order_acquire);
+            cache_direct_edge_after->target.load(std::memory_order_acquire);
         const std::uint64_t mismatch_after =
             g_jit_cache_hash_misses.load(std::memory_order_relaxed);
         mapped_entry[6] = 0x05;
         const bool cache_contract_ok =
             smc_first == 12 && smc_second == 13 && hash_before != hash_after &&
             mismatch_after > mismatch_before &&
-            direct_slot_tls_lookup_ok &&
-            cache_direct_slot_before == cache_direct_slot_after &&
+            direct_edge_ownership_ok &&
+            cache_direct_edge_after != nullptr &&
+            cache_direct_edge_before != cache_direct_edge_after &&
+            cache_direct_edge_repeat != cache_direct_edge_after &&
             cache_direct_entry_before == nullptr &&
+            cache_direct_edge_repeat->target.load(std::memory_order_acquire) == nullptr &&
             cache_direct_entry_after == nullptr;
         const bool cache_public_hash_abi_ok =
             cache_result_before.guest_size == mapped_entry.size() &&
@@ -36798,10 +36701,14 @@ std::string ExerciseTranslationEngineJson() {
             const std::uint64_t fallthrough_rip = conditional_rip + 5;
             const std::uint64_t taken_rip = conditional_rip + 16;
             LsxDecodedRegion conditional_block = DecodeGuestBasicRegion(conditional_rip, 8);
+            LsxDecodedRegion taken_witness = DecodeGuestBasicRegion(taken_rip, 1);
+            LsxDecodedRegion fallthrough_witness =
+                DecodeGuestBasicRegion(fallthrough_rip, 1);
 
-            std::atomic<std::uint64_t> conditional_epoch{1};
-            ChainPatchCell taken_slot(taken_rip, &conditional_epoch);
-            ChainPatchCell fallthrough_slot(fallthrough_rip, &conditional_epoch);
+            PublishedCodeWitness taken_publication(&taken_witness);
+            PublishedCodeWitness fallthrough_publication(&fallthrough_witness);
+            OutboundEdgeState taken_slot(taken_rip);
+            OutboundEdgeState fallthrough_slot(fallthrough_rip);
             constexpr std::uint64_t kTakenMarker = 0x1122334455667788ull;
             constexpr std::uint64_t kFallthroughMarker = 0x4C53585F4D41524Bull;
             Arm64BlockEntry taken_marker = arena.EmitReturnImmediateBlock(kTakenMarker);
@@ -36811,39 +36718,33 @@ std::string ExerciseTranslationEngineJson() {
                 arena.EmitSharedChainReturnImmediateBlock(kTakenMarker);
             Arm64BlockEntry fallthrough_chain_marker =
                 arena.EmitSharedChainReturnImmediateBlock(kFallthroughMarker);
-            const auto arm_slot = [](ChainPatchCell& slot, Arm64BlockEntry target,
-                                     Arm64BlockEntry chain_target) {
-                slot.guest_size.store(1, std::memory_order_relaxed);
-                slot.guest_hash.store(HashGuestCodeWindow(slot.guest_rip, 1),
-                                      std::memory_order_relaxed);
-                slot.chain_target.store(chain_target,
-                                        std::memory_order_relaxed);
-                slot.MarkPublication();
-                slot.target.store(target, std::memory_order_release);
+            const auto arm_slot = [](OutboundEdgeState& slot, Arm64BlockEntry selected_entry,
+                                     const PublishedCodeWitness* witness) {
+                slot.code_witness.store(witness, std::memory_order_relaxed);
+                slot.enters_resident_frame = true;
+                slot.target.store(selected_entry, std::memory_order_release);
             };
-            arm_slot(taken_slot, taken_marker, taken_chain_marker);
-            arm_slot(fallthrough_slot, fallthrough_marker,
-                     fallthrough_chain_marker);
+            arm_slot(taken_slot, taken_chain_marker, &taken_publication);
+            arm_slot(fallthrough_slot, fallthrough_chain_marker,
+                     &fallthrough_publication);
 
             Arm64BlockEntry conditional_direct = nullptr;
             Arm64BlockEntry conditional_entry = arena.EmitNativeControlFlowBlock(
                 conditional_block, &taken_slot, &conditional_direct,
                 &fallthrough_slot);
-            const auto set_chain_budget = [](LsxMachineImage& state,
-                                             const std::uint16_t dispatch_budget,
-                                             const std::uint16_t validation_budget = 2) {
-                state.dispatch_chain_budget = dispatch_budget;
-                state.code_validation_budget = validation_budget;
+            const auto set_edge_phase = [](LsxMachineImage& state,
+                                           const std::uint32_t phase) {
+                state.native_edge_phase = phase;
             };
 
             LsxMachineImage taken_state{};
             WriteGuestGpr64(taken_state, LsxGpr::Rdi, 0);
-            set_chain_budget(taken_state, 2);
+            set_edge_phase(taken_state, 2);
             const std::uint64_t taken_result =
                 conditional_direct != nullptr ? conditional_direct(&taken_state) : 0;
             LsxMachineImage fallthrough_state{};
             WriteGuestGpr64(fallthrough_state, LsxGpr::Rdi, 1);
-            set_chain_budget(fallthrough_state, 2);
+            set_edge_phase(fallthrough_state, 2);
             const std::uint64_t fallthrough_result =
                 conditional_direct != nullptr ? conditional_direct(&fallthrough_state) : 0;
             conditional_two_edge_semantic_ok =
@@ -36853,31 +36754,31 @@ std::string ExerciseTranslationEngineJson() {
                 taken_result == kTakenMarker &&
                 fallthrough_result == kFallthroughMarker;
 
-            const std::uint64_t epoch_before_safepoint =
-                conditional_epoch.load(std::memory_order_acquire);
+            const std::uint32_t revision_before_safepoint =
+                taken_publication.revision.load(std::memory_order_acquire);
             LsxMachineImage safepoint_state{};
             WriteGuestGpr64(safepoint_state, LsxGpr::Rdi, 1);
-            set_chain_budget(safepoint_state, 1);
+            set_edge_phase(safepoint_state, 1);
             const std::uint64_t safepoint_result =
                 conditional_direct != nullptr ? conditional_direct(&safepoint_state) : 0;
             conditional_two_edge_safepoint_ok =
                 safepoint_result == fallthrough_rip &&
                 fallthrough_slot.target.load(std::memory_order_acquire) ==
-                    fallthrough_marker &&
-                conditional_epoch.load(std::memory_order_acquire) ==
-                    epoch_before_safepoint;
+                    fallthrough_chain_marker &&
+                taken_publication.revision.load(std::memory_order_acquire) ==
+                    revision_before_safepoint;
 
             conditional_code[16] ^= 0x01;
             LsxMachineImage smc_state{};
             WriteGuestGpr64(smc_state, LsxGpr::Rdi, 0);
-            set_chain_budget(smc_state, 1, 1);
+            set_edge_phase(smc_state, 1);
             const std::uint64_t smc_result =
                 conditional_direct != nullptr ? conditional_direct(&smc_state) : 0;
             conditional_two_edge_smc_ok =
                 smc_result == taken_rip &&
                 taken_slot.target.load(std::memory_order_acquire) == nullptr &&
-                conditional_epoch.load(std::memory_order_acquire) ==
-                    epoch_before_safepoint + 1;
+                taken_publication.revision.load(std::memory_order_acquire) ==
+                    revision_before_safepoint + 1;
             conditional_code[16] ^= 0x01;
         }
         const bool conditional_two_edge_direct_ok =
@@ -36898,10 +36799,10 @@ std::string ExerciseTranslationEngineJson() {
             constexpr std::size_t kBlockCount = 128;
             constexpr std::size_t kIterations = 4096;
             std::array<std::array<std::uint8_t, 4>, kBlockCount> chain_code{};
-            std::vector<std::unique_ptr<ChainPatchCell>> chain_slots;
+            std::vector<std::unique_ptr<OutboundEdgeState>> linear_edges;
             std::array<Arm64BlockEntry, kBlockCount> chain_entries{};
             std::array<Arm64BlockEntry, kBlockCount> chain_bodies{};
-            chain_slots.reserve(kBlockCount);
+            linear_edges.reserve(kBlockCount);
             bool emitted_all = true;
             for (std::size_t index = 0; index < kBlockCount; ++index) {
                 chain_code[index] = {
@@ -36909,14 +36810,14 @@ std::string ExerciseTranslationEngineJson() {
                 };
                 const std::uint64_t rip =
                     reinterpret_cast<std::uint64_t>(chain_code[index].data());
-                chain_slots.push_back(
-                    std::make_unique<ChainPatchCell>(rip + 4, nullptr));
+                linear_edges.push_back(
+                    std::make_unique<OutboundEdgeState>(rip + 4));
                 LsxDecodedRegion block = DecodeGuestBasicRegion(rip, 1);
                 Arm64BlockEntry normal_direct = nullptr;
                 Arm64BlockEntry chain_body = nullptr;
                 bool chain_abi = false;
                 chain_entries[index] = arena.EmitNativeControlFlowBlock(
-                    block, chain_slots[index].get(), &normal_direct, nullptr,
+                    block, linear_edges[index].get(), &normal_direct, nullptr,
                     nullptr, nullptr, &chain_abi, &chain_body);
                 chain_bodies[index] = chain_body;
                 emitted_all =
@@ -36924,11 +36825,6 @@ std::string ExerciseTranslationEngineJson() {
                     normal_direct == chain_entries[index] && chain_abi &&
                     chain_body != nullptr;
             }
-            for (std::size_t index = 0; index + 1 < kBlockCount; ++index) {
-                chain_slots[index]->target.store(chain_entries[index + 1],
-                                                 std::memory_order_relaxed);
-            }
-
             LsxMachineImage warm_state{};
             for (std::size_t index = 0; index < kBlockCount; ++index) {
                 (void)chain_entries[index](&warm_state);
@@ -36941,8 +36837,8 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage chained_state{};
             const auto measure_baseline = [&]() {
                 for (std::size_t index = 0; index + 1 < kBlockCount; ++index) {
-                    chain_slots[index]->chain_target.store(nullptr,
-                                                           std::memory_order_relaxed);
+                    linear_edges[index]->target.store(nullptr,
+                                                      std::memory_order_relaxed);
                 }
                 const auto begin = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < kIterations; ++iteration) {
@@ -36959,13 +36855,12 @@ std::string ExerciseTranslationEngineJson() {
                 // deliberately crosses the periodic validation boundary; without this reset the
                 // next sample would measure the retired post-safepoint edge rather than chaining.
                 for (std::size_t index = 0; index + 1 < kBlockCount; ++index) {
-                    chain_slots[index]->chain_target.store(
+                    linear_edges[index]->target.store(
                         chain_bodies[index + 1], std::memory_order_relaxed);
                 }
                 const auto begin = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < kIterations; ++iteration) {
-                    chained_state.dispatch_chain_budget = 4096;
-                    chained_state.code_validation_budget = 4096;
+                    chained_state.native_edge_phase = 4096;
                     (void)chain_entries[0](&chained_state);
                 }
                 return static_cast<std::uint64_t>(
@@ -37024,18 +36919,13 @@ std::string ExerciseTranslationEngineJson() {
         bool generic_indirect_pic_persistence_roundtrip_ok = false;
         {
             const ScopedJitSelfTestProductionDirect production_direct_scope;
-            const auto set_chain_budget = [](LsxMachineImage& state,
-                                             const std::uint16_t dispatch_budget,
-                                             const std::uint16_t validation_budget = 2) {
-                state.dispatch_chain_budget = dispatch_budget;
-                state.code_validation_budget = validation_budget;
+            const auto set_edge_phase = [](LsxMachineImage& state,
+                                           const std::uint32_t phase) {
+                state.native_edge_phase = phase;
             };
-            const auto arm_slot = [](ChainPatchCell& slot, Arm64BlockEntry target,
-                                     const std::uint32_t guest_size = 0,
-                                     const std::uint64_t guest_hash = 0) {
-                slot.guest_size.store(guest_size, std::memory_order_relaxed);
-                slot.guest_hash.store(guest_hash, std::memory_order_relaxed);
-                slot.MarkPublication();
+            const auto arm_slot = [](OutboundEdgeState& slot, Arm64BlockEntry target,
+                                     const PublishedCodeWitness* witness = nullptr) {
+                slot.code_witness.store(witness, std::memory_order_relaxed);
                 slot.target.store(target, std::memory_order_release);
             };
 
@@ -37045,9 +36935,8 @@ std::string ExerciseTranslationEngineJson() {
             constexpr std::uint64_t kPicMarkerB = 0x02468ace13579bdfull;
             Arm64BlockEntry pic_marker_a = arena.EmitReturnImmediateBlock(kPicMarkerA);
             Arm64BlockEntry pic_marker_b = arena.EmitReturnImmediateBlock(kPicMarkerB);
-            std::atomic<std::uint64_t> pic_epoch{1};
-            ChainPatchCell pic_slot_a(kPicGuestTargetA, &pic_epoch);
-            ChainPatchCell pic_slot_b(kPicGuestTargetB, &pic_epoch);
+            OutboundEdgeState pic_slot_a(kPicGuestTargetA);
+            OutboundEdgeState pic_slot_b(kPicGuestTargetB);
             arm_slot(pic_slot_a, pic_marker_a);
             arm_slot(pic_slot_b, pic_marker_b);
 
@@ -37056,7 +36945,7 @@ std::string ExerciseTranslationEngineJson() {
             };
             LsxDecodedRegion pic_jmp_block = DecodeGuestBasicRegion(
                 reinterpret_cast<std::uint64_t>(pic_jmp_rax.data()), 1);
-            PolymorphicChainSite pic_site(nullptr, pic_jmp_block.start_rip);
+            IndirectEdgeFanout pic_site(nullptr, pic_jmp_block.start_rip);
             pic_site.ways[0].store(&pic_slot_a, std::memory_order_release);
             pic_site.ways[1].store(&pic_slot_b, std::memory_order_release);
             Arm64BlockEntry pic_jmp_direct = nullptr;
@@ -37068,12 +36957,12 @@ std::string ExerciseTranslationEngineJson() {
                 &pic_jmp_used, &pic_jmp_chain_abi, &pic_jmp_chain);
             LsxMachineImage pic_state_a{};
             WriteGuestGpr64(pic_state_a, LsxGpr::Rax, kPicGuestTargetA);
-            set_chain_budget(pic_state_a, 2);
+            set_edge_phase(pic_state_a, 2);
             const std::uint64_t pic_result_a =
                 pic_jmp_direct != nullptr ? pic_jmp_direct(&pic_state_a) : 0;
             LsxMachineImage pic_state_b{};
             WriteGuestGpr64(pic_state_b, LsxGpr::Rax, kPicGuestTargetB);
-            set_chain_budget(pic_state_b, 2);
+            set_edge_phase(pic_state_b, 2);
             const std::uint64_t pic_result_b =
                 pic_jmp_direct != nullptr ? pic_jmp_direct(&pic_state_b) : 0;
             generic_indirect_pic_mono_poly_ok =
@@ -37082,11 +36971,11 @@ std::string ExerciseTranslationEngineJson() {
                 pic_state_a.rip_or_exit == kPicGuestTargetA &&
                 pic_state_b.rip_or_exit == kPicGuestTargetB;
 
-            // A cold way installs the target's stable ChainPatchCell before falling back. Once
+            // A cold way installs the target's stable OutboundEdgeState before falling back. Once
             // normal publication fills that slot, the same emitted block must chain without a
             // second binder call.
             LsxTranslationEngine pic_backend;
-            PolymorphicChainSite cold_site(&pic_backend, pic_jmp_block.start_rip);
+            IndirectEdgeFanout cold_site(&pic_backend, pic_jmp_block.start_rip);
             Arm64BlockEntry cold_jmp_direct = nullptr;
             bool cold_jmp_used = false;
             Arm64BlockEntry cold_jmp_entry = arena.EmitNativeControlFlowBlock(
@@ -37096,21 +36985,21 @@ std::string ExerciseTranslationEngineJson() {
                 g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             LsxMachineImage cold_state{};
             WriteGuestGpr64(cold_state, LsxGpr::Rax, kPicGuestTargetA);
-            set_chain_budget(cold_state, 2);
+            set_edge_phase(cold_state, 2);
             const std::uint64_t cold_result =
                 cold_jmp_direct != nullptr ? cold_jmp_direct(&cold_state) : 0;
             const std::uint64_t bind_after_miss =
                 g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
-            ChainPatchCell* cold_bound_slot =
+            OutboundEdgeState* cold_bound_slot =
                 cold_site.ways[0].load(std::memory_order_acquire);
             if (cold_bound_slot == nullptr) {
                 cold_bound_slot = cold_site.ways[1].load(std::memory_order_acquire);
             }
-            pic_backend.PublishChainPatch(
-                kPicGuestTargetA, pic_marker_a, nullptr, 1, 0, 0);
+            pic_backend.InstallPublishedDestination(
+                kPicGuestTargetA, pic_marker_a, nullptr, nullptr, 0);
             LsxMachineImage warm_state{};
             WriteGuestGpr64(warm_state, LsxGpr::Rax, kPicGuestTargetA);
-            set_chain_budget(warm_state, 2);
+            set_edge_phase(warm_state, 2);
             const std::uint64_t warm_result =
                 cold_jmp_direct != nullptr ? cold_jmp_direct(&warm_state) : 0;
             const std::uint64_t bind_after_hit =
@@ -37125,7 +37014,7 @@ std::string ExerciseTranslationEngineJson() {
             const std::array<std::uint8_t, 1> pic_ret = {0xc3};
             LsxDecodedRegion pic_ret_block = DecodeGuestBasicRegion(
                 reinterpret_cast<std::uint64_t>(pic_ret.data()), 1);
-            PolymorphicChainSite ret_site(nullptr, pic_ret_block.start_rip, true);
+            IndirectEdgeFanout ret_site(nullptr, pic_ret_block.start_rip, true);
             ret_site.ways[0].store(&pic_slot_a, std::memory_order_release);
             Arm64BlockEntry pic_ret_direct = nullptr;
             bool pic_ret_used = false;
@@ -37138,7 +37027,7 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage pic_ret_state{};
             WriteGuestGpr64(pic_ret_state, LsxGpr::Rsp,
                      reinterpret_cast<std::uint64_t>(pic_ret_stack.data()));
-            set_chain_budget(pic_ret_state, 2);
+            set_edge_phase(pic_ret_state, 2);
             const std::uint64_t pic_ret_rsp_before =
                 ReadGuestGpr64(pic_ret_state, LsxGpr::Rsp);
             const std::uint64_t pic_ret_result =
@@ -37147,7 +37036,7 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage pic_zero_state{};
             WriteGuestGpr64(pic_zero_state, LsxGpr::Rsp,
                      reinterpret_cast<std::uint64_t>(pic_zero_stack.data()));
-            set_chain_budget(pic_zero_state, 2);
+            set_edge_phase(pic_zero_state, 2);
             const std::uint64_t pic_zero_rsp_before =
                 ReadGuestGpr64(pic_zero_state, LsxGpr::Rsp);
             const std::uint64_t zero_bind_before =
@@ -37184,10 +37073,10 @@ std::string ExerciseTranslationEngineJson() {
                     kRetNineMarkerBase + static_cast<std::uint64_t>(index);
                 Arm64BlockEntry marker =
                     arena.EmitReturnImmediateBlock(ret_nine_markers[index]);
-                ret_nine_backend.PublishChainPatch(
-                    ret_nine_guest_targets[index], marker, nullptr, 1, 0, 0);
+                ret_nine_backend.InstallPublishedDestination(
+                    ret_nine_guest_targets[index], marker, nullptr, nullptr, 0);
             }
-            PolymorphicChainSite ret_nine_site(
+            IndirectEdgeFanout ret_nine_site(
                 &ret_nine_backend, pic_ret_block.start_rip, true);
             Arm64BlockEntry ret_nine_direct = nullptr;
             bool ret_nine_used = false;
@@ -37203,7 +37092,7 @@ std::string ExerciseTranslationEngineJson() {
                     LsxMachineImage state{};
                     WriteGuestGpr64(state, LsxGpr::Rsp,
                              reinterpret_cast<std::uint64_t>(stack.data()));
-                    set_chain_budget(state, 2);
+                    set_edge_phase(state, 2);
                     const std::uint64_t rsp_before =
                         ReadGuestGpr64(state, LsxGpr::Rsp);
                     const std::uint64_t result =
@@ -37223,7 +37112,7 @@ std::string ExerciseTranslationEngineJson() {
             std::array<bool, kRetNineTargetCount> ret_nine_cached{};
             std::size_t ret_nine_populated_ways = 0;
             for (const auto& way : ret_nine_site.ways) {
-                ChainPatchCell* const slot = way.load(std::memory_order_acquire);
+                OutboundEdgeState* const slot = way.load(std::memory_order_acquire);
                 if (slot == nullptr) {
                     continue;
                 }
@@ -37244,7 +37133,7 @@ std::string ExerciseTranslationEngineJson() {
                 g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed);
             generic_indirect_pic_ret_nine_way_warm_ok =
                 ret_nine_entry != nullptr && ret_nine_used &&
-                ret_nine_site.way_count == PolymorphicChainSite::kReturnWayCount &&
+                ret_nine_site.way_count == IndirectEdgeFanout::kReturnWayCount &&
                 ret_nine_first_ok && ret_nine_all_cached &&
                 ret_nine_bind_after_first ==
                     ret_nine_bind_before + kRetNineTargetCount &&
@@ -37258,13 +37147,11 @@ std::string ExerciseTranslationEngineJson() {
             };
             const std::uint64_t pic_smc_rip =
                 reinterpret_cast<std::uint64_t>(pic_smc_bytes.data());
-            std::atomic<std::uint64_t> pic_smc_epoch{9};
-            ChainPatchCell pic_smc_slot(pic_smc_rip, &pic_smc_epoch);
-            arm_slot(pic_smc_slot, pic_marker_a,
-                     static_cast<std::uint32_t>(pic_smc_bytes.size()),
-                     HashGuestCodeWindow(pic_smc_rip,
-                                    static_cast<std::uint32_t>(pic_smc_bytes.size())));
-            PolymorphicChainSite pic_smc_site(nullptr, pic_ret_block.start_rip, true);
+            OutboundEdgeState pic_smc_slot(pic_smc_rip);
+            LsxDecodedRegion pic_smc_witness = DecodeGuestBasicRegion(pic_smc_rip, 8);
+            PublishedCodeWitness pic_smc_publication(&pic_smc_witness);
+            arm_slot(pic_smc_slot, pic_marker_a, &pic_smc_publication);
+            IndirectEdgeFanout pic_smc_site(nullptr, pic_ret_block.start_rip, true);
             pic_smc_site.ways[0].store(&pic_smc_slot, std::memory_order_release);
             Arm64BlockEntry pic_smc_ret_direct = nullptr;
             bool pic_smc_ret_used = false;
@@ -37277,7 +37164,7 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage pic_safepoint_state{};
             WriteGuestGpr64(pic_safepoint_state, LsxGpr::Rsp,
                      reinterpret_cast<std::uint64_t>(pic_safepoint_stack.data()));
-            set_chain_budget(pic_safepoint_state, 1);
+            set_edge_phase(pic_safepoint_state, 1);
             const std::uint64_t pic_safepoint_result =
                 pic_smc_ret_direct != nullptr
                     ? pic_smc_ret_direct(&pic_safepoint_state)
@@ -37285,7 +37172,7 @@ std::string ExerciseTranslationEngineJson() {
             const bool valid_safepoint_ok =
                 pic_safepoint_result == pic_smc_rip &&
                 pic_smc_slot.target.load(std::memory_order_acquire) == pic_marker_a &&
-                pic_smc_epoch.load(std::memory_order_acquire) == 9;
+                pic_smc_publication.revision.load(std::memory_order_acquire) == 1;
             pic_smc_bytes[0] ^= 1u;
             alignas(16) std::array<std::uint64_t, 2> pic_mutated_stack = {
                 pic_smc_rip, 0,
@@ -37293,7 +37180,7 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage pic_mutated_state{};
             WriteGuestGpr64(pic_mutated_state, LsxGpr::Rsp,
                      reinterpret_cast<std::uint64_t>(pic_mutated_stack.data()));
-            set_chain_budget(pic_mutated_state, 1, 1);
+            set_edge_phase(pic_mutated_state, 1);
             const std::uint64_t pic_mutated_result =
                 pic_smc_ret_direct != nullptr
                     ? pic_smc_ret_direct(&pic_mutated_state)
@@ -37302,7 +37189,7 @@ std::string ExerciseTranslationEngineJson() {
                 pic_smc_ret_used && valid_safepoint_ok &&
                 pic_mutated_result == pic_smc_rip &&
                 pic_smc_slot.target.load(std::memory_order_acquire) == nullptr &&
-                pic_smc_epoch.load(std::memory_order_acquire) == 10;
+                pic_smc_publication.revision.load(std::memory_order_acquire) == 2;
             pic_smc_bytes[0] ^= 1u;
 
             const std::uint64_t retire_bind_before =
@@ -37310,11 +37197,11 @@ std::string ExerciseTranslationEngineJson() {
             cold_site.Retire();
             LsxMachineImage retired_state{};
             WriteGuestGpr64(retired_state, LsxGpr::Rax, kPicGuestTargetA);
-            set_chain_budget(retired_state, 2);
+            set_edge_phase(retired_state, 2);
             const std::uint64_t retired_result =
                 cold_jmp_direct != nullptr ? cold_jmp_direct(&retired_state) : 0;
             generic_indirect_pic_deny_retire_ok =
-                BindPolymorphicChainSite(&cold_site, 0) == nullptr &&
+                BindIndirectEdgeFanout(&cold_site, 0) == nullptr &&
                 retired_result == kPicGuestTargetA &&
                 cold_site.ways[0].load(std::memory_order_acquire) == nullptr &&
                 cold_site.ways[1].load(std::memory_order_acquire) == nullptr &&
@@ -37331,7 +37218,7 @@ std::string ExerciseTranslationEngineJson() {
                     pic_jmp_block, nullptr, nullptr,
                     &pic_site, pic_segments, pic_entry_segment, pic_direct_segment);
 #ifdef __ANDROID__
-            PolymorphicChainSite restored_pic_site(nullptr, pic_jmp_block.start_rip);
+            IndirectEdgeFanout restored_pic_site(nullptr, pic_jmp_block.start_rip);
             restored_pic_site.ways[0].store(&pic_slot_a, std::memory_order_release);
             restored_pic_site.ways[1].store(&pic_slot_b, std::memory_order_release);
             Arm64BlockEntry restored_pic_entry = nullptr;
@@ -37343,7 +37230,7 @@ std::string ExerciseTranslationEngineJson() {
                     restored_pic_direct);
             LsxMachineImage restored_pic_state{};
             WriteGuestGpr64(restored_pic_state, LsxGpr::Rax, kPicGuestTargetB);
-            set_chain_budget(restored_pic_state, 2);
+            set_edge_phase(restored_pic_state, 2);
             const std::uint64_t restored_pic_result =
                 restored_pic_entry != nullptr
                     ? restored_pic_entry(&restored_pic_state)
@@ -37365,12 +37252,12 @@ std::string ExerciseTranslationEngineJson() {
             generic_indirect_pic_deny_retire_ok &&
             generic_indirect_pic_persistence_roundtrip_ok;
 
-        // End-to-end direct-link contract. A slot obtained before target
+        // End-to-end native-edge contract. A slot obtained before target
         // compilation is null. Native target compilation publishes a distinct
         // fast entry, a generated JMP consumer tail-calls it, and mutation is
         // detected by the consumer-side hash guard before stale code executes.
-        alignas(16) std::array<std::uint8_t, 128> chain_patch_code{};
-        chain_patch_code.fill(0x90);
+        alignas(16) std::array<std::uint8_t, 128> outbound_edge_code{};
+        outbound_edge_code.fill(0x90);
         constexpr std::size_t kDirectConsumerOffset = 0;
         constexpr std::size_t kDirectCallConsumerOffset = 8;
         constexpr std::size_t kDirectMultiCallConsumerOffset = 16;
@@ -37378,27 +37265,27 @@ std::string ExerciseTranslationEngineJson() {
         constexpr std::size_t kDirectTargetOffset = 64;
         constexpr std::size_t kDirectBackwardJmpConsumerOffset = 96;
         constexpr std::size_t kDirectBackwardMultiJmpConsumerOffset = 104;
-        chain_patch_code[kDirectConsumerOffset] = 0xe9; // jmp rel32
+        outbound_edge_code[kDirectConsumerOffset] = 0xe9; // jmp rel32
         const std::int32_t direct_displacement = static_cast<std::int32_t>(
             kDirectTargetOffset - (kDirectConsumerOffset + 5));
-        std::memcpy(chain_patch_code.data() + 1, &direct_displacement,
+        std::memcpy(outbound_edge_code.data() + 1, &direct_displacement,
                     sizeof(direct_displacement));
-        chain_patch_code[kDirectCallConsumerOffset] = 0xe8; // call rel32
+        outbound_edge_code[kDirectCallConsumerOffset] = 0xe8; // call rel32
         const std::int32_t direct_call_displacement = static_cast<std::int32_t>(
             kDirectTargetOffset - (kDirectCallConsumerOffset + 5));
-        std::memcpy(chain_patch_code.data() + kDirectCallConsumerOffset + 1,
+        std::memcpy(outbound_edge_code.data() + kDirectCallConsumerOffset + 1,
                     &direct_call_displacement, sizeof(direct_call_displacement));
         // add ecx, 1; call rel32. CALL's implicit guest-stack write makes this
         // multi-instruction generic block direct-safe without a checked wrapper.
         const std::array<std::uint8_t, 4> direct_multi_call_prefix = {
             0x83, 0xc1, 0x01, 0xe8,
         };
-        std::memcpy(chain_patch_code.data() + kDirectMultiCallConsumerOffset,
+        std::memcpy(outbound_edge_code.data() + kDirectMultiCallConsumerOffset,
                     direct_multi_call_prefix.data(), direct_multi_call_prefix.size());
         const std::int32_t direct_multi_call_displacement =
             static_cast<std::int32_t>(
                 kDirectTargetOffset - (kDirectMultiCallConsumerOffset + 8));
-        std::memcpy(chain_patch_code.data() + kDirectMultiCallConsumerOffset + 4,
+        std::memcpy(outbound_edge_code.data() + kDirectMultiCallConsumerOffset + 4,
                     &direct_multi_call_displacement,
                     sizeof(direct_multi_call_displacement));
         // mov [rdi], eax; jmp rel32. The explicit store exercises the other
@@ -37406,12 +37293,12 @@ std::string ExerciseTranslationEngineJson() {
         const std::array<std::uint8_t, 3> direct_multi_jmp_prefix = {
             0x89, 0x07, 0xe9,
         };
-        std::memcpy(chain_patch_code.data() + kDirectMultiJmpConsumerOffset,
+        std::memcpy(outbound_edge_code.data() + kDirectMultiJmpConsumerOffset,
                     direct_multi_jmp_prefix.data(), direct_multi_jmp_prefix.size());
         const std::int32_t direct_multi_jmp_displacement =
             static_cast<std::int32_t>(
                 kDirectTargetOffset - (kDirectMultiJmpConsumerOffset + 7));
-        std::memcpy(chain_patch_code.data() + kDirectMultiJmpConsumerOffset + 3,
+        std::memcpy(outbound_edge_code.data() + kDirectMultiJmpConsumerOffset + 3,
                     &direct_multi_jmp_displacement,
                     sizeof(direct_multi_jmp_displacement));
         // The published target itself is a non-faulting one-instruction JMP.  Its successor is
@@ -37420,63 +37307,63 @@ std::string ExerciseTranslationEngineJson() {
         const std::array<std::uint8_t, 2> direct_target_bytes = {
             0xeb, 0x00,
         };
-        std::memcpy(chain_patch_code.data() + kDirectTargetOffset,
+        std::memcpy(outbound_edge_code.data() + kDirectTargetOffset,
                     direct_target_bytes.data(), direct_target_bytes.size());
         const std::array<std::uint8_t, 6> direct_target_callee = {
             0xb8, 0x44, 0x33, 0x22, 0x11, 0xc3,
         };
-        std::memcpy(chain_patch_code.data() + kDirectTargetOffset + 2,
+        std::memcpy(outbound_edge_code.data() + kDirectTargetOffset + 2,
                     direct_target_callee.data(), direct_target_callee.size());
         const std::array<std::uint8_t, 6> direct_mutated_callee = {
             0xb8, 0x55, 0x33, 0x22, 0x11, 0xc3,
         };
         constexpr std::size_t kDirectMutatedCalleeOffset = 80;
-        std::memcpy(chain_patch_code.data() + kDirectMutatedCalleeOffset,
+        std::memcpy(outbound_edge_code.data() + kDirectMutatedCalleeOffset,
                     direct_mutated_callee.data(), direct_mutated_callee.size());
-        chain_patch_code[kDirectBackwardJmpConsumerOffset] = 0xe9; // jmp rel32
+        outbound_edge_code[kDirectBackwardJmpConsumerOffset] = 0xe9; // jmp rel32
         const std::int32_t direct_backward_jmp_displacement =
             static_cast<std::int32_t>(
                 kDirectTargetOffset - (kDirectBackwardJmpConsumerOffset + 5));
-        std::memcpy(chain_patch_code.data() + kDirectBackwardJmpConsumerOffset + 1,
+        std::memcpy(outbound_edge_code.data() + kDirectBackwardJmpConsumerOffset + 1,
                     &direct_backward_jmp_displacement,
                     sizeof(direct_backward_jmp_displacement));
-        std::memcpy(chain_patch_code.data() + kDirectBackwardMultiJmpConsumerOffset,
+        std::memcpy(outbound_edge_code.data() + kDirectBackwardMultiJmpConsumerOffset,
                     direct_multi_jmp_prefix.data(), direct_multi_jmp_prefix.size());
         const std::int32_t direct_backward_multi_jmp_displacement =
             static_cast<std::int32_t>(
                 kDirectTargetOffset - (kDirectBackwardMultiJmpConsumerOffset + 7));
         std::memcpy(
-            chain_patch_code.data() + kDirectBackwardMultiJmpConsumerOffset + 3,
+            outbound_edge_code.data() + kDirectBackwardMultiJmpConsumerOffset + 3,
             &direct_backward_multi_jmp_displacement,
             sizeof(direct_backward_multi_jmp_displacement));
 
         const std::uint64_t direct_consumer_rip =
-            reinterpret_cast<std::uint64_t>(chain_patch_code.data() +
+            reinterpret_cast<std::uint64_t>(outbound_edge_code.data() +
                                             kDirectConsumerOffset);
         const std::uint64_t direct_call_consumer_rip =
-            reinterpret_cast<std::uint64_t>(chain_patch_code.data() +
+            reinterpret_cast<std::uint64_t>(outbound_edge_code.data() +
                                             kDirectCallConsumerOffset);
         const std::uint64_t direct_multi_call_consumer_rip =
-            reinterpret_cast<std::uint64_t>(chain_patch_code.data() +
+            reinterpret_cast<std::uint64_t>(outbound_edge_code.data() +
                                             kDirectMultiCallConsumerOffset);
         const std::uint64_t direct_multi_jmp_consumer_rip =
-            reinterpret_cast<std::uint64_t>(chain_patch_code.data() +
+            reinterpret_cast<std::uint64_t>(outbound_edge_code.data() +
                                             kDirectMultiJmpConsumerOffset);
         const std::uint64_t direct_target_rip =
-            reinterpret_cast<std::uint64_t>(chain_patch_code.data() +
+            reinterpret_cast<std::uint64_t>(outbound_edge_code.data() +
                                             kDirectTargetOffset);
         const std::uint64_t direct_backward_jmp_consumer_rip =
             reinterpret_cast<std::uint64_t>(
-                chain_patch_code.data() + kDirectBackwardJmpConsumerOffset);
+                outbound_edge_code.data() + kDirectBackwardJmpConsumerOffset);
         const std::uint64_t direct_backward_multi_jmp_consumer_rip =
             reinterpret_cast<std::uint64_t>(
-                chain_patch_code.data() + kDirectBackwardMultiJmpConsumerOffset);
+                outbound_edge_code.data() + kDirectBackwardMultiJmpConsumerOffset);
         LsxTranslationEngine direct_backend;
-        ChainPatchCell* direct_slot_precompile =
-            direct_backend.AcquireChainPatchCell(direct_target_rip);
+        OutboundEdgeState* direct_edge_precompile =
+            direct_backend.CreateOutboundEdge(direct_target_rip);
         const Arm64BlockEntry direct_precompile_entry =
-            direct_slot_precompile != nullptr
-                ? direct_slot_precompile->target.load(std::memory_order_acquire)
+            direct_edge_precompile != nullptr
+                ? direct_edge_precompile->target.load(std::memory_order_acquire)
                 : nullptr;
         // Emit both consumers while their embedded stable target slot is still
         // null. The first invocation must take the generated fallback path;
@@ -37501,7 +37388,7 @@ std::string ExerciseTranslationEngineJson() {
             direct_consumer_lookup.entry != nullptr
                 ? direct_consumer_lookup.entry(&direct_prepublish_state)
                 : 0;
-        const bool chain_patch_prepublish_fallback_ok =
+        const bool edge_prepublish_fallback_ok =
             direct_consumer_lookup.entry != nullptr &&
             direct_prepublish_result == direct_target_rip &&
             ReadGuestGpr64(direct_prepublish_state, LsxGpr::Rax) == 0xabcddcbaull &&
@@ -37510,13 +37397,13 @@ std::string ExerciseTranslationEngineJson() {
         const TranslationRecord direct_target_lookup =
             direct_backend.ResolveTranslation(direct_target_rip);
         const Arm64BlockEntry direct_published_entry =
-            direct_slot_precompile != nullptr
-                ? direct_slot_precompile->target.load(std::memory_order_acquire)
+            direct_edge_precompile != nullptr
+                ? direct_edge_precompile->target.load(std::memory_order_acquire)
                 : nullptr;
-        const bool chain_patch_first_use_armed =
-            direct_slot_precompile != nullptr &&
-            direct_slot_precompile->publication_generation.load(
-                std::memory_order_acquire) != 1;
+        const bool edge_first_use_armed =
+            direct_edge_precompile != nullptr &&
+            direct_edge_precompile->code_witness.load(
+                std::memory_order_acquire) != nullptr;
 
         // A newly published slot must hash before its first direct execution. Keep this
         // independent from the larger generated-consumer test so changing that test's number
@@ -37524,31 +37411,26 @@ std::string ExerciseTranslationEngineJson() {
         alignas(16) std::array<std::uint8_t, 8> direct_first_validation_code = {
             0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
         };
-        std::atomic<std::uint64_t> direct_first_validation_epoch{7};
-        ChainPatchCell direct_first_validation_slot(
-            reinterpret_cast<std::uint64_t>(direct_first_validation_code.data()),
-            &direct_first_validation_epoch);
-        direct_first_validation_slot.guest_size.store(
-            static_cast<std::uint32_t>(direct_first_validation_code.size()),
-            std::memory_order_relaxed);
-        direct_first_validation_slot.guest_hash.store(
-            HashGuestCodeWindow(direct_first_validation_slot.guest_rip,
-                           static_cast<std::uint32_t>(direct_first_validation_code.size())),
-            std::memory_order_relaxed);
-        direct_first_validation_slot.MarkPublication();
+        OutboundEdgeState direct_first_validation_slot(
+            reinterpret_cast<std::uint64_t>(direct_first_validation_code.data()));
+        LsxDecodedRegion direct_first_validation_witness = DecodeGuestBasicRegion(
+            direct_first_validation_slot.guest_rip, 8);
+        PublishedCodeWitness direct_first_validation_publication(
+            &direct_first_validation_witness);
+        direct_first_validation_slot.code_witness.store(
+            &direct_first_validation_publication, std::memory_order_relaxed);
         direct_first_validation_slot.target.store(direct_published_entry,
                                                   std::memory_order_release);
         direct_first_validation_code[0] = 0xcc;
         const Arm64BlockEntry direct_first_validation_result =
             ValidateObservedDirectTarget(&direct_first_validation_slot,
                                          direct_published_entry);
-        const bool chain_patch_first_validation_smc_ok =
+        const bool edge_first_validation_smc_ok =
             direct_published_entry != nullptr &&
             direct_first_validation_result == nullptr &&
             direct_first_validation_slot.target.load(std::memory_order_acquire) == nullptr &&
-            direct_first_validation_slot.publication_generation.load(
-                std::memory_order_acquire) >= 3 &&
-            direct_first_validation_epoch.load(std::memory_order_acquire) == 8;
+            direct_first_validation_publication.revision.load(
+                std::memory_order_acquire) == 2;
         LsxEntryPacket direct_execute_ctx{};
         const std::uint64_t direct_tls_before_mutation =
             direct_backend.RunGuest(direct_target_rip, direct_execute_ctx);
@@ -37697,17 +37579,13 @@ std::string ExerciseTranslationEngineJson() {
         // Warm calls above intentionally advanced the periodic counter. Re-arm this deliberate
         // mutation at a validation boundary so the end-to-end test still proves invalidation
         // before stale generated code can execute.
-        if (direct_slot_precompile != nullptr) {
-            direct_slot_precompile->MarkPublication();
-        }
-        chain_patch_code[kDirectTargetOffset + 1] = static_cast<std::uint8_t>(
+        outbound_edge_code[kDirectTargetOffset + 1] = static_cast<std::uint8_t>(
             kDirectMutatedCalleeOffset - (kDirectTargetOffset + 2));
         direct_stack[0] = kDirectReturnSentinel;
         LsxMachineImage direct_mutated_state{};
         // Force both independent boundaries: this probe verifies immediate retirement of a
         // deliberately mutated target rather than the production amortization cadence.
-        direct_mutated_state.dispatch_chain_budget = 1;
-        direct_mutated_state.code_validation_budget = 1;
+        direct_mutated_state.native_edge_phase = 1;
         WriteGuestGpr64(direct_mutated_state, LsxGpr::Rax, 0xdeadbeefull);
         WriteGuestGpr64(direct_mutated_state, LsxGpr::Rsp,
                  reinterpret_cast<std::uint64_t>(direct_stack.data()));
@@ -37717,44 +37595,44 @@ std::string ExerciseTranslationEngineJson() {
             direct_consumer_lookup.entry != nullptr
                 ? direct_consumer_lookup.entry(&direct_mutated_state)
                 : 0;
-        ChainPatchCell* direct_slot_after_mutation =
-            direct_backend.AcquireChainPatchCell(direct_target_rip);
+        OutboundEdgeState* direct_edge_after_mutation =
+            direct_backend.CreateOutboundEdge(direct_target_rip);
         const Arm64BlockEntry direct_entry_after_mutation =
-            direct_slot_after_mutation != nullptr
-                ? direct_slot_after_mutation->target.load(std::memory_order_acquire)
+            direct_edge_after_mutation != nullptr
+                ? direct_edge_after_mutation->target.load(std::memory_order_acquire)
                 : nullptr;
-        // The direct consumer just cleared its stale target and bumped the backend epoch.
-        // Re-enter through RunGuest to prove the dispatcher cannot reuse its populated TLS way
-        // and instead re-hashes/recompiles the mutated target bytes.
+        // The direct consumer retired the stale destination revision. Re-enter through RunGuest
+        // to prove the dispatcher rejects its populated way and recompiles the mutated bytes.
         const std::uint64_t direct_tls_after_mutation =
             direct_backend.RunGuest(direct_target_rip, direct_execute_ctx);
-        chain_patch_code[kDirectTargetOffset + 1] = 0x00;
+        outbound_edge_code[kDirectTargetOffset + 1] = 0x00;
 
-        const bool chain_patch_precompile_null =
-            direct_slot_precompile != nullptr && direct_precompile_entry == nullptr;
-        const bool chain_patch_distinct_publish =
+        const bool edge_precompile_null =
+            direct_edge_precompile != nullptr && direct_precompile_entry == nullptr;
+        const bool edge_distinct_publish =
             direct_published_entry != nullptr &&
             direct_target_lookup.entry != nullptr &&
             direct_published_entry != direct_target_lookup.entry &&
             (direct_target_lookup.flags & 8u) != 0;
-        const bool chain_patch_mutation_invalidated =
-            direct_slot_after_mutation == direct_slot_precompile &&
+        const bool edge_mutation_invalidated =
+            direct_edge_after_mutation != nullptr &&
+            direct_edge_after_mutation != direct_edge_precompile &&
             direct_entry_after_mutation == nullptr &&
             direct_mutation_result == direct_target_rip &&
             ReadGuestGpr64(direct_mutated_state, LsxGpr::Rax) == 0xdeadbeefull &&
             ReadGuestGpr64(direct_mutated_state, LsxGpr::Rsp) == direct_mutated_rsp;
-        const bool chain_patch_tls_smc_fallback_ok =
+        const bool edge_tls_smc_fallback_ok =
             direct_tls_before_mutation == 0x11223344ull &&
             direct_tls_after_mutation == 0x11223355ull;
-        const bool chain_patch_e2e_ok =
-            chain_patch_precompile_null && chain_patch_prepublish_fallback_ok &&
-            chain_patch_distinct_publish && chain_patch_first_use_armed &&
-            chain_patch_first_validation_smc_ok &&
+        const bool edge_e2e_ok =
+            edge_precompile_null && edge_prepublish_fallback_ok &&
+            edge_distinct_publish && edge_first_use_armed &&
+            edge_first_validation_smc_ok &&
             direct_consumer_ok && direct_call_consumer_ok &&
             direct_multi_call_consumer_ok && direct_multi_jmp_consumer_ok &&
             direct_backward_jmp_cycle_guard_ok &&
             direct_backward_multi_jmp_cycle_guard_ok &&
-            chain_patch_mutation_invalidated && chain_patch_tls_smc_fallback_ok;
+            edge_mutation_invalidated && edge_tls_smc_fallback_ok;
 
         // A raw HLE-marker target can synchronously fault inside the host implementation.  It
         // must therefore remain null in an already-emitted consumer slot and return to RunGuest,
@@ -37779,8 +37657,8 @@ std::string ExerciseTranslationEngineJson() {
             reinterpret_cast<std::uint64_t>(direct_fault_code.data() +
                                             kDirectFaultTargetOffset);
         LsxTranslationEngine direct_fault_backend;
-        ChainPatchCell* const direct_fault_slot =
-            direct_fault_backend.AcquireChainPatchCell(direct_fault_target_rip);
+        OutboundEdgeState* const direct_fault_slot =
+            direct_fault_backend.CreateOutboundEdge(direct_fault_target_rip);
         const TranslationRecord direct_fault_consumer_lookup =
             direct_fault_backend.ResolveTranslation(direct_fault_consumer_rip);
         const TranslationRecord direct_fault_target_lookup =
@@ -37793,8 +37671,7 @@ std::string ExerciseTranslationEngineJson() {
         const bool direct_fault_target_fallback_ok =
             direct_fault_slot != nullptr &&
             direct_fault_slot->target.load(std::memory_order_acquire) == nullptr &&
-            direct_fault_slot->guest_size.load(std::memory_order_relaxed) == 0 &&
-            direct_fault_slot->guest_hash.load(std::memory_order_relaxed) == 0 &&
+            direct_fault_slot->code_witness.load(std::memory_order_relaxed) == nullptr &&
             direct_fault_consumer_lookup.entry != nullptr &&
             direct_fault_consumer_result == direct_fault_target_rip &&
             direct_fault_target_lookup.entry != nullptr &&
@@ -45233,14 +45110,16 @@ std::string ExerciseTranslationEngineJson() {
             generic_hle_marker_entry != generic_hle_marker_direct;
         StableDecodedBlock generic_hle_marker_stable = DecodeStableBlock(
             reinterpret_cast<std::uint64_t>(generic_hle_marker_program.data()), 1);
+        std::uint64_t generic_hle_marker_identity = 0;
         const bool generic_hle_marker_stable_hash_ok =
             generic_hle_marker_stable.block != nullptr &&
             generic_hle_marker_stable.block->instructions.size() == 1 &&
             IsJitHleBridgeMarkerInstruction(
                 generic_hle_marker_stable.block->instructions.front()) &&
-            generic_hle_marker_stable.guest_hash == HashGuestCodeWindow(
-                reinterpret_cast<std::uint64_t>(generic_hle_marker_program.data()),
-                static_cast<std::uint32_t>(generic_hle_marker_program.size()));
+            generic_hle_marker_stable.guest_hash == 0 &&
+            HashDecodedBlockBytes(*generic_hle_marker_stable.block,
+                                  generic_hle_marker_identity) &&
+            generic_hle_marker_identity != 0;
 
         // GENERIC_MEMORY_WRITE_NATIVE_DIFFERENTIAL_GATE
         // Native and interpreter execute against distinct memory images.  The final
@@ -45330,7 +45209,7 @@ std::string ExerciseTranslationEngineJson() {
 
         // A locked semantic leaf is an AAPCS call in the middle of this block. R12 is read often
         // enough to occupy the first (caller-saved) GPR-cache slot, so the final store proves that
-        // helper-call cache reconstruction preserves the base instead of using clobbered x6-x8.
+        // helper-call cache recovery preserves the base instead of using clobbered x6-x8.
         const std::array<std::uint8_t, 14> generic_cached_base_call_program = {
             0x49, 0x8b, 0x5c, 0x24, 0x40,       // mov rbx,[r12+0x40]
             0xf0, 0xff, 0x43, 0x10,             // lock inc dword [rbx+0x10]
@@ -45556,7 +45435,7 @@ std::string ExerciseTranslationEngineJson() {
                              nested_stack_isolation_ok &&
                              execute_loop_ok && direct_zero_root_chain_ok && cache_contract_ok &&
                              cache_public_hash_abi_ok &&
-                             persistent_ir_derived_recompute_ok && chain_patch_e2e_ok &&
+                             persistent_ir_derived_recompute_ok && edge_e2e_ok &&
                              conditional_two_edge_direct_ok &&
                              direct_fault_target_fallback_ok &&
                              direct_fault_synthetic_resume_ok &&
@@ -45626,8 +45505,8 @@ std::string ExerciseTranslationEngineJson() {
             << R"("directZeroRootTargetResult":)" << direct_zero_target_result << ","
             << R"("directZeroRootChainResult":)" << direct_zero_chain_result << ","
             << R"("cacheContractOk":)" << (cache_contract_ok ? "true" : "false") << ","
-            << R"("directSlotTlsLookupOk":)"
-            << (direct_slot_tls_lookup_ok ? "true" : "false") << ","
+            << R"("directEdgeOwnershipOk":)"
+            << (direct_edge_ownership_ok ? "true" : "false") << ","
             << R"("cachePublicHashAbiOk":)"
             << (cache_public_hash_abi_ok ? "true" : "false") << ","
             << R"("persistentIrDerivedRecomputeOk":)"
@@ -45637,37 +45516,37 @@ std::string ExerciseTranslationEngineJson() {
             << R"("cacheHashBefore":"0x)" << std::hex << hash_before << std::dec << R"(",)"
             << R"("cacheHashAfter":"0x)" << std::hex << hash_after << std::dec << R"(",)"
             << R"("cacheInvalidations":)" << (mismatch_after - mismatch_before) << ","
-            << R"("directLinkStable":)"
-            << (direct_slot_after_mutation == direct_slot_precompile ? "true" : "false")
+            << R"("nativeEdgePrivateEdges":)"
+            << (direct_edge_after_mutation != direct_edge_precompile ? "true" : "false")
             << ","
-            << R"("directLinkSeparateTarget":)"
-            << (chain_patch_distinct_publish ? "true" : "false") << ","
-            << R"("directLinkFirstUseArmed":)"
-            << (chain_patch_first_use_armed ? "true" : "false") << ","
-            << R"("directLinkFirstValidationSmcOk":)"
-            << (chain_patch_first_validation_smc_ok ? "true" : "false") << ","
-            << R"("directLinkInvalidated":)"
-            << (chain_patch_mutation_invalidated ? "true" : "false") << ","
-            << R"("directLinkPrecompileNull":)"
-            << (chain_patch_precompile_null ? "true" : "false") << ","
-            << R"("directLinkPrepublishFallbackOk":)"
-            << (chain_patch_prepublish_fallback_ok ? "true" : "false") << ","
-            << R"("directLinkConsumerOk":)"
+            << R"("nativeEdgeSeparateTarget":)"
+            << (edge_distinct_publish ? "true" : "false") << ","
+            << R"("nativeEdgeFirstUseArmed":)"
+            << (edge_first_use_armed ? "true" : "false") << ","
+            << R"("nativeEdgeFirstValidationSmcOk":)"
+            << (edge_first_validation_smc_ok ? "true" : "false") << ","
+            << R"("nativeEdgeInvalidated":)"
+            << (edge_mutation_invalidated ? "true" : "false") << ","
+            << R"("nativeEdgePrecompileNull":)"
+            << (edge_precompile_null ? "true" : "false") << ","
+            << R"("nativeEdgePrepublishFallbackOk":)"
+            << (edge_prepublish_fallback_ok ? "true" : "false") << ","
+            << R"("nativeEdgeConsumerOk":)"
             << (direct_consumer_ok ? "true" : "false") << ","
-            << R"("directLinkCallConsumerOk":)"
+            << R"("nativeEdgeCallConsumerOk":)"
             << (direct_call_consumer_ok ? "true" : "false") << ","
-            << R"("directLinkMultiCallConsumerOk":)"
+            << R"("nativeEdgeMultiCallConsumerOk":)"
             << (direct_multi_call_consumer_ok ? "true" : "false") << ","
-            << R"("directLinkMultiJmpConsumerOk":)"
+            << R"("nativeEdgeMultiJmpConsumerOk":)"
             << (direct_multi_jmp_consumer_ok ? "true" : "false") << ","
-            << R"("directLinkBackwardJmpCycleGuardOk":)"
+            << R"("nativeEdgeBackwardJmpCycleGuardOk":)"
             << (direct_backward_jmp_cycle_guard_ok ? "true" : "false") << ","
-            << R"("directLinkBackwardMultiJmpCycleGuardOk":)"
+            << R"("nativeEdgeBackwardMultiJmpCycleGuardOk":)"
             << (direct_backward_multi_jmp_cycle_guard_ok ? "true" : "false") << ","
-            << R"("directLinkTlsSmcFallbackOk":)"
-            << (chain_patch_tls_smc_fallback_ok ? "true" : "false") << ","
-            << R"("directLinkE2EOk":)"
-            << (chain_patch_e2e_ok ? "true" : "false") << ","
+            << R"("nativeEdgeTlsSmcFallbackOk":)"
+            << (edge_tls_smc_fallback_ok ? "true" : "false") << ","
+            << R"("nativeEdgeE2EOk":)"
+            << (edge_e2e_ok ? "true" : "false") << ","
             << R"("conditionalTwoEdgeDirectOk":)"
             << (conditional_two_edge_direct_ok ? "true" : "false") << ","
             << R"("conditionalTwoEdgeSemanticOk":)"
@@ -45685,42 +45564,42 @@ std::string ExerciseTranslationEngineJson() {
             << (direct_fault_target_fallback_ok ? "true" : "false") << ","
             << R"("directFaultSyntheticResumeOk":)"
             << (direct_fault_synthetic_resume_ok ? "true" : "false") << ","
-            << R"("directLinkConsumerResult":"0x)" << std::hex
+            << R"("nativeEdgeConsumerResult":"0x)" << std::hex
             << direct_consumer_result << std::dec << R"(",)"
-            << R"("directLinkTargetRip":"0x)" << std::hex
+            << R"("nativeEdgeTargetRip":"0x)" << std::hex
             << direct_target_rip << std::dec << R"(",)"
-            << R"("directLinkPrepublishResult":"0x)" << std::hex
+            << R"("nativeEdgePrepublishResult":"0x)" << std::hex
             << direct_prepublish_result << std::dec << R"(",)"
-            << R"("directLinkCallResult":"0x)" << std::hex
+            << R"("nativeEdgeCallResult":"0x)" << std::hex
             << direct_call_result << std::dec << R"(",)"
-            << R"("directLinkMultiCallResult":"0x)" << std::hex
+            << R"("nativeEdgeMultiCallResult":"0x)" << std::hex
             << direct_multi_call_result << std::dec << R"(",)"
-            << R"("directLinkMultiCallFlags":"0x)" << std::hex
+            << R"("nativeEdgeMultiCallFlags":"0x)" << std::hex
             << direct_multi_call_consumer_lookup.flags << std::dec << R"(",)"
-            << R"("directLinkMultiCallRax":"0x)" << std::hex
+            << R"("nativeEdgeMultiCallRax":"0x)" << std::hex
             << ReadGuestGpr64(direct_multi_call_state, LsxGpr::Rax) << std::dec << R"(",)"
-            << R"("directLinkMultiCallRcx":"0x)" << std::hex
+            << R"("nativeEdgeMultiCallRcx":"0x)" << std::hex
             << ReadGuestGpr64(direct_multi_call_state, LsxGpr::Rcx) << std::dec << R"(",)"
-            << R"("directLinkMultiCallRspDelta":)"
+            << R"("nativeEdgeMultiCallRspDelta":)"
             << static_cast<std::int64_t>(
                    ReadGuestGpr64(direct_multi_call_state, LsxGpr::Rsp) -
                    direct_multi_call_rsp)
             << ","
-            << R"("directLinkMultiJmpResult":"0x)" << std::hex
+            << R"("nativeEdgeMultiJmpResult":"0x)" << std::hex
             << direct_multi_jmp_result << std::dec << R"(",)"
-            << R"("directLinkMultiJmpFlags":"0x)" << std::hex
+            << R"("nativeEdgeMultiJmpFlags":"0x)" << std::hex
             << direct_multi_jmp_consumer_lookup.flags << std::dec << R"(",)"
-            << R"("directLinkMultiJmpStore":"0x)" << std::hex
+            << R"("nativeEdgeMultiJmpStore":"0x)" << std::hex
             << direct_multi_jmp_store << std::dec << R"(",)"
-            << R"("directLinkBackwardJmpResult":"0x)" << std::hex
+            << R"("nativeEdgeBackwardJmpResult":"0x)" << std::hex
             << direct_backward_jmp_result << std::dec << R"(",)"
-            << R"("directLinkBackwardJmpFlags":"0x)" << std::hex
+            << R"("nativeEdgeBackwardJmpFlags":"0x)" << std::hex
             << direct_backward_jmp_consumer_lookup.flags << std::dec << R"(",)"
-            << R"("directLinkBackwardMultiJmpResult":"0x)" << std::hex
+            << R"("nativeEdgeBackwardMultiJmpResult":"0x)" << std::hex
             << direct_backward_multi_jmp_result << std::dec << R"(",)"
-            << R"("directLinkBackwardMultiJmpFlags":"0x)" << std::hex
+            << R"("nativeEdgeBackwardMultiJmpFlags":"0x)" << std::hex
             << direct_backward_multi_jmp_consumer_lookup.flags << std::dec << R"(",)"
-            << R"("directLinkMutationResult":"0x)" << std::hex
+            << R"("nativeEdgeMutationResult":"0x)" << std::hex
             << direct_mutation_result << std::dec << R"(",)"
             << R"("divideErrorDeliveryOk":)"
             << (divide_error_delivery_ok ? "true" : "false") << ","

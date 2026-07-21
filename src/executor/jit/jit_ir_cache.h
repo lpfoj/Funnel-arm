@@ -92,7 +92,7 @@ enum class JitNativeRelocationKind : std::uint8_t {
     ModuleRelative = 0,
     IrBlock = 1,
     IrInstruction = 2,
-    ChainPatchCell = 3,
+    OutboundEdgeState = 3,
     SegmentAddress = 4,
     // Legacy v2 relocation kinds retained so old shards can still be read as IR-only. Native
     // restore rejects both because arbitrary module offsets are not stable across relinks.
@@ -100,7 +100,7 @@ enum class JitNativeRelocationKind : std::uint8_t {
     // Versioned logical helper id resolved by the current runtime. New native captures use this
     // for every callable module target and reject any helper missing from the stable-id table.
     StableExternal = 6,
-    PolymorphicChainSite = 7,
+    IndirectEdgeFanout = 7,
 };
 
 struct JitNativeRelocation {

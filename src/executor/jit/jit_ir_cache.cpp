@@ -338,7 +338,7 @@ private:
 
 [[nodiscard]] bool ValidNativeRelocationKind(const JitNativeRelocationKind kind) noexcept {
     return static_cast<std::uint8_t>(kind) <=
-           static_cast<std::uint8_t>(JitNativeRelocationKind::PolymorphicChainSite);
+           static_cast<std::uint8_t>(JitNativeRelocationKind::IndirectEdgeFanout);
 }
 
 [[nodiscard]] std::uint32_t ReadLittleEndianU32(const std::uint8_t* bytes) noexcept {
@@ -435,7 +435,7 @@ private:
                 return false;
             }
             if (!ValidPointerMaterializationSequence(segment, relocation)) {
-                error = "cached native relocation does not reference fixed MOVZ/MOVK sequence";
+                error = "cached native relocation lacks a fixed MOVZ/MOVK sequence";
                 return false;
             }
             switch (relocation.kind) {
@@ -460,9 +460,9 @@ private:
             case JitNativeRelocationKind::ModuleRelative:
             case JitNativeRelocationKind::BackendRelative:
                 break;
-            case JitNativeRelocationKind::ChainPatchCell:
+            case JitNativeRelocationKind::OutboundEdgeState:
                 if (relocation.target_index > 1) {
-                    error = "cached direct-link relocation edge out of bounds";
+                    error = "cached outbound-edge relocation index out of bounds";
                     return false;
                 }
                 break;
@@ -472,9 +472,9 @@ private:
                     return false;
                 }
                 break;
-            case JitNativeRelocationKind::PolymorphicChainSite:
+            case JitNativeRelocationKind::IndirectEdgeFanout:
                 if (relocation.target_index != 0 || relocation.addend != 0) {
-                    error = "invalid cached indirect-link-site relocation";
+                    error = "invalid cached indirect-fanout relocation";
                     return false;
                 }
                 break;
@@ -767,7 +767,7 @@ void WriteNativeRelocation(ByteWriter& writer,
 
     // These fields are compiler products, not decoded guest facts.  Keep their serialized bytes
     // only for format compatibility/strict validation, then discard them fail-closed.  The
-    // current JIT production classifiers reconstruct them before a loaded block can be
+    // current JIT production classifiers regenerate them before a loaded block can be
     // lowered or published.
     instruction.attributes = 0;
     instruction.category = LsxOpClass::Unsupported;
