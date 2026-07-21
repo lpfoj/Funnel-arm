@@ -82,9 +82,9 @@ bool HasPersistentAndroidFiberContext(const OrbisFiber* fiber) {
 
 void TraceAndroidFiberTransition(const char* operation, const char* phase, const s32 result,
                                  const void* subject) {
-    const auto* machine = Executor::Jit::CurrentMachineImage();
+    const auto* machine = Executor::Jit::FindActiveMachineImage();
     const u64 guest_rsp =
-        machine != nullptr ? Executor::Jit::GetGpr64(*machine, LsxGpr::Rsp) : 0;
+        machine != nullptr ? Executor::Jit::ReadGuestGpr64(*machine, LsxGpr::Rsp) : 0;
     const u64 guest_rip = machine != nullptr ? machine->rip_or_exit : 0;
     auto& runtime = g_android_fiber_runtime;
 
@@ -171,29 +171,29 @@ void DestroyAndroidContinuation(OrbisFiber* fiber) {
         return;
     }
     if (continuation->owns_stack_lease) {
-        Executor::Jit::ReleaseLsxStackLease(continuation->stack_lease);
+        Executor::Jit::ReturnGuestStackWindow(continuation->stack_lease);
     }
     delete continuation;
     fiber->context = nullptr;
 }
 
 bool CapturePostHleContinuation(LsxMachineImage& destination, const u64 result) {
-    auto* current = Executor::Jit::CurrentMachineImage();
+    auto* current = Executor::Jit::FindActiveMachineImage();
     if (current == nullptr) {
         return false;
     }
 
-    if (Executor::Jit::CaptureCurrentGuestPostHleState(destination)) {
-        Executor::Jit::SetGpr64(destination, LsxGpr::Rax, result);
+    if (Executor::Jit::SnapshotGuestStateAfterBridge(destination)) {
+        Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rax, result);
         destination.direct_chain_budget = 0;
         return destination.rip_or_exit != 0 &&
-               Executor::Jit::GetGpr64(destination, LsxGpr::Rsp) != 0;
+               Executor::Jit::ReadGuestGpr64(destination, LsxGpr::Rsp) != 0;
     }
 
     u64 guest_rsp = 0;
     u64 guest_return = 0;
     if (executor_live_get_current_hle_guest_rsp(&guest_rsp) != 0 || guest_rsp == 0) {
-        guest_rsp = Executor::Jit::GetGpr64(*current, LsxGpr::Rsp);
+        guest_rsp = Executor::Jit::ReadGuestGpr64(*current, LsxGpr::Rsp);
     }
     (void)executor_live_get_current_hle_call_site(
         &guest_return, nullptr, nullptr, nullptr, 0, nullptr, 0);
@@ -205,24 +205,24 @@ bool CapturePostHleContinuation(LsxMachineImage& destination, const u64 result) 
     }
 
     destination = *current;
-    Executor::Jit::SetGpr64(destination, LsxGpr::Rax, result);
-    Executor::Jit::SetGpr64(destination, LsxGpr::Rsp, guest_rsp + sizeof(u64));
+    Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rax, result);
+    Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rsp, guest_rsp + sizeof(u64));
     destination.rip_or_exit = guest_return;
     destination.direct_chain_budget = 0;
     return true;
 }
 
 bool PublishAndroidFiberState(const LsxMachineImage& source) {
-    auto* current = Executor::Jit::CurrentMachineImage();
+    auto* current = Executor::Jit::FindActiveMachineImage();
     if (current == nullptr) {
         return false;
     }
     *current = source;
-    return Executor::Jit::MarkCurrentGuestStateOverride();
+    return Executor::Jit::AnnounceGuestStateReplacement();
 }
 
 void AdoptCurrentThreadExecutionState(LsxMachineImage& destination) {
-    const auto* current = Executor::Jit::CurrentMachineImage();
+    const auto* current = Executor::Jit::FindActiveMachineImage();
     if (current == nullptr) {
         return;
     }
@@ -238,7 +238,7 @@ void AdoptCurrentThreadExecutionState(LsxMachineImage& destination) {
 bool BuildInitialAndroidFiberState(OrbisFiber* fiber, const u64 arg_on_run_to,
                                    AndroidFiberContinuation& continuation,
                                    LsxMachineImage& destination) {
-    const auto* current = Executor::Jit::CurrentMachineImage();
+    const auto* current = Executor::Jit::FindActiveMachineImage();
     if (current == nullptr || fiber->entry == nullptr) {
         return false;
     }
@@ -258,16 +258,16 @@ bool BuildInitialAndroidFiberState(OrbisFiber* fiber, const u64 arg_on_run_to,
         destination.x87_control_word = 0x037f;
         destination.mxcsr = 0x9fc0;
     }
-    Executor::Jit::SetGpr64(destination, LsxGpr::Rdi, fiber->arg_on_initialize);
-    Executor::Jit::SetGpr64(destination, LsxGpr::Rsi, arg_on_run_to);
+    Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rdi, fiber->arg_on_initialize);
+    Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rsi, arg_on_run_to);
 
     u64 stack_top = 0;
     if (fiber->addr_context != nullptr && fiber->size_context != 0) {
         stack_top = reinterpret_cast<u64>(fiber->addr_context) + fiber->size_context;
     } else {
         continuation.stack_lease =
-            Executor::Jit::AcquireLsxStackLease(
-                Executor::Jit::CurrentMachineImage());
+            Executor::Jit::BorrowGuestStackWindow(
+                Executor::Jit::FindActiveMachineImage());
         continuation.owns_stack_lease =
             continuation.stack_lease.current_sp != 0;
         stack_top = continuation.stack_lease.current_sp;
@@ -281,7 +281,7 @@ bool BuildInitialAndroidFiberState(OrbisFiber* fiber, const u64 arg_on_run_to,
     // return at the top rather than borrowing the suspended caller's return chain.
     const u64 stack_pointer = stack_top - sizeof(u64);
     Executor::Jit::StoreGuestScalar(stack_pointer, 0, sizeof(u64));
-    Executor::Jit::SetGpr64(destination, LsxGpr::Rsp, stack_pointer);
+    Executor::Jit::WriteGuestGpr64(destination, LsxGpr::Rsp, stack_pointer);
     return true;
 }
 
@@ -306,7 +306,7 @@ s32 RunAndroidFiber(OrbisFiber* fiber, const u64 arg_on_run_to, u64* arg_on_retu
         if (continuation->resume_arg_slot != nullptr) {
             *continuation->resume_arg_slot = arg_on_run_to;
         }
-        Executor::Jit::SetGpr64(next, LsxGpr::Rax, ORBIS_OK);
+        Executor::Jit::WriteGuestGpr64(next, LsxGpr::Rax, ORBIS_OK);
     } else if (!BuildInitialAndroidFiberState(
                    fiber, arg_on_run_to, *continuation, next)) {
         return ORBIS_FIBER_ERROR_INVALID;
@@ -355,7 +355,7 @@ s32 SwitchAndroidFiber(OrbisFiber* fiber, const u64 arg_on_run_to, u64* arg_on_r
         if (next_continuation->resume_arg_slot != nullptr) {
             *next_continuation->resume_arg_slot = arg_on_run_to;
         }
-        Executor::Jit::SetGpr64(next, LsxGpr::Rax, ORBIS_OK);
+        Executor::Jit::WriteGuestGpr64(next, LsxGpr::Rax, ORBIS_OK);
     } else if (!BuildInitialAndroidFiberState(
                    fiber, arg_on_run_to, *next_continuation, next)) {
         return ORBIS_FIBER_ERROR_INVALID;
@@ -395,7 +395,7 @@ s32 ReturnAndroidFiberToThread(const u64 arg_on_return, u64* arg_on_run) {
     if (runtime.thread_return_slot != nullptr) {
         *runtime.thread_return_slot = arg_on_return;
     }
-    Executor::Jit::SetGpr64(runtime.thread_machine, LsxGpr::Rax, ORBIS_OK);
+    Executor::Jit::WriteGuestGpr64(runtime.thread_machine, LsxGpr::Rax, ORBIS_OK);
     runtime.current_fiber->state = FiberState::Idle;
     runtime.current_fiber = nullptr;
     runtime.thread_return_slot = nullptr;
@@ -436,10 +436,10 @@ s32 TraceAndroidFiberResult(const char* operation, const s32 result, const void*
                 operation, static_cast<u32>(result), subject,
                 static_cast<unsigned long long>(detail0),
                 static_cast<unsigned long long>(detail1));
-            if (const auto* machine = Executor::Jit::CurrentMachineImage();
+            if (const auto* machine = Executor::Jit::FindActiveMachineImage();
                 machine != nullptr) {
-                const u64 rsp = Executor::Jit::GetGpr64(*machine, LsxGpr::Rsp);
-                const u64 rbp = Executor::Jit::GetGpr64(*machine, LsxGpr::Rbp);
+                const u64 rsp = Executor::Jit::ReadGuestGpr64(*machine, LsxGpr::Rsp);
+                const u64 rbp = Executor::Jit::ReadGuestGpr64(*machine, LsxGpr::Rbp);
                 std::fprintf(trace, "machine rip=0x%llx rsp=0x%llx rbp=0x%llx\n",
                              static_cast<unsigned long long>(machine->rip_or_exit),
                              static_cast<unsigned long long>(rsp),
@@ -1020,7 +1020,7 @@ s32 PS4_SYSV_ABI sceFiberGetThreadFramePointerAddress(u64* addr_frame_pointer) {
     if (!g_android_fiber_runtime.active) {
         return ORBIS_FIBER_ERROR_PERMISSION;
     }
-    *addr_frame_pointer = Executor::Jit::GetGpr64(
+    *addr_frame_pointer = Executor::Jit::ReadGuestGpr64(
         g_android_fiber_runtime.thread_machine, LsxGpr::Rbp);
     return ORBIS_OK;
 #else

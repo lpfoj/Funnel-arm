@@ -595,7 +595,7 @@ void WriteInstruction(ByteWriter& writer, const LsxDecodedOp& instruction) {
     std::uint8_t flags = 0;
     flags |= instruction.can_execute_vector ? kInstructionFlagCanExecuteVector : 0;
     flags |= instruction.can_execute_scalar_float ? kInstructionFlagCanExecuteScalarFloat : 0;
-    flags |= instruction.can_jit_initial ? kInstructionFlagCanJitInitial : 0;
+    flags |= instruction.eligible_for_initial_native ? kInstructionFlagCanJitInitial : 0;
     flags |= instruction.terminates_block ? kInstructionFlagTerminatesBlock : 0;
     writer.U8(flags);
     writer.U8(instruction.operand_count);
@@ -748,7 +748,7 @@ void WriteNativeRelocation(ByteWriter& writer,
     instruction.category = static_cast<LsxOpClass>(category);
     instruction.can_execute_vector = (flags & kInstructionFlagCanExecuteVector) != 0;
     instruction.can_execute_scalar_float = (flags & kInstructionFlagCanExecuteScalarFloat) != 0;
-    instruction.can_jit_initial = (flags & kInstructionFlagCanJitInitial) != 0;
+    instruction.eligible_for_initial_native = (flags & kInstructionFlagCanJitInitial) != 0;
     instruction.terminates_block = (flags & kInstructionFlagTerminatesBlock) != 0;
     instruction.decoded.attributes = decoded_attributes;
 
@@ -774,7 +774,7 @@ void WriteNativeRelocation(ByteWriter& writer,
     instruction.can_execute_vector = false;
     instruction.can_execute_scalar_float = false;
     instruction.can_execute_x87 = false;
-    instruction.can_jit_initial = false;
+    instruction.eligible_for_initial_native = false;
     instruction.terminates_block = false;
     return true;
 }
@@ -788,8 +788,8 @@ void WriteNativeRelocation(ByteWriter& writer,
     ByteWriter body{limits.max_file_bytes};
     body.U16(kRecordSchemaVersion);
     std::uint16_t flags = 0;
-    flags |= record.block.can_jit_initial ? kBlockFlagCanJitInitial : 0;
-    flags |= record.block.decode_failed ? kBlockFlagDecodeFailed : 0;
+    flags |= record.block.SupportsInitialNativeTier() ? kBlockFlagCanJitInitial : 0;
+    flags |= record.block.HasDecodeFailure() ? kBlockFlagDecodeFailed : 0;
     body.U16(flags);
     body.U64(record.guest_rip);
     body.U64(record.guest_hash);
@@ -876,10 +876,12 @@ void WriteNativeRelocation(ByteWriter& writer,
         error = "truncated cache diagnostic";
         return false;
     }
-    // can_jit_initial is derived from current instruction capabilities.  Deserialize it only as
+    // Initial-tier eligibility is derived from current instruction capabilities. Deserialize it only as
     // a known schema bit, then leave the block fail-closed until production canonicalization.
-    record.block.can_jit_initial = false;
-    record.block.decode_failed = (flags & kBlockFlagDecodeFailed) != 0;
+    record.block.SelectInitialNativeTier(false);
+    if ((flags & kBlockFlagDecodeFailed) != 0) {
+        record.block.RejectDecode();
+    }
     if (diagnostic.empty()) {
         record.block.diagnostic.clear();
     } else {

@@ -46,48 +46,48 @@ static_assert(GprSlot(LsxGpr::Rsp) == 4);
 static_assert(GprSlot(LsxGpr::R15) == 15);
 
 enum class AluOp : std::uint8_t {
-    Add = 0x41,
-    Sub = 0x16,
-    Cmp = 0x73,
-    And = 0x2c,
-    Or = 0x58,
-    Xor = 0x0d,
-    Test = 0x65,
+    Add,
+    Subtract,
+    Compare,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseTest,
 };
 
 enum class ShiftOp : std::uint8_t {
-    Shl = 0x52,
-    Shr = 0x19,
-    Sar = 0x6b,
+    LogicalLeft,
+    LogicalRight,
+    ArithmeticRight,
 };
 
 enum class IncDecOp : std::uint8_t {
-    Dec = 0x35,
-    Inc = 0x6e,
+    Decrement,
+    Increment,
 };
 
 enum class BitTestOp : std::uint8_t {
-    Test = 0x4a,
-    Set = 0x71,
-    Reset = 0x23,
-    Complement = 0x5c,
+    Inspect,
+    Raise,
+    Clear,
+    Toggle,
 };
 
 enum class VectorLogicOp : std::uint8_t {
-    Xor = 0x67,
-    And = 0x14,
-    Or = 0x49,
-    AndNot = 0x2e,
+    ExclusiveOr,
+    Intersection,
+    Union,
+    SubtractMask,
 };
 
 enum class ScalarArithOp : std::uint8_t {
-    Add = 0x37,
-    Sub = 0x64,
-    Mul = 0x12,
-    Div = 0x7b,
-    Min = 0x29,
-    Max = 0x50,
-    AddSub = 0x0e,
+    Sum,
+    Difference,
+    Product,
+    Quotient,
+    Minimum,
+    Maximum,
+    AlternatingDifferenceSum,
 };
 
 inline constexpr std::size_t kLsxInstructionByteLimit = 15;
@@ -126,10 +126,15 @@ struct alignas(32) LsxMachineImage {
     std::uint64_t x87_instruction_pointer = 0;
     std::uint64_t x87_data_pointer = 0;
     std::array<std::array<std::uint8_t, 0x20>, 16> ymm{};
-    // Non-architectural address of this host thread's g_current_fault_ir TLS slot. Keeping the
-    // resolved address in per-execution state lets every directly chained memory block load it
-    // with one LDR instead of crossing into C++ merely to resolve TLS at block entry.
+    // Non-architectural address of this host thread's g_current_fault_ir TLS slot. Specialized
+    // helper-backed paths retain it for compatibility; generic native memory operations publish
+    // through native_fault_ir without touching dynamic TLS.
     std::uint64_t fault_ir_slot = 0;
+    // Generic native blocks publish the current decoded instruction here immediately before a
+    // faultable host access. Keeping the pointer in the execution image lets the signal bridge
+    // derive guest RIP from the IR and removes both the TLS store and the separate rip_or_exit
+    // store from the hot memory path. Specialized/semantic paths may continue using fault_ir_slot.
+    std::uint64_t native_fault_ir = 0;
 };
 
 // AAPCS64 returns this two-qword aggregate in x0/x1.  The leaf-HLE fast bridge uses the second
@@ -159,6 +164,7 @@ static_assert(offsetof(LsxMachineImage, x87_instruction_pointer) == 0x130);
 static_assert(offsetof(LsxMachineImage, x87_data_pointer) == 0x138);
 static_assert(offsetof(LsxMachineImage, ymm) == 0x140);
 static_assert(offsetof(LsxMachineImage, fault_ir_slot) == 0x340);
+static_assert(offsetof(LsxMachineImage, native_fault_ir) == 0x348);
 static_assert(sizeof(LsxMachineImage) == 0x360);
 
 struct LsxEntryPacket {
@@ -295,7 +301,7 @@ struct LsxDecodedOp {
     std::uint32_t mnemonic = 0;
     std::array<std::uint8_t, kLsxInstructionByteLimit> bytes{};
     DecodeSummary decoded{};
-    // The retained IR stores only operand_count_visible entries (see BuildLsxCodeRegion). The
+    // The retained IR stores only operand_count_visible entries (see DecodeGuestBasicRegion). The
     // architectural maximum for the visible subset is five; hidden decoder operands never enter
     // the published region.
     std::array<LsxOperandRecord, kLsxVisibleOperandLimit> operands{};
@@ -306,42 +312,41 @@ struct LsxDecodedOp {
     bool can_execute_vector = false;
     bool can_execute_scalar_float = false;
     bool can_execute_x87 = false;
-    bool can_jit_initial = false;
+    bool eligible_for_initial_native = false;
     bool terminates_block = false;
 };
 
 static_assert(std::is_standard_layout_v<LsxDecodedOp>);
 
-template <std::uint32_t TrueCode>
-struct LsxEncodedLatch {
-    std::uint32_t code = 0;
-
-    constexpr LsxEncodedLatch() = default;
-    constexpr LsxEncodedLatch(const bool value) : code(value ? TrueCode : 0) {}
-
-    constexpr LsxEncodedLatch& operator=(const bool value) noexcept {
-        code = value ? TrueCode : 0;
-        return *this;
-    }
-
-    [[nodiscard]] constexpr operator bool() const noexcept {
-        return code == TrueCode;
-    }
+enum class RegionDecodeStatus : std::uint8_t {
+    Ready,
+    Rejected,
 };
 
-static_assert(std::is_standard_layout_v<LsxEncodedLatch<1>>);
-static_assert(std::is_trivially_copyable_v<LsxEncodedLatch<1>>);
-static_assert(sizeof(LsxEncodedLatch<1>) == sizeof(std::uint32_t));
+enum class RegionExecutionTier : std::uint8_t {
+    Interpreter,
+    InitialNative,
+};
 
 struct LsxDecodedRegion {
     std::uint64_t start_rip = 0;
     std::uint64_t end_rip = 0;
     std::vector<LsxDecodedOp> instructions{};
-    // Full-width, fail-closed latches avoid a byte-header ABI while retaining field-style access
-    // for decode, cache serialization and diagnostic code.
-    LsxEncodedLatch<0xc17a4e31u> can_jit_initial{};
-    LsxEncodedLatch<0xd3c0de65u> decode_failed{};
+    RegionDecodeStatus decode_status = RegionDecodeStatus::Ready;
+    RegionExecutionTier execution_tier = RegionExecutionTier::Interpreter;
     std::string diagnostic{};
+
+    [[nodiscard]] bool HasDecodeFailure() const noexcept {
+        return decode_status == RegionDecodeStatus::Rejected;
+    }
+    [[nodiscard]] bool SupportsInitialNativeTier() const noexcept {
+        return execution_tier == RegionExecutionTier::InitialNative;
+    }
+    void RejectDecode() noexcept { decode_status = RegionDecodeStatus::Rejected; }
+    void SelectInitialNativeTier(const bool enabled) noexcept {
+        execution_tier = enabled ? RegionExecutionTier::InitialNative
+                                 : RegionExecutionTier::Interpreter;
+    }
 };
 
 struct LsxStackReservoir {
@@ -387,12 +392,12 @@ struct LsxEngineReport {
     const char* reason = "lsx_translation_contract_incomplete";
 };
 
-std::uint64_t RunArm64Translation(std::uint64_t guest_rip, const LsxEntryPacket& ctx);
+std::uint64_t DispatchGuestOnArm64(std::uint64_t guest_rip, const LsxEntryPacket& ctx);
 
-LsxEngineReport InspectLsxEngine();
+LsxEngineReport QueryTranslationEngine();
 
 // Cheap, lock-free counters for the Android on-screen runtime HUD.  Keep this separate from
-// LsxEngineStatusJson(): the latter sorts the hot-helper table and builds a large diagnostic JSON,
+// DescribeTranslationEngineJson(): the latter sorts the hot-helper table and builds a large diagnostic JSON,
 // while the HUD samples these relaxed atomics only once per second.
 struct RuntimeStatsSnapshot {
     std::uint64_t decoded_blocks{};
@@ -413,46 +418,46 @@ struct RuntimeStatsSnapshot {
     std::uint64_t persistent_native_capture_rejected{};
 };
 
-[[nodiscard]] RuntimeStatsSnapshot GetRuntimeStatsSnapshot() noexcept;
+[[nodiscard]] RuntimeStatsSnapshot SnapshotTranslationTelemetry() noexcept;
 // Configures the per-title, cross-process decoded/native-block cache. The executable fingerprint
 // must be content-derived (never a host pointer); every hit is still verified against the live
 // guest bytes before relocated native code is allowed to publish.
-void ConfigurePersistentBlockCache(const std::string& root_dir, const std::string& title_id,
+void ConfigureTranslationStore(const std::string& root_dir, const std::string& title_id,
                                    std::uint64_t executable_fingerprint, bool enabled);
-std::string LsxEngineStatusJson();
-std::string LsxEngineSelfTestJson();
+std::string DescribeTranslationEngineJson();
+std::string ExerciseTranslationEngineJson();
 // Minimal metadata-only test seam for the isolated primary/fallback compiler
 // differential. It never executes the returned entry.
-extern "C" bool LsxProbeResolveTranslation(
+extern "C" bool ExecutorProbeTranslationMetadata(
     std::uint64_t guest_rip, TranslationRecord* out) noexcept;
 // Diagnostic-only proof seam: resolves a captured host PC to the exact emitted
 // code allocation that owns it.  It does not expose or execute guest state.
-extern "C" bool LsxProbeLocateNativeRange(
+extern "C" bool ExecutorProbeNativeOwnership(
     std::uint64_t host_pc, std::uint64_t* range_base,
     std::uint64_t* range_size) noexcept;
 
-std::uint64_t GetGpr64(const LsxMachineImage& state, LsxGpr reg);
-void SetGpr64(LsxMachineImage& state, LsxGpr reg, std::uint64_t value);
-std::uint32_t GetGpr32(const LsxMachineImage& state, LsxGpr reg);
-void SetGpr32(LsxMachineImage& state, LsxGpr reg, std::uint32_t value);
-std::uint16_t GetGpr16(const LsxMachineImage& state, LsxGpr reg);
-void SetGpr16(LsxMachineImage& state, LsxGpr reg, std::uint16_t value);
-std::uint8_t GetGpr8(const LsxMachineImage& state, LsxGpr reg, bool high8 = false);
-void SetGpr8(LsxMachineImage& state, LsxGpr reg, std::uint8_t value, bool high8 = false);
+std::uint64_t ReadGuestGpr64(const LsxMachineImage& state, LsxGpr reg);
+void WriteGuestGpr64(LsxMachineImage& state, LsxGpr reg, std::uint64_t value);
+std::uint32_t ReadGuestGpr32(const LsxMachineImage& state, LsxGpr reg);
+void WriteGuestGpr32(LsxMachineImage& state, LsxGpr reg, std::uint32_t value);
+std::uint16_t ReadGuestGpr16(const LsxMachineImage& state, LsxGpr reg);
+void WriteGuestGpr16(LsxMachineImage& state, LsxGpr reg, std::uint16_t value);
+std::uint8_t ReadGuestGpr8(const LsxMachineImage& state, LsxGpr reg, bool high8 = false);
+void WriteGuestGpr8(LsxMachineImage& state, LsxGpr reg, std::uint8_t value, bool high8 = false);
 std::uint64_t TruncateToOperandWidth(std::uint64_t value, std::uint32_t size_bits);
 std::uint64_t ExtendSignedOperand(std::uint64_t value, std::uint32_t size_bits);
 // Byte-exact, domain-separated fingerprint contract for live-code validation. Cached native blocks
 // are reusable only
 // while this fingerprint and the decoded guest span match.
-std::uint64_t FingerprintCodeSpan(std::uint64_t guest_va, std::uint32_t size_bytes);
-void CommitAddFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, std::uint64_t result,
+std::uint64_t HashGuestCodeWindow(std::uint64_t guest_va, std::uint32_t size_bytes);
+void RecordIntegerAdditionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, std::uint64_t result,
                     std::uint32_t size_bits);
-void CommitSubtractFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, std::uint64_t result,
+void RecordIntegerSubtractionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, std::uint64_t result,
                     std::uint32_t size_bits);
-void CommitLogicFlags(LsxMachineImage& state, std::uint64_t result, std::uint32_t size_bits);
-void CommitCarryAddFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool carry,
+void RecordLogicalResultFlags(LsxMachineImage& state, std::uint64_t result, std::uint32_t size_bits);
+void RecordCarryingAdditionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool carry,
                     std::uint64_t result, std::uint32_t size_bits);
-void CommitBorrowSubtractFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool borrow,
+void RecordBorrowingSubtractionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool borrow,
                     std::uint64_t result, std::uint32_t size_bits);
 std::uint64_t LoadGuestScalar(std::uint64_t guest_va, std::uint32_t size_bytes);
 void CopyBytesFromGuest(std::uint64_t guest_va, void* dst, std::uint32_t size_bytes);
@@ -460,229 +465,28 @@ void StoreGuestScalar(std::uint64_t guest_va, std::uint64_t value, std::uint32_t
 void CopyBytesToGuest(std::uint64_t guest_va, const void* src, std::uint32_t size_bytes);
 void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, std::size_t state_offset,
                        std::uint32_t size_bits);
-LsxStackReservoir& AccessLsxStackReservoir();
-LsxStackLease AcquireLsxStackLease(LsxMachineImage* state);
-void ReleaseLsxStackLease(const LsxStackLease& frame);
-LsxMachineImage* CurrentMachineImage();
-LsxMachineImage* SwapDiagnosticMachineImage(LsxMachineImage* state);
+LsxStackReservoir& LocalGuestStackReservoir();
+LsxStackLease BorrowGuestStackWindow(LsxMachineImage* state);
+void ReturnGuestStackWindow(const LsxStackLease& frame);
+LsxMachineImage* FindActiveMachineImage();
+LsxMachineImage* ExchangeDiagnosticMachineImage(LsxMachineImage* state);
 // Returns the architectural state at the continuation after the currently executing HLE call.
 // Bridge markers temporarily repurpose guest registers for their sideband protocol, so code that
 // suspends execution from inside an HLE must capture this normalized image instead of the raw
-// marker image returned by CurrentMachineImage().
-bool CaptureCurrentGuestPostHleState(LsxMachineImage& destination);
+// marker image returned by FindActiveMachineImage().
+bool SnapshotGuestStateAfterBridge(LsxMachineImage& destination);
 // HLE implementations that perform an architectural context switch can replace the live machine
 // image and mark it authoritative. The bridge then skips its ordinary function-return epilogue,
 // which would otherwise overwrite the resumed RIP/RSP and callee-saved registers.
-bool MarkCurrentGuestStateOverride();
-bool ConsumeCurrentGuestStateOverride();
-LsxStackLease PrepareLsxEntry(LsxMachineImage& state, std::uint64_t guest_rip,
+bool AnnounceGuestStateReplacement();
+bool TakeGuestStateReplacementNotice();
+LsxStackLease InitializeGuestEntryFrame(LsxMachineImage& state, std::uint64_t guest_rip,
                                           const LsxEntryPacket& ctx);
 bool SignalGuestRunCompletion(std::uint64_t result);
 bool GuestRunCompletionPending();
 std::uint64_t GuestRunCompletionValue();
 void ResetGuestRunCompletion();
-LsxDecodedRegion BuildLsxCodeRegion(std::uint64_t guest_rip, std::uint32_t max_instructions);
-bool QualifiesForInitialLowering(const LsxDecodedRegion& block);
-
-// Scalar precision-conversion contract: x0=dst xmm, x1=old dst xmm,
-// x2=src scalar, x3=direction.
-void ExecuteIntegerArithmetic(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand, AluOp op,
-         std::uint32_t size_bits, std::uint32_t shift_bits);
-std::uint64_t ExecuteIntegerArithmeticMemory(LsxMachineImage& state, std::uint64_t mem_value, std::uint64_t operand,
-                     AluOp op, std::uint32_t size_bits);
-std::uint64_t ExecuteIntegerArithmeticAtomic(LsxMachineImage& state, void* target, std::uint64_t operand,
-                           AluOp op, std::uint32_t size_bits);
-void LoadReversedEndian(LsxMachineImage& state, const void* src, std::size_t state_offset, std::uint32_t size_bits);
-void StoreReversedEndian(const LsxMachineImage& state, void* dst, std::size_t state_offset, std::uint32_t size_bits);
-void CopyFixedWidthValue(void* dst, const void* src, std::size_t size);
-bool TestCondition(const LsxMachineImage& state, LsxMnemonicCode mnemonic);
-std::uint64_t ResolveConditionCode(const LsxMachineImage& state, LsxMnemonicCode mnemonic,
-                       std::uint64_t true_value, std::uint64_t false_value);
-void WriteConditionToRegister(LsxMachineImage& state, std::size_t state_offset, LsxMnemonicCode mnemonic);
-void WriteConditionToMemory(const LsxMachineImage& state, void* dst, LsxMnemonicCode mnemonic);
-void SelectRegisterConditionally(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-          LsxMnemonicCode mnemonic, std::uint32_t size_bits);
-void ShiftRegisterOperand(LsxMachineImage& state, std::size_t state_offset, std::uint64_t count,
-           ShiftOp op, std::uint32_t size_bits);
-void ShiftMemoryOperand(LsxMachineImage& state, void* target, std::uint64_t count, ShiftOp op,
-              std::uint32_t size_bits);
-void Shld(LsxMachineImage& state, std::size_t state_offset, std::uint64_t source,
-          std::uint64_t count, std::uint32_t size_bits);
-void ShldMem(LsxMachineImage& state, void* target, std::uint64_t source,
-             std::uint64_t count, std::uint32_t size_bits);
-void RotateRegisterOperand(LsxMachineImage& state, std::size_t state_offset, std::uint64_t count,
-            bool rotate_right, std::uint32_t size_bits);
-void RotateMem(LsxMachineImage& state, void* target, std::uint64_t count,
-               bool rotate_right, std::uint32_t size_bits);
-void AdjustRegisterByOne(LsxMachineImage& state, std::size_t state_offset, IncDecOp op, std::uint32_t size_bits);
-void AdjustMemoryByOne(LsxMachineImage& state, void* target, IncDecOp op, std::uint32_t size_bits);
-void AdjustAtomicMemoryByOne(LsxMachineImage& state, void* target, IncDecOp op, std::uint32_t size_bits);
-void NegateRegisterOperand(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
-void NegateMemoryOperand(LsxMachineImage& state, void* target, std::uint32_t size_bits);
-void NegateAtomicMemoryOperand(LsxMachineImage& state, void* target, std::uint32_t size_bits);
-void NotMemLocked(LsxMachineImage& state, void* target, std::uint32_t size_bits);
-void MultiplyAccumulatorPair(LsxMachineImage& state, std::uint64_t operand, std::uint32_t size_bits, bool is_signed);
-void DivideAccumulatorPair(LsxMachineImage& state, std::uint64_t divisor, std::uint32_t size_bits, bool is_signed);
-void ExecuteCarryArithmetic(LsxMachineImage& state, std::size_t state_offset, std::uint64_t operand,
-            bool subtract, std::uint32_t size_bits);
-void ExecuteCarryArithmeticMemory(LsxMachineImage& state, void* target, std::uint64_t operand, bool subtract,
-               std::uint32_t size_bits);
-void ExecuteCarryArithmeticAtomic(LsxMachineImage& state, void* target, std::uint64_t operand, bool subtract,
-                     std::uint32_t size_bits);
-void ComputeAndWithInvertedSource(LsxMachineImage& state, std::size_t state_offset, std::uint64_t lhs_not,
-          std::uint64_t rhs, std::uint32_t size_bits);
-void IsolateLeastSignificantSetBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-          std::uint32_t size_bits);
-void ChangeStringTraversalDirection(LsxMachineImage& state, bool set);
-void CopyStringUnit(LsxMachineImage& state, std::uint64_t element_size, bool repeat);
-void FillStringUnit(LsxMachineImage& state, std::uint64_t element_size, bool repeat);
-void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
-          bool repeat_not_equal);
-void CompareExchangeValue(LsxMachineImage& state, void* target, bool target_is_register_lane, std::uint32_t target_shift,
-             std::size_t src_state_offset, std::uint32_t src_shift, std::uint32_t size_bits);
-void CompareExchangeMemoryAtomic(LsxMachineImage& state, void* target, bool target_is_register_lane,
-                   std::uint32_t target_shift, std::size_t src_state_offset,
-                   std::uint32_t src_shift, std::uint32_t size_bits);
-void ExtractContiguousBits(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-           std::uint32_t control, std::uint32_t size_bits);
-void ClearLeastSignificantSetBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-          std::uint32_t size_bits);
-void ProbeRegisterBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t bit_index,
-           std::uint32_t size_bits);
-void ModifyRegisterBit(LsxMachineImage& state, std::uintptr_t state_offset_or_mem_ptr, bool target_is_memory,
-             std::uint64_t bit_index, bool unsigned_memory_index, std::uint32_t size_bits,
-             BitTestOp op);
-void ModifyAtomicMemoryBit(LsxMachineImage& state, std::uintptr_t state_offset_or_mem_ptr, bool target_is_memory,
-                   std::uint64_t bit_index, bool unsigned_memory_index, std::uint32_t size_bits,
-                   BitTestOp op);
-void LocateSetBit(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-             bool reverse, std::uint32_t size_bits);
-void ExchangeAddRegister(LsxMachineImage& state, std::size_t dst_state_offset, std::size_t src_state_offset,
-          std::uint32_t size_bits);
-void ExchangeAddMemory(LsxMachineImage& state, void* target, std::size_t src_state_offset, std::uint32_t size_bits);
-void ExchangeAddMemoryAtomic(LsxMachineImage& state, void* target, std::size_t src_state_offset,
-                   std::uint32_t size_bits);
-void CountSetBits(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-            std::uint32_t src_size_bits, std::uint32_t dst_size_bits);
-void CountLeadingZeroes(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-           std::uint32_t src_size_bits, std::uint32_t dst_size_bits);
-void CountTrailingZeroes(LsxMachineImage& state, std::size_t state_offset, std::uint64_t value,
-           std::uint32_t src_size_bits, std::uint32_t dst_size_bits);
-void ReverseRegisterByteOrder(LsxMachineImage& state, std::size_t state_offset, std::uint32_t size_bits);
-void ComplementMemoryOperand(void* target, std::uint32_t size_bits);
-void MultiplySignedOperands(LsxMachineImage& state, std::size_t state_offset, std::uint64_t lhs, std::uint64_t rhs,
-          std::uint32_t size_bits);
-void TransferVectorValue(void* dst, const void* src, std::size_t size, bool zero_upper_ymm);
-void TransferScalarVectorBits(void* vector, void* other, std::size_t size, std::uint32_t mode);
-void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src, const void* src, bool high_qword,
-               std::uint32_t mode);
-void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs, bool high_selector,
-              bool full_vector);
-void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
-              VectorLogicOp op);
-void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, VectorLogicOp op, std::size_t size);
-void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, std::size_t size);
-void DuplicatePackedSingleLanes(void* dst, const void* src, bool high_source_elements, std::size_t size);
-void BroadcastScalarLane(void* dst, const void* src, std::size_t element_size, std::size_t total_size);
-void BroadcastVectorHalf(void* dst, const void* src);
-std::uint64_t CollectVectorSignBits(const void* src, std::size_t lane_bytes, std::size_t total_size);
-void ExtractVectorDword(void* dst, const void* src, std::uint32_t index, bool store_qword);
-void ExtractVectorLane(void* dst, const void* src, std::uint32_t index, bool store_qword,
-                     std::size_t element_size);
-void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
-               bool src_is_memory);
-void InsertVectorIntegerLane(void* dst, const void* old_dst, std::uint64_t value, std::uint32_t index,
-            std::size_t element_size);
-void InsertVectorHalf(void* dst, const void* old_dst, const void* src, std::uint32_t half_index);
-void ExtractVectorHalf(void* dst, const void* src, std::uint32_t half_index, bool zero_upper_ymm);
-void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, std::uint32_t imm);
-void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
-               std::size_t lane_bytes, std::size_t total_size,
-               bool repeat_mask_per_128 = false);
-void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               std::size_t lane_bytes, std::size_t total_size);
-void BlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               std::size_t total_size);
-void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
-              std::size_t total_size);
-void PermuteBytesFromMask(void* dst, const void* src, const void* mask, std::size_t total_size);
-void InterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
-            bool high_half, std::size_t total_size);
-void InterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
-             bool high_half, std::size_t total_size);
-void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
-                     std::size_t scalar_size);
-void PermuteDwordsFromImmediate(void* dst, const void* src, std::uint8_t imm);
-void PermutePackedWords(void* dst, const void* src, std::uint8_t imm, std::size_t total_size,
-             bool high_half);
-void PermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, std::uint8_t imm);
-void PermuteVectorPairs(void* dst, const void* lhs, const void* rhs, std::uint8_t imm,
-           std::size_t total_size, bool double_lane);
-void ExtendPackedUnsignedLanes(void* dst, const void* src, std::size_t src_element_size,
-                       std::size_t dst_element_size, std::size_t total_size);
-void ExtendPackedSignedLanes(void* dst, const void* src, std::size_t src_element_size,
-                       std::size_t dst_element_size, std::size_t total_size);
-void ConvertIntegerToScalar(void* dst, const void* old_dst, std::uint64_t value,
-                   std::uint32_t source_size_bits, bool integer_to_double);
-void ConvertScalarToInteger(LsxMachineImage& state, std::size_t state_offset, const void* scalar_src,
-                     std::uint32_t dst_size_bits, bool source_is_double,
-                     bool use_current_rounding);
-void CompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void* rhs, bool compare_double);
-void ComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, ScalarArithOp op,
-                  bool operate_double);
-void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, bool operate_double);
-void RoundScalarFloating(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
-                  bool operate_double, std::uint32_t mxcsr);
-void AddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
-                   bool subtract, std::size_t total_size);
-void SaturateWordToUnsignedByte(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void SaturateDwordToUnsignedWord(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void ShiftPackedQuadwords(void* dst, const void* src, std::uint64_t count, bool left,
-                   std::size_t total_size);
-void ShiftPackedWordGroups(void* dst, const void* src, std::uint64_t count,
-                      std::size_t element_bytes, bool left, bool arithmetic_right,
-                      std::size_t total_size);
-void ShiftWholeVectorBytes(void* dst, const void* src, std::size_t shift, bool left,
-                      std::size_t total_size);
-void ShiftPackedLegacyImmediate(void* dst, const void* src, std::uint64_t count, std::size_t element_bytes,
-           bool left, bool arithmetic_right, std::size_t total_size);
-void ShiftPackedVectorImmediate(void* dst, const void* src, std::uint64_t count, std::size_t element_bytes,
-            bool left, bool arithmetic_right, std::size_t total_size);
-void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, std::uint32_t mode,
-                     std::size_t total_size);
-void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
-                   bool compare_signed, bool select_max, std::size_t total_size);
-void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
-                    bool signed_greater_than, std::size_t total_size);
-void ComputePackedFloating(void* dst, const void* lhs, const void* rhs, ScalarArithOp op,
-                       bool operate_double, std::size_t total_size);
-void SquareRootPackedFloating(void* dst, const void* src, bool operate_double, std::size_t total_size,
-                 bool zero_upper_ymm);
-void ComparePackedFloating(void* dst, const void* lhs, const void* rhs, std::uint32_t predicate,
-                         bool operate_double, std::size_t total_size);
-void EstimatePackedReciprocal(void* dst, const void* src, bool reciprocal_sqrt,
-                               std::size_t total_size, bool zero_upper_ymm);
-void RoundPackedFloating(void* dst, const void* src, std::uint32_t imm, bool operate_double,
-                  std::size_t total_size, bool zero_upper_ymm, std::uint32_t mxcsr);
-void AddHorizontalPackedFloating(void* dst, const void* lhs, const void* rhs, bool double_lane,
-                               bool subtract, std::size_t total_size, bool zero_upper_ymm);
-void AddHorizontalPackedDwords(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void FindMinimumUnsignedWord(void* dst, const void* src, bool zero_upper_ymm);
-void DotProductPackedSingle(void* dst, const void* lhs, const void* rhs, std::uint8_t imm,
-           std::size_t total_size, bool zero_upper_ymm);
-void ConvertPackedIntegerFloat(void* dst, const void* src, bool int_to_float, bool truncate,
-                        std::size_t total_size, std::uint32_t mxcsr);
-void CompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* lhs, const void* rhs,
-                    std::uint32_t predicate, bool operate_double);
-void PermuteVectorLanes(void* dst, const void* src, const void* control, std::uint8_t imm,
-             std::size_t total_size, bool double_lane, bool immediate_control);
-void TransferVectorBySignMask(void* vector, const void* mask, void* other, std::size_t total_size,
-              std::size_t lane_bytes, bool store_direction);
-void ConvertScalarFormatLocal(std::array<std::uint8_t, 32>& dst,
-                         const std::array<std::uint8_t, 16>& old_dst,
-                         const void* src_scalar, bool single_to_double);
-void TransferLegacyFpEnvironment(LsxMachineImage& state, std::uint64_t address, bool save,
-                   bool is_64_bit_image = false);
-void CompareExchangeWideAtomic(LsxMachineImage& state, std::uint64_t address);
+LsxDecodedRegion DecodeGuestBasicRegion(std::uint64_t guest_rip, std::uint32_t max_instructions);
+bool RegionAcceptsNativeTier(const LsxDecodedRegion& block);
 
 } // namespace Executor::Jit

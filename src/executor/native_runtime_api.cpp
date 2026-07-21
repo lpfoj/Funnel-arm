@@ -313,7 +313,7 @@ std::uint64_t RunJitMappedFunction(const std::uint64_t guest_rip,
     ctx.stack_base = stack_base;
     ctx.stack_size = stack_size;
     ctx.allow_guest_return_sentinel = 1;
-    return Executor::Jit::RunArm64Translation(guest_rip, ctx);
+    return Executor::Jit::DispatchGuestOnArm64(guest_rip, ctx);
 }
 
 constexpr std::size_t JitFsBaseStateOffset =
@@ -332,7 +332,7 @@ std::uint64_t ReadJitStateQword(const Executor::Jit::LsxMachineImage& state,
 
 std::uint64_t JitGpr(const Executor::Jit::LsxMachineImage& state,
                           const Executor::Jit::LsxGpr reg) {
-    return Executor::Jit::GetGpr64(state, reg);
+    return Executor::Jit::ReadGuestGpr64(state, reg);
 }
 
 void FillBox64RegsFromJitState(const Executor::Jit::LsxMachineImage& state,
@@ -362,22 +362,22 @@ void FillBox64RegsFromJitState(const Executor::Jit::LsxMachineImage& state,
 
 void RestoreJitStateFromBox64Regs(Executor::Jit::LsxMachineImage& state,
                                        const ExecutorBox64GuestRegsSnapshot& in) {
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rax, in.regs[0]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rcx, in.regs[1]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rdx, in.regs[2]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rbx, in.regs[3]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rsp, in.regs[4]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rbp, in.regs[5]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rsi, in.regs[6]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::Rdi, in.regs[7]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R8, in.regs[8]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R9, in.regs[9]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R10, in.regs[10]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R11, in.regs[11]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R12, in.regs[12]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R13, in.regs[13]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R14, in.regs[14]);
-    Executor::Jit::SetGpr64(state, Executor::Jit::LsxGpr::R15, in.regs[15]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rax, in.regs[0]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rcx, in.regs[1]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rdx, in.regs[2]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rbx, in.regs[3]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rsp, in.regs[4]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rbp, in.regs[5]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rsi, in.regs[6]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rdi, in.regs[7]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R8, in.regs[8]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R9, in.regs[9]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R10, in.regs[10]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R11, in.regs[11]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R12, in.regs[12]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R13, in.regs[13]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R14, in.regs[14]);
+    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R15, in.regs[15]);
     state.rip_or_exit = in.rip;
     state.fs_base = in.fsbase;
     state.gs_base = in.gsbase;
@@ -601,7 +601,7 @@ std::atomic_bool g_load_exec_process_worker_active{false};
 
 int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
     if (RuntimeGuestJitActive()) {
-        auto* state = Executor::Jit::CurrentMachineImage();
+        auto* state = Executor::Jit::FindActiveMachineImage();
         if (state == nullptr) {
             out = {};
             return -1;
@@ -5587,9 +5587,9 @@ extern "C" void executor_live_log_fiber_transition(
             static_cast<unsigned long long>(guest_return));
         if (result != 0) {
             std::uint64_t guest_rbp = 0;
-            if (const auto* machine = Executor::Jit::CurrentMachineImage();
+            if (const auto* machine = Executor::Jit::FindActiveMachineImage();
                 machine != nullptr) {
-                guest_rbp = Executor::Jit::GetGpr64(
+                guest_rbp = Executor::Jit::ReadGuestGpr64(
                     *machine, Executor::Jit::LsxGpr::Rbp);
             }
             std::fprintf(trace, "  failureStack rbp=0x%llx",
@@ -7535,7 +7535,7 @@ extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
             std::uint64_t calls{};
         };
         static thread_local std::array<HotLeafHleEdge, 16> hot_edges{};
-        const auto* const guest_state = Executor::Jit::CurrentMachineImage();
+        const auto* const guest_state = Executor::Jit::FindActiveMachineImage();
         const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
         const std::size_t hot_index =
             static_cast<std::size_t>(((native_function >> 4) ^ (guest_rip >> 4)) &
@@ -20088,7 +20088,7 @@ void ConfigureJitPersistentCacheForLaunch(
     const bool jit_launch, const std::filesystem::path& app0_path,
     const std::filesystem::path& executable_path) {
     if (!jit_launch) {
-        Executor::Jit::ConfigurePersistentBlockCache({}, {}, 0, false);
+        Executor::Jit::ConfigureTranslationStore({}, {}, 0, false);
         return;
     }
 
@@ -20113,7 +20113,7 @@ void ConfigureJitPersistentCacheForLaunch(
         : 0;
     const std::string cache_title =
         JitCacheTitleId(app0_path, executable_path, executable_fingerprint);
-    Executor::Jit::ConfigurePersistentBlockCache(
+    Executor::Jit::ConfigureTranslationStore(
         g_root, cache_title, executable_fingerprint,
         cache_enabled && executable_fingerprint != 0);
     const auto fingerprint_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -22888,7 +22888,7 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
         if (regs == nullptr || regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
             return -2;
         }
-        auto* state = Executor::Jit::CurrentMachineImage();
+        auto* state = Executor::Jit::FindActiveMachineImage();
         if (state == nullptr) {
             return -1;
         }
@@ -24683,7 +24683,7 @@ extern "C" const char* executor_lsx4_runtime_status() {
 
 extern "C" const char* executor_lsx4_runtime_jit_status() {
     static std::string status;
-    status = Executor::Jit::LsxEngineStatusJson();
+    status = Executor::Jit::DescribeTranslationEngineJson();
     return status.c_str();
 }
 
@@ -24729,7 +24729,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
         return -1;
     }
 
-    const auto cpu = Executor::Jit::GetRuntimeStatsSnapshot();
+    const auto cpu = Executor::Jit::SnapshotTranslationTelemetry();
     const auto gpu = Libraries::GnmDriver::ExecutorGetGnmHudStats();
     values[0] = cpu.decoded_blocks;
     values[1] = cpu.native_blocks;
@@ -24754,7 +24754,7 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
 
 extern "C" const char* executor_lsx4_runtime_jit_selftest() {
     static std::string status;
-    status = Executor::Jit::LsxEngineSelfTestJson();
+    status = Executor::Jit::ExerciseTranslationEngineJson();
     const bool guest_range_ok = executor_jit_guest_range_selftest() != 0;
     if (!status.empty() && status.back() == '}') {
         status.pop_back();
@@ -25803,7 +25803,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     // false mapped-entry completion.
                     ctx.allow_guest_return_sentinel = 1;
                     const std::uint64_t guest_result =
-                        Executor::Jit::RunArm64Translation(request.entry, ctx);
+                        Executor::Jit::DispatchGuestOnArm64(request.entry, ctx);
                     result = static_cast<int>(guest_result);
                 } catch (const std::exception& e) {
                     exception_text = e.what();
