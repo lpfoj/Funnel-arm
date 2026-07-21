@@ -198,7 +198,7 @@ bool CapturePostHleContinuation(LsxMachineImage& destination, const u64 result) 
     (void)executor_live_get_current_hle_call_site(
         &guest_return, nullptr, nullptr, nullptr, 0, nullptr, 0);
     if (guest_return == 0 && guest_rsp != 0) {
-        guest_return = Executor::Jit::ReadMemory(guest_rsp, sizeof(u64));
+        guest_return = Executor::Jit::LoadGuestScalar(guest_rsp, sizeof(u64));
     }
     if (guest_rsp == 0 || guest_return == 0) {
         return false;
@@ -280,7 +280,7 @@ bool BuildInitialAndroidFiberState(OrbisFiber* fiber, const u64 arg_on_run_to,
     // A fiber entry is required to return through sceFiberReturnToThread. Keep a fail-closed zero
     // return at the top rather than borrowing the suspended caller's return chain.
     const u64 stack_pointer = stack_top - sizeof(u64);
-    Executor::Jit::WriteMemory(stack_pointer, 0, sizeof(u64));
+    Executor::Jit::StoreGuestScalar(stack_pointer, 0, sizeof(u64));
     Executor::Jit::SetGpr64(destination, LsxGpr::Rsp, stack_pointer);
     return true;
 }
@@ -447,7 +447,7 @@ s32 TraceAndroidFiberResult(const char* operation, const s32 result, const void*
                 for (u32 index = 0; index < 32; ++index) {
                     const u64 address = rsp + index * sizeof(u64);
                     const u64 value =
-                        Executor::Jit::ReadMemory(address, sizeof(u64));
+                        Executor::Jit::LoadGuestScalar(address, sizeof(u64));
                     std::fprintf(trace, "  stack[%02u] @0x%llx = 0x%llx\n", index,
                                  static_cast<unsigned long long>(address),
                                  static_cast<unsigned long long>(value));

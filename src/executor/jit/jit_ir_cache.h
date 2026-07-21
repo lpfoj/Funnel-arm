@@ -60,7 +60,7 @@ inline constexpr std::uint32_t kJitNativeFlagPostLoadDirectV8 = 1u << 9;
 // CMPXCHG now enters its specialized CAS helper directly from a native block, with aligned
 // locked memory using one host atomic compare-exchange instead of the global semantic mutex.
 inline constexpr std::uint32_t kJitNativeFlagPostLoadDirectV9 = 1u << 10;
-// Faultable native blocks now resolve the thread-local fault IR slot once per Execute and load
+// Faultable native blocks now resolve the thread-local fault IR slot once per RunGuest and load
 // that address directly from LsxMachineImage. Older cached bodies still call the C++ TLS resolver in
 // every block prologue, so selectively rebuild only blocks which can touch guest memory.
 inline constexpr std::uint32_t kJitNativeFlagDirectFaultSlotV10 = 1u << 11;

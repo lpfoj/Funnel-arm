@@ -441,8 +441,8 @@ std::uint16_t GetGpr16(const LsxMachineImage& state, LsxGpr reg);
 void SetGpr16(LsxMachineImage& state, LsxGpr reg, std::uint16_t value);
 std::uint8_t GetGpr8(const LsxMachineImage& state, LsxGpr reg, bool high8 = false);
 void SetGpr8(LsxMachineImage& state, LsxGpr reg, std::uint8_t value, bool high8 = false);
-std::uint64_t MaskToSize(std::uint64_t value, std::uint32_t size_bits);
-std::uint64_t SignExtend(std::uint64_t value, std::uint32_t size_bits);
+std::uint64_t TruncateToOperandWidth(std::uint64_t value, std::uint32_t size_bits);
+std::uint64_t ExtendSignedOperand(std::uint64_t value, std::uint32_t size_bits);
 // Byte-exact, domain-separated fingerprint contract for live-code validation. Cached native blocks
 // are reusable only
 // while this fingerprint and the decoded guest span match.
@@ -456,11 +456,11 @@ void CommitCarryAddFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_
                     std::uint64_t result, std::uint32_t size_bits);
 void CommitBorrowSubtractFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool borrow,
                     std::uint64_t result, std::uint32_t size_bits);
-std::uint64_t ReadMemory(std::uint64_t guest_va, std::uint32_t size_bytes);
-void ReadMemoryBytes(std::uint64_t guest_va, void* dst, std::uint32_t size_bytes);
-void WriteMemory(std::uint64_t guest_va, std::uint64_t value, std::uint32_t size_bytes);
-void WriteMemoryBytes(std::uint64_t guest_va, const void* src, std::uint32_t size_bytes);
-void ExecuteJitXchgMem(LsxMachineImage& state, void* target, std::size_t state_offset,
+std::uint64_t LoadGuestScalar(std::uint64_t guest_va, std::uint32_t size_bytes);
+void CopyBytesFromGuest(std::uint64_t guest_va, void* dst, std::uint32_t size_bytes);
+void StoreGuestScalar(std::uint64_t guest_va, std::uint64_t value, std::uint32_t size_bytes);
+void CopyBytesToGuest(std::uint64_t guest_va, const void* src, std::uint32_t size_bytes);
+void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, std::size_t state_offset,
                        std::uint32_t size_bits);
 LsxStackReservoir& AccessLsxStackReservoir();
 LsxStackLease AcquireLsxStackLease(LsxMachineImage* state);
@@ -479,10 +479,10 @@ bool MarkCurrentGuestStateOverride();
 bool ConsumeCurrentGuestStateOverride();
 LsxStackLease PrepareLsxEntry(LsxMachineImage& state, std::uint64_t guest_rip,
                                           const LsxEntryPacket& ctx);
-bool RequestCurrentGuestExit(std::uint64_t result);
-bool IsGuestExitRequested();
-std::uint64_t GetGuestExitResult();
-void ClearGuestExitRequest();
+bool SignalGuestRunCompletion(std::uint64_t result);
+bool GuestRunCompletionPending();
+std::uint64_t GuestRunCompletionValue();
+void ResetGuestRunCompletion();
 LsxDecodedRegion BuildLsxCodeRegion(std::uint64_t guest_rip, std::uint32_t max_instructions);
 bool QualifiesForInitialLowering(const LsxDecodedRegion& block);
 
