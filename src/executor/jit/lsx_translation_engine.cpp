@@ -13,6 +13,7 @@
 
 #include "common/x86_decoder.h"
 #include <xbyak_aarch64/xbyak_aarch64.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -398,11 +399,6 @@ std::uint32_t ReadGuestTscAux() {
 #endif
 }
 
-// X86 exposes the decoded displacement value together with its encoded width.  Persistent IR
-// and a few decoder versions may retain only the raw low bits in `value`; relying on the C++
-// field's apparent signedness consequently turns disp8/disp32 stack references into large
-// positive offsets.  Canonicalize from the architectural encoded width at every effective-address
-// boundary.  This matches x86-64 ModRM/SIB sign extension and is shared by helper and native paths.
 std::int64_t SignedMemoryDisplacement(const LsxOperandRecord& operand) {
     const std::uint32_t bits = operand.mem.disp.size;
     std::uint64_t raw = static_cast<std::uint64_t>(operand.mem.disp.value);
@@ -763,9 +759,6 @@ bool JitBlockUsesDirectFaultSlotV10(const LsxDecodedRegion& block) {
                 }
             }
         }
-        // These families access the guest stack or implicit string addresses even when X86
-        // exposes no explicit referenced memory operand. Conservatively including scalar
-        // MOVSD/CMPSD is harmless: it only upgrades a few extra cached blocks once.
         switch (mnemonic) {
         case X86_MNEMONIC_PUSH:
         case X86_MNEMONIC_POP:
@@ -1387,31 +1380,49 @@ bool ReadGuestBytesChecked(std::uint64_t address, void* dst, std::size_t size);
 }
 
 LsxEngineReport QueryTranslationEngine() {
-    LsxEngineReport status{};
-    status.executable = true;
-    status.reason = "lsx_translation_contract_active";
-    return status;
+    return LsxEngineReport{
+        .compiled = true,
+        .executable = true,
+        .reason = "lsx_aarch64_translation_ready",
+    };
 }
 
-std::uint64_t HashGuestCodeWindow(const std::uint64_t guest_va,
-                              const std::uint32_t size_bytes) {
-    Common::ContentFingerprint64 fingerprint{Common::FingerprintDomain::GuestCode};
-    std::array<std::uint8_t, 256> bytes{};
-    std::uint32_t offset = 0;
-    while (offset < size_bytes) {
-        const std::uint32_t remaining = size_bytes - offset;
-        const std::uint32_t chunk =
-            remaining < bytes.size() ? remaining : static_cast<std::uint32_t>(bytes.size());
-        if (!ReadGuestBytesChecked(guest_va + offset, bytes.data(), chunk)) {
-            std::ostringstream error;
-            error << "JIT HashGuestCodeWindow unreadable guest range va=0x" << std::hex
-                  << guest_va << " size=0x" << size_bytes << " offset=0x" << offset;
-            throw std::runtime_error(error.str());
+class GuestCodeFingerprinter {
+public:
+    GuestCodeFingerprinter(const std::uint64_t base, const std::uint32_t length)
+        : base_(base), length_(length) {}
+
+    std::uint64_t Run() {
+        Common::ContentFingerprint64 digest{Common::FingerprintDomain::GuestCode};
+        while (consumed_ != length_) {
+            const auto count = static_cast<std::uint32_t>(
+                std::min<std::size_t>(buffer_.size(), length_ - consumed_));
+            if (!ReadGuestBytesChecked(base_ + consumed_, buffer_.data(), count)) {
+                FailUnreadable();
+            }
+            digest.Update(std::span<const std::uint8_t>{buffer_.data(), count});
+            consumed_ += count;
         }
-        fingerprint.Update(std::span<const std::uint8_t>{bytes.data(), chunk});
-        offset += chunk;
+        return digest.Finish();
     }
-    return fingerprint.Finish();
+
+private:
+    [[noreturn]] void FailUnreadable() const {
+        std::ostringstream message;
+        message << "guest code digest cannot read va=0x" << std::hex << base_
+                << " length=0x" << length_ << " consumed=0x" << consumed_;
+        throw std::runtime_error(message.str());
+    }
+
+    std::uint64_t base_{};
+    std::uint32_t length_{};
+    std::uint32_t consumed_{};
+    std::array<std::uint8_t, 512> buffer_{};
+};
+
+std::uint64_t HashGuestCodeWindow(const std::uint64_t guest_va,
+                                  const std::uint32_t size_bytes) {
+    return GuestCodeFingerprinter{guest_va, size_bytes}.Run();
 }
 
 void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool repeat_equal,
@@ -7023,127 +7034,98 @@ std::uint64_t ExecuteProfiledInterpreterBridge(LsxMachineImage* state, const Lsx
     return InterpretDecodedRegion(state, block);
 }
 
-Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
-                                         Arm64BlockEntry observed) noexcept {
-    if (slot == nullptr || observed == nullptr ||
-        slot->target.load(std::memory_order_acquire) != observed) {
+enum class DirectTargetAudit : std::uint8_t {
+    Scheduled,
+    Safepoint,
+};
+
+struct DirectTargetDigest {
+    std::uint32_t guest_size{};
+    std::uint64_t expected{};
+    std::uint64_t observed{};
+    bool matches{};
+};
+
+DirectTargetDigest InspectDirectTargetBytes(const ChainPatchCell& cell) noexcept {
+    DirectTargetDigest digest{
+        .guest_size = cell.guest_size.load(std::memory_order_acquire),
+        .expected = cell.guest_hash.load(std::memory_order_acquire),
+    };
+    if (digest.guest_size == 0) {
+        return digest;
+    }
+    try {
+        digest.observed = HashGuestCodeWindow(cell.guest_rip, digest.guest_size);
+        digest.matches = digest.observed == digest.expected;
+    } catch (...) {
+        digest.matches = false;
+    }
+    return digest;
+}
+
+void RetireRejectedDirectTarget(ChainPatchCell& cell, const Arm64BlockEntry candidate,
+                                const DirectTargetDigest& digest,
+                                const DirectTargetAudit audit) noexcept {
+    Arm64BlockEntry expected = candidate;
+    if (cell.target.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
+        cell.chain_target.store(nullptr, std::memory_order_release);
+        cell.refresh_counter.store(kJitCacheInitialValidation, std::memory_order_relaxed);
+        if (cell.execution_cache_epoch != nullptr) {
+            cell.execution_cache_epoch->fetch_add(1, std::memory_order_release);
+        }
+    }
+    g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
+
+    static std::atomic<std::uint32_t> log_budget{0};
+    const auto ordinal = log_budget.fetch_add(1, std::memory_order_relaxed);
+    if (ordinal >= 128) {
+        return;
+    }
+    JitLog("[EXECUTOR_JIT_EDGE_INVALIDATE] n=%u mode=%s rip=0x%llx size=0x%x "
+           "expectedHash=0x%llx observedHash=0x%llx",
+           ordinal, audit == DirectTargetAudit::Safepoint ? "safepoint" : "scheduled",
+           static_cast<unsigned long long>(cell.guest_rip), digest.guest_size,
+           static_cast<unsigned long long>(digest.expected),
+           static_cast<unsigned long long>(digest.observed));
+}
+
+template <DirectTargetAudit Audit>
+Arm64BlockEntry AuditDirectTarget(ChainPatchCell* const slot,
+                                  const Arm64BlockEntry candidate) noexcept {
+    if (slot == nullptr || candidate == nullptr ||
+        slot->target.load(std::memory_order_acquire) != candidate) {
         return nullptr;
     }
-
-    if (JitGuestHotSamplerEnabled()) {
-        SampleJitGuestRip(slot->guest_rip);
-    }
-    if (!ShouldHashObservedDirectTarget(slot, observed)) {
-        // Retirement publishes nullptr before changing the remaining metadata.
-        // Re-read target so a concurrent retire cannot return the stale entry
-        // from this no-hash path.
-        return slot->target.load(std::memory_order_acquire) == observed
-                   ? observed
-                   : nullptr;
+    if constexpr (Audit == DirectTargetAudit::Scheduled) {
+        if (JitGuestHotSamplerEnabled()) {
+            SampleJitGuestRip(slot->guest_rip);
+        }
+        if (!ShouldHashObservedDirectTarget(slot, candidate)) {
+            return slot->target.load(std::memory_order_acquire) == candidate
+                       ? candidate
+                       : nullptr;
+        }
     }
 
-    const std::uint32_t guest_size =
-        slot->guest_size.load(std::memory_order_acquire);
-    const std::uint64_t expected_hash =
-        slot->guest_hash.load(std::memory_order_acquire);
-    bool valid = guest_size != 0;
-    std::uint64_t live_hash = 0;
-    if (valid) {
-        try {
-            live_hash = HashGuestCodeWindow(slot->guest_rip, guest_size);
-            valid = live_hash == expected_hash;
-        } catch (...) {
-            valid = false;
-        }
-    }
-    if (!valid) {
-        Arm64BlockEntry expected = observed;
-        const bool cleared = slot->target.compare_exchange_strong(
-            expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
-        if (cleared) {
-            slot->chain_target.store(nullptr, std::memory_order_release);
-            slot->refresh_counter.store(kJitCacheInitialValidation,
-                                        std::memory_order_relaxed);
-            if (slot->execution_cache_epoch != nullptr) {
-                // The generated direct consumer falls back to the dispatcher after this store.
-                // Bump the owner epoch so that fallback cannot reuse a stale TLS way before the
-                // authoritative cache retires and recompiles the mutated guest block.
-                slot->execution_cache_epoch->fetch_add(1, std::memory_order_release);
-            }
-        }
-        g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<std::uint32_t> s_direct_smc_budget{0};
-        const std::uint32_t n =
-            s_direct_smc_budget.fetch_add(1, std::memory_order_relaxed);
-        if (n < 64) {
-            JitLog("[EXECUTOR_JIT_DIRECT_SMC_INVALIDATE] n=%u rip=0x%llx "
-                        "size=0x%x expectedHash=0x%llx liveHash=0x%llx",
-                        n,
-                        static_cast<unsigned long long>(slot->guest_rip),
-                        guest_size,
-                        static_cast<unsigned long long>(expected_hash),
-                        static_cast<unsigned long long>(live_hash));
-        }
+    const auto digest = InspectDirectTargetBytes(*slot);
+    if (!digest.matches) {
+        RetireRejectedDirectTarget(*slot, candidate, digest, Audit);
         return nullptr;
     }
-
-    return slot->target.load(std::memory_order_acquire) == observed
-               ? observed
+    return slot->target.load(std::memory_order_acquire) == candidate
+               ? candidate
                : nullptr;
 }
 
+Arm64BlockEntry ValidateObservedDirectTarget(ChainPatchCell* slot,
+                                             Arm64BlockEntry observed) noexcept {
+    return AuditDirectTarget<DirectTargetAudit::Scheduled>(slot, observed);
+}
+
 Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(ChainPatchCell* slot,
-                                                    Arm64BlockEntry observed) noexcept {
-    if (slot == nullptr || observed == nullptr ||
-        slot->target.load(std::memory_order_acquire) != observed) {
-        return nullptr;
-    }
-
-    const std::uint32_t guest_size =
-        slot->guest_size.load(std::memory_order_acquire);
-    const std::uint64_t expected_hash =
-        slot->guest_hash.load(std::memory_order_acquire);
-    bool valid = guest_size != 0;
-    std::uint64_t live_hash = 0;
-    if (valid) {
-        try {
-            live_hash = HashGuestCodeWindow(slot->guest_rip, guest_size);
-            valid = live_hash == expected_hash;
-        } catch (...) {
-            valid = false;
-        }
-    }
-    if (!valid) {
-        Arm64BlockEntry expected = observed;
-        if (slot->target.compare_exchange_strong(
-                expected, nullptr, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            slot->chain_target.store(nullptr, std::memory_order_release);
-            slot->refresh_counter.store(kJitCacheInitialValidation,
-                                        std::memory_order_relaxed);
-            if (slot->execution_cache_epoch != nullptr) {
-                slot->execution_cache_epoch->fetch_add(1, std::memory_order_release);
-            }
-        }
-        g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<std::uint32_t> s_direct_safepoint_smc_budget{0};
-        const std::uint32_t n =
-            s_direct_safepoint_smc_budget.fetch_add(1, std::memory_order_relaxed);
-        if (n < 64) {
-            JitLog("[EXECUTOR_JIT_DIRECT_SAFEPOINT_SMC_INVALIDATE] n=%u "
-                        "rip=0x%llx size=0x%x expectedHash=0x%llx liveHash=0x%llx",
-                        n,
-                        static_cast<unsigned long long>(slot->guest_rip),
-                        guest_size,
-                        static_cast<unsigned long long>(expected_hash),
-                        static_cast<unsigned long long>(live_hash));
-        }
-        return nullptr;
-    }
-
-    return slot->target.load(std::memory_order_acquire) == observed
-               ? observed
-               : nullptr;
+                                                        Arm64BlockEntry observed) noexcept {
+    return AuditDirectTarget<DirectTargetAudit::Safepoint>(slot, observed);
 }
 
 Arm64BlockEntry ValidateObservedDirectChainTargetAtSafepoint(
@@ -7152,10 +7134,8 @@ Arm64BlockEntry ValidateObservedDirectChainTargetAtSafepoint(
         slot->chain_target.load(std::memory_order_acquire) != observed) {
         return nullptr;
     }
-    const Arm64BlockEntry normal =
-        slot->target.load(std::memory_order_acquire);
-    if (normal == nullptr ||
-        ValidateObservedDirectTargetAtSafepoint(slot, normal) == nullptr) {
+    const auto normal = slot->target.load(std::memory_order_acquire);
+    if (AuditDirectTarget<DirectTargetAudit::Safepoint>(slot, normal) == nullptr) {
         slot->chain_target.store(nullptr, std::memory_order_release);
         return nullptr;
     }
@@ -34559,171 +34539,133 @@ RuntimeStatsSnapshot SnapshotTranslationTelemetry() noexcept {
 }
 
 std::string DescribeTranslationEngineJson() {
-    const auto st = QueryTranslationEngine();
-    struct HotHelperSnapshot {
-        std::uint64_t rip = 0;
-        std::uint64_t count = 0;
-        std::uint32_t insn_count = 0;
-        std::uint32_t first_mnemonic = 0;
-    };
-    std::array<HotHelperSnapshot, kJitHotHelperSlots> hot_helpers{};
-    for (std::size_t i = 0; i < g_jit_hot_helper_slots.size(); ++i) {
-        hot_helpers[i].rip = g_jit_hot_helper_slots[i].rip.load(std::memory_order_relaxed);
-        hot_helpers[i].count =
-            g_jit_hot_helper_slots[i].count.load(std::memory_order_relaxed);
-        hot_helpers[i].insn_count =
-            g_jit_hot_helper_slots[i].insn_count.load(std::memory_order_relaxed);
-        hot_helpers[i].first_mnemonic =
-            g_jit_hot_helper_slots[i].first_mnemonic.load(std::memory_order_relaxed);
-    }
-    for (std::size_t i = 0; i + 1 < hot_helpers.size(); ++i) {
-        std::size_t best = i;
-        for (std::size_t j = i + 1; j < hot_helpers.size(); ++j) {
-            if (hot_helpers[j].count > hot_helpers[best].count) {
-                best = j;
-            }
-        }
-        if (best != i) {
-            const HotHelperSnapshot tmp = hot_helpers[i];
-            hot_helpers[i] = hot_helpers[best];
-            hot_helpers[best] = tmp;
-        }
-    }
+    using Json = nlohmann::ordered_json;
 
-    std::ostringstream out;
-    out << "{"
-        << R"("name":"lsx-aarch64-translation-engine",)"
-        << R"("source":"ps4run-native-arm64",)"
-        << R"("compiled":)" << (st.compiled ? "true" : "false") << ","
-        << R"("executable":)" << (st.executable ? "true" : "false") << ","
-        << R"("reason":")" << JsonEscape(st.reason) << R"(",)"
-        << R"("engine":")" << JsonEscape(g_lsx_translation_engine.Name()) << R"(",)"
-        << R"("runtimeBlocks":{)"
-        << R"("decoded":)" << g_jit_blocks_decoded.load(std::memory_order_relaxed) << ","
-        << R"("native":)" << g_jit_blocks_native.load(std::memory_order_relaxed) << ","
-        << R"("helper":)" << g_jit_blocks_helper.load(std::memory_order_relaxed) << ","
-        << R"("unsupported":)" << g_jit_blocks_unsupported.load(std::memory_order_relaxed)
-        << ","
-        << R"("cacheHash":{)"
-        << R"("hits":)" << g_jit_cache_hash_hits.load(std::memory_order_relaxed) << ","
-        << R"("mismatches":)"
-        << g_jit_cache_hash_misses.load(std::memory_order_relaxed) << "},"
-        << R"("persistentIrCache":{)"
-        << R"("enabled":)"
-        << (g_jit_persistent_ir_enabled.load(std::memory_order_relaxed) ? "true" : "false")
-        << ","
-        << R"("hits":)" << g_jit_persistent_ir_hits.load(std::memory_order_relaxed) << ","
-        << R"("misses":)" << g_jit_persistent_ir_misses.load(std::memory_order_relaxed)
-        << ","
-        << R"("loaded":)"
-        << g_jit_persistent_ir_records_loaded.load(std::memory_order_relaxed) << ","
-        << R"("written":)"
-        << g_jit_persistent_ir_records_written.load(std::memory_order_relaxed) << ","
-        << R"("corruptShards":)"
-        << g_jit_persistent_ir_corrupt_shards.load(std::memory_order_relaxed) << "},"
-        << R"("persistentNative":{)"
-        << R"("hits":)"
-        << g_jit_persistent_native_hits.load(std::memory_order_relaxed) << ","
-        << R"("segmentsRestored":)"
-        << g_jit_persistent_native_segments_restored.load(std::memory_order_relaxed)
-        << ","
-        << R"("captured":)"
-        << g_jit_persistent_native_records_captured.load(std::memory_order_relaxed)
-        << ","
-        << R"("written":)"
-        << g_jit_persistent_native_records_written.load(std::memory_order_relaxed)
-        << ","
-        << R"("restoreFallback":)"
-        << g_jit_persistent_native_restore_fallbacks.load(std::memory_order_relaxed)
-        << ","
-        << R"("captureRejected":)"
-        << g_jit_persistent_native_capture_rejected.load(std::memory_order_relaxed)
-        << "},"
-        << R"("checkedNative":{)"
-        << R"("hits":)" << g_jit_checked_native_hits.load(std::memory_order_relaxed) << ","
-        << R"("trusted":)" << g_jit_checked_native_trusted.load(std::memory_order_relaxed)
-        << ","
-        << R"("fallback":)" << g_jit_checked_native_fallback.load(std::memory_order_relaxed)
-        << "},"
-        << R"("nativeSimd":{)"
-        << R"("blocks":)" << g_jit_native_simd_blocks.load(std::memory_order_relaxed)
-        << ","
-        << R"("fullyDirectBlocks":)"
-        << g_jit_native_fully_direct_blocks.load(std::memory_order_relaxed) << ","
-        << R"("fastInstructions":)"
-        << g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) << ","
-        << R"("semanticInstructions":)"
-        << g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) << ","
-        << R"("faultableWritebackBlocks":)"
-        << g_jit_native_simd_faultable_writeback_blocks.load(
-               std::memory_order_relaxed)
-        << "},"
-        << R"("nativeScalar":{)"
-        << R"("blocks":)" << g_jit_native_scalar_blocks.load(std::memory_order_relaxed)
-        << ","
-        << R"("directInstructions":)"
-        << g_jit_native_scalar_direct_instructions.load(std::memory_order_relaxed) << ","
-        << R"("semanticInstructions":)"
-        << g_jit_native_scalar_semantic_instructions.load(std::memory_order_relaxed) << ","
-        << R"("repStringBulk":{)"
-        << R"("movsCalls":)"
-        << g_jit_rep_movs_bulk_calls.load(std::memory_order_relaxed) << ","
-        << R"("movsBytes":)"
-        << g_jit_rep_movs_bulk_bytes.load(std::memory_order_relaxed) << ","
-        << R"("stosCalls":)"
-        << g_jit_rep_stos_bulk_calls.load(std::memory_order_relaxed) << ","
-        << R"("stosBytes":)"
-        << g_jit_rep_stos_bulk_bytes.load(std::memory_order_relaxed) << "},"
-        << R"("controlSemanticTerminators":)"
-        << g_jit_native_control_semantic_terminators.load(
-               std::memory_order_relaxed)
-        << "},"
-        << R"("leafHleFusion":{)"
-        << R"("compiledBlocks":)"
-        << g_jit_leaf_hle_fused_blocks.load(std::memory_order_relaxed)
-        << "},"
-        << R"("hotHelpers":[)";
-    bool first_hot = true;
-    for (const auto& hot : hot_helpers) {
-        if (hot.rip == 0 || hot.count == 0) {
+    const auto status = QueryTranslationEngine();
+    const auto relaxed = [](const auto& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    const auto address_text = [](const std::uint64_t address) {
+        std::ostringstream text;
+        text << "0x" << std::hex << address;
+        return text.str();
+    };
+
+    struct HotHelperSnapshot {
+        std::uint64_t rip{};
+        std::uint64_t count{};
+        std::uint32_t instruction_count{};
+        std::uint32_t first_mnemonic{};
+    };
+    std::array<HotHelperSnapshot, kJitHotHelperSlots> helpers{};
+    for (std::size_t index = 0; index < helpers.size(); ++index) {
+        const auto& source = g_jit_hot_helper_slots[index];
+        helpers[index] = {
+            .rip = relaxed(source.rip),
+            .count = relaxed(source.count),
+            .instruction_count = relaxed(source.insn_count),
+            .first_mnemonic = relaxed(source.first_mnemonic),
+        };
+    }
+    std::ranges::sort(helpers, std::greater{}, &HotHelperSnapshot::count);
+
+    Json document = Json::object();
+    document["name"] = "lsx-aarch64-translation-engine";
+    document["architecture"] = "aarch64";
+    document["compiled"] = status.compiled;
+    document["executable"] = status.executable;
+    document["reason"] = status.reason;
+    document["engine"] = g_lsx_translation_engine.Name();
+    document["runtimeBlocks"] = {
+        {"decoded", relaxed(g_jit_blocks_decoded)},
+        {"native", relaxed(g_jit_blocks_native)},
+        {"helper", relaxed(g_jit_blocks_helper)},
+        {"unsupported", relaxed(g_jit_blocks_unsupported)},
+        {"cacheHash", {
+            {"hits", relaxed(g_jit_cache_hash_hits)},
+            {"mismatches", relaxed(g_jit_cache_hash_misses)},
+        }},
+        {"persistentIrCache", {
+            {"enabled", relaxed(g_jit_persistent_ir_enabled)},
+            {"hits", relaxed(g_jit_persistent_ir_hits)},
+            {"misses", relaxed(g_jit_persistent_ir_misses)},
+            {"loaded", relaxed(g_jit_persistent_ir_records_loaded)},
+            {"written", relaxed(g_jit_persistent_ir_records_written)},
+            {"corruptShards", relaxed(g_jit_persistent_ir_corrupt_shards)},
+        }},
+        {"persistentNative", {
+            {"hits", relaxed(g_jit_persistent_native_hits)},
+            {"segmentsRestored", relaxed(g_jit_persistent_native_segments_restored)},
+            {"captured", relaxed(g_jit_persistent_native_records_captured)},
+            {"written", relaxed(g_jit_persistent_native_records_written)},
+            {"restoreFallback", relaxed(g_jit_persistent_native_restore_fallbacks)},
+            {"captureRejected", relaxed(g_jit_persistent_native_capture_rejected)},
+        }},
+        {"checkedNative", {
+            {"hits", relaxed(g_jit_checked_native_hits)},
+            {"trusted", relaxed(g_jit_checked_native_trusted)},
+            {"fallback", relaxed(g_jit_checked_native_fallback)},
+        }},
+        {"nativeSimd", {
+            {"blocks", relaxed(g_jit_native_simd_blocks)},
+            {"fullyDirectBlocks", relaxed(g_jit_native_fully_direct_blocks)},
+            {"fastInstructions", relaxed(g_jit_native_simd_fast_instructions)},
+            {"semanticInstructions", relaxed(g_jit_native_simd_semantic_instructions)},
+            {"faultableWritebackBlocks", relaxed(g_jit_native_simd_faultable_writeback_blocks)},
+        }},
+        {"nativeScalar", {
+            {"blocks", relaxed(g_jit_native_scalar_blocks)},
+            {"directInstructions", relaxed(g_jit_native_scalar_direct_instructions)},
+            {"semanticInstructions", relaxed(g_jit_native_scalar_semantic_instructions)},
+            {"repStringBulk", {
+                {"movsCalls", relaxed(g_jit_rep_movs_bulk_calls)},
+                {"movsBytes", relaxed(g_jit_rep_movs_bulk_bytes)},
+                {"stosCalls", relaxed(g_jit_rep_stos_bulk_calls)},
+                {"stosBytes", relaxed(g_jit_rep_stos_bulk_bytes)},
+            }},
+            {"controlSemanticTerminators", relaxed(g_jit_native_control_semantic_terminators)},
+        }},
+        {"leafHleFusion", {
+            {"compiledBlocks", relaxed(g_jit_leaf_hle_fused_blocks)},
+        }},
+    };
+
+    Json hot_helpers = Json::array();
+    for (const auto& helper : helpers) {
+        if (helper.rip == 0 || helper.count == 0) {
             continue;
         }
-        if (!first_hot) {
-            out << ",";
-        }
-        first_hot = false;
-        const char* first_mnemonic_name =
-            X86MnemonicGetString(static_cast<X86Mnemonic>(hot.first_mnemonic));
-        out << "{"
-            << R"("rip":"0x)" << std::hex << hot.rip << std::dec << R"(",)"
-            << R"("count":)" << hot.count << ","
-            << R"("insn":)" << hot.insn_count << ","
-            << R"("firstMnemonic":)" << hot.first_mnemonic << ","
-            << R"("firstMnemonicName":")"
-            << JsonEscape(first_mnemonic_name != nullptr ? first_mnemonic_name : "<unknown>")
-            << R"("})";
+        const char* mnemonic =
+            X86MnemonicGetString(static_cast<X86Mnemonic>(helper.first_mnemonic));
+        hot_helpers.push_back({
+            {"rip", address_text(helper.rip)},
+            {"count", helper.count},
+            {"insn", helper.instruction_count},
+            {"firstMnemonic", helper.first_mnemonic},
+            {"firstMnemonicName", mnemonic != nullptr ? mnemonic : "<unknown>"},
+        });
     }
-    out << "]"
-        << "},"
-        << R"("coverage":{)"
-        << R"("machineContractFunctions":)" << st.machine_contract_functions << ","
-        << R"("translationManifestFunctions":)" << st.translation_manifest_functions << ","
-        << R"("implementedCoreHelpers":)" << st.implemented_core_helpers << ","
-        << R"("compilerFunctions":)" << st.compiler_functions << ","
-        << R"("decodeFunctions":)" << st.decode_functions << ","
-        << R"("operandFunctions":)" << st.operand_functions << ","
-        << R"("memoryFunctions":)" << st.memory_functions << ","
-        << R"("flagsFunctions":)" << st.flags_functions << ","
-        << R"("stackLeaseFunctions":)" << st.stack_lease_functions << ","
-        << R"("signalFunctions":)" << st.signal_functions << ","
-        << R"("tlsSymbols":)" << st.tls_symbols
-        << "},"
-        << R"("nextRequired":["pc-interpreter parity across guest module boundaries",)"
-        << R"("JIT thread state dump on render stalls",)"
-        << R"("replace remaining interpreter-helper blocks with direct AArch64 blocks",)"
-        << R"("stack-argument and guest-frame parity against the native execution contract"])"
-        << "}";
-    return out.str();
+    document["runtimeBlocks"]["hotHelpers"] = std::move(hot_helpers);
+    document["coverage"] = {
+        {"machineContractFunctions", status.machine_contract_functions},
+        {"translationManifestFunctions", status.translation_manifest_functions},
+        {"implementedCoreHelpers", status.implemented_core_helpers},
+        {"compilerFunctions", status.compiler_functions},
+        {"decodeFunctions", status.decode_functions},
+        {"operandFunctions", status.operand_functions},
+        {"memoryFunctions", status.memory_functions},
+        {"flagsFunctions", status.flags_functions},
+        {"stackLeaseFunctions", status.stack_lease_functions},
+        {"signalFunctions", status.signal_functions},
+        {"tlsSymbols", status.tls_symbols},
+    };
+    document["nextRequired"] = {
+        "pc-interpreter parity across guest module boundaries",
+        "JIT thread state dump on render stalls",
+        "replace remaining interpreter-helper blocks with direct AArch64 blocks",
+        "stack-argument and guest-frame parity against the native execution contract",
+    };
+    return document.dump();
 }
 
 namespace {

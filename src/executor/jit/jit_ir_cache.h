@@ -100,9 +100,6 @@ enum class JitNativeRelocationKind : std::uint8_t {
     // Versioned logical helper id resolved by the current runtime. New native captures use this
     // for every callable module target and reject any helper missing from the stable-id table.
     StableExternal = 6,
-    // The emitted block referenced its per-source indirect branch/return PIC. The raw pointer is
-    // never serialized; restore supplies a freshly constructed process-local site and patches it
-    // into the fixed MOVZ/MOVK materialization.
     PolymorphicChainSite = 7,
 };
 

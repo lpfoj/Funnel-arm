@@ -207,11 +207,6 @@ struct ExecutorBox64GuestRegsSnapshot {
 extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const void* regs, std::size_t regs_size);
 
-// BDWGC stops JIT guest threads through the guest SIGUSR1/SIG30 handler.  The collector can
-// scan the separate x86 stacks once they are registered below, but a managed reference may exist
-// only in an emulated x86 GPR at that exact safepoint.  Native AArch64 ucontext registers do not
-// contain those values.  Keep one compact, permanently-rooted register image per host TID; the
-// signal bridge refreshes the slot before it enters Mono's suspend handler.
 constexpr std::size_t kJitGcRegisterRootSlots = 256;
 alignas(64) std::array<ExecutorBox64GuestRegsSnapshot, kJitGcRegisterRootSlots>
     g_jit_gc_register_roots{};
@@ -432,12 +427,6 @@ std::vector<ExecutorGuestReadableRange> g_box64_guest_stack_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_gc_sideband_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_readable_ranges;
 
-// JIT reference validation reads guest stacks through ExecutorJitReadGuestBytes.
-// Those mmap-backed stacks are intentionally outside Core::MemoryManager, so the old path first
-// missed its VMA tree and then serialized on g_box64_guest_stack_lock for every operand.  Registered
-// readable ranges are process-lifetime objects in this runtime; publish only pages fully contained
-// by a range into an exact-address lock-free cache.  A hit is therefore a sufficient containment
-// proof, while unaligned/cross-page accesses retain the authoritative locked range check.
 constexpr std::uint64_t JitRegisteredPageSize = 4_KB;
 constexpr std::uint64_t JitRegisteredPageMask = JitRegisteredPageSize - 1;
 constexpr std::size_t JitRegisteredPageCacheSlots = 16384;
@@ -2127,18 +2116,6 @@ bool IsJitOrdinaryGuestRange(const std::uint64_t address, const std::size_t size
         return false;
     }
 
-    // IsValidMapping walks the VMA std::map. Reference-helper loads and stores call this path for
-    // every guest operand, even though the set of usable address-space regions is fixed for the
-    // lifetime of the process MemoryManager (map/unmap only carve and merge VMAs inside those
-    // regions). Cache successful whole-page validations so the common 1/2/4/8/16-byte operand path
-    // is one relaxed atomic load instead of an ordered-map lookup. This deliberately is not
-    // thread_local: Android resolves function-local TLS in this dlopened library through
-    // tlsdesc_resolver_dynamic, which profiling showed consuming 10% of Game:Main after the VMA
-    // lookup itself had fallen to 1.2%. The validated property is process-global, and the
-    // MemoryManager singleton is not replaced during a process lifetime, so a shared lock-free
-    // direct map is the exact contract and avoids that resolver entirely. Validating the complete
-    // page on a miss keeps boundary/gap behavior byte-exact; cross-page operands retain the
-    // authoritative slow path below.
     constexpr std::uint64_t GuestValidationPageSize = 64_KB;
     constexpr std::uint64_t GuestValidationPageMask = GuestValidationPageSize - 1;
     constexpr std::size_t GuestValidationCacheSlots = 256;
@@ -2195,9 +2172,6 @@ bool IsJitCurrentThreadStackRange(const std::uint64_t address, const std::size_t
 }
 
 bool IsJitGuestRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
-    // Registered pthread/fallback stacks live outside Core::MemoryManager.  Check their
-    // process-lifetime page publication first so hot reference-validation operands do not pay an
-    // expected VMA miss before reaching the range which actually owns them.
     return IsJitRegisteredPageCached(address, size) ||
            IsJitOrdinaryGuestRange(address, size) ||
            IsJitRegisteredGuestRange(address, size);
@@ -2442,9 +2416,6 @@ extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const vo
          !IsHostAddressReadableByProcMaps(host_src + size - 1))) {
         return false;
     }
-    // PageManager intentionally write-protects GPU-observed guest pages. If this store reaches a
-    // watched page, Linux supplies ESR_ELx.WnR in the AArch64 signal context; the shared reference
-    // signal path invalidates/unprotects the page and resumes this instruction.
     std::memcpy(reinterpret_cast<void*>(host_address), reinterpret_cast<const void*>(host_src),
                 size);
     return true;
@@ -9405,24 +9376,6 @@ static int ExecutorInstallMonoLibcStringFastpath(void* seg_host, std::size_t seg
     return (strlen_already && equal_already && aot_compare_already) ? 1 : 0;
 }
 
-// mono_aot_get_class_from_name has two independent cache walks.  The GHash walk below is already
-// bounded, but a GHash miss falls through to the AOT file's compact class_name_table.  Unity 4.6's
-// upstream loop trusts every uint16 `next` index and has no cycle check:
-//
-//   table_size = class_name_table[0]; table = class_name_table + 1;
-//   entry = &table[hash * 2];
-//   while (TRUE) { index=entry[0]; next=entry[1]; ...;
-//                  if (next) entry=&table[next * 2]; else break; }
-//
-// `table_size` is only the number of primary buckets.  The official AOT compiler appends collision
-// records after those buckets (`new_entry->index = table->len`), so next>=table_size is legal.  It
-// emits one class record per TypeDef row, which gives two reference-safe structural bounds without
-// needing the unstored final table length:
-//   * every valid next index is below table_size + TypeDef.rows;
-//   * a valid chain visits at most TypeDef.rows class records.
-// A normal next==0 remains on Mono's untouched TRUE/null path.  A guard violation instead unlocks
-// and returns FALSE so mono_class_from_name performs its normal metadata/name-cache fallback;
-// returning TRUE/null for corruption would silently lose System.Enum.
 enum class ExecutorMonoAotChainOutcome : std::uint8_t {
     Hit,
     Miss,
@@ -9531,7 +9484,7 @@ static bool ExecutorMonoAotChainPolicySelfTest() {
 static int ExecutorInstallMonoAotClassNameChainGuard(void* seg_host, std::size_t seg_size) {
     auto* bytes = static_cast<std::uint8_t*>(seg_host);
     if (!RuntimeGuestJitActive()) {
-        return 2;  // Backend A/reference path is intentionally untouched.
+        return 2;
     }
     if (!bytes || !ExecutorMonoSetupImtPool() || !ExecutorMonoAotChainPolicySelfTest()) {
         return -1;
@@ -11010,19 +10963,6 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_STACK_CANARY_PATCH] direct_got_stack_chk skipped branchPatch=0");
     }
-    // ROOT-CAUSE FIX (2026-06-15): this IMT trampoline "overflow" fix WAS the dominant black-screen
-    // crash. A/B proven: with it installed sig11=2 (RAX=0 byte-cmp in a generated 0x7f slab block, reached
-    // via IMT-builder->get_numerous_trampoline -> our alloc-patch's rax=0 sentinel + jmp slab); with it
-    // skipped sig11=0 and the game progresses to UnityGfxDeviceWorker/SceneObserver. The type-2 pool does
-    // NOT actually overflow in normal play, so this patch was a self-inflicted crash. DEFAULT-OFF now;
-    // opt back in only with the run-enable-imt-fix marker (debugging).
-    // RE-ENABLED 2026-06-15 (default-ON) with Codex's reference-correct overflow fix. ROOT CONFIRMED:
-    // the type-2 IMT pool (128) DOES overflow during mscorlib class setup -> mono fatally logs
-    // "Ran out of trampolines of type 2 ... (128)" and the loader thread exits(-1) -> Assembly-CSharp
-    // never loads -> scene never builds. The old crash was NOT "the fix is unnecessary"; it was the
-    // rax=0 sentinel below. The overflow branch now returns a VALID pre-gen IMT thunk (see CODEX FIX),
-    // honouring Mono's get_numerous_trampoline contract (return executable thunk, never 0). Disable for
-    // A/B with the run-no-imt-fix marker.
     if (std::fopen("/data/data/app.lsx4.android/files/run-no-imt-fix", "r")) {
         NativeLog(ANDROID_LOG_WARN, "[EXECUTOR_IMT_FIX] disabled by run-no-imt-fix marker");
         return -2;
@@ -13502,20 +13442,6 @@ extern "C" void executor_mono_vcall_entry_dump() {
                         (unsigned long long)this_ptr, (unsigned long long)r11, pre.c_str());
 }
 
-// Register JIT guest stacks/TLS as Boehm GC roots. Boehm scans the native AArch64 stacks (and
-// therefore the current JIT LsxMachineImage/register spill), but it cannot discover references
-// that exist only on the separate x86-64 guest stacks. Register only real guest stack/TLS ranges:
-// pinning the heap or disabling collection masks this boundary bug and eventually exhausts mspace.
-//
-// We append each tracked guest stack/TLS range to BDWGC's GC_static_roots[] directly (decoded from
-// the stripped sprx via the "Too many root sets" string -> GC_add_roots_inner @0x8032ae740):
-//   GC_static_roots base = 0x8033c02c8, entry stride 0x20 {r_start@0, r_end@8, r_next@0x10, r_tmp@0x18}
-//   GC_n_root_sets (dword) = 0x803398818  (MAX_ROOT_SETS = 0x400)
-//   GC_root_size  (qword)  = 0x803398808
-// Guest VA == host VA (1:1; GuestReadByteCheckedLocked deref proves it). Called from sceGnmSubmitDone
-// (has the mapped-entry read context + runs during the loading frames, before/while the scene builds).
-// Idempotent + gated by the run-gc-guest-roots marker. Writes the entry fields first, then bumps the
-// count last, so a concurrent GC mark sees only complete entries.
 extern "C" void executor_lsx4_register_guest_gc_roots() {
     const bool guest_roots_enabled = ExecutorGcGuestRootsEnabled();
     static const bool force_no_gc = std::filesystem::exists(
@@ -23317,10 +23243,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto force_interpret_audio_sentinel =
         std::filesystem::path(g_root) / "run-force-interpret-audio";
     if (std::filesystem::exists(force_interpret_audio_sentinel)) {
-        // Keep the main/render path native.  Only the RSDK audio worker needs the reference
-        // semantics while the remaining native SIMD discrepancy is narrowed down; applying this
-        // address range process-wide used to destroy frame rate because Game:Main executes code
-        // from the same eboot range.
         setenv("EXECUTOR_FORCE_INTERPRET_LO", "0x8001e0000", 1);
         setenv("EXECUTOR_FORCE_INTERPRET_HI", "0x801700000", 1);
         const bool thread2_only = std::filesystem::exists(
@@ -23336,10 +23258,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   force_interpret_audio_sentinel.string().c_str(),
                   thread2_only ? "Thread2" : "all");
     }
-    // Generic, data-driven differential bisection. File format:
-    //   <inclusive-lo> <exclusive-hi> [guest-thread-name]
-    // Keeping the range outside the binary lets one isolate a native/reference divergence
-    // without adding title addresses or rebuilding between bisection steps.
     const auto force_interpret_range_sentinel =
         std::filesystem::path(g_root) / "diag-force-interpret-range";
     if (std::filesystem::exists(force_interpret_range_sentinel)) {
@@ -23805,9 +23723,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto force_interpret_all_sentinel =
         std::filesystem::path(g_root) / "run-force-interpret-all";
     if (std::filesystem::exists(force_interpret_all_sentinel)) {
-        // Diagnostic: route the WHOLE eboot code range through the reference interpreter so EVERY
-        // guest store passes WriteMemoryBytes' host-image guard — captures the exact guest RIP of the
-        // native block that stores a garbage host address (STORE_INTO_HOST_IMAGE). Slow; capture-only.
         setenv("EXECUTOR_FORCE_INTERPRET_LO", "0x800000000", 1);
         setenv("EXECUTOR_FORCE_INTERPRET_HI", "0x810000000", 1);
         NativeLog(ANDROID_LOG_INFO,
@@ -24072,12 +23987,6 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                       "[EXECUTOR_BOX64_FAST] enabled=1 profile=fast bigblock=3 callret=1 "
                       "safeflags=0 fastround=1 fastnan=1 dirty=1 strongmem=%s log=0", sm);
         }
-        // Unity Mono normally relies on SIGSEGV-driven null checks. In the Android embedded-box64
-        // service that competes with box64/ART signal handling, so force Mono's portable explicit
-        // null-check path for live Unity bring-up. Keep thread suspension on the PC/reference
-        // preemptive path and deliver SIGUSR1 at HLE alertable wait safe points with the Orbis
-        // ucontext adapter. That preserves the native wait lifetime while still running Mono's
-        // real guest suspend handler instead of synthesizing the semaphore ACK.
         setenv("MONO_DEBUG", "explicit-null-checks", 1);
         unsetenv("MONO_THREADS_SUSPEND");
         if (std::filesystem::exists(light_oracle_sentinel)) {
@@ -25752,14 +25661,6 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     if (primary_guest_thread != nullptr) {
                         Libraries::Kernel::g_curthread = primary_guest_thread;
                         Common::SetCurrentThreadName(primary_guest_thread->name.c_str());
-                        // The primary guest Pthread is allocated while the mapped-entry request is
-                        // prepared, but JIT executes it on this dedicated native worker.  A
-                        // normal guest pthread binds NativeThread from RunThread(); the primary
-                        // path previously skipped that step, leaving GetHandle()==0.  Mono could
-                        // then enumerate Game:Main for stop-the-world, but pthread_kill(0, SIGUSR1)
-                        // never delivered its suspend handler and the initiator waited forever for
-                        // the missing ACK.  Bind the Pthread to the worker that actually owns its
-                        // JIT guest state, matching the reference's 1:1 native thread model.
                         primary_guest_thread->native_thr.Initialize();
                         // std::thread inherits the creator's host signal mask.  The Android launch
                         // thread has SIGURG blocked, so Mono's suspend signal was successfully
