@@ -39,6 +39,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -340,6 +341,18 @@ void ExecuteIntegerArithmetic(LsxMachineImage& state, std::size_t state_offset, 
 #endif
 
 namespace {
+
+// Some semantic entry points bind their ABI arguments into a typed operation before entering the
+// implementation kernel.  The object disappears after inlining; it is a compile-time adapter and
+// introduces neither allocation nor indirect dispatch in optimized builds.
+template <auto Kernel, typename... Arguments>
+struct BoundSemanticEntry {
+    std::tuple<Arguments...> arguments;
+
+    [[gnu::always_inline]] inline decltype(auto) Invoke() {
+        return std::apply(Kernel, arguments);
+    }
+};
 
 thread_local bool g_jit_stable_guest_reads = false;
 
@@ -2717,7 +2730,7 @@ private:
     // v9: semantic-leaf calls reconstruct caller-saved register caches. Native payloads emitted
     // by v8 can retain a helper-clobbered guest base and must never be restored; decoded IR remains
     // reusable and will be lowered again without discarding the expensive decode cache.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210004ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210005ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -32167,12 +32180,23 @@ bool RegionAcceptsNativeTier(const LsxDecodedRegion& block) {
     return true;
 }
 
-void CopyFixedWidthValue(void* dst, const void* src, const std::size_t size) {
-    if (dst == nullptr || src == nullptr || size == 0) {
+struct FixedWidthCopyRequest {
+    void* destination;
+    const void* source;
+    std::size_t bytes;
+};
+
+[[gnu::always_inline]] static inline void SemanticKernelCopyFixedWidthValue(const FixedWidthCopyRequest& request) {
+    if (request.destination == nullptr || request.source == nullptr || request.bytes == 0) {
         return;
     }
-    const auto* first = static_cast<const std::uint8_t*>(src);
-    std::copy_n(first, size, static_cast<std::uint8_t*>(dst));
+    const auto* first = static_cast<const std::uint8_t*>(request.source);
+    std::copy_n(first, request.bytes, static_cast<std::uint8_t*>(request.destination));
+}
+
+void CopyFixedWidthValue(void* argument0, const void* argument1, const std::size_t argument2) {
+    const FixedWidthCopyRequest operation{argument0, argument1, argument2};
+    SemanticKernelCopyFixedWidthValue(operation);
 }
 
 namespace {
@@ -32234,8 +32258,8 @@ void PublishIntegerAluFlags(LsxMachineImage& state, const std::uint64_t left,
 
 } // namespace
 
-void ExecuteIntegerArithmetic(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t operand,
-         const AluOp op, const std::uint32_t size_bits, const std::uint32_t shift_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelExecuteIntegerArithmetic(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t operand,
+         const AluOp op, const std::uint32_t size_bits, const std::uint32_t shift_bits){
     auto* const storage = reinterpret_cast<std::uint8_t*>(&state) + state_offset;
     const std::uint64_t container = LoadUnaligned<std::uint64_t>(storage);
     const std::uint64_t width_mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
@@ -32254,6 +32278,10 @@ void ExecuteIntegerArithmetic(LsxMachineImage& state, const std::size_t state_of
     const std::uint64_t updated = (container & ~positioned_mask) |
                                   ((outcome.value << shift_bits) & positioned_mask);
     StoreUnaligned<std::uint64_t>(storage, updated);
+}
+
+void ExecuteIntegerArithmetic(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const AluOp argument3, const std::uint32_t argument4, const std::uint32_t argument5) {
+    SemanticKernelExecuteIntegerArithmetic(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 namespace {
@@ -32482,8 +32510,8 @@ void RestoreLegacyFpState(LsxMachineImage& state, const LegacyFpImage& image,
 }
 } // namespace
 
-void TransferLegacyFpEnvironment(LsxMachineImage& state, const std::uint64_t address,
-                                 const bool save, const bool is_64_bit_image) {
+[[gnu::always_inline]] static inline void SemanticKernelTransferLegacyFpEnvironment(LsxMachineImage& state, const std::uint64_t address,
+                                 const bool save, const bool is_64_bit_image){
     if (save) {
         const auto image = SerializeLegacyFpState(state, is_64_bit_image);
         CopyBytesToGuest(address, image.data(), static_cast<std::uint32_t>(image.size()));
@@ -32494,7 +32522,11 @@ void TransferLegacyFpEnvironment(LsxMachineImage& state, const std::uint64_t add
     }
 }
 
-void CompareExchangeWideAtomic(LsxMachineImage& state, const std::uint64_t address) {
+void TransferLegacyFpEnvironment(LsxMachineImage& argument0, const std::uint64_t argument1, const bool argument2, const bool argument3) {
+    SemanticKernelTransferLegacyFpEnvironment(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCompareExchangeWideAtomic(LsxMachineImage& state, const std::uint64_t address){
     std::scoped_lock serialized{g_locked_memory_mutex};
     const std::array<std::uint64_t, 2> memory{
         LoadGuestScalar(address, sizeof(std::uint64_t)),
@@ -32516,6 +32548,10 @@ void CompareExchangeWideAtomic(LsxMachineImage& state, const std::uint64_t addre
         }
     }
     state.rflags = (state.rflags & ~kFlagZf) | (equal ? kFlagZf : 0);
+}
+
+void CompareExchangeWideAtomic(LsxMachineImage& argument0, const std::uint64_t argument1) {
+    SemanticKernelCompareExchangeWideAtomic(argument0, argument1);
 }
 
 namespace {
@@ -32560,8 +32596,8 @@ bool CopyBytesInReverse(const EndianTransfer& transfer) {
 }
 } // namespace
 
-void LoadReversedEndian(LsxMachineImage& state, const void* src, const std::size_t state_offset,
-                        const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelLoadReversedEndian(LsxMachineImage& state, const void* src, const std::size_t state_offset,
+                        const std::uint32_t size_bits){
     std::uint64_t destination_lane = 0;
     const EndianTransfer transfer{src, &destination_lane, size_bits >> 3u};
     if (CopyBytesInReverse(transfer)) {
@@ -32569,21 +32605,33 @@ void LoadReversedEndian(LsxMachineImage& state, const void* src, const std::size
     }
 }
 
-void StoreReversedEndian(const LsxMachineImage& state, void* dst, const std::size_t state_offset,
-                         const std::uint32_t size_bits) {
+void LoadReversedEndian(LsxMachineImage& argument0, const void* argument1, const std::size_t argument2, const std::uint32_t argument3) {
+    SemanticKernelLoadReversedEndian(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelStoreReversedEndian(const LsxMachineImage& state, void* dst, const std::size_t state_offset,
+                         const std::uint32_t size_bits){
     const auto* state_bytes = reinterpret_cast<const std::uint8_t*>(&state);
     const EndianTransfer transfer{state_bytes + state_offset, dst, size_bits >> 3u};
     (void)CopyBytesInReverse(transfer);
 }
 
-std::uint64_t ExecuteIntegerArithmeticMemory(LsxMachineImage& state, const std::uint64_t mem_value, const std::uint64_t operand,
-                     const AluOp op, const std::uint32_t size_bits) {
+void StoreReversedEndian(const LsxMachineImage& argument0, void* argument1, const std::size_t argument2, const std::uint32_t argument3) {
+    SemanticKernelStoreReversedEndian(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline std::uint64_t SemanticKernelExecuteIntegerArithmeticMemory(LsxMachineImage& state, const std::uint64_t mem_value, const std::uint64_t operand,
+                     const AluOp op, const std::uint32_t size_bits){
     const std::uint64_t width_mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
     const std::uint64_t left = mem_value & width_mask;
     const std::uint64_t right = operand & width_mask;
     const IntegerAluOutcome outcome = EvaluateIntegerAlu(left, right, op, size_bits);
     PublishIntegerAluFlags(state, left, right, outcome, size_bits);
     return outcome.value;
+}
+
+std::uint64_t ExecuteIntegerArithmeticMemory(LsxMachineImage& argument0, const std::uint64_t argument1, const std::uint64_t argument2, const AluOp argument3, const std::uint32_t argument4) {
+    return SemanticKernelExecuteIntegerArithmeticMemory(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -32669,8 +32717,8 @@ bool AtomicLoad(const void* target, const std::uint32_t size_bits,
 
 } // namespace
 
-std::uint64_t ExecuteIntegerArithmeticAtomic(LsxMachineImage& state, void* target, const std::uint64_t operand,
-                           const AluOp op, const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline std::uint64_t SemanticKernelExecuteIntegerArithmeticAtomic(LsxMachineImage& state, void* target, const std::uint64_t operand,
+                           const AluOp op, const std::uint32_t size_bits){
     const bool valid_width = size_bits == 8 || size_bits == 16 ||
                              size_bits == 32 || size_bits == 64;
     if (target == nullptr || !valid_width) {
@@ -32702,6 +32750,10 @@ std::uint64_t ExecuteIntegerArithmeticAtomic(LsxMachineImage& state, void* targe
     const auto outcome = evaluate(observed);
     PublishIntegerAluFlags(state, observed, rhs, outcome, size_bits);
     return read_only ? outcome.value : committed;
+}
+
+std::uint64_t ExecuteIntegerArithmeticAtomic(LsxMachineImage& argument0, void* argument1, const std::uint64_t argument2, const AluOp argument3, const std::uint32_t argument4) {
+    return SemanticKernelExecuteIntegerArithmeticAtomic(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -32784,7 +32836,7 @@ bool CommitAtomicMutation(void* target, const std::uint32_t width, Transform&& t
 
 } // namespace
 
-bool TestCondition(const LsxMachineImage& state, const LsxMnemonicCode mnemonic_code) {
+[[gnu::always_inline]] static inline bool SemanticKernelTestCondition(const LsxMachineImage& state, const LsxMnemonicCode mnemonic_code){
     const auto flag = [&](const std::uint64_t mask) { return (state.rflags & mask) != 0; };
     const bool carry = flag(kFlagCf);
     const bool parity = flag(kFlagPf);
@@ -32813,8 +32865,12 @@ bool TestCondition(const LsxMachineImage& state, const LsxMnemonicCode mnemonic_
     return false;
 }
 
-std::uint64_t ResolveConditionCode(const LsxMachineImage& state, const LsxMnemonicCode mnemonic,
-                       const std::uint64_t true_value, const std::uint64_t false_value) {
+bool TestCondition(const LsxMachineImage& argument0, const LsxMnemonicCode argument1) {
+    return SemanticKernelTestCondition(argument0, argument1);
+}
+
+[[gnu::always_inline]] static inline std::uint64_t SemanticKernelResolveConditionCode(const LsxMachineImage& state, const LsxMnemonicCode mnemonic,
+                       const std::uint64_t true_value, const std::uint64_t false_value){
     const bool selected = TestCondition(state, mnemonic);
 #if defined(__aarch64__)
     std::uint64_t result = 0;
@@ -32832,21 +32888,35 @@ std::uint64_t ResolveConditionCode(const LsxMachineImage& state, const LsxMnemon
 #endif
 }
 
-void WriteConditionToRegister(LsxMachineImage& state, const std::size_t state_offset,
-           const LsxMnemonicCode mnemonic) {
+std::uint64_t ResolveConditionCode(const LsxMachineImage& argument0, const LsxMnemonicCode argument1, const std::uint64_t argument2, const std::uint64_t argument3) {
+    BoundSemanticEntry<&SemanticKernelResolveConditionCode, decltype((argument0)), decltype((argument1)), decltype((argument2)), decltype((argument3))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2, argument3)};
+    return dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelWriteConditionToRegister(LsxMachineImage& state, const std::size_t state_offset,
+           const LsxMnemonicCode mnemonic){
     const std::uint8_t encoded = TestCondition(state, mnemonic) ? 1u : 0u;
     StoreStateLane(state, state_offset, encoded, 8);
 }
 
-void WriteConditionToMemory(const LsxMachineImage& state, void* dst, const LsxMnemonicCode mnemonic) {
+void WriteConditionToRegister(LsxMachineImage& argument0, const std::size_t argument1, const LsxMnemonicCode argument2) {
+    SemanticKernelWriteConditionToRegister(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelWriteConditionToMemory(const LsxMachineImage& state, void* dst, const LsxMnemonicCode mnemonic){
     if (dst != nullptr) {
         const std::array<std::uint8_t, 2> encodings{0u, 1u};
         std::memcpy(dst, &encodings[TestCondition(state, mnemonic)], 1);
     }
 }
 
-void SelectRegisterConditionally(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-          const LsxMnemonicCode mnemonic, const std::uint32_t size_bits) {
+void WriteConditionToMemory(const LsxMachineImage& argument0, void* argument1, const LsxMnemonicCode argument2) {
+    SemanticKernelWriteConditionToMemory(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelSelectRegisterConditionally(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+          const LsxMnemonicCode mnemonic, const std::uint32_t size_bits){
     const auto commit_selected_value = [&] {
         StoreStateLane(state, state_offset, value, size_bits);
     };
@@ -32854,6 +32924,11 @@ void SelectRegisterConditionally(LsxMachineImage& state, const std::size_t state
         return;
     }
     commit_selected_value();
+}
+
+void SelectRegisterConditionally(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const LsxMnemonicCode argument3, const std::uint32_t argument4) {
+    auto operation = std::bind_front(&SemanticKernelSelectRegisterConditionally);
+    operation(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -32909,14 +32984,18 @@ void PublishShiftFlags(LsxMachineImage& state, const ShiftOutcome& outcome,
 
 } // namespace
 
-void ShiftRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t count,
-           const ShiftOp op, const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelShiftRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t count,
+           const ShiftOp op, const std::uint32_t size_bits){
     const ShiftOutcome result = EvaluateShift(LoadStateLane(state, state_offset), count,
                                               op, size_bits);
     if (result.changed) {
         StoreStateLane(state, state_offset, result.value, size_bits);
         PublishShiftFlags(state, result, size_bits);
     }
+}
+
+void ShiftRegisterOperand(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const ShiftOp argument3, const std::uint32_t argument4) {
+    SemanticKernelShiftRegisterOperand(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -32940,8 +33019,8 @@ void TransformMemoryLaneThroughState(LsxMachineImage& architectural_state, void*
 }
 } // namespace
 
-void ShiftMemoryOperand(LsxMachineImage& state, void* target, const std::uint64_t count, const ShiftOp op,
-              const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelShiftMemoryOperand(LsxMachineImage& state, void* target, const std::uint64_t count, const ShiftOp op,
+              const std::uint32_t size_bits){
     const auto masked_count = static_cast<std::uint32_t>(count) &
                               (size_bits == 64 ? UINT32_C(0x3f) : UINT32_C(0x1f));
     if (size_bits == 0 || masked_count == 0) {
@@ -32954,8 +33033,12 @@ void ShiftMemoryOperand(LsxMachineImage& state, void* target, const std::uint64_
         });
 }
 
-void Shld(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t source,
-          const std::uint64_t count, const std::uint32_t size_bits) {
+void ShiftMemoryOperand(LsxMachineImage& argument0, void* argument1, const std::uint64_t argument2, const ShiftOp argument3, const std::uint32_t argument4) {
+    SemanticKernelShiftMemoryOperand(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelShld(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t source,
+          const std::uint64_t count, const std::uint32_t size_bits){
     if (size_bits != 16 && size_bits != 32 && size_bits != 64) {
         return;
     }
@@ -32989,8 +33072,12 @@ void Shld(LsxMachineImage& state, const std::size_t state_offset, const std::uin
     PublishShiftFlags(state, outcome, size_bits);
 }
 
-void ShldMem(LsxMachineImage& state, void* target, const std::uint64_t source,
-             const std::uint64_t count, const std::uint32_t size_bits) {
+void Shld(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint64_t argument3, const std::uint32_t argument4) {
+    SemanticKernelShld(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelShldMem(LsxMachineImage& state, void* target, const std::uint64_t source,
+             const std::uint64_t count, const std::uint32_t size_bits){
     const bool supported = size_bits == 16 || size_bits == 32 || size_bits == 64;
     const auto count_mask = size_bits == 64 ? UINT32_C(0x3f) : UINT32_C(0x1f);
     if (!supported || (static_cast<std::uint32_t>(count) & count_mask) == 0) {
@@ -33001,6 +33088,10 @@ void ShldMem(LsxMachineImage& state, void* target, const std::uint64_t source,
         [=](LsxMachineImage& scratch, const std::size_t lane) {
             Shld(scratch, lane, source, count, size_bits);
         });
+}
+
+void ShldMem(LsxMachineImage& argument0, void* argument1, const std::uint64_t argument2, const std::uint64_t argument3, const std::uint32_t argument4) {
+    SemanticKernelShldMem(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -33040,9 +33131,9 @@ RotationResult EvaluateRotation(const std::uint64_t input, const std::uint64_t r
 }
 } // namespace
 
-void RotateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset,
+[[gnu::always_inline]] static inline void SemanticKernelRotateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset,
                            const std::uint64_t count, const bool rotate_right,
-                           const std::uint32_t size_bits) {
+                           const std::uint32_t size_bits){
     const auto rotation = EvaluateRotation(LoadStateLane(state, state_offset), count,
                                            rotate_right, size_bits);
     if (!rotation.changed) {
@@ -33055,8 +33146,12 @@ void RotateRegisterOperand(LsxMachineImage& state, const std::size_t state_offse
     }
 }
 
-void AdjustRegisterByOne(LsxMachineImage& state, const std::size_t state_offset, const IncDecOp op,
-            const std::uint32_t size_bits) {
+void RotateRegisterOperand(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const bool argument3, const std::uint32_t argument4) {
+    SemanticKernelRotateRegisterOperand(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelAdjustRegisterByOne(LsxMachineImage& state, const std::size_t state_offset, const IncDecOp op,
+            const std::uint32_t size_bits){
     const std::uint64_t preserved_carry = state.rflags & kFlagCf;
     const std::uint64_t mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
     const std::uint64_t before = LoadStateLane(state, state_offset) & mask;
@@ -33067,8 +33162,12 @@ void AdjustRegisterByOne(LsxMachineImage& state, const std::size_t state_offset,
     StoreStateLane(state, state_offset, outcome.value, size_bits);
 }
 
-void RotateMem(LsxMachineImage& state, void* target, const std::uint64_t count,
-               const bool rotate_right, const std::uint32_t size_bits) {
+void AdjustRegisterByOne(LsxMachineImage& argument0, const std::size_t argument1, const IncDecOp argument2, const std::uint32_t argument3) {
+    SemanticKernelAdjustRegisterByOne(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelRotateMem(LsxMachineImage& state, void* target, const std::uint64_t count,
+               const bool rotate_right, const std::uint32_t size_bits){
     TransformMemoryLaneThroughState(
         state, target, size_bits,
         [=](LsxMachineImage& scratch, const std::size_t lane) {
@@ -33076,7 +33175,13 @@ void RotateMem(LsxMachineImage& state, void* target, const std::uint64_t count,
         });
 }
 
-void AdjustMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits) {
+void RotateMem(LsxMachineImage& argument0, void* argument1, const std::uint64_t argument2, const bool argument3, const std::uint32_t argument4) {
+    BoundSemanticEntry<&SemanticKernelRotateMem, decltype((argument0)), decltype((argument1)), decltype((argument2)), decltype((argument3)), decltype((argument4))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2, argument3, argument4)};
+    dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelAdjustMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits){
     TransformMemoryLaneThroughState(
         state, target, size_bits,
         [=](LsxMachineImage& scratch, const std::size_t lane) {
@@ -33084,7 +33189,13 @@ void AdjustMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, 
         });
 }
 
-void AdjustAtomicMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits) {
+void AdjustMemoryByOne(LsxMachineImage& argument0, void* argument1, const IncDecOp argument2, const std::uint32_t argument3) {
+    BoundSemanticEntry<&SemanticKernelAdjustMemoryByOne, decltype((argument0)), decltype((argument1)), decltype((argument2)), decltype((argument3))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2, argument3)};
+    dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelAdjustAtomicMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits){
     const auto arithmetic = op == IncDecOp::Decrement ? AluOp::Subtract : AluOp::Add;
     const auto transform = [=](const std::uint64_t input) {
         return EvaluateIntegerAlu(input, 1, arithmetic, size_bits).value;
@@ -33099,21 +33210,35 @@ void AdjustAtomicMemoryByOne(LsxMachineImage& state, void* target, const IncDecO
     state.rflags = (state.rflags & ~kFlagCf) | saved_carry;
 }
 
-void NegateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits) {
+void AdjustAtomicMemoryByOne(LsxMachineImage& argument0, void* argument1, const IncDecOp argument2, const std::uint32_t argument3) {
+    SemanticKernelAdjustAtomicMemoryByOne(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelNegateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits){
     const auto operand = TruncateToOperandWidth(LoadStateLane(state, state_offset), size_bits);
     const auto evaluated = EvaluateIntegerAlu(0, operand, AluOp::Subtract, size_bits);
     PublishIntegerAluFlags(state, 0, operand, evaluated, size_bits);
     StoreStateLane(state, state_offset, evaluated.value, size_bits);
 }
 
-void NegateMemoryOperand(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
+void NegateRegisterOperand(LsxMachineImage& argument0, const std::size_t argument1, const std::uint32_t argument2) {
+    SemanticKernelNegateRegisterOperand(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelNegateMemoryOperand(LsxMachineImage& state, void* target, const std::uint32_t size_bits){
     TransformMemoryLaneThroughState(state, target, size_bits,
         [=](LsxMachineImage& scratch, const std::size_t lane) {
             NegateRegisterOperand(scratch, lane, size_bits);
         });
 }
 
-void NegateAtomicMemoryOperand(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
+void NegateMemoryOperand(LsxMachineImage& argument0, void* argument1, const std::uint32_t argument2) {
+    BoundSemanticEntry<&SemanticKernelNegateMemoryOperand, decltype((argument0)), decltype((argument1)), decltype((argument2))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2)};
+    dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelNegateAtomicMemoryOperand(LsxMachineImage& state, void* target, const std::uint32_t size_bits){
     const auto negation = [size_bits](const std::uint64_t observed) {
         return TruncateToOperandWidth(std::uint64_t{0} - observed, size_bits);
     };
@@ -33129,7 +33254,11 @@ void NegateAtomicMemoryOperand(LsxMachineImage& state, void* target, const std::
     PublishIntegerAluFlags(state, 0, before, outcome, size_bits);
 }
 
-void NotMemLocked(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
+void NegateAtomicMemoryOperand(LsxMachineImage& argument0, void* argument1, const std::uint32_t argument2) {
+    SemanticKernelNegateAtomicMemoryOperand(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelNotMemLocked(LsxMachineImage& state, void* target, const std::uint32_t size_bits){
     (void)state;
     std::uint64_t discarded_before = 0, discarded_after = 0;
     (void)CommitAtomicMutation(
@@ -33138,6 +33267,10 @@ void NotMemLocked(LsxMachineImage& state, void* target, const std::uint32_t size
             return TruncateToOperandWidth(input ^ UINT64_MAX, size_bits);
         },
         discarded_before, discarded_after);
+}
+
+void NotMemLocked(LsxMachineImage& argument0, void* argument1, const std::uint32_t argument2) {
+    SemanticKernelNotMemLocked(argument0, argument1, argument2);
 }
 
 namespace {
@@ -33195,8 +33328,8 @@ void CommitAccumulatorProduct(LsxMachineImage& state, const AccumulatorProduct& 
 }
 } // namespace
 
-void MultiplyAccumulatorPair(LsxMachineImage& state, const std::uint64_t operand,
-                             const std::uint32_t size_bits, const bool is_signed) {
+[[gnu::always_inline]] static inline void SemanticKernelMultiplyAccumulatorPair(LsxMachineImage& state, const std::uint64_t operand,
+                             const std::uint32_t size_bits, const bool is_signed){
     if (size_bits != 8 && size_bits != 16 && size_bits != 32 && size_bits != 64) {
         return;
     }
@@ -33207,8 +33340,12 @@ void MultiplyAccumulatorPair(LsxMachineImage& state, const std::uint64_t operand
     state.rflags = (state.rflags & ~(kFlagCf | kFlagOf)) | arithmetic_flags;
 }
 
-void DivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, const std::uint32_t size_bits,
-            const bool is_signed) {
+void MultiplyAccumulatorPair(LsxMachineImage& argument0, const std::uint64_t argument1, const std::uint32_t argument2, const bool argument3) {
+    SemanticKernelMultiplyAccumulatorPair(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelDivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, const std::uint32_t size_bits,
+            const bool is_signed){
     const auto divide_error = [] {
 #ifdef __ANDROID__
         // x86 reports both a zero divisor and an out-of-range quotient through #DE.  Route that
@@ -33374,6 +33511,10 @@ void DivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, 
     }
 }
 
+void DivideAccumulatorPair(LsxMachineImage& argument0, const std::uint64_t argument1, const std::uint32_t argument2, const bool argument3) {
+    SemanticKernelDivideAccumulatorPair(argument0, argument1, argument2, argument3);
+}
+
 namespace {
 struct CarryArithmeticResult {
     std::uint64_t left{};
@@ -33410,9 +33551,9 @@ void PublishCarryArithmetic(LsxMachineImage& state, const CarryArithmeticResult&
 }
 } // namespace
 
-void ExecuteCarryArithmetic(LsxMachineImage& state, const std::size_t state_offset,
-                            const std::uint64_t operand, const bool subtract,
-                            const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelExecuteCarryArithmetic(
+    LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t operand,
+    const bool subtract, const std::uint32_t size_bits) {
     const auto evaluated = EvaluateCarryArithmetic(
         LoadStateLane(state, state_offset), operand, size_bits, subtract,
         (state.rflags & kFlagCf) != 0);
@@ -33420,8 +33561,14 @@ void ExecuteCarryArithmetic(LsxMachineImage& state, const std::size_t state_offs
     StoreStateLane(state, state_offset, evaluated.value, size_bits);
 }
 
-void ExecuteCarryArithmeticMemory(LsxMachineImage& state, void* target, const std::uint64_t operand, const bool subtract,
-               const std::uint32_t size_bits) {
+void ExecuteCarryArithmetic(LsxMachineImage& argument0, const std::size_t argument1,
+                            const std::uint64_t argument2, const bool argument3,
+                            const std::uint32_t argument4) {
+    SemanticKernelExecuteCarryArithmetic(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExecuteCarryArithmeticMemory(LsxMachineImage& state, void* target, const std::uint64_t operand, const bool subtract,
+               const std::uint32_t size_bits){
     TransformMemoryLaneThroughState(
         state, target, size_bits,
         [=](LsxMachineImage& scratch, const std::size_t lane) {
@@ -33429,8 +33576,14 @@ void ExecuteCarryArithmeticMemory(LsxMachineImage& state, void* target, const st
         });
 }
 
-void ExecuteCarryArithmeticAtomic(LsxMachineImage& state, void* target, const std::uint64_t operand,
-                     const bool subtract, const std::uint32_t size_bits) {
+void ExecuteCarryArithmeticMemory(LsxMachineImage& argument0, void* argument1, const std::uint64_t argument2, const bool argument3, const std::uint32_t argument4) {
+    BoundSemanticEntry<&SemanticKernelExecuteCarryArithmeticMemory, decltype((argument0)), decltype((argument1)), decltype((argument2)), decltype((argument3)), decltype((argument4))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2, argument3, argument4)};
+    dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExecuteCarryArithmeticAtomic(LsxMachineImage& state, void* target, const std::uint64_t operand,
+                     const bool subtract, const std::uint32_t size_bits){
     const bool incoming = (state.rflags & kFlagCf) != 0;
     const auto transform = [=](const std::uint64_t input) {
         return EvaluateCarryArithmetic(input, operand, size_bits, subtract, incoming).value;
@@ -33443,14 +33596,22 @@ void ExecuteCarryArithmeticAtomic(LsxMachineImage& state, void* target, const st
     PublishCarryArithmetic(state, evaluated, subtract, size_bits);
 }
 
-void ComputeAndWithInvertedSource(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs_not,
-          const std::uint64_t rhs, const std::uint32_t size_bits) {
+void ExecuteCarryArithmeticAtomic(LsxMachineImage& argument0, void* argument1, const std::uint64_t argument2, const bool argument3, const std::uint32_t argument4) {
+    SemanticKernelExecuteCarryArithmeticAtomic(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelComputeAndWithInvertedSource(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs_not,
+          const std::uint64_t rhs, const std::uint32_t size_bits){
     const IntegerAluOutcome outcome{
         .value = TruncateToOperandWidth((lhs_not ^ UINT64_MAX) & rhs, size_bits),
         .flags = IntegerFlagClass::Logical,
     };
     PublishIntegerAluFlags(state, 0, 0, outcome, size_bits);
     StoreStateLane(state, state_offset, outcome.value, size_bits);
+}
+
+void ComputeAndWithInvertedSource(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint64_t argument3, const std::uint32_t argument4) {
+    SemanticKernelComputeAndWithInvertedSource(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -33475,16 +33636,26 @@ void ApplyLowestBitTransform(LsxMachineImage& state, const std::size_t destinati
 }
 } // namespace
 
-void IsolateLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset,
+[[gnu::always_inline]] static inline void SemanticKernelIsolateLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset,
                                    const std::uint64_t value,
-                                   const std::uint32_t size_bits) {
+                                   const std::uint32_t size_bits){
     ApplyLowestBitTransform(state, state_offset, value, size_bits,
                             LowestBitTransform::Isolate);
 }
 
-void ChangeStringTraversalDirection(LsxMachineImage& state, const bool set) {
+void IsolateLeastSignificantSetBit(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3) {
+    SemanticKernelIsolateLeastSignificantSetBit(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelChangeStringTraversalDirection(LsxMachineImage& state, const bool set){
     const std::uint64_t selected_direction = static_cast<std::uint64_t>(set) * kFlagDf;
     state.rflags = (state.rflags & ~kFlagDf) | selected_direction;
+}
+
+void ChangeStringTraversalDirection(LsxMachineImage& argument0, const bool argument1) {
+    BoundSemanticEntry<&SemanticKernelChangeStringTraversalDirection, decltype((argument0)), decltype((argument1))> dispatch{
+        std::forward_as_tuple(argument0, argument1)};
+    dispatch.Invoke();
 }
 
 namespace {
@@ -33698,12 +33869,20 @@ void ExecuteStringTransfer(LsxMachineImage& state, const std::uint64_t element_b
 }
 } // namespace
 
-void CopyStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat) {
+[[gnu::always_inline]] static inline void SemanticKernelCopyStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat){
     ExecuteStringTransfer(state, element_size, repeat, StringTransferKind::Copy);
 }
 
-void FillStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat) {
+void CopyStringUnit(LsxMachineImage& argument0, const std::uint64_t argument1, const bool argument2) {
+    SemanticKernelCopyStringUnit(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelFillStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat){
     ExecuteStringTransfer(state, element_size, repeat, StringTransferKind::Fill);
+}
+
+void FillStringUnit(LsxMachineImage& argument0, const std::uint64_t argument1, const bool argument2) {
+    SemanticKernelFillStringUnit(argument0, argument1, argument2);
 }
 
 namespace {
@@ -33727,8 +33906,8 @@ bool RepeatComparisonAllowsNext(const bool repeat_while_equal,
 }
 } // namespace
 
-void CompareStringUnit(LsxMachineImage& state, const LsxMnemonicCode mnemonic_code,
-                       const bool repeat_equal, const bool repeat_not_equal) {
+[[gnu::always_inline]] static inline void SemanticKernelCompareStringUnit(LsxMachineImage& state, const LsxMnemonicCode mnemonic_code,
+                       const bool repeat_equal, const bool repeat_not_equal){
     const auto element_bytes = DecodeComparisonElementBytes(mnemonic_code);
     if (element_bytes == 0) {
         return;
@@ -33760,6 +33939,10 @@ void CompareStringUnit(LsxMachineImage& state, const LsxMnemonicCode mnemonic_co
     if (repeats) {
         WriteGuestGpr64(state, LsxGpr::Rcx, remaining);
     }
+}
+
+void CompareStringUnit(LsxMachineImage& argument0, const LsxMnemonicCode argument1, const bool argument2, const bool argument3) {
+    SemanticKernelCompareStringUnit(argument0, argument1, argument2, argument3);
 }
 
 namespace {
@@ -33830,9 +34013,9 @@ void PublishCompareExchangeResult(LsxMachineImage& state, const std::uint64_t ex
 }
 } // namespace
 
-void CompareExchangeValue(LsxMachineImage& state, void* target, const bool target_is_register_lane,
+[[gnu::always_inline]] static inline void SemanticKernelCompareExchangeValue(LsxMachineImage& state, void* target, const bool target_is_register_lane,
                           const std::uint32_t target_shift, const std::size_t src_state_offset,
-                          const std::uint32_t src_shift, const std::uint32_t size_bits) {
+                          const std::uint32_t src_shift, const std::uint32_t size_bits){
     if (target == nullptr || size_bits == 0) {
         return;
     }
@@ -33860,12 +34043,16 @@ void CompareExchangeValue(LsxMachineImage& state, void* target, const bool targe
     PublishCompareExchangeResult(state, expected, observed, size_bits, exchanged);
 }
 
-void CompareExchangeMemoryAtomic(LsxMachineImage& state, void* target,
+void CompareExchangeValue(LsxMachineImage& argument0, void* argument1, const bool argument2, const std::uint32_t argument3, const std::size_t argument4, const std::uint32_t argument5, const std::uint32_t argument6) {
+    SemanticKernelCompareExchangeValue(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCompareExchangeMemoryAtomic(LsxMachineImage& state, void* target,
                                  const bool target_is_register_lane,
                                  const std::uint32_t target_shift,
                                  const std::size_t src_state_offset,
                                  const std::uint32_t src_shift,
-                                 const std::uint32_t size_bits) {
+                                 const std::uint32_t size_bits){
     const auto bytes = size_bits >> 3u;
     const auto address = reinterpret_cast<std::uintptr_t>(target);
     const bool needs_serial_fallback = bytes == 0 || (address & (bytes - 1u)) != 0;
@@ -33889,8 +34076,12 @@ void CompareExchangeMemoryAtomic(LsxMachineImage& state, void* target,
     PublishCompareExchangeResult(state, expected, observed, size_bits, exchanged);
 }
 
-void ExtractContiguousBits(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-           const std::uint32_t control, const std::uint32_t size_bits) {
+void CompareExchangeMemoryAtomic(LsxMachineImage& argument0, void* argument1, const bool argument2, const std::uint32_t argument3, const std::size_t argument4, const std::uint32_t argument5, const std::uint32_t argument6) {
+    SemanticKernelCompareExchangeMemoryAtomic(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExtractContiguousBits(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+           const std::uint32_t control, const std::uint32_t size_bits){
     const std::array<std::uint32_t, 2> field{
         control & UINT32_C(0xff), (control >> 8u) & UINT32_C(0xff)};
     const bool start_is_valid = field[0] < size_bits;
@@ -33903,14 +34094,22 @@ void ExtractContiguousBits(LsxMachineImage& state, const std::size_t state_offse
     StoreStateLane(state, state_offset, extracted, size_bits);
 }
 
-void ClearLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-          const std::uint32_t size_bits) {
+void ExtractContiguousBits(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3, const std::uint32_t argument4) {
+    SemanticKernelExtractContiguousBits(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelClearLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+          const std::uint32_t size_bits){
     ApplyLowestBitTransform(state, state_offset, value, size_bits,
                             LowestBitTransform::Clear);
 }
 
-void ProbeRegisterBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t bit_index,
-           const std::uint32_t size_bits) {
+void ClearLeastSignificantSetBit(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3) {
+    SemanticKernelClearLeastSignificantSetBit(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelProbeRegisterBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t bit_index,
+           const std::uint32_t size_bits){
     const auto normalized_bit = size_bits == 0 ? 0 : bit_index % size_bits;
     const auto carry_value = size_bits == 0
                                  ? std::uint64_t{0}
@@ -33918,6 +34117,10 @@ void ProbeRegisterBit(LsxMachineImage& state, const std::size_t state_offset, co
     if (size_bits != 0) {
         state.rflags ^= (state.rflags ^ carry_value) & kFlagCf;
     }
+}
+
+void ProbeRegisterBit(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3) {
+    SemanticKernelProbeRegisterBit(argument0, argument1, argument2, argument3);
 }
 
 namespace {
@@ -33976,10 +34179,10 @@ void PublishBitCarry(LsxMachineImage& state, const std::uint64_t lane,
 }
 } // namespace
 
-void ModifyRegisterBit(LsxMachineImage& state, const std::uintptr_t state_offset_or_mem_ptr,
+[[gnu::always_inline]] static inline void SemanticKernelModifyRegisterBit(LsxMachineImage& state, const std::uintptr_t state_offset_or_mem_ptr,
              const bool target_is_memory, const std::uint64_t bit_index,
              const bool unsigned_memory_index, const std::uint32_t size_bits,
-             const BitTestOp op) {
+             const BitTestOp op){
     if (size_bits == 0) {
         return;
     }
@@ -34017,10 +34220,14 @@ void ModifyRegisterBit(LsxMachineImage& state, const std::uintptr_t state_offset
     StoreStateLane(state, state_offset_or_mem_ptr, register_result, size_bits);
 }
 
-void ModifyAtomicMemoryBit(LsxMachineImage& state, const std::uintptr_t state_offset_or_mem_ptr,
+void ModifyRegisterBit(LsxMachineImage& argument0, const std::uintptr_t argument1, const bool argument2, const std::uint64_t argument3, const bool argument4, const std::uint32_t argument5, const BitTestOp argument6) {
+    SemanticKernelModifyRegisterBit(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelModifyAtomicMemoryBit(LsxMachineImage& state, const std::uintptr_t state_offset_or_mem_ptr,
                    const bool target_is_memory, const std::uint64_t bit_index,
                    const bool unsigned_memory_index, const std::uint32_t size_bits,
-                   const BitTestOp op) {
+                   const BitTestOp op){
     if (!target_is_memory || state_offset_or_mem_ptr == 0 || size_bits == 0) {
         ModifyRegisterBit(state, state_offset_or_mem_ptr, target_is_memory, bit_index,
                 unsigned_memory_index, size_bits, op);
@@ -34048,8 +34255,12 @@ void ModifyAtomicMemoryBit(LsxMachineImage& state, const std::uintptr_t state_of
     PublishBitCarry(state, before, location.bit);
 }
 
-void LocateSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-             const bool reverse, const std::uint32_t size_bits) {
+void ModifyAtomicMemoryBit(LsxMachineImage& argument0, const std::uintptr_t argument1, const bool argument2, const std::uint64_t argument3, const bool argument4, const std::uint32_t argument5, const BitTestOp argument6) {
+    SemanticKernelModifyAtomicMemoryBit(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelLocateSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+             const bool reverse, const std::uint32_t size_bits){
     const auto source = TruncateToOperandWidth(value, size_bits);
     if (!source) {
         state.rflags |= kFlagZf;
@@ -34061,8 +34272,12 @@ void LocateSetBit(LsxMachineImage& state, const std::size_t state_offset, const 
     state.rflags = state.rflags & ~kFlagZf;
 }
 
-void ExchangeAddRegister(LsxMachineImage& state, const std::size_t dst_state_offset, const std::size_t src_state_offset,
-          const std::uint32_t size_bits) {
+void LocateSetBit(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const bool argument3, const std::uint32_t argument4) {
+    SemanticKernelLocateSetBit(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExchangeAddRegister(LsxMachineImage& state, const std::size_t dst_state_offset, const std::size_t src_state_offset,
+          const std::uint32_t size_bits){
     const auto destination_before = TruncateToOperandWidth(
         LoadStateLane(state, dst_state_offset), size_bits);
     const auto source_before = TruncateToOperandWidth(
@@ -34075,6 +34290,10 @@ void ExchangeAddRegister(LsxMachineImage& state, const std::size_t dst_state_off
     for (const auto& [offset, lane] : writes) {
         StoreStateLane(state, offset, lane, size_bits);
     }
+}
+
+void ExchangeAddRegister(LsxMachineImage& argument0, const std::size_t argument1, const std::size_t argument2, const std::uint32_t argument3) {
+    SemanticKernelExchangeAddRegister(argument0, argument1, argument2, argument3);
 }
 
 namespace {
@@ -34126,27 +34345,39 @@ void ExecuteMemoryExchangeAdd(LsxMachineImage& state, void* target,
 }
 } // namespace
 
-void ExchangeAddMemory(LsxMachineImage& state, void* target,
-                       const std::size_t src_state_offset, const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelExchangeAddMemory(LsxMachineImage& state, void* target,
+                       const std::size_t src_state_offset, const std::uint32_t size_bits){
     ExecuteMemoryExchangeAdd(state, target, src_state_offset, size_bits, false);
 }
 
-void ExchangeAddMemoryAtomic(LsxMachineImage& state, void* target,
+void ExchangeAddMemory(LsxMachineImage& argument0, void* argument1, const std::size_t argument2, const std::uint32_t argument3) {
+    SemanticKernelExchangeAddMemory(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExchangeAddMemoryAtomic(LsxMachineImage& state, void* target,
                              const std::size_t src_state_offset,
-                             const std::uint32_t size_bits) {
+                             const std::uint32_t size_bits){
     ExecuteMemoryExchangeAdd(state, target, src_state_offset, size_bits, true);
 }
 
-void CountSetBits(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-            const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits) {
+void ExchangeAddMemoryAtomic(LsxMachineImage& argument0, void* argument1, const std::size_t argument2, const std::uint32_t argument3) {
+    SemanticKernelExchangeAddMemoryAtomic(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCountSetBits(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+            const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits){
     const auto source = TruncateToOperandWidth(value, src_size_bits);
     const auto population = static_cast<std::uint64_t>(std::popcount(source));
     StorePopcntFlags(state, source);
     StoreStateLane(state, state_offset, population, dst_size_bits);
 }
 
-void CountLeadingZeroes(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-           const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits) {
+void CountSetBits(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3, const std::uint32_t argument4) {
+    SemanticKernelCountSetBits(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCountLeadingZeroes(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+           const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits){
     const auto source = TruncateToOperandWidth(value, src_size_bits);
     const auto host_leading = static_cast<std::uint32_t>(std::countl_zero(source));
     const auto unused_host_bits = UINT32_C(64) - std::min(src_size_bits, UINT32_C(64));
@@ -34157,8 +34388,12 @@ void CountLeadingZeroes(LsxMachineImage& state, const std::size_t state_offset, 
     StoreStateLane(state, state_offset, guest_leading, dst_size_bits);
 }
 
-void CountTrailingZeroes(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-           const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits) {
+void CountLeadingZeroes(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3, const std::uint32_t argument4) {
+    SemanticKernelCountLeadingZeroes(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCountTrailingZeroes(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
+           const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits){
     const auto source = TruncateToOperandWidth(value, src_size_bits);
     const auto trailing = source == 0
                               ? static_cast<std::uint64_t>(src_size_bits)
@@ -34167,7 +34402,11 @@ void CountTrailingZeroes(LsxMachineImage& state, const std::size_t state_offset,
     StoreStateLane(state, state_offset, trailing, dst_size_bits);
 }
 
-void ReverseRegisterByteOrder(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits) {
+void CountTrailingZeroes(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint32_t argument3, const std::uint32_t argument4) {
+    SemanticKernelCountTrailingZeroes(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelReverseRegisterByteOrder(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits){
     const auto bytes = size_bits == 64 ? UINT32_C(8) : UINT32_C(4);
     const auto source = TruncateToOperandWidth(LoadStateLane(state, state_offset), size_bits);
     std::uint64_t reversed = 0;
@@ -34177,7 +34416,11 @@ void ReverseRegisterByteOrder(LsxMachineImage& state, const std::size_t state_of
     }
 }
 
-void ComplementMemoryOperand(void* target, const std::uint32_t size_bits) {
+void ReverseRegisterByteOrder(LsxMachineImage& argument0, const std::size_t argument1, const std::uint32_t argument2) {
+    SemanticKernelReverseRegisterByteOrder(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelComplementMemoryOperand(void* target, const std::uint32_t size_bits){
     const auto bytes = static_cast<std::size_t>(size_bits >> 3u);
     if (target == nullptr || bytes == 0 || bytes > sizeof(std::uint64_t)) {
         return;
@@ -34187,6 +34430,10 @@ void ComplementMemoryOperand(void* target, const std::uint32_t size_bits) {
     std::transform(image.begin(), image.begin() + bytes, image.begin(),
                    [](const std::uint8_t lane) { return static_cast<std::uint8_t>(lane ^ 0xffu); });
     std::memcpy(target, image.data(), bytes);
+}
+
+void ComplementMemoryOperand(void* argument0, const std::uint32_t argument1) {
+    SemanticKernelComplementMemoryOperand(argument0, argument1);
 }
 
 namespace {
@@ -34227,8 +34474,8 @@ SignedProduct EvaluateSignedProduct(const std::uint64_t lhs, const std::uint64_t
 }
 } // namespace
 
-void MultiplySignedOperands(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs,
-          const std::uint64_t rhs, const std::uint32_t size_bits) {
+[[gnu::always_inline]] static inline void SemanticKernelMultiplySignedOperands(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs,
+          const std::uint64_t rhs, const std::uint32_t size_bits){
     const bool supported_width = size_bits == 8 || size_bits == 16 ||
                                  size_bits == 32 || size_bits == 64;
     if (!supported_width) {
@@ -34238,6 +34485,10 @@ void MultiplySignedOperands(LsxMachineImage& state, const std::size_t state_offs
     const auto overflow_flags = product.overflow ? kFlagCf | kFlagOf : UINT64_C(0);
     state.rflags = (state.rflags & ~(kFlagCf | kFlagOf)) | overflow_flags;
     StoreStateLane(state, state_offset, product.low, size_bits);
+}
+
+void MultiplySignedOperands(LsxMachineImage& argument0, const std::size_t argument1, const std::uint64_t argument2, const std::uint64_t argument3, const std::uint32_t argument4) {
+    SemanticKernelMultiplySignedOperands(argument0, argument1, argument2, argument3, argument4);
 }
 
 RuntimeStatsSnapshot SnapshotTranslationTelemetry() noexcept {
@@ -34501,9 +34752,9 @@ SemanticVectorImage SelectVectorElements(const SemanticVectorImage& left,
 
 } // namespace
 
-void ConvertScalarFormatLocal(std::array<std::uint8_t, 32>& dst,
+[[gnu::always_inline]] static inline void SemanticKernelConvertScalarFormatLocal(std::array<std::uint8_t, 32>& dst,
                          const std::array<std::uint8_t, 16>& old_dst,
-                         const void* src_scalar, const bool single_to_double) {
+                         const void* src_scalar, const bool single_to_double){
     auto result = SemanticVectorImage::Capture(old_dst.data(), old_dst.size());
     if (single_to_double) {
         const double converted = static_cast<double>(LoadUnaligned<float>(src_scalar));
@@ -34515,8 +34766,12 @@ void ConvertScalarFormatLocal(std::array<std::uint8_t, 32>& dst,
     dst = result.bytes;
 }
 
-void TransferVectorValue(void* dst, const void* src, const std::size_t size,
-                         const bool zero_upper_ymm) {
+void ConvertScalarFormatLocal(std::array<std::uint8_t, 32>& argument0, const std::array<std::uint8_t, 16>& argument1, const void* argument2, const bool argument3) {
+    SemanticKernelConvertScalarFormatLocal(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelTransferVectorValue(void* dst, const void* src, const std::size_t size,
+                         const bool zero_upper_ymm){
     if (dst == nullptr || src == nullptr || !IsSemanticVectorWidth(size)) {
         return;
     }
@@ -34524,8 +34779,12 @@ void TransferVectorValue(void* dst, const void* src, const std::size_t size,
     source.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : size);
 }
 
-void TransferScalarVectorBits(void* vector, void* other, const std::size_t size,
-                              const std::uint32_t mode) {
+void TransferVectorValue(void* argument0, const void* argument1, const std::size_t argument2, const bool argument3) {
+    SemanticKernelTransferVectorValue(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelTransferScalarVectorBits(void* vector, void* other, const std::size_t size,
+                              const std::uint32_t mode){
     if (vector == nullptr || other == nullptr) {
         return;
     }
@@ -34540,9 +34799,13 @@ void TransferScalarVectorBits(void* vector, void* other, const std::size_t size,
                      load_vector ? 16u : (wide_scalar_store ? 8u : size));
 }
 
-void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src,
+void TransferScalarVectorBits(void* argument0, void* argument1, const std::size_t argument2, const std::uint32_t argument3) {
+    SemanticKernelTransferScalarVectorBits(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelMergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src,
                                     const void* src, const bool high_qword,
-                                    const std::uint32_t mode) {
+                                    const std::uint32_t mode){
     if (dst == nullptr || old_dst_or_src == nullptr || (mode == 2 && src == nullptr)) {
         return;
     }
@@ -34560,9 +34823,13 @@ void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src,
     }
 }
 
-void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs,
+void MergePackedSingleHighFromLow64(void* argument0, const void* argument1, const void* argument2, const bool argument3, const std::uint32_t argument4) {
+    SemanticKernelMergePackedSingleHighFromLow64(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelMergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs,
                                   const bool high_selector,
-                                  const bool full_vector) {
+                                  const bool full_vector){
     if (dst == nullptr || lhs == nullptr || (full_vector && rhs == nullptr)) {
         return;
     }
@@ -34581,13 +34848,21 @@ void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs,
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
-              const VectorLogicOp op) {
+void MergePackedSingleLowFromHigh(void* argument0, const void* argument1, const void* argument2, const bool argument3, const bool argument4) {
+    SemanticKernelMergePackedSingleLowFromHigh(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
+              const VectorLogicOp op){
     ExecuteVectorBoolean(dst.data(), dst.data(), src.data(), op, dst.size());
 }
 
-void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, const VectorLogicOp op,
-            const std::size_t size) {
+void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& argument0, const std::array<std::uint8_t, 16>& argument1, const VectorLogicOp argument2) {
+    SemanticKernelExecuteLegacyVectorBoolean(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, const VectorLogicOp op,
+            const std::size_t size){
     using VectorSemantic::BooleanOperation;
     const auto semantic_op = [op]() {
         switch (op) {
@@ -34602,7 +34877,11 @@ void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, const Vec
     (void)VectorSemantic::ApplyBoolean(dst, lhs, rhs, size, semantic_op);
 }
 
-void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, const std::size_t size) {
+void ExecuteVectorBoolean(void* argument0, const void* argument1, const void* argument2, const VectorLogicOp argument3, const std::size_t argument4) {
+    SemanticKernelExecuteVectorBoolean(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelTestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, const std::size_t size){
     if (lhs == nullptr || rhs == nullptr || size == 0 || size > 32) {
         return;
     }
@@ -34617,14 +34896,22 @@ void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* r
     StoreStatusFlags(state, flags);
 }
 
-void DuplicatePackedSingleLanes(void* dst, const void* src, const bool high_source_elements,
-                          const std::size_t size) {
+void TestPackedVectorBits(LsxMachineImage& argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
+    SemanticKernelTestPackedVectorBits(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelDuplicatePackedSingleLanes(void* dst, const void* src, const bool high_source_elements,
+                          const std::size_t size){
     (void)VectorSemantic::DuplicateDwordParity(
         dst, src, size, high_source_elements);
 }
 
-void BroadcastScalarLane(void* dst, const void* src, const std::size_t element_size,
-                      const std::size_t total_size) {
+void DuplicatePackedSingleLanes(void* argument0, const void* argument1, const bool argument2, const std::size_t argument3) {
+    SemanticKernelDuplicatePackedSingleLanes(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelBroadcastScalarLane(void* dst, const void* src, const std::size_t element_size,
+                      const std::size_t total_size){
     if (dst == nullptr || src == nullptr || element_size == 0 || element_size > 8 ||
         !IsSemanticVectorWidth(total_size) || total_size % element_size != 0) {
         return;
@@ -34637,7 +34924,11 @@ void BroadcastScalarLane(void* dst, const void* src, const std::size_t element_s
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void BroadcastVectorHalf(void* dst, const void* src) {
+void BroadcastScalarLane(void* argument0, const void* argument1, const std::size_t argument2, const std::size_t argument3) {
+    SemanticKernelBroadcastScalarLane(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelBroadcastVectorHalf(void* dst, const void* src){
     if (dst == nullptr || src == nullptr) {
         return;
     }
@@ -34648,8 +34939,12 @@ void BroadcastVectorHalf(void* dst, const void* src) {
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-std::uint64_t CollectVectorSignBits(const void* src, const std::size_t lane_bytes,
-                        const std::size_t total_size) {
+void BroadcastVectorHalf(void* argument0, const void* argument1) {
+    SemanticKernelBroadcastVectorHalf(argument0, argument1);
+}
+
+[[gnu::always_inline]] static inline std::uint64_t SemanticKernelCollectVectorSignBits(const void* src, const std::size_t lane_bytes,
+                        const std::size_t total_size){
     if (src == nullptr || lane_bytes == 0 || total_size > 32) {
         return 0;
     }
@@ -34665,7 +34960,11 @@ std::uint64_t CollectVectorSignBits(const void* src, const std::size_t lane_byte
     return result;
 }
 
-void ExtractVectorDword(void* dst, const void* src, const std::uint32_t index, const bool store_qword) {
+std::uint64_t CollectVectorSignBits(const void* argument0, const std::size_t argument1, const std::size_t argument2) {
+    return SemanticKernelCollectVectorSignBits(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExtractVectorDword(void* dst, const void* src, const std::uint32_t index, const bool store_qword){
     if (dst == nullptr || src == nullptr) {
         return;
     }
@@ -34675,8 +34974,12 @@ void ExtractVectorDword(void* dst, const void* src, const std::uint32_t index, c
     std::memcpy(dst, &scalar, store_qword ? 8u : 4u);
 }
 
-void ExtractVectorLane(void* dst, const void* src, const std::uint32_t index,
-                     const bool store_qword, const std::size_t element_size) {
+void ExtractVectorDword(void* argument0, const void* argument1, const std::uint32_t argument2, const bool argument3) {
+    SemanticKernelExtractVectorDword(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExtractVectorLane(void* dst, const void* src, const std::uint32_t index,
+                     const bool store_qword, const std::size_t element_size){
     if (dst == nullptr || src == nullptr || element_size == 0 || element_size > 8) {
         return;
     }
@@ -34688,8 +34991,12 @@ void ExtractVectorLane(void* dst, const void* src, const std::uint32_t index,
     std::memcpy(dst, scalar.data(), store_qword ? scalar.size() : element_size);
 }
 
-void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
-               const bool src_is_memory) {
+void ExtractVectorLane(void* argument0, const void* argument1, const std::uint32_t argument2, const bool argument3, const std::size_t argument4) {
+    SemanticKernelExtractVectorLane(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelInsertPackedSingleLane(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
+               const bool src_is_memory){
     if (dst == nullptr || old_dst == nullptr || src == nullptr) {
         return;
     }
@@ -34707,8 +35014,12 @@ void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, con
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void InsertVectorIntegerLane(void* dst, const void* old_dst, const std::uint64_t value,
-            const std::uint32_t index, const std::size_t element_size) {
+void InsertPackedSingleLane(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const bool argument4) {
+    SemanticKernelInsertPackedSingleLane(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelInsertVectorIntegerLane(void* dst, const void* old_dst, const std::uint64_t value,
+            const std::uint32_t index, const std::size_t element_size){
     if (dst == nullptr || old_dst == nullptr || element_size == 0 || element_size > 8) {
         return;
     }
@@ -34718,7 +35029,11 @@ void InsertVectorIntegerLane(void* dst, const void* old_dst, const std::uint64_t
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void InsertVectorHalf(void* dst, const void* old_dst, const void* src, const std::uint32_t half_index) {
+void InsertVectorIntegerLane(void* argument0, const void* argument1, const std::uint64_t argument2, const std::uint32_t argument3, const std::size_t argument4) {
+    SemanticKernelInsertVectorIntegerLane(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelInsertVectorHalf(void* dst, const void* old_dst, const void* src, const std::uint32_t half_index){
     if (dst == nullptr || old_dst == nullptr || src == nullptr) {
         return;
     }
@@ -34728,8 +35043,12 @@ void InsertVectorHalf(void* dst, const void* old_dst, const void* src, const std
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void ExtractVectorHalf(void* dst, const void* src, const std::uint32_t half_index,
-                  const bool zero_upper_ymm) {
+void InsertVectorHalf(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3) {
+    SemanticKernelInsertVectorHalf(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExtractVectorHalf(void* dst, const void* src, const std::uint32_t half_index,
+                  const bool zero_upper_ymm){
     if (dst == nullptr || src == nullptr) {
         return;
     }
@@ -34739,7 +35058,11 @@ void ExtractVectorHalf(void* dst, const void* src, const std::uint32_t half_inde
     result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : 16u);
 }
 
-void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm) {
+void ExtractVectorHalf(void* argument0, const void* argument1, const std::uint32_t argument2, const bool argument3) {
+    SemanticKernelExtractVectorHalf(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermuteVectorHalves(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr) {
         return;
     }
@@ -34757,9 +35080,13 @@ void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, const std:
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
+void PermuteVectorHalves(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3) {
+    SemanticKernelPermuteVectorHalves(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelBlendVectorImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
                const std::size_t lane_bytes, const std::size_t total_size,
-               const bool repeat_mask_per_128) {
+               const bool repeat_mask_per_128){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || lane_bytes == 0 ||
         total_size > 32) {
         return;
@@ -34778,8 +35105,12 @@ void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, const std
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               const std::size_t lane_bytes, const std::size_t total_size) {
+void BlendVectorImmediate(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const std::size_t argument4, const std::size_t argument5, const bool argument6) {
+    SemanticKernelBlendVectorImmediate(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelBlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
+               const std::size_t lane_bytes, const std::size_t total_size){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || mask == nullptr ||
         lane_bytes == 0 || total_size > 32) {
         return;
@@ -34798,8 +35129,12 @@ void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* 
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void BlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               const std::size_t total_size) {
+void BlendVectorByMask(void* argument0, const void* argument1, const void* argument2, const void* argument3, const std::size_t argument4, const std::size_t argument5) {
+    SemanticKernelBlendVectorByMask(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelBlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
+               const std::size_t total_size){
     constexpr auto byte_granularity = sizeof(std::uint8_t);
     const std::array<const void*, 3> inputs{lhs, rhs, mask};
     if (total_size > kSemanticVectorBytes ||
@@ -34810,8 +35145,13 @@ void BlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs,
                       total_size);
 }
 
-void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
-              const std::size_t total_size) {
+void BlendVectorBytesByRegisterMask(void* argument0, const void* argument1, const void* argument2, const void* argument3, const std::size_t argument4) {
+    auto operation = std::bind_front(&SemanticKernelBlendVectorBytesByRegisterMask);
+    operation(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelBlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
+              const std::size_t total_size){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
         return;
     }
@@ -34825,7 +35165,11 @@ void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, cons
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void PermuteBytesFromMask(void* dst, const void* src, const void* mask, const std::size_t total_size) {
+void BlendVectorWordsImmediate(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const std::size_t argument4) {
+    SemanticKernelBlendVectorWordsImmediate(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermuteBytesFromMask(void* dst, const void* src, const void* mask, const std::size_t total_size){
     if (dst == nullptr || src == nullptr || mask == nullptr || total_size > 32) {
         return;
     }
@@ -34841,6 +35185,10 @@ void PermuteBytesFromMask(void* dst, const void* src, const void* mask, const st
         }
     }
     result.Publish(dst, total_size);
+}
+
+void PermuteBytesFromMask(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
+    SemanticKernelPermuteBytesFromMask(argument0, argument1, argument2, argument3);
 }
 
 namespace {
@@ -34872,20 +35220,28 @@ void InterleavePackedLanes(void* dst, const void* lhs, const void* rhs,
 }
 } // namespace
 
-void InterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs,
+[[gnu::always_inline]] static inline void SemanticKernelInterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs,
                                  const std::size_t element_bytes, const bool high_half,
-                                 const std::size_t total_size) {
+                                 const std::size_t total_size){
     InterleavePackedLanes(dst, lhs, rhs, element_bytes, high_half, total_size, false);
 }
 
-void InterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs,
+void InterleavePackedLegacyLanes(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
+    SemanticKernelInterleavePackedLegacyLanes(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelInterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs,
                                  const std::size_t element_bytes, const bool high_half,
-                                 const std::size_t total_size) {
+                                 const std::size_t total_size){
     InterleavePackedLanes(dst, lhs, rhs, element_bytes, high_half, total_size, true);
 }
 
-void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
-                     const std::size_t scalar_size) {
+void InterleavePackedVectorLanes(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
+    SemanticKernelInterleavePackedVectorLanes(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelMergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
+                     const std::size_t scalar_size){
     if (dst == nullptr || old_dst == nullptr || scalar_src == nullptr || scalar_size > 16) {
         return;
     }
@@ -34895,7 +35251,11 @@ void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_sr
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void PermuteDwordsFromImmediate(void* dst, const void* src, const std::uint8_t imm) {
+void MergeScalarVectorLane(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
+    SemanticKernelMergeScalarVectorLane(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermuteDwordsFromImmediate(void* dst, const void* src, const std::uint8_t imm){
     if (dst == nullptr || src == nullptr) {
         return;
     }
@@ -34909,8 +35269,12 @@ void PermuteDwordsFromImmediate(void* dst, const void* src, const std::uint8_t i
     result.Publish(dst, 16);
 }
 
-void PermutePackedWords(void* dst, const void* src, const std::uint8_t imm,
-             const std::size_t total_size, const bool high_half) {
+void PermuteDwordsFromImmediate(void* argument0, const void* argument1, const std::uint8_t argument2) {
+    SemanticKernelPermuteDwordsFromImmediate(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermutePackedWords(void* dst, const void* src, const std::uint8_t imm,
+             const std::size_t total_size, const bool high_half){
     if (dst == nullptr || src == nullptr || total_size > 32) {
         return;
     }
@@ -34928,7 +35292,11 @@ void PermutePackedWords(void* dst, const void* src, const std::uint8_t imm,
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void PermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm) {
+void PermutePackedWords(void* argument0, const void* argument1, const std::uint8_t argument2, const std::size_t argument3, const bool argument4) {
+    SemanticKernelPermutePackedWords(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr) {
         return;
     }
@@ -34944,8 +35312,12 @@ void PermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, const
     result.Publish(dst, 16);
 }
 
-void PermuteVectorPairs(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm,
-           const std::size_t total_size, const bool double_lane) {
+void PermutePackedSingleLanes(void* argument0, const void* argument1, const void* argument2, const std::uint8_t argument3) {
+    SemanticKernelPermutePackedSingleLanes(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermuteVectorPairs(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm,
+           const std::size_t total_size, const bool double_lane){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
         return;
     }
@@ -34969,6 +35341,10 @@ void PermuteVectorPairs(void* dst, const void* lhs, const void* rhs, const std::
         }
     }
     result.Publish(dst, kSemanticVectorBytes);
+}
+
+void PermuteVectorPairs(void* argument0, const void* argument1, const void* argument2, const std::uint8_t argument3, const std::size_t argument4, const bool argument5) {
+    SemanticKernelPermuteVectorPairs(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 namespace {
@@ -35001,24 +35377,32 @@ void ExpandPackedLanes(void* destination, const void* source,
 }
 } // namespace
 
-void ExtendPackedUnsignedLanes(void* dst, const void* src, const std::size_t src_element_size,
-                       const std::size_t dst_element_size, const std::size_t total_size) {
+[[gnu::always_inline]] static inline void SemanticKernelExtendPackedUnsignedLanes(void* dst, const void* src, const std::size_t src_element_size,
+                       const std::size_t dst_element_size, const std::size_t total_size){
     ExpandPackedLanes(dst, src, src_element_size, dst_element_size,
                       total_size, false);
 }
 
-void ExtendPackedSignedLanes(void* dst, const void* src, const std::size_t src_element_size,
-                       const std::size_t dst_element_size, const std::size_t total_size) {
+void ExtendPackedUnsignedLanes(void* argument0, const void* argument1, const std::size_t argument2, const std::size_t argument3, const std::size_t argument4) {
+    SemanticKernelExtendPackedUnsignedLanes(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelExtendPackedSignedLanes(void* dst, const void* src, const std::size_t src_element_size,
+                       const std::size_t dst_element_size, const std::size_t total_size){
     ExpandPackedLanes(dst, src, src_element_size, dst_element_size,
                       total_size, true);
+}
+
+void ExtendPackedSignedLanes(void* argument0, const void* argument1, const std::size_t argument2, const std::size_t argument3, const std::size_t argument4) {
+    SemanticKernelExtendPackedSignedLanes(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
 double ApplyScalarRound(double value, std::uint32_t mode);
 } // namespace
 
-void ConvertIntegerToScalar(void* dst, const void* old_dst, const std::uint64_t value,
-                   const std::uint32_t source_size_bits, const bool integer_to_double) {
+[[gnu::always_inline]] static inline void SemanticKernelConvertIntegerToScalar(void* dst, const void* old_dst, const std::uint64_t value,
+                   const std::uint32_t source_size_bits, const bool integer_to_double){
     if (dst == nullptr || old_dst == nullptr) {
         return;
     }
@@ -35034,6 +35418,10 @@ void ConvertIntegerToScalar(void* dst, const void* old_dst, const std::uint64_t 
         std::memcpy(result.bytes.data(), &converted, sizeof(converted));
     }
     result.Publish(dst, kSemanticVectorBytes);
+}
+
+void ConvertIntegerToScalar(void* argument0, const void* argument1, const std::uint64_t argument2, const std::uint32_t argument3, const bool argument4) {
+    SemanticKernelConvertIntegerToScalar(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -35057,9 +35445,9 @@ std::uint64_t ConvertRoundedScalarToInteger(const double rounded, const std::uin
 }
 } // namespace
 
-void ConvertScalarToInteger(LsxMachineImage& state, const std::size_t state_offset, const void* scalar_src,
+[[gnu::always_inline]] static inline void SemanticKernelConvertScalarToInteger(LsxMachineImage& state, const std::size_t state_offset, const void* scalar_src,
                      const std::uint32_t dst_size_bits, const bool source_is_double,
-                     const bool use_current_rounding) {
+                     const bool use_current_rounding){
     const bool supported_destination = dst_size_bits == 32 || dst_size_bits == 64;
     if (scalar_src == nullptr || !supported_destination) {
         return;
@@ -35076,7 +35464,11 @@ void ConvertScalarToInteger(LsxMachineImage& state, const std::size_t state_offs
                    dst_size_bits);
 }
 
-void CompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void* rhs, const bool compare_double) {
+void ConvertScalarToInteger(LsxMachineImage& argument0, const std::size_t argument1, const void* argument2, const std::uint32_t argument3, const bool argument4, const bool argument5) {
+    SemanticKernelConvertScalarToInteger(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void* rhs, const bool compare_double){
     if (lhs == nullptr || rhs == nullptr) {
         return;
     }
@@ -35092,6 +35484,10 @@ void CompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void*
     const std::uint64_t pf = static_cast<std::uint64_t>(unordered) * kFlagPf;
     const std::uint64_t cf = static_cast<std::uint64_t>(unordered || left < right) * kFlagCf;
     StoreStatusFlags(state, zf | pf | cf);
+}
+
+void CompareOrderedScalarFp(LsxMachineImage& argument0, const void* argument1, const void* argument2, const bool argument3) {
+    SemanticKernelCompareOrderedScalarFp(argument0, argument1, argument2, argument3);
 }
 
 namespace {
@@ -35183,8 +35579,8 @@ void EvaluateScalarFloatingLane(SemanticVectorImage& output, const void* left_so
 }
 } // namespace
 
-void ComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, const ScalarArithOp op,
-                  const bool operate_double) {
+[[gnu::always_inline]] static inline void SemanticKernelComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, const ScalarArithOp op,
+                  const bool operate_double){
     const std::array<const void*, 2> sources{lhs_old_dst, rhs};
     if (dst == nullptr || std::ranges::any_of(
                               sources, [](const void* source) { return source == nullptr; })) {
@@ -35199,7 +35595,11 @@ void ComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, 
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, const bool operate_double) {
+void ComputeScalarFloating(void* argument0, const void* argument1, const void* argument2, const ScalarArithOp argument3, const bool argument4) {
+    SemanticKernelComputeScalarFloating(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelSquareRootScalarFloating(void* dst, const void* old_dst, const void* src, const bool operate_double){
     if (dst == nullptr || old_dst == nullptr || src == nullptr) {
         return;
     }
@@ -35215,8 +35615,12 @@ void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, c
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void RoundScalarFloating(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
-                  const bool operate_double, const std::uint32_t mxcsr) {
+void SquareRootScalarFloating(void* argument0, const void* argument1, const void* argument2, const bool argument3) {
+    SemanticKernelSquareRootScalarFloating(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelRoundScalarFloating(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
+                  const bool operate_double, const std::uint32_t mxcsr){
     if (dst == nullptr || old_dst == nullptr || src == nullptr) {
         return;
     }
@@ -35231,6 +35635,10 @@ void RoundScalarFloating(void* dst, const void* old_dst, const void* src, const 
         std::memcpy(result.bytes.data(), &value, sizeof(value));
     }
     result.Publish(dst, kSemanticVectorBytes);
+}
+
+void RoundScalarFloating(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const bool argument4, const std::uint32_t argument5) {
+    SemanticKernelRoundScalarFloating(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 namespace {
@@ -35249,10 +35657,14 @@ void StoreElement(std::uint8_t* ptr, std::uint64_t value, const std::size_t elem
 }
 } // namespace
 
-void AddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
-                   const bool subtract, const std::size_t total_size) {
+[[gnu::always_inline]] static inline void SemanticKernelAddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
+                   const bool subtract, const std::size_t total_size){
     (void)VectorSemantic::AddOrSubtractPacked(
         dst, lhs, rhs, element_size, total_size, subtract);
+}
+
+void AddSubtractPackedIntegers(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
+    SemanticKernelAddSubtractPackedIntegers(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 namespace {
@@ -35316,13 +35728,23 @@ void SaturatePackedUnsigned(const std::array<const void*, 2>& sources, void* des
 }
 } // namespace
 
-void SaturateWordToUnsignedByte(void* dst, const void* lhs, const void* rhs, const std::size_t total_size) {
+[[gnu::always_inline]] static inline void SemanticKernelSaturateWordToUnsignedByte(void* dst, const void* lhs, const void* rhs, const std::size_t total_size){
     SaturatePackedUnsigned({lhs, rhs}, dst, total_size, PackedSaturationSource::Words);
 }
 
-void SaturateDwordToUnsignedWord(void* dst, const void* lhs, const void* rhs, const std::size_t total_size) {
+void SaturateWordToUnsignedByte(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
+    auto operation = std::bind_front(&SemanticKernelSaturateWordToUnsignedByte);
+    operation(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelSaturateDwordToUnsignedWord(void* dst, const void* lhs, const void* rhs, const std::size_t total_size){
     const std::array<const void*, 2> operands{lhs, rhs};
     SaturatePackedUnsigned(operands, dst, total_size, PackedSaturationSource::Dwords);
+}
+
+void SaturateDwordToUnsignedWord(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
+    auto operation = std::bind_front(&SemanticKernelSaturateDwordToUnsignedWord);
+    operation(argument0, argument1, argument2, argument3);
 }
 
 namespace {
@@ -35357,16 +35779,21 @@ void VPackedElementShift(void* dst, const void* src, const std::uint64_t count,
 }
 } // namespace
 
-void ShiftPackedQuadwords(void* dst, const void* src, const std::uint64_t count, const bool left,
-                   const std::size_t total_size) {
+[[gnu::always_inline]] static inline void SemanticKernelShiftPackedQuadwords(void* dst, const void* src, const std::uint64_t count, const bool left,
+                   const std::size_t total_size){
     const std::size_t lane_width = sizeof(std::uint64_t);
     VPackedElementShift(dst, src, count, lane_width, left,
                         /*arithmetic_right=*/false, total_size);
 }
 
-void ShiftPackedWordGroups(void* dst, const void* src, const std::uint64_t count,
+void ShiftPackedQuadwords(void* argument0, const void* argument1, const std::uint64_t argument2, const bool argument3, const std::size_t argument4) {
+    auto operation = std::bind_front(&SemanticKernelShiftPackedQuadwords);
+    operation(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelShiftPackedWordGroups(void* dst, const void* src, const std::uint64_t count,
                       const std::size_t element_bytes, const bool left,
-                      const bool arithmetic_right, const std::size_t total_size) {
+                      const bool arithmetic_right, const std::size_t total_size){
     struct ShiftDescription {
         void* output;
         const void* input;
@@ -35382,8 +35809,14 @@ void ShiftPackedWordGroups(void* dst, const void* src, const std::uint64_t count
                         request.toward_high_bits, request.sign_filling, request.vector_bytes);
 }
 
-void ShiftWholeVectorBytes(void* dst, const void* src, const std::size_t shift, const bool left,
-                      const std::size_t total_size) {
+void ShiftPackedWordGroups(void* argument0, const void* argument1, const std::uint64_t argument2, const std::size_t argument3, const bool argument4, const bool argument5, const std::size_t argument6) {
+    BoundSemanticEntry<&SemanticKernelShiftPackedWordGroups, decltype((argument0)), decltype((argument1)), decltype((argument2)), decltype((argument3)), decltype((argument4)), decltype((argument5)), decltype((argument6))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2, argument3, argument4, argument5, argument6)};
+    dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelShiftWholeVectorBytes(void* dst, const void* src, const std::size_t shift, const bool left,
+                      const std::size_t total_size){
     if (dst == nullptr || src == nullptr || total_size > 32) {
         return;
     }
@@ -35407,9 +35840,13 @@ void ShiftWholeVectorBytes(void* dst, const void* src, const std::size_t shift, 
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void ShiftPackedLegacyImmediate(void* dst, const void* src, const std::uint64_t count,
+void ShiftWholeVectorBytes(void* argument0, const void* argument1, const std::size_t argument2, const bool argument3, const std::size_t argument4) {
+    SemanticKernelShiftWholeVectorBytes(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelShiftPackedLegacyImmediate(void* dst, const void* src, const std::uint64_t count,
            const std::size_t element_bytes, const bool left, const bool arithmetic_right,
-           const std::size_t total_size) {
+           const std::size_t total_size){
     if (dst == nullptr || src == nullptr || total_size > kSemanticVectorBytes) {
         return;
     }
@@ -35421,9 +35858,13 @@ void ShiftPackedLegacyImmediate(void* dst, const void* src, const std::uint64_t 
     std::copy_n(output.bytes.begin(), total_size, static_cast<std::uint8_t*>(dst));
 }
 
-void ShiftPackedVectorImmediate(void* dst, const void* src, const std::uint64_t count,
+void ShiftPackedLegacyImmediate(void* argument0, const void* argument1, const std::uint64_t argument2, const std::size_t argument3, const bool argument4, const bool argument5, const std::size_t argument6) {
+    SemanticKernelShiftPackedLegacyImmediate(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelShiftPackedVectorImmediate(void* dst, const void* src, const std::uint64_t count,
             const std::size_t element_bytes, const bool left, const bool arithmetic_right,
-            const std::size_t total_size) {
+            const std::size_t total_size){
     const auto dispatch = element_bytes == sizeof(std::uint64_t)
                               ? &ShiftPackedQuadwords
                               : nullptr;
@@ -35435,8 +35876,14 @@ void ShiftPackedVectorImmediate(void* dst, const void* src, const std::uint64_t 
                           arithmetic_right, total_size);
 }
 
-void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::uint32_t mode,
-                     const std::size_t total_size) {
+void ShiftPackedVectorImmediate(void* argument0, const void* argument1, const std::uint64_t argument2, const std::size_t argument3, const bool argument4, const bool argument5, const std::size_t argument6) {
+    BoundSemanticEntry<&SemanticKernelShiftPackedVectorImmediate, decltype((argument0)), decltype((argument1)), decltype((argument2)), decltype((argument3)), decltype((argument4)), decltype((argument5)), decltype((argument6))> dispatch{
+        std::forward_as_tuple(argument0, argument1, argument2, argument3, argument4, argument5, argument6)};
+    dispatch.Invoke();
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelMultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::uint32_t mode,
+                     const std::size_t total_size){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
         return;
     }
@@ -35468,8 +35915,12 @@ void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, const s
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
-                   const bool compare_signed, const bool select_max, const std::size_t total_size) {
+void MultiplyPackedIntegers(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const std::size_t argument4) {
+    SemanticKernelMultiplyPackedIntegers(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelSelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
+                   const bool compare_signed, const bool select_max, const std::size_t total_size){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_size == 0 ||
         element_size > 8 || total_size > 32) {
         return;
@@ -35495,8 +35946,12 @@ void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, con
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
-                    const bool signed_greater_than, const std::size_t total_size) {
+void SelectPackedIntegerExtrema(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const bool argument5, const std::size_t argument6) {
+    SemanticKernelSelectPackedIntegerExtrema(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelComparePackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
+                    const bool signed_greater_than, const std::size_t total_size){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_size == 0 ||
         element_size > 8 || total_size > 32) {
         return;
@@ -35519,6 +35974,10 @@ void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, const st
                     match ? std::uint8_t{0xff} : std::uint8_t{0});
     }
     result.Publish(dst, kSemanticVectorBytes);
+}
+
+void ComparePackedIntegers(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
+    SemanticKernelComparePackedIntegers(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 namespace {
@@ -35585,8 +36044,8 @@ void ComputePackedArithmetic(void* destination, const void* left, const void* ri
 
 } // namespace
 
-void ComputePackedFloating(void* dst, const void* lhs, const void* rhs, const ScalarArithOp op,
-                       const bool operate_double, const std::size_t total_size) {
+[[gnu::always_inline]] static inline void SemanticKernelComputePackedFloating(void* dst, const void* lhs, const void* rhs, const ScalarArithOp op,
+                       const bool operate_double, const std::size_t total_size){
     if (operate_double) {
         ComputePackedArithmetic<double, std::uint64_t>(dst, lhs, rhs, op, total_size);
     } else {
@@ -35594,8 +36053,12 @@ void ComputePackedFloating(void* dst, const void* lhs, const void* rhs, const Sc
     }
 }
 
-void SquareRootPackedFloating(void* dst, const void* src, const bool operate_double,
-                 const std::size_t total_size, const bool zero_upper_ymm) {
+void ComputePackedFloating(void* argument0, const void* argument1, const void* argument2, const ScalarArithOp argument3, const bool argument4, const std::size_t argument5) {
+    SemanticKernelComputePackedFloating(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelSquareRootPackedFloating(void* dst, const void* src, const bool operate_double,
+                 const std::size_t total_size, const bool zero_upper_ymm){
     if (operate_double) {
         TransformPackedUnary<double>(dst, src, total_size, zero_upper_ymm,
                                      [](double value, std::size_t) {
@@ -35607,6 +36070,10 @@ void SquareRootPackedFloating(void* dst, const void* src, const bool operate_dou
                                         return std::sqrt(value);
                                     });
     }
+}
+
+void SquareRootPackedFloating(void* argument0, const void* argument1, const bool argument2, const std::size_t argument3, const bool argument4) {
+    SemanticKernelSquareRootPackedFloating(argument0, argument1, argument2, argument3, argument4);
 }
 
 namespace {
@@ -35683,8 +36150,8 @@ bool EvaluateFloatComparePredicate(const double lhs, const double rhs, const std
 }
 } // namespace
 
-void ComparePackedFloating(void* dst, const void* lhs, const void* rhs, const std::uint32_t predicate,
-                         const bool operate_double, const std::size_t total_size) {
+[[gnu::always_inline]] static inline void SemanticKernelComparePackedFloating(void* dst, const void* lhs, const void* rhs, const std::uint32_t predicate,
+                         const bool operate_double, const std::size_t total_size){
     const auto compare_double = [predicate](std::uint8_t* output,
                                             const std::uint8_t* left,
                                             const std::uint8_t* right,
@@ -35710,8 +36177,12 @@ void ComparePackedFloating(void* dst, const void* lhs, const void* rhs, const st
     }
 }
 
-void EstimatePackedReciprocal(void* dst, const void* src, const bool reciprocal_sqrt,
-                               const std::size_t total_size, const bool zero_upper_ymm) {
+void ComparePackedFloating(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const bool argument4, const std::size_t argument5) {
+    SemanticKernelComparePackedFloating(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelEstimatePackedReciprocal(void* dst, const void* src, const bool reciprocal_sqrt,
+                               const std::size_t total_size, const bool zero_upper_ymm){
     TransformPackedUnary<float>(
         dst, src, total_size, zero_upper_ymm,
         [reciprocal_sqrt](const float value, std::size_t) {
@@ -35720,8 +36191,12 @@ void EstimatePackedReciprocal(void* dst, const void* src, const bool reciprocal_
         });
 }
 
-void RoundPackedFloating(void* dst, const void* src, const std::uint32_t imm, const bool operate_double,
-                  const std::size_t total_size, const bool zero_upper_ymm, const std::uint32_t mxcsr) {
+void EstimatePackedReciprocal(void* argument0, const void* argument1, const bool argument2, const std::size_t argument3, const bool argument4) {
+    SemanticKernelEstimatePackedReciprocal(argument0, argument1, argument2, argument3, argument4);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelRoundPackedFloating(void* dst, const void* src, const std::uint32_t imm, const bool operate_double,
+                  const std::size_t total_size, const bool zero_upper_ymm, const std::uint32_t mxcsr){
     const std::uint32_t mode = (imm & 4u) != 0 ? (mxcsr >> 13u) & 3u : imm & 3u;
     if (operate_double) {
         TransformPackedUnary<double>(
@@ -35734,6 +36209,10 @@ void RoundPackedFloating(void* dst, const void* src, const std::uint32_t imm, co
                 return static_cast<float>(ApplyScalarRound(value, mode));
             });
     }
+}
+
+void RoundPackedFloating(void* argument0, const void* argument1, const std::uint32_t argument2, const bool argument3, const std::size_t argument4, const bool argument5, const std::uint32_t argument6) {
+    SemanticKernelRoundPackedFloating(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
 }
 
 namespace {
@@ -35810,9 +36289,9 @@ void TransformHorizontalPairs(void* destination, const void* left_source,
 }
 } // namespace
 
-void AddHorizontalPackedFloating(void* dst, const void* lhs, const void* rhs,
+[[gnu::always_inline]] static inline void SemanticKernelAddHorizontalPackedFloating(void* dst, const void* lhs, const void* rhs,
                                const bool double_lane, const bool subtract,
-                               const std::size_t total_size, const bool zero_upper_ymm) {
+                               const std::size_t total_size, const bool zero_upper_ymm){
     if (double_lane) {
         TransformHorizontalPairs<double>(
             dst, lhs, rhs, total_size, zero_upper_ymm,
@@ -35828,7 +36307,11 @@ void AddHorizontalPackedFloating(void* dst, const void* lhs, const void* rhs,
     }
 }
 
-void AddHorizontalPackedDwords(void* dst, const void* lhs, const void* rhs, const std::size_t total_size) {
+void AddHorizontalPackedFloating(void* argument0, const void* argument1, const void* argument2, const bool argument3, const bool argument4, const std::size_t argument5, const bool argument6) {
+    SemanticKernelAddHorizontalPackedFloating(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelAddHorizontalPackedDwords(void* dst, const void* lhs, const void* rhs, const std::size_t total_size){
     TransformHorizontalPairs<std::int32_t>(
         dst, lhs, rhs, total_size, /*publish_full=*/true,
         [](std::int32_t a, std::int32_t b) {
@@ -35837,7 +36320,11 @@ void AddHorizontalPackedDwords(void* dst, const void* lhs, const void* rhs, cons
         });
 }
 
-void FindMinimumUnsignedWord(void* dst, const void* src, const bool zero_upper_ymm) {
+void AddHorizontalPackedDwords(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
+    SemanticKernelAddHorizontalPackedDwords(argument0, argument1, argument2, argument3);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelFindMinimumUnsignedWord(void* dst, const void* src, const bool zero_upper_ymm){
     if (dst == nullptr || src == nullptr) {
         return;
     }
@@ -35856,8 +36343,12 @@ void FindMinimumUnsignedWord(void* dst, const void* src, const bool zero_upper_y
     result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : 16u);
 }
 
-void DotProductPackedSingle(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm,
-           const std::size_t total_size, const bool zero_upper_ymm) {
+void FindMinimumUnsignedWord(void* argument0, const void* argument1, const bool argument2) {
+    SemanticKernelFindMinimumUnsignedWord(argument0, argument1, argument2);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelDotProductPackedSingle(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm,
+           const std::size_t total_size, const bool zero_upper_ymm){
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
         return;
     }
@@ -35886,9 +36377,13 @@ void DotProductPackedSingle(void* dst, const void* lhs, const void* rhs, const s
     result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : total_size);
 }
 
-void ConvertPackedIntegerFloat(void* dst, const void* src, const bool int_to_float,
+void DotProductPackedSingle(void* argument0, const void* argument1, const void* argument2, const std::uint8_t argument3, const std::size_t argument4, const bool argument5) {
+    SemanticKernelDotProductPackedSingle(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelConvertPackedIntegerFloat(void* dst, const void* src, const bool int_to_float,
                         const bool truncate, const std::size_t total_size,
-                        const std::uint32_t mxcsr) {
+                        const std::uint32_t mxcsr){
     const auto rounding_mode = (mxcsr >> 13u) & 3u;
     TransformPackedUnary<std::uint32_t>(
         dst, src, total_size, /*publish_full=*/true,
@@ -35906,8 +36401,12 @@ void ConvertPackedIntegerFloat(void* dst, const void* src, const bool int_to_flo
         });
 }
 
-void CompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* lhs, const void* rhs,
-                    const std::uint32_t predicate, const bool operate_double) {
+void ConvertPackedIntegerFloat(void* argument0, const void* argument1, const bool argument2, const bool argument3, const std::size_t argument4, const std::uint32_t argument5) {
+    SemanticKernelConvertPackedIntegerFloat(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelCompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* lhs, const void* rhs,
+                    const std::uint32_t predicate, const bool operate_double){
     if (dst == nullptr || old_dst == nullptr || lhs == nullptr || rhs == nullptr) {
         return;
     }
@@ -35925,9 +36424,13 @@ void CompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* 
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void PermuteVectorLanes(void* dst, const void* src, const void* control, const std::uint8_t imm,
+void CompareScalarFloatingPredicate(void* argument0, const void* argument1, const void* argument2, const void* argument3, const std::uint32_t argument4, const bool argument5) {
+    SemanticKernelCompareScalarFloatingPredicate(argument0, argument1, argument2, argument3, argument4, argument5);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelPermuteVectorLanes(void* dst, const void* src, const void* control, const std::uint8_t imm,
              const std::size_t total_size, const bool double_lane,
-             const bool immediate_control) {
+             const bool immediate_control){
     if (dst == nullptr || src == nullptr || (!immediate_control && control == nullptr) ||
         total_size > 32) {
         return;
@@ -35957,8 +36460,12 @@ void PermuteVectorLanes(void* dst, const void* src, const void* control, const s
     result.Publish(dst, kSemanticVectorBytes);
 }
 
-void TransferVectorBySignMask(void* vector, const void* mask, void* other, const std::size_t total_size,
-              const std::size_t lane_bytes, const bool store_direction) {
+void PermuteVectorLanes(void* argument0, const void* argument1, const void* argument2, const std::uint8_t argument3, const std::size_t argument4, const bool argument5, const bool argument6) {
+    SemanticKernelPermuteVectorLanes(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
+}
+
+[[gnu::always_inline]] static inline void SemanticKernelTransferVectorBySignMask(void* vector, const void* mask, void* other, const std::size_t total_size,
+              const std::size_t lane_bytes, const bool store_direction){
     if (vector == nullptr || other == nullptr || mask == nullptr || lane_bytes == 0 ||
         total_size > 32) {
         return;
@@ -35981,6 +36488,10 @@ void TransferVectorBySignMask(void* vector, const void* mask, void* other, const
     }
     result.Publish(store_direction ? other : vector,
                    store_direction ? total_size : kSemanticVectorBytes);
+}
+
+void TransferVectorBySignMask(void* argument0, const void* argument1, void* argument2, const std::size_t argument3, const std::size_t argument4, const bool argument5) {
+    SemanticKernelTransferVectorBySignMask(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 std::string ExerciseTranslationEngineJson() {
