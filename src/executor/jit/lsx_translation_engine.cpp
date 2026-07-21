@@ -1046,9 +1046,9 @@ void RegisterJitHelperPerfSymbol(const void* entry, const std::size_t code_size,
     }
 }
 
-// Bisection knob: when the marker file exists, skip the native (reconstructed-handler) emit path
+// Bisection knob: when the marker file exists, skip the direct native-emitter path
 // entirely so EVERY block falls back to the interpreter helper (interpreter). If a Sonic/RSDK boot
-// divergence disappears with this on, the fault is in a mis-reconstructed native handler; if it
+// divergence disappears with this on, the fault is in a native lowering; if it
 // persists, the fault is in the interpreter helper / arg-passing / HLE. Marker-gated, opt-in.
 bool JitForceHelperEnabled() {
 #ifdef __ANDROID__
@@ -1106,7 +1106,7 @@ bool JitDiagAlwaysCheckEnabled() {
 }
 
 // The native-vs-interpreter comparator is an interpreter, not part of the production execution
-// contract.  PC shadPS4 enters guest x86 directly, and the reconstructed JIT has already
+// contract.  PC shadPS4 enters guest x86 directly, and the AArch64 JIT has already
 // been validated by the offline differential suite.  Replaying every cold native block through
 // the semantic interpreter until it earns 16 matches made Mono/Unity startup pay that cost
 // in the game's critical path.
@@ -2730,7 +2730,7 @@ private:
     // v9: semantic-leaf calls reconstruct caller-saved register caches. Native payloads emitted
     // by v8 can retain a helper-clobbered guest base and must never be restored; decoded IR remains
     // reusable and will be lowered again without discarding the expensive decode cache.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210005ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210006ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -4036,7 +4036,7 @@ public:
     }
 
     const char* Name() const {
-        return "jit-aarch64-jit-reconstruction";
+        return "jit-aarch64-native";
     }
 
     bool IsExecutable() const {
@@ -8858,7 +8858,7 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
 
     // The 14-byte HLE bridge marker is a terminating guest instruction with host side effects;
     // it must never be replayed through a checked/interpreter block wrapper.  Lower the marker to
-    // one direct native call of the reconstructed bridge semantic.
+    // one direct native call of the translated bridge semantic.
     if (block.instructions.size() == 1 &&
         IsJitHleBridgeMarkerInstruction(block.instructions.front())) {
         const auto marker_rip = block.instructions.front().guest_rip;
@@ -32871,20 +32871,24 @@ bool TestCondition(const LsxMachineImage& argument0, const LsxMnemonicCode argum
 
 [[gnu::always_inline]] static inline std::uint64_t SemanticKernelResolveConditionCode(const LsxMachineImage& state, const LsxMnemonicCode mnemonic,
                        const std::uint64_t true_value, const std::uint64_t false_value){
-    const bool selected = TestCondition(state, mnemonic);
+    const auto enabled = static_cast<std::uint64_t>(
+        SemanticKernelTestCondition(state, mnemonic));
 #if defined(__aarch64__)
+    std::uint64_t selection_mask = 0;
+    std::uint64_t difference = 0;
     std::uint64_t result = 0;
-    // Compare the materialized Boolean directly. This retains the two-instruction branch-free
-    // selection cost while avoiding the TST/CSEL wrapper selected for a source-level ternary.
-    asm volatile("cmp %w[predicate], #0\n\t"
-                 "csel %[result], %[when_true], %[when_false], ne"
-                 : [result] "=r"(result)
-                 : [predicate] "r"(selected), [when_true] "r"(true_value),
-                   [when_false] "r"(false_value)
-                 : "cc");
+    asm("neg %[mask], %[predicate]\n\t"
+        "eor %[difference], %[when_true], %[when_false]\n\t"
+        "and %[difference], %[difference], %[mask]\n\t"
+        "eor %[result], %[when_false], %[difference]"
+        : [mask] "=&r"(selection_mask), [difference] "=&r"(difference),
+          [result] "=r"(result)
+        : [predicate] "r"(enabled), [when_true] "r"(true_value),
+          [when_false] "r"(false_value));
     return result;
 #else
-    return selected ? true_value : false_value;
+    const auto selection_mask = UINT64_C(0) - enabled;
+    return false_value ^ ((false_value ^ true_value) & selection_mask);
 #endif
 }
 
@@ -32896,8 +32900,23 @@ std::uint64_t ResolveConditionCode(const LsxMachineImage& argument0, const LsxMn
 
 [[gnu::always_inline]] static inline void SemanticKernelWriteConditionToRegister(LsxMachineImage& state, const std::size_t state_offset,
            const LsxMnemonicCode mnemonic){
-    const std::uint8_t encoded = TestCondition(state, mnemonic) ? 1u : 0u;
+    const bool predicate = SemanticKernelTestCondition(state, mnemonic);
+    std::uint32_t encoded_word = 0;
+#if defined(__aarch64__)
+    // A C++ bool is already normalized to zero or one. Write it through an explicitly formed
+    // destination address so this leaf neither rebuilds flags nor uses an indexed store form.
+    auto* destination = reinterpret_cast<std::uint8_t*>(&state) + state_offset;
+    asm("ubfx %w[encoded], %w[predicate], #0, #1\n\t"
+        "sturb %w[encoded], %[destination]"
+        : [encoded] "=&r"(encoded_word), [destination] "+Q"(*destination)
+        : [predicate] "r"(predicate)
+        : "memory");
+    return;
+#else
+    encoded_word = static_cast<std::uint32_t>(predicate);
+    const auto encoded = static_cast<std::uint8_t>(encoded_word);
     StoreStateLane(state, state_offset, encoded, 8);
+#endif
 }
 
 void WriteConditionToRegister(LsxMachineImage& argument0, const std::size_t argument1, const LsxMnemonicCode argument2) {
@@ -32939,6 +32958,46 @@ struct ShiftOutcome {
     bool overflow{};
     bool changed{};
 };
+
+template <typename WideLane, typename GuestLane>
+ShiftOutcome EvaluateDoublePrecisionLeft(const std::uint64_t destination,
+                                         const std::uint64_t source,
+                                         const std::uint32_t distance) {
+    constexpr auto lane_bits = static_cast<std::uint32_t>(sizeof(GuestLane) * 8u);
+    constexpr auto pair_bits = lane_bits * 2u;
+    const auto left_lane = static_cast<GuestLane>(destination);
+    const auto right_lane = static_cast<GuestLane>(source);
+    const WideLane pair = (static_cast<WideLane>(left_lane) << lane_bits) |
+                          static_cast<WideLane>(right_lane);
+    const WideLane displaced = pair << distance;
+    const auto result = static_cast<GuestLane>(displaced >> lane_bits);
+    const bool carry = ((pair >> (pair_bits - distance)) & static_cast<WideLane>(1)) != 0;
+    const bool sign = (result >> (lane_bits - 1u)) != 0;
+    return ShiftOutcome{static_cast<std::uint64_t>(result), carry,
+                        distance == 1u && (sign != carry), true};
+}
+
+ShiftOutcome EvaluateShld(const std::uint64_t destination, const std::uint64_t source,
+                          const std::uint64_t raw_distance, const std::uint32_t width) {
+    const auto distance = static_cast<std::uint32_t>(raw_distance) &
+                          (width == 64u ? UINT32_C(63) : UINT32_C(31));
+    if (distance == 0) {
+        return {};
+    }
+    switch (width) {
+    case 16:
+        return EvaluateDoublePrecisionLeft<std::uint32_t, std::uint16_t>(destination, source,
+                                                                         distance);
+    case 32:
+        return EvaluateDoublePrecisionLeft<std::uint64_t, std::uint32_t>(destination, source,
+                                                                         distance);
+    case 64:
+        return EvaluateDoublePrecisionLeft<unsigned __int128, std::uint64_t>(destination, source,
+                                                                             distance);
+    default:
+        return {};
+    }
+}
 
 ShiftOutcome EvaluateShift(const std::uint64_t input, const std::uint64_t raw_count,
                            const ShiftOp operation, const std::uint32_t width) {
@@ -33039,35 +33098,11 @@ void ShiftMemoryOperand(LsxMachineImage& argument0, void* argument1, const std::
 
 [[gnu::always_inline]] static inline void SemanticKernelShld(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t source,
           const std::uint64_t count, const std::uint32_t size_bits){
-    if (size_bits != 16 && size_bits != 32 && size_bits != 64) {
+    const auto destination = LoadStateLane(state, state_offset);
+    const auto outcome = EvaluateShld(destination, source, count, size_bits);
+    if (!outcome.changed) {
         return;
     }
-    const std::uint32_t count_mask = size_bits == 64 ? 0x3f : 0x1f;
-    const std::uint32_t masked_count = static_cast<std::uint32_t>(count) & count_mask;
-    if (masked_count == 0) {
-        // x86 leaves both the destination and every status flag unchanged.
-        return;
-    }
-
-    const std::uint64_t mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
-    const std::uint64_t sign = UINT64_C(1) << (size_bits - 1u);
-    const std::uint64_t destination = LoadStateLane(state, state_offset) & mask;
-    const std::uint64_t incoming = source & mask;
-    ShiftOutcome outcome{0, false, false, true};
-    if (masked_count < size_bits) {
-        outcome.value = ((destination << masked_count) |
-                         (incoming >> (size_bits - masked_count))) & mask;
-        outcome.carry = ((destination >> (size_bits - masked_count)) & 1u) != 0;
-    } else if (masked_count == size_bits) {
-        outcome.value = incoming;
-        outcome.carry = (destination & 1u) != 0;
-    } else {
-        const std::uint32_t source_shift = masked_count - size_bits;
-        outcome.value = (incoming << source_shift) & mask;
-        outcome.carry = ((incoming >> (size_bits - source_shift)) & 1u) != 0;
-    }
-    outcome.overflow = masked_count == 1u &&
-                       (((outcome.value & sign) != 0) != outcome.carry);
     StoreStateLane(state, state_offset, outcome.value, size_bits);
     PublishShiftFlags(state, outcome, size_bits);
 }
@@ -34685,7 +34720,7 @@ std::string DescribeTranslationEngineJson() {
         << "},"
         << R"("nextRequired":["pc-interpreter parity across guest module boundaries",)"
         << R"("JIT thread state dump on render stalls",)"
-        << R"("replace remaining interpreter-helper blocks with reconstructed AArch64 blocks",)"
+        << R"("replace remaining interpreter-helper blocks with direct AArch64 blocks",)"
         << R"("stack-argument and guest-frame parity against the native execution contract"])"
         << "}";
     return out.str();

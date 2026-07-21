@@ -1246,7 +1246,7 @@ extern "C" bool executor_lsx4_android_should_suppress_guest_thread(void* start_r
     (void)arg;
     // On Android every *guest* pthread MUST run through the mapped guest-thread path
     // (RunBox64GuestThread -> run_guest_thread). In the FEX route this registers the thread's FEX
-    // TLS/alt-stack, and in JIT it dispatches the x86 start routine through the reconstructed
+    // TLS/alt-stack, and in JIT it dispatches the x86 start routine through the translated
     // AArch64 JIT. The fallthrough RunThread path calls start_routine() directly as host code; on
     // arm64 that executes the guest x86 bytes as arm64 -> SIGILL/ILL_ILLOPC (host pc == guest addr).
     // That is exactly what kills JIT worker threads once Mono creates Thread2.
@@ -25733,7 +25733,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     << R"("tlsImageSize":)" << request.tls_image_size << ","
                     << R"("tcbBase":")" << Hex64(request.tcb_base) << R"(",)"
                     << R"("segmentCount":)" << request.segment_count << ","
-                    << R"("next_step":"JIT is executing the loaded module entry through the reconstructed AArch64 JIT route")"
+                    << R"("next_step":"JIT is executing the loaded module entry through the native AArch64 JIT route")"
                     << "}";
             g_box64_mapped_entry_info = running.str();
             g_status = std::string(
