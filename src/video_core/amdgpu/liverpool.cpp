@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/preprocessor/stringize.hpp>
+#include <xxhash.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -843,6 +844,15 @@ void ExecutorEopTraceSubmitDonePulse(u64 pulse) {
 }
 #endif
 
+static bool Pm4DescriptorCacheEnabled() {
+#ifdef __ANDROID__
+    static const bool enabled = !ExecutorEnvFlag("EXECUTOR_DISABLE_PM4_DESCRIPTOR_CACHE");
+    return enabled;
+#else
+    return true;
+#endif
+}
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
         LOG_ERROR(
@@ -855,6 +865,136 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     }
 
     return span.subspan(offset);
+}
+
+Liverpool::Pm4StreamFingerprint Liverpool::FingerprintPm4Stream(
+    Pm4Engine engine, std::span<const u32> stream) noexcept {
+    // Two independent fingerprints make a cache collision fail closed without retaining and
+    // comparing another full command-buffer copy. The format tag invalidates every old entry when
+    // descriptor semantics change.
+    constexpr u64 FormatTag = 0x504d3402ULL;
+    const u64 seed = FormatTag ^ (static_cast<u64>(engine) << 48) ^ stream.size();
+    const XXH128_hash_t digest = XXH3_128bits_withSeed(stream.data(), stream.size_bytes(), seed);
+    return {.primary = digest.low64,
+            .verifier = digest.high64,
+            .words = static_cast<u32>(stream.size()),
+            .engine = engine};
+}
+
+std::shared_ptr<const Liverpool::Pm4DescriptorPlan> Liverpool::BuildPm4DescriptorPlan(
+    const Pm4StreamFingerprint& fingerprint, std::span<const u32> stream) {
+    constexpr u32 MaxCacheableWords = 64 * 1024;
+    constexpr u32 MaxCacheablePackets = 4096;
+    if (stream.empty() || stream.size() != fingerprint.words ||
+        stream.size() > MaxCacheableWords) {
+        return {};
+    }
+
+    auto plan = std::make_shared<Pm4DescriptorPlan>();
+    plan->fingerprint = fingerprint;
+    plan->packets.reserve(std::min<std::size_t>(stream.size() / 2 + 1, 512));
+    std::size_t offset = 0;
+    while (offset < stream.size()) {
+        const auto* header = reinterpret_cast<const PM4Header*>(stream.data() + offset);
+        const u32 type = header->type;
+        u32 packet_words = 1;
+        u16 opcode = 0;
+        if (type == 3) {
+            const u64 expanded_words = static_cast<u64>(header->type3.NumWords()) + 1;
+            if (expanded_words > stream.size() - offset) {
+                return {};
+            }
+            packet_words = static_cast<u32>(expanded_words);
+            opcode = static_cast<u16>(static_cast<PM4ItOpcode>(header->type3.opcode));
+        } else if (type != 2) {
+            // Type-0 is deliberately rejected by the production graphics parser and types 1/other
+            // are malformed. Such streams always stay on the diagnostic parser path.
+            return {};
+        }
+        if (plan->packets.size() == MaxCacheablePackets) {
+            return {};
+        }
+        plan->packets.push_back({.offset_words = static_cast<u32>(offset),
+                                 .packet_words = packet_words,
+                                 .opcode = opcode,
+                                 .type = static_cast<u8>(type)});
+        offset += packet_words;
+    }
+    return plan;
+}
+
+std::shared_ptr<const Liverpool::Pm4DescriptorPlan> Liverpool::FindPm4DescriptorPlan(
+    const Pm4StreamFingerprint& fingerprint) {
+    const u32 set = static_cast<u32>(fingerprint.primary) & (Pm4DescriptorCacheSets - 1);
+    const u32 first = set * Pm4DescriptorCacheWays;
+    ++pm4_descriptor_cache_clock_;
+    const auto log_metrics = [&] {
+#ifdef __ANDROID__
+        const u64 lookups = pm4_descriptor_cache_hits_ + pm4_descriptor_cache_misses_;
+        if ((lookups & 4095) == 0 && lookups != 0) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_PM4_DESCRIPTOR_CACHE] lookups=%llu hits=%llu "
+                                "misses=%llu inserts=%llu hitPct=%.1f",
+                                static_cast<unsigned long long>(lookups),
+                                static_cast<unsigned long long>(pm4_descriptor_cache_hits_),
+                                static_cast<unsigned long long>(pm4_descriptor_cache_misses_),
+                                static_cast<unsigned long long>(pm4_descriptor_cache_inserts_),
+                                100.0 * static_cast<double>(pm4_descriptor_cache_hits_) /
+                                    static_cast<double>(lookups));
+        }
+#endif
+    };
+    for (u32 way = 0; way < Pm4DescriptorCacheWays; ++way) {
+        auto& line = pm4_descriptor_cache_[first + way];
+        if (line.plan && line.fingerprint == fingerprint) {
+            line.last_use = pm4_descriptor_cache_clock_;
+            ++pm4_descriptor_cache_hits_;
+            log_metrics();
+            return line.plan;
+        }
+    }
+    ++pm4_descriptor_cache_misses_;
+    log_metrics();
+    return {};
+}
+
+bool Liverpool::AdmitPm4DescriptorPlanBuild(
+    const Pm4StreamFingerprint& fingerprint) noexcept {
+    // A direct-mapped doorkeeper prevents one-shot command buffers from allocating a descriptor
+    // vector only to evict it immediately. The second observation admits the stream; collisions
+    // merely delay caching and can never change execution semantics.
+    const u32 index = static_cast<u32>(fingerprint.primary ^ (fingerprint.verifier >> 32)) &
+                      (Pm4DescriptorAdmissionLines - 1);
+    auto& line = pm4_descriptor_admission_[index];
+    if (line.occupied && line.fingerprint == fingerprint) {
+        return true;
+    }
+    line.fingerprint = fingerprint;
+    line.occupied = true;
+    return false;
+}
+
+void Liverpool::RememberPm4DescriptorPlan(std::shared_ptr<const Pm4DescriptorPlan> plan) {
+    if (!plan || plan->packets.empty()) {
+        return;
+    }
+    const auto& fingerprint = plan->fingerprint;
+    const u32 set = static_cast<u32>(fingerprint.primary) & (Pm4DescriptorCacheSets - 1);
+    const u32 first = set * Pm4DescriptorCacheWays;
+    Pm4DescriptorCacheLine* victim = &pm4_descriptor_cache_[first];
+    for (u32 way = 0; way < Pm4DescriptorCacheWays; ++way) {
+        auto& line = pm4_descriptor_cache_[first + way];
+        if (line.plan && line.fingerprint == fingerprint) {
+            return;
+        }
+        if (!line.plan || line.last_use < victim->last_use) {
+            victim = &line;
+        }
+    }
+    victim->fingerprint = fingerprint;
+    victim->plan = std::move(plan);
+    victim->last_use = ++pm4_descriptor_cache_clock_;
+    ++pm4_descriptor_cache_inserts_;
 }
 
 bool Liverpool::CopyIndirectAtEncounter(Pm4Engine engine, VAddr address, u32 num_words,
@@ -2208,17 +2348,56 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
     }
     u32 chain_hops = 0;
 
+    const u32* descriptor_base = ccb.data();
+    std::shared_ptr<const Pm4DescriptorPlan> descriptor_plan;
+    std::shared_ptr<const Pm4DescriptorPlan> descriptor_candidate;
+    std::size_t descriptor_cursor = 0;
+    const auto bind_descriptor_plan = [&] {
+        descriptor_base = ccb.data();
+        descriptor_plan.reset();
+        descriptor_candidate.reset();
+        descriptor_cursor = 0;
+        const bool immutable_stream = !owned_ccb.empty() && ccb.data() == owned_ccb.data() &&
+                                      ccb.size() == owned_ccb.size();
+        if (!Pm4DescriptorCacheEnabled() || !immutable_stream || ccb.empty() ||
+            ccb.size() > std::numeric_limits<u32>::max()) {
+            return;
+        }
+        const auto fingerprint = FingerprintPm4Stream(Pm4Engine::Constant, ccb);
+        descriptor_plan = FindPm4DescriptorPlan(fingerprint);
+        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(fingerprint)) {
+            descriptor_candidate = BuildPm4DescriptorPlan(fingerprint, ccb);
+        }
+    };
+    bind_descriptor_plan();
+
     while (!ccb.empty() && !state->abort) {
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
-        const u32 type = header->type;
+        const Pm4PacketDescriptor* cached_descriptor = nullptr;
+        if (descriptor_plan) {
+            const std::size_t offset_words = static_cast<std::size_t>(ccb.data() - descriptor_base);
+            while (descriptor_cursor < descriptor_plan->packets.size() &&
+                   descriptor_plan->packets[descriptor_cursor].offset_words < offset_words) {
+                ++descriptor_cursor;
+            }
+            if (descriptor_cursor < descriptor_plan->packets.size() &&
+                descriptor_plan->packets[descriptor_cursor].offset_words == offset_words) {
+                cached_descriptor = &descriptor_plan->packets[descriptor_cursor];
+            } else {
+                descriptor_plan.reset();
+            }
+        }
+        const u32 type = cached_descriptor ? cached_descriptor->type : header->type;
         if (type != 3) {
             state->abort = true;
             LOG_ERROR(Lib_GnmDriver, "Invalid CE PM4 type {}", type);
             break;
         }
-        const size_t packet_words = static_cast<size_t>(header->type3.NumWords()) + 1;
+        const size_t packet_words = cached_descriptor
+                                        ? cached_descriptor->packet_words
+                                        : static_cast<size_t>(header->type3.NumWords()) + 1;
         if (packet_words > ccb.size()) {
             state->abort = true;
             LOG_ERROR(Lib_GnmDriver,
@@ -2227,7 +2406,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
             break;
         }
 
-        const PM4ItOpcode opcode = header->type3.opcode;
+        const PM4ItOpcode opcode = cached_descriptor
+                                       ? static_cast<PM4ItOpcode>(cached_descriptor->opcode)
+                                       : header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -2312,8 +2493,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
                     state->abort = true;
                     break;
                 }
+                if (descriptor_candidate && !state->abort) {
+                    RememberPm4DescriptorPlan(std::move(descriptor_candidate));
+                }
                 owned_ccb = std::move(child);
                 ccb = std::span<const u32>{owned_ccb};
+                bind_descriptor_plan();
                 continue;
             }
             auto task = ProcessCeUpdate({}, std::move(child), state, ib_depth + 1);
@@ -2337,6 +2522,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
             break;
         }
         ccb = NextPacket(ccb, packet_words);
+    }
+
+    if (!state->abort && descriptor_candidate) {
+        RememberPm4DescriptorPlan(std::move(descriptor_candidate));
     }
 
     FIBER_EXIT;
@@ -2419,6 +2608,28 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool guest_markers_enabled = rasterizer && Config::getVkGuestMarkersEnabled();
 
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    std::shared_ptr<const Pm4DescriptorPlan> descriptor_plan;
+    std::shared_ptr<const Pm4DescriptorPlan> descriptor_candidate;
+    std::size_t descriptor_cursor = 0;
+    const auto bind_descriptor_plan = [&] {
+        descriptor_plan.reset();
+        descriptor_candidate.reset();
+        descriptor_cursor = 0;
+        const bool immutable_stream = !owned_dcb.empty() && dcb.data() == owned_dcb.data() &&
+                                      dcb.size() == owned_dcb.size();
+        if (!Pm4DescriptorCacheEnabled() || !immutable_stream || dcb.empty() ||
+            dcb.size() > std::numeric_limits<u32>::max()) {
+            return;
+        }
+        const auto fingerprint = FingerprintPm4Stream(Pm4Engine::Graphics, dcb);
+        descriptor_plan = FindPm4DescriptorPlan(fingerprint);
+        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(fingerprint)) {
+            // A miss executes the original parser. Publish the read-only descriptor list only
+            // after the stream repeats and completes without a parser/semantic abort.
+            descriptor_candidate = BuildPm4DescriptorPlan(fingerprint, dcb);
+        }
+    };
+    bind_descriptor_plan();
 #ifdef __ANDROID__
     u32 eop_trace_dcb_dw = static_cast<u32>(dcb.size());
     ExecutorEopTraceParserBegin(base_addr, eop_trace_dcb_dw);
@@ -2427,10 +2638,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
-        const u32 type = header->type;
+        const Pm4PacketDescriptor* cached_descriptor = nullptr;
+        if (descriptor_plan) {
+            const auto* stream_base = reinterpret_cast<const u32*>(base_addr);
+            const std::size_t offset_words = static_cast<std::size_t>(dcb.data() - stream_base);
+            while (descriptor_cursor < descriptor_plan->packets.size() &&
+                   descriptor_plan->packets[descriptor_cursor].offset_words < offset_words) {
+                ++descriptor_cursor;
+            }
+            if (descriptor_cursor < descriptor_plan->packets.size() &&
+                descriptor_plan->packets[descriptor_cursor].offset_words == offset_words) {
+                cached_descriptor = &descriptor_plan->packets[descriptor_cursor];
+            } else {
+                // Conditional execution can jump only to packet boundaries in a valid cached
+                // stream. Any mismatch returns immediately to the bounds-checking parser.
+                descriptor_plan.reset();
+            }
+        }
+        const u32 type = cached_descriptor ? cached_descriptor->type : header->type;
         size_t packet_words = 1;
         if (type == 3) {
-            packet_words = static_cast<size_t>(header->type3.NumWords()) + 1;
+            packet_words = cached_descriptor
+                               ? cached_descriptor->packet_words
+                               : static_cast<size_t>(header->type3.NumWords()) + 1;
             if (packet_words > dcb.size()) {
                 state->abort = true;
                 LOG_ERROR(Lib_GnmDriver,
@@ -2490,8 +2720,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             dcb = NextPacket(dcb, 1);
             continue;
         case 3:
-            const u32 count = header->type3.NumWords();
-            const PM4ItOpcode opcode = header->type3.opcode;
+            const u32 count = static_cast<u32>(packet_words - 1);
+            const PM4ItOpcode opcode = cached_descriptor
+                                           ? static_cast<PM4ItOpcode>(cached_descriptor->opcode)
+                                           : header->type3.opcode;
 #ifdef __ANDROID__
             if (kLiveChecks) {
                 ++exec_live_summary.packets;
@@ -3842,10 +4074,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         state->abort = true;
                         break;
                     }
+                    if (descriptor_candidate && !state->abort) {
+                        RememberPm4DescriptorPlan(std::move(descriptor_candidate));
+                    }
                     owned_dcb = std::move(child);
                     dcb = std::span<const u32>{owned_dcb};
                     base_addr = reinterpret_cast<uintptr_t>(dcb.data());
                     logical_dcb_base = address;
+                    bind_descriptor_plan();
 #ifdef __ANDROID__
                     eop_trace_dcb_dw = static_cast<u32>(dcb.size());
 #endif
@@ -3946,6 +4182,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             RESUME_GFX(ce_task);
         }
     }
+    if (!state->abort && descriptor_candidate) {
+        RememberPm4DescriptorPlan(std::move(descriptor_candidate));
+    }
 
 #ifdef __ANDROID__
     ExecutorEopTraceParserEnd(base_addr, eop_trace_dcb_dw);
@@ -4012,12 +4251,49 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
+    const u32* descriptor_base = acb.data();
+    std::shared_ptr<const Pm4DescriptorPlan> descriptor_plan;
+    std::shared_ptr<const Pm4DescriptorPlan> descriptor_candidate;
+    std::size_t descriptor_cursor = 0;
+    const auto bind_descriptor_plan = [&] {
+        descriptor_base = acb.data();
+        descriptor_plan.reset();
+        descriptor_candidate.reset();
+        descriptor_cursor = 0;
+        const bool immutable_stream = !owned_acb.empty() && acb.data() == owned_acb.data() &&
+                                      acb.size() == owned_acb.size();
+        if (!Pm4DescriptorCacheEnabled() || !immutable_stream || queue.tmp_dwords != 0 ||
+            acb.empty() || acb.size() > std::numeric_limits<u32>::max()) {
+            return;
+        }
+        const auto fingerprint = FingerprintPm4Stream(Pm4Engine::Compute, acb);
+        descriptor_plan = FindPm4DescriptorPlan(fingerprint);
+        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(fingerprint)) {
+            descriptor_candidate = BuildPm4DescriptorPlan(fingerprint, acb);
+        }
+    };
+    bind_descriptor_plan();
     while (!acb.empty() && !state->abort) {
         ProcessCommands();
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 packet_total_words = 1;
         u32 next_dw_off = 1;
+        const Pm4PacketDescriptor* cached_descriptor = nullptr;
+        if (descriptor_plan) {
+            const std::size_t offset_words = static_cast<std::size_t>(acb.data() - descriptor_base);
+            while (descriptor_cursor < descriptor_plan->packets.size() &&
+                   descriptor_plan->packets[descriptor_cursor].offset_words < offset_words) {
+                ++descriptor_cursor;
+            }
+            if (descriptor_cursor < descriptor_plan->packets.size() &&
+                descriptor_plan->packets[descriptor_cursor].offset_words == offset_words) {
+                cached_descriptor = &descriptor_plan->packets[descriptor_cursor];
+            } else {
+                descriptor_plan.reset();
+            }
+        }
+        const u32 packet_type = cached_descriptor ? cached_descriptor->type : header->type.Value();
 
         // A root ACB may end in the middle of a type-3 packet. Keep appending later DingDong
         // segments until the packet is complete; never reinterpret a type-2 pad as a type-3 length.
@@ -4053,7 +4329,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
             std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
                         next_dw_off * sizeof(u32));
             queue.tmp_dwords = 0;
-        } else if (header->type == 2) {
+        } else if (packet_type == 2) {
             // Type-2 packet are used for padding purposes
             acb = NextPacket(acb, next_dw_off);
             if (advances_ring) {
@@ -4061,12 +4337,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                 *queue.read_addr %= queue.ring_size_dw;
             }
             continue;
-        } else if (header->type != 3) {
+        } else if (packet_type != 3) {
             state->abort = true;
-            LOG_ERROR(Lib_GnmDriver, "Invalid compute PM4 type {}", header->type.Value());
+            LOG_ERROR(Lib_GnmDriver, "Invalid compute PM4 type {}", packet_type);
             break;
         } else {
-            packet_total_words = header->type3.NumWords() + 1;
+            packet_total_words = cached_descriptor ? cached_descriptor->packet_words
+                                                   : header->type3.NumWords() + 1;
             next_dw_off = packet_total_words;
             // If the packet is split across the current root-ring segment, preserve all available
             // DWORDs. Later segments may be shorter than the remainder, so the append path above is
@@ -4085,7 +4362,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
             }
         }
 
-        const PM4ItOpcode opcode = header->type3.opcode;
+        const PM4ItOpcode opcode = cached_descriptor
+                                       ? static_cast<PM4ItOpcode>(cached_descriptor->opcode)
+                                       : header->type3.opcode;
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -4118,6 +4397,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                     *queue.read_addr += next_dw_off;
                     *queue.read_addr %= queue.ring_size_dw;
                 }
+                if (descriptor_candidate && !state->abort) {
+                    RememberPm4DescriptorPlan(std::move(descriptor_candidate));
+                }
                 owned_acb = std::move(child);
                 acb = std::span<const u32>{owned_acb};
                 base_addr = reinterpret_cast<VAddr>(acb.data());
@@ -4125,6 +4407,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                 logical_acb_base = address;
                 advances_ring = false;
                 indirect_patches.clear();
+                bind_descriptor_plan();
                 continue;
             }
             auto task = ProcessCompute<true>({}, vqid, std::move(child), state, ib_depth + 1,
@@ -4627,6 +4910,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
     if (state->abort && advances_ring) {
         // A malformed continuation must not poison the next independent DingDong segment.
         queue.tmp_dwords = 0;
+    }
+    if (!state->abort && descriptor_candidate) {
+        RememberPm4DescriptorPlan(std::move(descriptor_candidate));
     }
     FIBER_EXIT;
 }

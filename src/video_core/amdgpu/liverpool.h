@@ -234,6 +234,42 @@ private:
         Compute,
     };
 
+    struct Pm4StreamFingerprint {
+        u64 primary{};
+        u64 verifier{};
+        u32 words{};
+        Pm4Engine engine{};
+
+        auto operator<=>(const Pm4StreamFingerprint&) const = default;
+    };
+
+    struct Pm4PacketDescriptor {
+        u32 offset_words{};
+        u32 packet_words{};
+        u16 opcode{};
+        u8 type{};
+    };
+
+    struct Pm4DescriptorPlan {
+        Pm4StreamFingerprint fingerprint{};
+        std::vector<Pm4PacketDescriptor> packets{};
+    };
+
+    struct Pm4DescriptorCacheLine {
+        Pm4StreamFingerprint fingerprint{};
+        std::shared_ptr<const Pm4DescriptorPlan> plan{};
+        u64 last_use{};
+    };
+
+    struct Pm4DescriptorAdmissionLine {
+        Pm4StreamFingerprint fingerprint{};
+        bool occupied{};
+    };
+
+    static constexpr u32 Pm4DescriptorCacheSets = 256;
+    static constexpr u32 Pm4DescriptorCacheWays = 2;
+    static constexpr u32 Pm4DescriptorAdmissionLines = 1024;
+
     struct Pm4SnapshotKey {
         VAddr address{};
         u32 words{};
@@ -330,6 +366,15 @@ private:
 #endif
     void SnapshotCpuIndirectGraph(Pm4Engine engine, std::span<const u32> stream,
                                   const Pm4SubmissionStatePtr& state, u32 depth = 0) const;
+    [[nodiscard]] static Pm4StreamFingerprint FingerprintPm4Stream(
+        Pm4Engine engine, std::span<const u32> stream) noexcept;
+    [[nodiscard]] static std::shared_ptr<const Pm4DescriptorPlan> BuildPm4DescriptorPlan(
+        const Pm4StreamFingerprint& fingerprint, std::span<const u32> stream);
+    [[nodiscard]] std::shared_ptr<const Pm4DescriptorPlan> FindPm4DescriptorPlan(
+        const Pm4StreamFingerprint& fingerprint);
+    [[nodiscard]] bool AdmitPm4DescriptorPlanBuild(
+        const Pm4StreamFingerprint& fingerprint) noexcept;
+    void RememberPm4DescriptorPlan(std::shared_ptr<const Pm4DescriptorPlan> plan);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                          std::vector<u32> owned_dcb = {}, std::vector<u32> owned_ccb = {},
                          Pm4SubmissionStatePtr state = {}, u32 ib_depth = 0,
@@ -420,6 +465,15 @@ private:
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+    std::array<Pm4DescriptorCacheLine,
+               Pm4DescriptorCacheSets * Pm4DescriptorCacheWays>
+        pm4_descriptor_cache_{};
+    std::array<Pm4DescriptorAdmissionLine, Pm4DescriptorAdmissionLines>
+        pm4_descriptor_admission_{};
+    u64 pm4_descriptor_cache_clock_{};
+    u64 pm4_descriptor_cache_hits_{};
+    u64 pm4_descriptor_cache_misses_{};
+    u64 pm4_descriptor_cache_inserts_{};
     // SubmitAsc publishes new queue indices from guest threads while Process round-robins them on
     // the GPU thread. Monotonic atomic publication removes that otherwise-unsynchronised read/write.
     std::atomic<u32> num_mapped_queues{1u}; // GFX is always available
