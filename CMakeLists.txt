@@ -1177,6 +1177,15 @@ add_library(lsx4_executor_android SHARED
     src/executor/runtime_death_catcher.cpp
 )
 
+# The translation unit exposes many indirect helper targets to generated AArch64. Give every
+# function entry in that unit a BTI landing pad, including inline Xbyak allocator methods emitted
+# into the object. Besides hardening indirect dispatch, this prevents generic two-instruction
+# capability getters from sharing an unguarded machine body with unrelated external runtimes.
+if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set_source_files_properties(src/executor/jit/lsx_translation_engine.cpp PROPERTIES
+        COMPILE_OPTIONS "-mbranch-protection=bti")
+endif()
+
 # Persistent JIT native blocks contain generated AArch64, so their compatibility key must
 # follow the lowering ABI rather than the build-id of the whole shadps4 shared object.  Hash every
 # source/header which can change decoded IR or emitted bytes. CONFIGURE_DEPENDS makes an edit to

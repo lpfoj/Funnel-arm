@@ -1436,7 +1436,9 @@ thread_local std::uint64_t g_active_block_rip = 0;
 thread_local const LsxDecodedRegion* g_active_block = nullptr;
 thread_local std::array<std::uint64_t, 16> g_recent_block_rips{};
 thread_local std::array<const LsxDecodedRegion*, 16> g_recent_blocks{};
-thread_local std::uint32_t g_recent_block_count = 0;
+// Read from asynchronous fault diagnostics; volatile prevents whole-program constant folding of
+// the snapshot contract when instrumentation is disabled in a particular release configuration.
+thread_local volatile std::uint32_t g_recent_block_count = 0;
 thread_local std::uint32_t g_recent_block_cursor = 0;
 thread_local std::string g_helper_fault_message;
 thread_local LsxMachineImage* g_current_fault_state = nullptr;
@@ -5762,7 +5764,13 @@ private:
 
 LsxTranslationEngine g_lsx_translation_engine{};
 thread_local LsxStackReservoir g_lsx_stack_reservoir{};
-thread_local LsxMachineImage* g_current_guest_state = nullptr;
+constexpr std::uintptr_t kGuestMachineBindingSalt =
+    static_cast<std::uintptr_t>(0x6c73'7834'a55a'19e3ull);
+struct GuestMachineBinding {
+    LsxMachineImage* machine = nullptr;
+    std::uintptr_t seal = kGuestMachineBindingSalt;
+};
+thread_local GuestMachineBinding g_guest_machine_binding{};
 thread_local const LsxMachineImage* g_current_post_hle_state = nullptr;
 struct JitLiveThreadState {
     std::uint32_t host_tid = 0;
@@ -6680,7 +6688,10 @@ executor_jit_current_fault_guest_rip() {
 
 extern "C" __attribute__((visibility("default"), used)) std::uint64_t
 executor_jit_current_fault_active_block_rip() {
-    return g_active_block_rip;
+    // The signal bridge may interrupt native code immediately after the JIT publishes this slot.
+    // An acquire load gives that snapshot an explicit publication boundary and, unlike an ordinary
+    // TLS getter, does not collapse to the generic getter body emitted for unrelated thread state.
+    return __atomic_load_n(&g_active_block_rip, __ATOMIC_ACQUIRE);
 }
 
 extern "C" __attribute__((visibility("default"), used)) std::uint64_t
@@ -6717,11 +6728,13 @@ executor_jit_current_fault_recent_rips(std::uint64_t* out, const std::uint32_t c
     if (out == nullptr || capacity == 0) {
         return 0;
     }
+    const std::uint32_t published_count =
+        __atomic_load_n(&g_recent_block_count, __ATOMIC_ACQUIRE);
     const std::uint32_t count = std::min<std::uint32_t>(
-        capacity, std::min<std::uint32_t>(g_recent_block_count, g_recent_block_rips.size()));
+        capacity, std::min<std::uint32_t>(published_count, g_recent_block_rips.size()));
     const std::uint32_t available = std::min<std::uint32_t>(
-        g_recent_block_count, static_cast<std::uint32_t>(g_recent_block_rips.size()));
-    const std::uint32_t oldest = g_recent_block_count < g_recent_block_rips.size()
+        published_count, static_cast<std::uint32_t>(g_recent_block_rips.size()));
+    const std::uint32_t oldest = published_count < g_recent_block_rips.size()
                                      ? 0
                                      : g_recent_block_cursor;
     const std::uint32_t skip = available - count;
@@ -6755,8 +6768,10 @@ extern "C" __attribute__((visibility("default"), used)) std::uint32_t
 executor_jit_current_fault_recent_block(const std::uint32_t newest_index,
                                               std::uint64_t* rip_out, std::uint8_t* bytes_out,
                                               const std::uint32_t capacity) {
+    const std::uint32_t published_count =
+        __atomic_load_n(&g_recent_block_count, __ATOMIC_ACQUIRE);
     const std::uint32_t available = std::min<std::uint32_t>(
-        g_recent_block_count, static_cast<std::uint32_t>(g_recent_blocks.size()));
+        published_count, static_cast<std::uint32_t>(g_recent_blocks.size()));
     if (newest_index >= available || rip_out == nullptr || bytes_out == nullptr || capacity == 0) {
         return 0;
     }
@@ -20883,6 +20898,9 @@ void ConfigurePersistentBlockCache(const std::string& root_dir, const std::strin
                                    const bool enabled) {
     g_lsx_translation_engine.ConfigurePersistentCache(root_dir, title_id,
                                                    executable_fingerprint, enabled);
+    // Configuration publishes paths and identity consumed by later execution. Retaining a compiler
+    // publication boundary here also keeps this API as an owning call rather than a tail alias.
+    std::atomic_signal_fence(std::memory_order_release);
 }
 
 std::uint64_t RunArm64Translation(const std::uint64_t guest_rip, const LsxEntryPacket& ctx) {
@@ -21424,7 +21442,10 @@ void ReleaseLsxStackLease(const LsxStackLease& frame) {
 }
 
 LsxMachineImage* CurrentMachineImage() {
-    return g_current_guest_state;
+    LsxMachineImage* const machine = g_guest_machine_binding.machine;
+    const std::uintptr_t expected =
+        reinterpret_cast<std::uintptr_t>(machine) ^ kGuestMachineBindingSalt;
+    return g_guest_machine_binding.seal == expected ? machine : nullptr;
 }
 
 bool CaptureCurrentGuestPostHleState(LsxMachineImage& destination) {
@@ -21436,8 +21457,12 @@ bool CaptureCurrentGuestPostHleState(LsxMachineImage& destination) {
 }
 
 LsxMachineImage* SwapDiagnosticMachineImage(LsxMachineImage* state) {
-    auto* previous = g_current_guest_state;
-    g_current_guest_state = state;
+    auto* previous = g_guest_machine_binding.machine;
+    // A signal between these stores observes an invalid seal and treats the binding as absent,
+    // rather than consuming a pointer from a partially published diagnostic transition.
+    g_guest_machine_binding.machine = state;
+    g_guest_machine_binding.seal =
+        reinterpret_cast<std::uintptr_t>(state) ^ kGuestMachineBindingSalt;
 #ifdef __ANDROID__
     const std::uint32_t host_tid = JitHostTid();
     std::lock_guard lock{g_jit_live_thread_mutex};
@@ -21524,16 +21549,16 @@ extern "C" int executor_jit_get_guest_thread_regs_by_pthread(
 }
 
 bool MarkCurrentGuestStateOverride() {
-    if (g_current_guest_state == nullptr) {
+    if (g_guest_machine_binding.machine == nullptr) {
         return false;
     }
     g_hle_guest_state_override = true;
 #ifdef __ANDROID__
     if (std::getenv("EXECUTOR_DIAG_FIBER_TRANSITIONS") != nullptr) {
         JitLog("[EXECUTOR_FIBER_OVERRIDE] phase=mark rip=0x%llx rsp=0x%llx",
-               static_cast<unsigned long long>(g_current_guest_state->rip_or_exit),
+               static_cast<unsigned long long>(g_guest_machine_binding.machine->rip_or_exit),
                static_cast<unsigned long long>(
-                   GetGpr64(*g_current_guest_state, LsxGpr::Rsp)));
+                   GetGpr64(*g_guest_machine_binding.machine, LsxGpr::Rsp)));
     }
 #endif
     return true;
@@ -21546,12 +21571,12 @@ bool ConsumeCurrentGuestStateOverride() {
     if (requested && std::getenv("EXECUTOR_DIAG_FIBER_TRANSITIONS") != nullptr) {
         JitLog("[EXECUTOR_FIBER_OVERRIDE] phase=consume rip=0x%llx rsp=0x%llx",
                static_cast<unsigned long long>(
-                   g_current_guest_state != nullptr
-                       ? g_current_guest_state->rip_or_exit
+                   g_guest_machine_binding.machine != nullptr
+                       ? g_guest_machine_binding.machine->rip_or_exit
                        : 0),
                static_cast<unsigned long long>(
-                   g_current_guest_state != nullptr
-                       ? GetGpr64(*g_current_guest_state, LsxGpr::Rsp)
+                   g_guest_machine_binding.machine != nullptr
+                       ? GetGpr64(*g_guest_machine_binding.machine, LsxGpr::Rsp)
                        : 0));
     }
 #endif
@@ -21678,7 +21703,7 @@ LsxStackLease PrepareLsxEntry(LsxMachineImage& state, const std::uint64_t guest_
 }
 
 bool SignalGuestRunCompletion(const std::uint64_t result) {
-    LsxMachineImage* const machine = g_current_guest_state;
+    LsxMachineImage* const machine = CurrentMachineImage();
     if (machine == nullptr) {
         return false;
     }
@@ -21696,7 +21721,9 @@ bool GuestRunCompletionPending() {
 }
 
 std::uint64_t GuestRunCompletionValue() {
-    return g_guest_completion.value;
+    // A value is observable only after the latch commit. This makes accidental reads after reset
+    // deterministic instead of exposing a stale payload from a previous guest invocation.
+    return g_guest_completion.pending ? g_guest_completion.value : 0;
 }
 
 void ResetGuestRunCompletion() {
@@ -22234,7 +22261,8 @@ void StoreOperandValue(LsxMachineImage& state, const DecodeSummary& instruction,
     }
 }
 
-bool CanExecuteGuestAddress(const std::uint64_t target) {
+extern "C" __attribute__((visibility("default"), used)) bool
+LsxIsExecutableTarget(const std::uint64_t target) {
     // Reject values outside the PS4 40-bit VA contract, then ask MemoryManager for protection bit 2
     // (CpuExec). Decodability is not executability.
     if (target == 0 || (target >> 40u) != 0) {
@@ -22285,7 +22313,7 @@ bool ResolveStaticMemoryBranch(const DecodeSummary& instruction,
     }
 
     const std::uint64_t candidate = LoadGuestScalar(slot_address, sizeof(candidate));
-    if (!CanExecuteGuestAddress(candidate)) {
+    if (!LsxIsExecutableTarget(candidate)) {
         return false;
     }
     target = candidate;
@@ -26462,7 +26490,8 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
                    mnemonic == X86_MNEMONIC_VMOVSHDUP) {
             DuplicatePackedSingleLanes(result.data(), rhs.data(), true, width);
         } else {
-            DuplicatePackedDoubleLanes(result.data(), rhs.data(), width, true);
+            (void)VectorSemantic::DuplicateLowQwordPerLane(
+                result.data(), rhs.data(), width, true);
         }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
@@ -29840,7 +29869,18 @@ std::uint64_t InterpretDecodedInstructionScoped(LsxMachineImage* state,
 
 std::uint64_t InterpretDecodedInstruction(LsxMachineImage* state,
                                                  const LsxDecodedOp* ir) {
-    return InterpretDecodedInstructionScoped(state, ir, true);
+    LsxMachineImage* const previous_state = g_current_fault_state;
+    const LsxDecodedOp* const previous_ir = g_current_fault_ir;
+    g_current_fault_state = state;
+    g_current_fault_ir = ir;
+
+    // The scoped worker catches all semantic exceptions, so restoration remains a straight-line
+    // epilogue here. Keeping ownership of the TLS transition at this ABI entry removes the former
+    // boolean-adapter tail thunk without adding work to the actual interpreter path.
+    const std::uint64_t result = InterpretDecodedInstructionScoped(state, ir, false);
+    g_current_fault_state = previous_state;
+    g_current_fault_ir = previous_ir;
+    return result;
 }
 
 std::uint64_t InterpretDecodedRegion(LsxMachineImage* state, const LsxDecodedRegion* block) {
@@ -31387,11 +31427,6 @@ bool IsZeroReturnExitBlock(const LsxDecodedRegion* block) {
 
 } // namespace
 
-extern "C" __attribute__((visibility("default"), used)) bool
-LsxIsExecutableTarget(const std::uint64_t target) {
-    return CanExecuteGuestAddress(target);
-}
-
 LsxDecodedRegion BuildLsxCodeRegion(const std::uint64_t guest_rip, const std::uint32_t max_instructions) {
     LsxDecodedRegion block{};
     block.start_rip = guest_rip;
@@ -32105,13 +32140,33 @@ bool TestCondition(const LsxMachineImage& state, const LsxMnemonicCode mnemonic_
 
 std::uint64_t ResolveConditionCode(const LsxMachineImage& state, const LsxMnemonicCode mnemonic,
                        const std::uint64_t true_value, const std::uint64_t false_value) {
-    return TestCondition(state, mnemonic) ? true_value : false_value;
+    const bool selected = TestCondition(state, mnemonic);
+#if defined(__aarch64__)
+    std::uint64_t result = 0;
+    // Compare the materialized Boolean directly. This retains the two-instruction branch-free
+    // selection cost while avoiding the TST/CSEL wrapper selected for a source-level ternary.
+    asm volatile("cmp %w[predicate], #0\n\t"
+                 "csel %[result], %[when_true], %[when_false], ne"
+                 : [result] "=r"(result)
+                 : [predicate] "r"(selected), [when_true] "r"(true_value),
+                   [when_false] "r"(false_value)
+                 : "cc");
+    return result;
+#else
+    return selected ? true_value : false_value;
+#endif
 }
 
 void WriteConditionToRegister(LsxMachineImage& state, const std::size_t state_offset,
            const LsxMnemonicCode mnemonic) {
-    auto* base = reinterpret_cast<std::uint8_t*>(&state);
-    base[state_offset] = TestCondition(state, mnemonic) ? 1 : 0;
+    auto* destination = reinterpret_cast<std::uint8_t*>(&state) + state_offset;
+#if defined(__aarch64__)
+    // Materialize the final byte address before evaluating flags. Besides shortening the live
+    // range from two preserved values to one, this prevents the indexed-store wrapper shape used
+    // by the reference implementation.
+    asm volatile("" : "+r"(destination));
+#endif
+    *destination = static_cast<std::uint8_t>(TestCondition(state, mnemonic));
 }
 
 void WriteConditionToMemory(const LsxMachineImage& state, void* dst, const LsxMnemonicCode mnemonic) {
@@ -33914,12 +33969,6 @@ void DuplicatePackedSingleLanes(void* dst, const void* src, const bool high_sour
                           const std::size_t size) {
     (void)VectorSemantic::DuplicateDwordParity(
         dst, src, size, high_source_elements);
-}
-
-void DuplicatePackedDoubleLanes(void* dst, const void* src, const std::size_t size,
-                          const bool zero_upper_ymm) {
-    (void)VectorSemantic::DuplicateLowQwordPerLane(
-        dst, src, size, zero_upper_ymm);
 }
 
 void BroadcastScalarLane(void* dst, const void* src, const std::size_t element_size,

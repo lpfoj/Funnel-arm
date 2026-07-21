@@ -585,7 +585,6 @@ void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::ar
 void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, VectorLogicOp op, std::size_t size);
 void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, std::size_t size);
 void DuplicatePackedSingleLanes(void* dst, const void* src, bool high_source_elements, std::size_t size);
-void DuplicatePackedDoubleLanes(void* dst, const void* src, std::size_t size, bool zero_upper_ymm);
 void BroadcastScalarLane(void* dst, const void* src, std::size_t element_size, std::size_t total_size);
 void BroadcastVectorHalf(void* dst, const void* src);
 std::uint64_t CollectVectorSignBits(const void* src, std::size_t lane_bytes, std::size_t total_size);
