@@ -57,6 +57,10 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/undertale.jpg" alt="Undertale running in LSX4"><br><sub><b>Undertale</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/downwell.jpg" alt="Downwell running in LSX4"><br><sub><b>Downwell</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/minit.jpg" alt="Minit running in LSX4"><br><sub><b>Minit</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/resogun.png" alt="Resogun running in LSX4"><br><sub><b>Resogun</b></sub></td>
+  </tr>
 </table>
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
