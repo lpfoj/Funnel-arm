@@ -2,15 +2,31 @@
   <img src="assets/lsx4-banner.png" width="640" alt="LSX4, open-source PlayStation 4 emulator for Android">
 </p>
 
+<div align="center">
+  <img src="https://img.shields.io/badge/APRIL-2026-02?style=for-the-badge" alt="April 2026">
+  <a href="https://discord.gg/vHkKA6jFhh"><img src="https://img.shields.io/discord/1459510161512333519?style=for-the-badge&amp;logo=discord&amp;logoColor=white&amp;label=Discord&amp;color=5865F2" alt="Discord"></a>
+  <br>
+  <a href="https://ko-fi.com/llayer"><img src="https://img.shields.io/badge/Support%20me%20on-Ko--fi-%23FF5E5B?style=for-the-badge&amp;logo=ko-fi&amp;logoColor=white" alt="Support LSX4 on Ko-fi"></a>
+</div>
+
 # LSX4
 
 LSX4 is an open-source PlayStation 4 emulator application for Android.
 
-Development also makes use of current-generation large language models (LLMs).
-
 LSX4 does not include games, firmware, or other copyrighted system content.
 
+Development also makes use of current-generation large language models (LLMs).
+
+## Current development priorities
+
+- Improving performance in playable games.
+- Expanding title compatibility by resolving frontiers and invariants.
+- Implementing Mali support and improving performance on Mali devices.
+- Increasing the number of playable titles by testing currently untested games.
+
 ## Playable games
+
+Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
 <table>
   <tr>
@@ -62,6 +78,10 @@ This list includes only games that have been tested. The broader set of supporte
 | Shovel Knight | ✅ | |
 | Sonic Mania | ✅ | |
 | Undertale | ✅ | |
+
+## Contributing
+
+Contributions are welcome. Bug reports, compatibility results, performance traces, and focused pull requests are especially useful. Please open an issue before starting a substantial architectural change.
 
 ## Repository layout
 
