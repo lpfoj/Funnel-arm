@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -38,6 +39,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2715,7 +2717,7 @@ private:
     // v9: semantic-leaf calls reconstruct caller-saved register caches. Native payloads emitted
     // by v8 can retain a helper-clobbered guest base and must never be restored; decoded IR remains
     // reusable and will be lowered again without discarding the expensive decode cache.
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210003ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210004ull;
     static constexpr std::size_t kWriterBatchRecords = 512;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
@@ -32169,62 +32171,89 @@ void CopyFixedWidthValue(void* dst, const void* src, const std::size_t size) {
     if (dst == nullptr || src == nullptr || size == 0) {
         return;
     }
-    std::memcpy(dst, src, size);
+    const auto* first = static_cast<const std::uint8_t*>(src);
+    std::copy_n(first, size, static_cast<std::uint8_t*>(dst));
 }
+
+namespace {
+
+enum class IntegerFlagClass : std::uint8_t {
+    Addition,
+    Subtraction,
+    Logical,
+};
+
+struct IntegerAluOutcome {
+    std::uint64_t value{};
+    IntegerFlagClass flags{IntegerFlagClass::Logical};
+    bool writes_destination{true};
+};
+
+IntegerAluOutcome EvaluateIntegerAlu(const std::uint64_t left,
+                                     const std::uint64_t right,
+                                     const AluOp operation,
+                                     const std::uint32_t width) {
+    const auto narrow = [width](const std::uint64_t value) {
+        return TruncateToOperandWidth(value, width);
+    };
+    switch (operation) {
+    case AluOp::Add:
+        return {narrow(left + right), IntegerFlagClass::Addition, true};
+    case AluOp::Subtract:
+        return {narrow(left - right), IntegerFlagClass::Subtraction, true};
+    case AluOp::Compare:
+        return {narrow(left - right), IntegerFlagClass::Subtraction, false};
+    case AluOp::BitwiseAnd:
+        return {narrow(left & right), IntegerFlagClass::Logical, true};
+    case AluOp::BitwiseOr:
+        return {narrow(left | right), IntegerFlagClass::Logical, true};
+    case AluOp::BitwiseXor:
+        return {narrow(left ^ right), IntegerFlagClass::Logical, true};
+    case AluOp::BitwiseTest:
+        return {narrow(left & right), IntegerFlagClass::Logical, false};
+    }
+    return {narrow(left), IntegerFlagClass::Logical, false};
+}
+
+void PublishIntegerAluFlags(LsxMachineImage& state, const std::uint64_t left,
+                            const std::uint64_t right,
+                            const IntegerAluOutcome& outcome,
+                            const std::uint32_t width) {
+    switch (outcome.flags) {
+    case IntegerFlagClass::Addition:
+        RecordIntegerAdditionFlags(state, left, right, outcome.value, width);
+        return;
+    case IntegerFlagClass::Subtraction:
+        RecordIntegerSubtractionFlags(state, left, right, outcome.value, width);
+        return;
+    case IntegerFlagClass::Logical:
+        RecordLogicalResultFlags(state, outcome.value, width);
+        return;
+    }
+}
+
+} // namespace
 
 void ExecuteIntegerArithmetic(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t operand,
          const AluOp op, const std::uint32_t size_bits, const std::uint32_t shift_bits) {
-    auto* base = reinterpret_cast<std::uint8_t*>(&state);
-    const std::uint64_t raw_target = LoadUnaligned<std::uint64_t>(base + state_offset);
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t lhs = (raw_target >> shift_bits) & mask;
-    const std::uint64_t rhs = operand & mask;
-
-    std::uint64_t result = lhs;
-    bool write_back = true;
-    switch (op) {
-    case AluOp::Add:
-        result = TruncateToOperandWidth(lhs + rhs, size_bits);
-        RecordIntegerAdditionFlags(state, lhs, rhs, result, size_bits);
-        break;
-    case AluOp::Subtract:
-        result = TruncateToOperandWidth(lhs - rhs, size_bits);
-        RecordIntegerSubtractionFlags(state, lhs, rhs, result, size_bits);
-        break;
-    case AluOp::Compare:
-        result = TruncateToOperandWidth(lhs - rhs, size_bits);
-        RecordIntegerSubtractionFlags(state, lhs, rhs, result, size_bits);
-        write_back = false;
-        break;
-    case AluOp::BitwiseAnd:
-        result = TruncateToOperandWidth(lhs & rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        break;
-    case AluOp::BitwiseOr:
-        result = TruncateToOperandWidth(lhs | rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        break;
-    case AluOp::BitwiseXor:
-        result = TruncateToOperandWidth(lhs ^ rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        break;
-    case AluOp::BitwiseTest:
-        result = TruncateToOperandWidth(lhs & rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        write_back = false;
-        break;
-    }
-
-    if (!write_back) {
+    auto* const storage = reinterpret_cast<std::uint8_t*>(&state) + state_offset;
+    const std::uint64_t container = LoadUnaligned<std::uint64_t>(storage);
+    const std::uint64_t width_mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+    const std::uint64_t left = (container >> shift_bits) & width_mask;
+    const std::uint64_t right = operand & width_mask;
+    const IntegerAluOutcome outcome = EvaluateIntegerAlu(left, right, op, size_bits);
+    PublishIntegerAluFlags(state, left, right, outcome, size_bits);
+    if (!outcome.writes_destination) {
         return;
     }
     if (size_bits >= 32 && shift_bits == 0) {
-        StoreUnaligned<std::uint64_t>(base + state_offset, result);
+        StoreUnaligned<std::uint64_t>(storage, outcome.value);
         return;
     }
-    const std::uint64_t lane_mask = mask << shift_bits;
-    const std::uint64_t merged = (raw_target & ~lane_mask) | ((result & mask) << shift_bits);
-    StoreUnaligned<std::uint64_t>(base + state_offset, merged);
+    const std::uint64_t positioned_mask = width_mask << shift_bits;
+    const std::uint64_t updated = (container & ~positioned_mask) |
+                                  ((outcome.value << shift_bits) & positioned_mask);
+    StoreUnaligned<std::uint64_t>(storage, updated);
 }
 
 namespace {
@@ -32382,94 +32411,111 @@ void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, const s
     StoreStateLane(state, state_offset, mem_value, size_bits);
 }
 
-void TransferLegacyFpEnvironment(LsxMachineImage& state, const std::uint64_t address, const bool save,
-                   const bool is_64_bit_image) {
-    if (save) {
-        std::array<std::uint8_t, 512> area{};
-        StoreUnaligned<std::uint16_t>(area.data(), state.x87_control_word);
-        StoreUnaligned<std::uint16_t>(area.data() + 2u, X87ComposeStatusWord(state));
-        area[4] = state.x87_tag_word;
-        StoreUnaligned<std::uint16_t>(area.data() + 6u,
-                                      state.x87_last_opcode & 0x7ffu);
-        if (is_64_bit_image) {
-            StoreUnaligned<std::uint64_t>(area.data() + 8u,
-                                          state.x87_instruction_pointer);
-            StoreUnaligned<std::uint64_t>(area.data() + 16u,
-                                          state.x87_data_pointer);
-        } else {
-            StoreUnaligned<std::uint32_t>(
-                area.data() + 8u,
-                static_cast<std::uint32_t>(state.x87_instruction_pointer));
-            StoreUnaligned<std::uint32_t>(
-                area.data() + 16u,
-                static_cast<std::uint32_t>(state.x87_data_pointer));
-        }
-        StoreUnaligned<std::uint32_t>(area.data() + 0x18, state.mxcsr);
-        StoreUnaligned<std::uint32_t>(area.data() + 0x1c, 0x0000ffffu);
-        // FXSAVE serializes logical ST(0)..ST(7), while our state keeps physical R0..R7.
-        // RotateRegisterOperand by TOP exactly as FEX/real x86 do; FTW above remains a physical-bit mask.
-        for (std::size_t logical = 0; logical < state.x87_values.size(); ++logical) {
-            const std::size_t physical = (state.x87_top + logical) & 0x7u;
-            std::memcpy(area.data() + 0x20u + logical * 16u,
-                        state.x87_values[physical].data(), 10u);
-        }
-        for (std::size_t i = 0; i < kXmmRegisterCount; ++i) {
-            const auto* lane = XmmLane(state, i);
-            if (lane != nullptr) {
-                std::memcpy(area.data() + 0xa0u + i * 16u, lane, 16u);
-            }
-        }
-        CopyBytesToGuest(address, area.data(), static_cast<std::uint32_t>(area.size()));
-        return;
-    }
+namespace {
+constexpr std::size_t kLegacyFpImageBytes = 512;
+using LegacyFpImage = std::array<std::uint8_t, kLegacyFpImageBytes>;
 
-    // Read the complete architectural image before mutating state. A faulting FXRSTOR must not
-    // leave a half-restored register file.
-    std::array<std::uint8_t, 512> area{};
-    CopyBytesFromGuest(address, area.data(), static_cast<std::uint32_t>(area.size()));
-    state.x87_control_word = LoadUnaligned<std::uint16_t>(area.data());
-    X87ApplyStatusWord(state, LoadUnaligned<std::uint16_t>(area.data() + 2u));
-    const auto restored_top = state.x87_top;
-    state.x87_tag_word = area[4];
-    state.x87_last_opcode = static_cast<std::uint16_t>(
-        LoadUnaligned<std::uint16_t>(area.data() + 6u) & 0x7ffu);
-    if (is_64_bit_image) {
-        state.x87_instruction_pointer = LoadUnaligned<std::uint64_t>(area.data() + 8u);
-        state.x87_data_pointer = LoadUnaligned<std::uint64_t>(area.data() + 16u);
+template <typename Integer>
+void PutFpImageField(LegacyFpImage& image, const std::size_t offset, const Integer value) {
+    StoreUnaligned<Integer>(image.data() + offset, value);
+}
+
+template <typename Integer>
+Integer GetFpImageField(const LegacyFpImage& image, const std::size_t offset) {
+    return LoadUnaligned<Integer>(image.data() + offset);
+}
+
+LegacyFpImage SerializeLegacyFpState(const LsxMachineImage& state, const bool wide_pointers) {
+    LegacyFpImage image{};
+    PutFpImageField(image, 0x00, state.x87_control_word);
+    PutFpImageField(image, 0x02, X87ComposeStatusWord(state));
+    image.at(0x04) = state.x87_tag_word;
+    PutFpImageField(image, 0x06, static_cast<std::uint16_t>(state.x87_last_opcode & 0x7ffu));
+    if (wide_pointers) {
+        PutFpImageField(image, 0x08, state.x87_instruction_pointer);
+        PutFpImageField(image, 0x10, state.x87_data_pointer);
     } else {
-        state.x87_instruction_pointer = LoadUnaligned<std::uint32_t>(area.data() + 8u);
-        state.x87_data_pointer = LoadUnaligned<std::uint32_t>(area.data() + 16u);
+        PutFpImageField(image, 0x08, static_cast<std::uint32_t>(state.x87_instruction_pointer));
+        PutFpImageField(image, 0x10, static_cast<std::uint32_t>(state.x87_data_pointer));
     }
-    state.mxcsr = LoadUnaligned<std::uint32_t>(area.data() + 0x18u);
-    for (std::size_t logical = 0; logical < state.x87_values.size(); ++logical) {
-        const std::size_t physical = (restored_top + logical) & 0x7u;
-        state.x87_values[physical].fill(0);
-        std::memcpy(state.x87_values[physical].data(),
-                    area.data() + 0x20u + logical * 16u, 10u);
+    PutFpImageField(image, 0x18, state.mxcsr);
+    PutFpImageField(image, 0x1c, UINT32_C(0x0000ffff));
+
+    for (std::size_t logical = 0; logical != state.x87_values.size(); ++logical) {
+        const auto physical = (state.x87_top + logical) % state.x87_values.size();
+        std::copy_n(state.x87_values[physical].begin(), 10,
+                    image.begin() + 0x20u + logical * 16u);
     }
-    for (std::size_t i = 0; i < kXmmRegisterCount; ++i) {
-        auto* lane = XmmLane(state, i);
-        if (lane != nullptr) {
-            std::memcpy(lane, area.data() + 0xa0u + i * 16u, 16u);
+    for (std::size_t xmm = 0; xmm != kXmmRegisterCount; ++xmm) {
+        if (const auto* lane = XmmLane(state, xmm); lane != nullptr) {
+            std::copy_n(lane, 16, image.begin() + 0xa0u + xmm * 16u);
         }
+    }
+    return image;
+}
+
+void RestoreLegacyFpState(LsxMachineImage& state, const LegacyFpImage& image,
+                          const bool wide_pointers) {
+    state.x87_control_word = GetFpImageField<std::uint16_t>(image, 0x00);
+    X87ApplyStatusWord(state, GetFpImageField<std::uint16_t>(image, 0x02));
+    state.x87_tag_word = image.at(0x04);
+    state.x87_last_opcode = GetFpImageField<std::uint16_t>(image, 0x06) & 0x7ffu;
+    state.x87_instruction_pointer = wide_pointers
+                                        ? GetFpImageField<std::uint64_t>(image, 0x08)
+                                        : GetFpImageField<std::uint32_t>(image, 0x08);
+    state.x87_data_pointer = wide_pointers
+                                 ? GetFpImageField<std::uint64_t>(image, 0x10)
+                                 : GetFpImageField<std::uint32_t>(image, 0x10);
+    state.mxcsr = GetFpImageField<std::uint32_t>(image, 0x18);
+
+    const auto restored_top = state.x87_top;
+    for (std::size_t logical = 0; logical != state.x87_values.size(); ++logical) {
+        auto& physical = state.x87_values[(restored_top + logical) % state.x87_values.size()];
+        physical.fill(0);
+        std::copy_n(image.begin() + 0x20u + logical * 16u, 10, physical.begin());
+    }
+    for (std::size_t xmm = 0; xmm != kXmmRegisterCount; ++xmm) {
+        if (auto* lane = XmmLane(state, xmm); lane != nullptr) {
+            std::copy_n(image.begin() + 0xa0u + xmm * 16u, 16, lane);
+        }
+    }
+}
+} // namespace
+
+void TransferLegacyFpEnvironment(LsxMachineImage& state, const std::uint64_t address,
+                                 const bool save, const bool is_64_bit_image) {
+    if (save) {
+        const auto image = SerializeLegacyFpState(state, is_64_bit_image);
+        CopyBytesToGuest(address, image.data(), static_cast<std::uint32_t>(image.size()));
+    } else {
+        LegacyFpImage image{};
+        CopyBytesFromGuest(address, image.data(), static_cast<std::uint32_t>(image.size()));
+        RestoreLegacyFpState(state, image, is_64_bit_image);
     }
 }
 
 void CompareExchangeWideAtomic(LsxMachineImage& state, const std::uint64_t address) {
-    std::lock_guard lock{g_locked_memory_mutex};
-    const std::uint64_t mem_low = LoadGuestScalar(address, 8);
-    const std::uint64_t mem_high = LoadGuestScalar(address + 8u, 8);
-    const std::uint64_t cmp_low = ReadGuestGpr64(state, LsxGpr::Rax);
-    const std::uint64_t cmp_high = ReadGuestGpr64(state, LsxGpr::Rdx);
-    if (mem_low == cmp_low && mem_high == cmp_high) {
-        StoreGuestScalar(address, ReadGuestGpr64(state, LsxGpr::Rbx), 8);
-        StoreGuestScalar(address + 8u, ReadGuestGpr64(state, LsxGpr::Rcx), 8);
-        state.rflags |= kFlagZf;
+    std::scoped_lock serialized{g_locked_memory_mutex};
+    const std::array<std::uint64_t, 2> memory{
+        LoadGuestScalar(address, sizeof(std::uint64_t)),
+        LoadGuestScalar(address + sizeof(std::uint64_t), sizeof(std::uint64_t))};
+    const std::array<std::uint64_t, 2> expected{
+        ReadGuestGpr64(state, LsxGpr::Rax), ReadGuestGpr64(state, LsxGpr::Rdx)};
+    const bool equal = std::ranges::equal(memory, expected);
+    if (equal) {
+        const std::array<std::uint64_t, 2> replacement{
+            ReadGuestGpr64(state, LsxGpr::Rbx), ReadGuestGpr64(state, LsxGpr::Rcx)};
+        for (std::size_t half = 0; half != replacement.size(); ++half) {
+            StoreGuestScalar(address + half * sizeof(std::uint64_t), replacement[half],
+                             sizeof(std::uint64_t));
+        }
     } else {
-        WriteGuestGpr64(state, LsxGpr::Rax, mem_low);
-        WriteGuestGpr64(state, LsxGpr::Rdx, mem_high);
-        state.rflags &= ~kFlagZf;
+        const std::array<LsxGpr, 2> accumulator_pair{LsxGpr::Rax, LsxGpr::Rdx};
+        for (std::size_t half = 0; half != memory.size(); ++half) {
+            WriteGuestGpr64(state, accumulator_pair[half], memory[half]);
+        }
     }
+    state.rflags = (state.rflags & ~kFlagZf) | (equal ? kFlagZf : 0);
 }
 
 namespace {
@@ -32494,61 +32540,50 @@ void StoreCountFlags(LsxMachineImage& state, const bool source_zero, const std::
 }
 } // namespace
 
-void LoadReversedEndian(LsxMachineImage& state, const void* src, const std::size_t state_offset,
-               const std::uint32_t size_bits) {
-    if (src == nullptr || size_bits == 0) {
-        return;
+namespace {
+struct EndianTransfer {
+    const void* source{};
+    void* destination{};
+    std::uint32_t byte_count{};
+};
+
+bool CopyBytesInReverse(const EndianTransfer& transfer) {
+    if (transfer.source == nullptr || transfer.destination == nullptr ||
+        transfer.byte_count == 0 || transfer.byte_count > sizeof(std::uint64_t)) {
+        return false;
     }
-    const std::uint32_t size_bytes = size_bits / 8;
-    std::uint64_t raw = 0;
-    std::memcpy(&raw, src, size_bytes);
-    StoreStateLane(state, state_offset, ByteSwapSized(raw, size_bytes), size_bits);
+    std::array<std::uint8_t, sizeof(std::uint64_t)> snapshot{};
+    std::memcpy(snapshot.data(), transfer.source, transfer.byte_count);
+    std::reverse_copy(snapshot.begin(), snapshot.begin() + transfer.byte_count,
+                      static_cast<std::uint8_t*>(transfer.destination));
+    return true;
+}
+} // namespace
+
+void LoadReversedEndian(LsxMachineImage& state, const void* src, const std::size_t state_offset,
+                        const std::uint32_t size_bits) {
+    std::uint64_t destination_lane = 0;
+    const EndianTransfer transfer{src, &destination_lane, size_bits >> 3u};
+    if (CopyBytesInReverse(transfer)) {
+        StoreStateLane(state, state_offset, destination_lane, size_bits);
+    }
 }
 
 void StoreReversedEndian(const LsxMachineImage& state, void* dst, const std::size_t state_offset,
-                const std::uint32_t size_bits) {
-    if (dst == nullptr || size_bits == 0) {
-        return;
-    }
-    const std::uint32_t size_bytes = size_bits / 8;
-    const auto* base = reinterpret_cast<const std::uint8_t*>(&state);
-    const std::uint64_t raw = LoadUnaligned<std::uint64_t>(base + state_offset);
-    const std::uint64_t swapped = ByteSwapSized(raw & TruncateToOperandWidth(~std::uint64_t{0}, size_bits), size_bytes);
-    std::memcpy(dst, &swapped, size_bytes);
+                         const std::uint32_t size_bits) {
+    const auto* state_bytes = reinterpret_cast<const std::uint8_t*>(&state);
+    const EndianTransfer transfer{state_bytes + state_offset, dst, size_bits >> 3u};
+    (void)CopyBytesInReverse(transfer);
 }
 
 std::uint64_t ExecuteIntegerArithmeticMemory(LsxMachineImage& state, const std::uint64_t mem_value, const std::uint64_t operand,
                      const AluOp op, const std::uint32_t size_bits) {
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t lhs = mem_value & mask;
-    const std::uint64_t rhs = operand & mask;
-
-    std::uint64_t result = 0;
-    switch (op) {
-    case AluOp::Add:
-        result = TruncateToOperandWidth(lhs + rhs, size_bits);
-        RecordIntegerAdditionFlags(state, lhs, rhs, result, size_bits);
-        break;
-    case AluOp::Subtract:
-    case AluOp::Compare:
-        result = TruncateToOperandWidth(lhs - rhs, size_bits);
-        RecordIntegerSubtractionFlags(state, lhs, rhs, result, size_bits);
-        break;
-    case AluOp::BitwiseAnd:
-    case AluOp::BitwiseTest:
-        result = TruncateToOperandWidth(lhs & rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        break;
-    case AluOp::BitwiseOr:
-        result = TruncateToOperandWidth(lhs | rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        break;
-    case AluOp::BitwiseXor:
-        result = TruncateToOperandWidth(lhs ^ rhs, size_bits);
-        RecordLogicalResultFlags(state, result, size_bits);
-        break;
-    }
-    return result;
+    const std::uint64_t width_mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+    const std::uint64_t left = mem_value & width_mask;
+    const std::uint64_t right = operand & width_mask;
+    const IntegerAluOutcome outcome = EvaluateIntegerAlu(left, right, op, size_bits);
+    PublishIntegerAluFlags(state, left, right, outcome, size_bits);
+    return outcome.value;
 }
 
 namespace {
@@ -32632,142 +32667,150 @@ bool AtomicLoad(const void* target, const std::uint32_t size_bits,
     }
 }
 
-std::uint64_t ApplyAluOperation(const std::uint64_t lhs,
-                                const std::uint64_t rhs, const AluOp op,
-                                const std::uint32_t size_bits) {
-    switch (op) {
-    case AluOp::Add:
-        return TruncateToOperandWidth(lhs + rhs, size_bits);
-    case AluOp::Subtract:
-    case AluOp::Compare:
-        return TruncateToOperandWidth(lhs - rhs, size_bits);
-    case AluOp::BitwiseAnd:
-    case AluOp::BitwiseTest:
-        return TruncateToOperandWidth(lhs & rhs, size_bits);
-    case AluOp::BitwiseOr:
-        return TruncateToOperandWidth(lhs | rhs, size_bits);
-    case AluOp::BitwiseXor:
-        return TruncateToOperandWidth(lhs ^ rhs, size_bits);
-    }
-    return TruncateToOperandWidth(lhs, size_bits);
-}
-
 } // namespace
 
 std::uint64_t ExecuteIntegerArithmeticAtomic(LsxMachineImage& state, void* target, const std::uint64_t operand,
                            const AluOp op, const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
+    const bool valid_width = size_bits == 8 || size_bits == 16 ||
+                             size_bits == 32 || size_bits == 64;
+    if (target == nullptr || !valid_width) {
         return 0;
     }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t rhs = operand & mask;
-    std::uint64_t previous = 0;
-    std::uint64_t result = 0;
-
-    if (op == AluOp::Compare || op == AluOp::BitwiseTest) {
-        if (!AtomicLoad(target, size_bits, previous)) {
-            std::lock_guard lock{g_locked_memory_mutex};
-            std::memcpy(&previous, target, size_bytes);
+    const auto rhs = TruncateToOperandWidth(operand, size_bits);
+    const auto evaluate = [=](const std::uint64_t observed) {
+        return EvaluateIntegerAlu(observed, rhs, op, size_bits);
+    };
+    std::uint64_t observed = 0;
+    std::uint64_t committed = 0;
+    const bool read_only = op == AluOp::Compare || op == AluOp::BitwiseTest;
+    bool used_host_atomic = read_only ? AtomicLoad(target, size_bits, observed)
+                                     : AtomicReadModifyWrite(
+                                           target, size_bits,
+                                           [&](const std::uint64_t value) {
+                                               return evaluate(value).value;
+                                           },
+                                           observed, committed);
+    if (!used_host_atomic) {
+        std::scoped_lock serialized{g_locked_memory_mutex};
+        const auto bytes = size_bits >> 3u;
+        std::memcpy(&observed, target, bytes);
+        committed = evaluate(observed).value;
+        if (!read_only) {
+            std::memcpy(target, &committed, bytes);
         }
-        return ExecuteIntegerArithmeticMemory(state, previous, rhs, op, size_bits);
     }
-
-    if (!AtomicReadModifyWrite(
-            target, size_bits,
-            [rhs, op, size_bits](const std::uint64_t observed) {
-                return ApplyAluOperation(observed, rhs, op, size_bits);
-            },
-            previous, result)) {
-        // X86 permits split locked operands, while AArch64 atomics require natural alignment.
-        std::lock_guard lock{g_locked_memory_mutex};
-        std::memcpy(&previous, target, size_bytes);
-        result = ApplyAluOperation(previous, rhs, op, size_bits);
-        std::memcpy(target, &result, size_bytes);
-    }
-    // Commit flags only after the successful CAS so they describe the value this operation
-    // actually replaced, not an observation lost to a concurrent writer.
-    ExecuteIntegerArithmeticMemory(state, previous, rhs, op, size_bits);
-    return result;
+    const auto outcome = evaluate(observed);
+    PublishIntegerAluFlags(state, observed, rhs, outcome, size_bits);
+    return read_only ? outcome.value : committed;
 }
 
-bool TestCondition(const LsxMachineImage& state, const LsxMnemonicCode mnemonic_code) {
-    const bool cf = (state.rflags & kFlagCf) != 0;
-    const bool pf = (state.rflags & kFlagPf) != 0;
-    const bool zf = (state.rflags & kFlagZf) != 0;
-    const bool sf = (state.rflags & kFlagSf) != 0;
-    const bool of = (state.rflags & kFlagOf) != 0;
-    const auto mnemonic = static_cast<X86Mnemonic>(mnemonic_code);
+namespace {
 
+enum class GuestPredicate : std::uint8_t {
+    Carry,
+    CarryOrZero,
+    SignedLess,
+    SignedLessOrEqual,
+    NotCarry,
+    Above,
+    SignedGreaterOrEqual,
+    SignedGreater,
+    NotOverflow,
+    NotParity,
+    NotSign,
+    NotZero,
+    Overflow,
+    Parity,
+    Sign,
+    Zero,
+    Never,
+};
+
+GuestPredicate DecodeGuestPredicate(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
-    case X86_MNEMONIC_CMOVB:
-    case X86_MNEMONIC_JB:
-    case X86_MNEMONIC_SETB:
-        return cf;
-    case X86_MNEMONIC_CMOVBE:
-    case X86_MNEMONIC_JBE:
-    case X86_MNEMONIC_SETBE:
-        return cf || zf;
-    case X86_MNEMONIC_CMOVL:
-    case X86_MNEMONIC_JL:
-    case X86_MNEMONIC_SETL:
-        return sf != of;
-    case X86_MNEMONIC_CMOVLE:
-    case X86_MNEMONIC_JLE:
-    case X86_MNEMONIC_SETLE:
-        return zf || (sf != of);
-    case X86_MNEMONIC_CMOVNB:
-    case X86_MNEMONIC_JNB:
-    case X86_MNEMONIC_SETNB:
-        return !cf;
-    case X86_MNEMONIC_CMOVNBE:
-    case X86_MNEMONIC_JNBE:
-    case X86_MNEMONIC_SETNBE:
-        return !cf && !zf;
-    case X86_MNEMONIC_CMOVNL:
-    case X86_MNEMONIC_JNL:
-    case X86_MNEMONIC_SETNL:
-        return sf == of;
-    case X86_MNEMONIC_CMOVNLE:
-    case X86_MNEMONIC_JNLE:
-    case X86_MNEMONIC_SETNLE:
-        return !zf && (sf == of);
-    case X86_MNEMONIC_CMOVNO:
-    case X86_MNEMONIC_JNO:
-    case X86_MNEMONIC_SETNO:
-        return !of;
-    case X86_MNEMONIC_CMOVNP:
-    case X86_MNEMONIC_JNP:
-    case X86_MNEMONIC_SETNP:
-        return !pf;
-    case X86_MNEMONIC_CMOVNS:
-    case X86_MNEMONIC_JNS:
-    case X86_MNEMONIC_SETNS:
-        return !sf;
-    case X86_MNEMONIC_CMOVNZ:
-    case X86_MNEMONIC_JNZ:
-    case X86_MNEMONIC_SETNZ:
-        return !zf;
-    case X86_MNEMONIC_CMOVO:
-    case X86_MNEMONIC_JO:
-    case X86_MNEMONIC_SETO:
-        return of;
-    case X86_MNEMONIC_CMOVP:
-    case X86_MNEMONIC_JP:
-    case X86_MNEMONIC_SETP:
-        return pf;
-    case X86_MNEMONIC_CMOVS:
-    case X86_MNEMONIC_JS:
-    case X86_MNEMONIC_SETS:
-        return sf;
-    case X86_MNEMONIC_CMOVZ:
-    case X86_MNEMONIC_JZ:
-    case X86_MNEMONIC_SETZ:
-        return zf;
+    case X86_MNEMONIC_CMOVB: case X86_MNEMONIC_JB: case X86_MNEMONIC_SETB:
+        return GuestPredicate::Carry;
+    case X86_MNEMONIC_CMOVBE: case X86_MNEMONIC_JBE: case X86_MNEMONIC_SETBE:
+        return GuestPredicate::CarryOrZero;
+    case X86_MNEMONIC_CMOVL: case X86_MNEMONIC_JL: case X86_MNEMONIC_SETL:
+        return GuestPredicate::SignedLess;
+    case X86_MNEMONIC_CMOVLE: case X86_MNEMONIC_JLE: case X86_MNEMONIC_SETLE:
+        return GuestPredicate::SignedLessOrEqual;
+    case X86_MNEMONIC_CMOVNB: case X86_MNEMONIC_JNB: case X86_MNEMONIC_SETNB:
+        return GuestPredicate::NotCarry;
+    case X86_MNEMONIC_CMOVNBE: case X86_MNEMONIC_JNBE: case X86_MNEMONIC_SETNBE:
+        return GuestPredicate::Above;
+    case X86_MNEMONIC_CMOVNL: case X86_MNEMONIC_JNL: case X86_MNEMONIC_SETNL:
+        return GuestPredicate::SignedGreaterOrEqual;
+    case X86_MNEMONIC_CMOVNLE: case X86_MNEMONIC_JNLE: case X86_MNEMONIC_SETNLE:
+        return GuestPredicate::SignedGreater;
+    case X86_MNEMONIC_CMOVNO: case X86_MNEMONIC_JNO: case X86_MNEMONIC_SETNO:
+        return GuestPredicate::NotOverflow;
+    case X86_MNEMONIC_CMOVNP: case X86_MNEMONIC_JNP: case X86_MNEMONIC_SETNP:
+        return GuestPredicate::NotParity;
+    case X86_MNEMONIC_CMOVNS: case X86_MNEMONIC_JNS: case X86_MNEMONIC_SETNS:
+        return GuestPredicate::NotSign;
+    case X86_MNEMONIC_CMOVNZ: case X86_MNEMONIC_JNZ: case X86_MNEMONIC_SETNZ:
+        return GuestPredicate::NotZero;
+    case X86_MNEMONIC_CMOVO: case X86_MNEMONIC_JO: case X86_MNEMONIC_SETO:
+        return GuestPredicate::Overflow;
+    case X86_MNEMONIC_CMOVP: case X86_MNEMONIC_JP: case X86_MNEMONIC_SETP:
+        return GuestPredicate::Parity;
+    case X86_MNEMONIC_CMOVS: case X86_MNEMONIC_JS: case X86_MNEMONIC_SETS:
+        return GuestPredicate::Sign;
+    case X86_MNEMONIC_CMOVZ: case X86_MNEMONIC_JZ: case X86_MNEMONIC_SETZ:
+        return GuestPredicate::Zero;
     default:
+        return GuestPredicate::Never;
+    }
+}
+
+template <typename Transform>
+bool CommitAtomicMutation(void* target, const std::uint32_t width, Transform&& transform,
+                          std::uint64_t& before, std::uint64_t& after) {
+    if (AtomicReadModifyWrite(target, width, std::forward<Transform>(transform), before, after)) {
+        return true;
+    }
+    if (target == nullptr || width == 0 || width > 64 || (width & 7u) != 0) {
         return false;
     }
+    std::scoped_lock serialized{g_locked_memory_mutex};
+    const auto bytes = width >> 3u;
+    std::memcpy(&before, target, bytes);
+    after = std::invoke(std::forward<Transform>(transform), before);
+    std::memcpy(target, &after, bytes);
+    return true;
+}
+
+} // namespace
+
+bool TestCondition(const LsxMachineImage& state, const LsxMnemonicCode mnemonic_code) {
+    const auto flag = [&](const std::uint64_t mask) { return (state.rflags & mask) != 0; };
+    const bool carry = flag(kFlagCf);
+    const bool parity = flag(kFlagPf);
+    const bool zero = flag(kFlagZf);
+    const bool sign = flag(kFlagSf);
+    const bool overflow = flag(kFlagOf);
+    switch (DecodeGuestPredicate(static_cast<X86Mnemonic>(mnemonic_code))) {
+    case GuestPredicate::Carry: return carry;
+    case GuestPredicate::CarryOrZero: return carry || zero;
+    case GuestPredicate::SignedLess: return sign != overflow;
+    case GuestPredicate::SignedLessOrEqual: return zero || sign != overflow;
+    case GuestPredicate::NotCarry: return !carry;
+    case GuestPredicate::Above: return !(carry || zero);
+    case GuestPredicate::SignedGreaterOrEqual: return sign == overflow;
+    case GuestPredicate::SignedGreater: return !zero && sign == overflow;
+    case GuestPredicate::NotOverflow: return !overflow;
+    case GuestPredicate::NotParity: return !parity;
+    case GuestPredicate::NotSign: return !sign;
+    case GuestPredicate::NotZero: return !zero;
+    case GuestPredicate::Overflow: return overflow;
+    case GuestPredicate::Parity: return parity;
+    case GuestPredicate::Sign: return sign;
+    case GuestPredicate::Zero: return zero;
+    case GuestPredicate::Never: return false;
+    }
+    return false;
 }
 
 std::uint64_t ResolveConditionCode(const LsxMachineImage& state, const LsxMnemonicCode mnemonic,
@@ -32791,112 +32834,124 @@ std::uint64_t ResolveConditionCode(const LsxMachineImage& state, const LsxMnemon
 
 void WriteConditionToRegister(LsxMachineImage& state, const std::size_t state_offset,
            const LsxMnemonicCode mnemonic) {
-    auto* destination = reinterpret_cast<std::uint8_t*>(&state) + state_offset;
-#if defined(__aarch64__)
-    // Materialize the final byte address before evaluating flags. Besides shortening the live
-    // range from two preserved values to one, this prevents the indexed-store wrapper shape used
-    // by the reference implementation.
-    asm volatile("" : "+r"(destination));
-#endif
-    *destination = static_cast<std::uint8_t>(TestCondition(state, mnemonic));
+    const std::uint8_t encoded = TestCondition(state, mnemonic) ? 1u : 0u;
+    StoreStateLane(state, state_offset, encoded, 8);
 }
 
 void WriteConditionToMemory(const LsxMachineImage& state, void* dst, const LsxMnemonicCode mnemonic) {
-    if (dst == nullptr) {
-        return;
+    if (dst != nullptr) {
+        const std::array<std::uint8_t, 2> encodings{0u, 1u};
+        std::memcpy(dst, &encodings[TestCondition(state, mnemonic)], 1);
     }
-    *static_cast<std::uint8_t*>(dst) = TestCondition(state, mnemonic) ? 1 : 0;
 }
 
 void SelectRegisterConditionally(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
           const LsxMnemonicCode mnemonic, const std::uint32_t size_bits) {
+    const auto commit_selected_value = [&] {
+        StoreStateLane(state, state_offset, value, size_bits);
+    };
     if (!TestCondition(state, mnemonic)) {
         return;
     }
-    StoreStateLane(state, state_offset, value, size_bits);
+    commit_selected_value();
 }
 
-void ShiftRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t count,
-           const ShiftOp op, const std::uint32_t size_bits) {
-    if (size_bits == 0) {
-        return;
-    }
-    const std::uint32_t count_mask = size_bits == 64 ? 0x3f : 0x1f;
-    const std::uint32_t masked_count = static_cast<std::uint32_t>(count) & count_mask;
-    if (masked_count == 0) {
-        return;
-    }
+namespace {
 
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-    const std::uint64_t lhs = LoadStateLane(state, state_offset) & mask;
+struct ShiftOutcome {
+    std::uint64_t value{};
+    bool carry{};
+    bool overflow{};
+    bool changed{};
+};
 
-    std::uint64_t result = 0;
-    bool cf = false;
-    bool of = false;
-    switch (op) {
-    case ShiftOp::LogicalLeft:
-        result = TruncateToOperandWidth(lhs << masked_count, size_bits);
-        cf = masked_count <= size_bits ? ((lhs >> (size_bits - masked_count)) & 1u) != 0 : false;
-        of = masked_count == 1 ? (((result & sign) != 0) != cf) : false;
-        break;
-    case ShiftOp::LogicalRight:
-        result = lhs >> masked_count;
-        cf = masked_count <= size_bits ? ((lhs >> (masked_count - 1)) & 1u) != 0 : false;
-        of = masked_count == 1 ? (lhs & sign) != 0 : false;
-        break;
-    case ShiftOp::ArithmeticRight:
-        result = TruncateToOperandWidth(static_cast<std::uint64_t>(ExtendSignedOperand(lhs, size_bits)) >> masked_count, size_bits);
-        if ((lhs & sign) != 0 && masked_count < size_bits) {
-            result |= mask << (size_bits - masked_count);
-        }
-        result &= mask;
-        cf = masked_count <= size_bits ? ((lhs >> (masked_count - 1)) & 1u) != 0 : false;
-        of = false;
-        break;
+ShiftOutcome EvaluateShift(const std::uint64_t input, const std::uint64_t raw_count,
+                           const ShiftOp operation, const std::uint32_t width) {
+    if (width == 0) {
+        return {};
     }
+    const std::uint32_t count = static_cast<std::uint32_t>(raw_count) &
+                                (width == 64 ? 63u : 31u);
+    if (count == 0) {
+        return {input, false, false, false};
+    }
+    const std::uint64_t mask = TruncateToOperandWidth(UINT64_MAX, width);
+    const std::uint64_t value = input & mask;
+    const std::uint64_t sign = UINT64_C(1) << (width - 1u);
+    ShiftOutcome result{0, false, false, true};
+    if (operation == ShiftOp::LogicalLeft) {
+        result.value = TruncateToOperandWidth(value << count, width);
+        result.carry = count <= width && ((value >> (width - count)) & 1u) != 0;
+        result.overflow = count == 1u && (((result.value & sign) != 0) != result.carry);
+    } else if (operation == ShiftOp::LogicalRight) {
+        result.value = value >> count;
+        result.carry = count <= width && ((value >> (count - 1u)) & 1u) != 0;
+        result.overflow = count == 1u && (value & sign) != 0;
+    } else {
+        const auto signed_value = std::bit_cast<std::int64_t>(ExtendSignedOperand(value, width));
+        result.value = TruncateToOperandWidth(
+            static_cast<std::uint64_t>(signed_value >> std::min(count, width - 1u)), width);
+        result.carry = count <= width && ((value >> (count - 1u)) & 1u) != 0;
+    }
+    return result;
+}
 
-    StoreStateLane(state, state_offset, result, size_bits);
-
-    std::uint64_t flags = 0;
-    if (cf) {
-        flags |= kFlagCf;
-    }
-    if (result == 0) {
-        flags |= kFlagZf;
-    }
-    if ((result & sign) != 0) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(result)) {
-        flags |= kFlagPf;
-    }
-    if (of) {
-        flags |= kFlagOf;
-    }
+void PublishShiftFlags(LsxMachineImage& state, const ShiftOutcome& outcome,
+                       const std::uint32_t width) {
+    const std::uint64_t sign = UINT64_C(1) << (width - 1u);
+    std::uint64_t flags = outcome.carry ? kFlagCf : 0;
+    flags |= outcome.value == 0 ? kFlagZf : 0;
+    flags |= (outcome.value & sign) != 0 ? kFlagSf : 0;
+    flags |= EvenParity8(outcome.value) ? kFlagPf : 0;
+    flags |= outcome.overflow ? kFlagOf : 0;
     StoreStatusFlags(state, flags);
 }
 
+} // namespace
+
+void ShiftRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t count,
+           const ShiftOp op, const std::uint32_t size_bits) {
+    const ShiftOutcome result = EvaluateShift(LoadStateLane(state, state_offset), count,
+                                              op, size_bits);
+    if (result.changed) {
+        StoreStateLane(state, state_offset, result.value, size_bits);
+        PublishShiftFlags(state, result, size_bits);
+    }
+}
+
+namespace {
+template <typename RegisterOperation>
+void TransformMemoryLaneThroughState(LsxMachineImage& architectural_state, void* memory,
+                                     const std::uint32_t width,
+                                     RegisterOperation&& operation) {
+    if (memory == nullptr || width == 0 || width > 64 || (width & 7u) != 0) {
+        return;
+    }
+    const auto bytes = width >> 3u;
+    std::uint64_t input_lane = 0;
+    std::memcpy(&input_lane, memory, bytes);
+    auto scratch = architectural_state;
+    constexpr auto scratch_lane = offsetof(LsxMachineImage, gpr);
+    StoreStateLane(scratch, scratch_lane, input_lane, width);
+    std::invoke(std::forward<RegisterOperation>(operation), scratch, scratch_lane);
+    const auto output_lane = TruncateToOperandWidth(LoadStateLane(scratch, scratch_lane), width);
+    architectural_state.rflags = scratch.rflags;
+    std::memcpy(memory, &output_lane, bytes);
+}
+} // namespace
+
 void ShiftMemoryOperand(LsxMachineImage& state, void* target, const std::uint64_t count, const ShiftOp op,
               const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
+    const auto masked_count = static_cast<std::uint32_t>(count) &
+                              (size_bits == 64 ? UINT32_C(0x3f) : UINT32_C(0x1f));
+    if (size_bits == 0 || masked_count == 0) {
         return;
     }
-
-    const std::uint32_t count_mask = size_bits == 64 ? 0x3f : 0x1f;
-    if ((static_cast<std::uint32_t>(count) & count_mask) == 0) {
-        return;
-    }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    std::uint64_t mem_value = 0;
-    std::memcpy(&mem_value, target, size_bytes);
-    LsxMachineImage temp = state;
-    StoreStateLane(temp, offsetof(LsxMachineImage, gpr), mem_value, size_bits);
-    ShiftRegisterOperand(temp, offsetof(LsxMachineImage, gpr), count, op, size_bits);
-    state.rflags = temp.rflags;
-    const std::uint64_t result = LoadStateLane(temp, offsetof(LsxMachineImage, gpr)) & TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::memcpy(target, &result, size_bytes);
+    TransformMemoryLaneThroughState(
+        state, target, size_bits,
+        [=](LsxMachineImage& scratch, const std::size_t lane) {
+            ShiftRegisterOperand(scratch, lane, count, op, size_bits);
+        });
 }
 
 void Shld(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t source,
@@ -32911,341 +32966,245 @@ void Shld(LsxMachineImage& state, const std::size_t state_offset, const std::uin
         return;
     }
 
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-    const std::uint64_t lhs = LoadStateLane(state, state_offset) & mask;
-    const std::uint64_t rhs = source & mask;
-    std::uint64_t result = 0;
-    bool cf = false;
+    const std::uint64_t mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+    const std::uint64_t sign = UINT64_C(1) << (size_bits - 1u);
+    const std::uint64_t destination = LoadStateLane(state, state_offset) & mask;
+    const std::uint64_t incoming = source & mask;
+    ShiftOutcome outcome{0, false, false, true};
     if (masked_count < size_bits) {
-        result = ((lhs << masked_count) |
-                  (rhs >> (size_bits - masked_count))) & mask;
-        cf = ((lhs >> (size_bits - masked_count)) & 1u) != 0;
+        outcome.value = ((destination << masked_count) |
+                         (incoming >> (size_bits - masked_count))) & mask;
+        outcome.carry = ((destination >> (size_bits - masked_count)) & 1u) != 0;
     } else if (masked_count == size_bits) {
-        // This is reachable only for a 16-bit operand (32/64-bit counts are masked).
-        result = rhs;
-        cf = (lhs & 1u) != 0;
+        outcome.value = incoming;
+        outcome.carry = (destination & 1u) != 0;
     } else {
-        // Intel documents 16-bit SHLD counts 17..31 as undefined. Model the actual
-        // 32-bit concatenated shift without C++ over-shifts, which is deterministic and
-        // agrees with the architectural operation for every defined count.
         const std::uint32_t source_shift = masked_count - size_bits;
-        result = (rhs << source_shift) & mask;
-        cf = ((rhs >> (size_bits - source_shift)) & 1u) != 0;
+        outcome.value = (incoming << source_shift) & mask;
+        outcome.carry = ((incoming >> (size_bits - source_shift)) & 1u) != 0;
     }
-
-    StoreStateLane(state, state_offset, result, size_bits);
-
-    std::uint64_t flags = 0;
-    if (cf) {
-        flags |= kFlagCf;
-    }
-    if (result == 0) {
-        flags |= kFlagZf;
-    }
-    if ((result & sign) != 0) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(result)) {
-        flags |= kFlagPf;
-    }
-    // OF is architecturally defined only for count=1. Match the scalar ShiftRegisterOperand helper's
-    // deterministic undefined-flag policy for larger counts; AF is likewise cleared.
-    if (masked_count == 1 && (((result & sign) != 0) != cf)) {
-        flags |= kFlagOf;
-    }
-    StoreStatusFlags(state, flags);
+    outcome.overflow = masked_count == 1u &&
+                       (((outcome.value & sign) != 0) != outcome.carry);
+    StoreStateLane(state, state_offset, outcome.value, size_bits);
+    PublishShiftFlags(state, outcome, size_bits);
 }
 
 void ShldMem(LsxMachineImage& state, void* target, const std::uint64_t source,
              const std::uint64_t count, const std::uint32_t size_bits) {
-    if (size_bits != 16 && size_bits != 32 && size_bits != 64) {
+    const bool supported = size_bits == 16 || size_bits == 32 || size_bits == 64;
+    const auto count_mask = size_bits == 64 ? UINT32_C(0x3f) : UINT32_C(0x1f);
+    if (!supported || (static_cast<std::uint32_t>(count) & count_mask) == 0) {
         return;
     }
-    const std::uint32_t count_mask = size_bits == 64 ? 0x3f : 0x1f;
-    if ((static_cast<std::uint32_t>(count) & count_mask) == 0) {
-        // A zero count does not access the memory operand.
-        return;
-    }
-    if (target == nullptr) {
-        return;
-    }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    std::uint64_t mem_value = 0;
-    std::memcpy(&mem_value, target, size_bytes);
-    LsxMachineImage temp = state;
-    StoreStateLane(temp, offsetof(LsxMachineImage, gpr), mem_value, size_bits);
-    Shld(temp, offsetof(LsxMachineImage, gpr), source, count, size_bits);
-    state.rflags = temp.rflags;
-    const std::uint64_t result =
-        LoadStateLane(temp, offsetof(LsxMachineImage, gpr)) &
-        TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::memcpy(target, &result, size_bytes);
+    TransformMemoryLaneThroughState(
+        state, target, size_bits,
+        [=](LsxMachineImage& scratch, const std::size_t lane) {
+            Shld(scratch, lane, source, count, size_bits);
+        });
 }
 
-void RotateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t count,
-            const bool rotate_right, const std::uint32_t size_bits) {
-    if (size_bits == 0) {
+namespace {
+struct RotationResult {
+    std::uint64_t lane{};
+    bool carry{};
+    bool overflow{};
+    bool writes_overflow{};
+    bool changed{};
+};
+
+template <typename Lane>
+Lane RotateLane(const Lane value, const int distance, const bool right) {
+    return right ? std::rotr(value, distance) : std::rotl(value, distance);
+}
+
+RotationResult EvaluateRotation(const std::uint64_t input, const std::uint64_t raw_count,
+                                const bool right, const std::uint32_t width) {
+    const auto masked = static_cast<std::uint32_t>(raw_count) &
+                        (width == 64 ? UINT32_C(63) : UINT32_C(31));
+    if (width == 0 || masked == 0 || masked % width == 0) {
+        return {};
+    }
+    const int distance = static_cast<int>(masked % width);
+    std::uint64_t output = 0;
+    switch (width) {
+    case 8: output = RotateLane(static_cast<std::uint8_t>(input), distance, right); break;
+    case 16: output = RotateLane(static_cast<std::uint16_t>(input), distance, right); break;
+    case 32: output = RotateLane(static_cast<std::uint32_t>(input), distance, right); break;
+    case 64: output = RotateLane(input, distance, right); break;
+    default: return {};
+    }
+    const bool carry = right ? ((output >> (width - 1u)) & 1u) != 0 : (output & 1u) != 0;
+    const bool high = ((output >> (width - 1u)) & 1u) != 0;
+    const bool next = width == 1 ? high : ((output >> (width - 2u)) & 1u) != 0;
+    return {output, carry, high != (right ? next : carry), masked == 1, true};
+}
+} // namespace
+
+void RotateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset,
+                           const std::uint64_t count, const bool rotate_right,
+                           const std::uint32_t size_bits) {
+    const auto rotation = EvaluateRotation(LoadStateLane(state, state_offset), count,
+                                           rotate_right, size_bits);
+    if (!rotation.changed) {
         return;
     }
-
-    const std::uint32_t count_mask = size_bits == 64 ? 0x3f : 0x1f;
-    const std::uint32_t masked_count = static_cast<std::uint32_t>(count) & count_mask;
-    if (masked_count == 0) {
-        return;
-    }
-
-    const std::uint32_t rotate_count = masked_count % size_bits;
-    if (rotate_count == 0) {
-        return;
-    }
-
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t value = LoadStateLane(state, state_offset) & mask;
-    std::uint64_t result = 0;
-    if (rotate_right) {
-        result = ((value >> rotate_count) | (value << (size_bits - rotate_count))) & mask;
-    } else {
-        result = ((value << rotate_count) | (value >> (size_bits - rotate_count))) & mask;
-    }
-    StoreStateLane(state, state_offset, result, size_bits);
-
-    const bool cf = rotate_right ? (((result >> (size_bits - 1)) & 1u) != 0) : ((result & 1u) != 0);
-    state.rflags = cf ? (state.rflags | kFlagCf) : (state.rflags & ~kFlagCf);
-    if (masked_count == 1) {
-        bool of = false;
-        if (rotate_right) {
-            const bool msb = ((result >> (size_bits - 1)) & 1u) != 0;
-            const bool next_msb = size_bits > 1 ? (((result >> (size_bits - 2)) & 1u) != 0) : msb;
-            of = msb != next_msb;
-        } else {
-            const bool msb = ((result >> (size_bits - 1)) & 1u) != 0;
-            of = msb != cf;
-        }
-        state.rflags = of ? (state.rflags | kFlagOf) : (state.rflags & ~kFlagOf);
+    StoreStateLane(state, state_offset, rotation.lane, size_bits);
+    state.rflags = (state.rflags & ~kFlagCf) | (rotation.carry ? kFlagCf : 0);
+    if (rotation.writes_overflow) {
+        state.rflags = (state.rflags & ~kFlagOf) | (rotation.overflow ? kFlagOf : 0);
     }
 }
 
 void AdjustRegisterByOne(LsxMachineImage& state, const std::size_t state_offset, const IncDecOp op,
             const std::uint32_t size_bits) {
-    const bool old_cf = (state.rflags & kFlagCf) != 0;
-    const std::uint64_t lhs = LoadStateLane(state, state_offset) & TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::uint64_t result = lhs;
-    if (op == IncDecOp::Decrement) {
-        result = TruncateToOperandWidth(lhs - 1, size_bits);
-        RecordIntegerSubtractionFlags(state, lhs, 1, result, size_bits);
-    } else {
-        result = TruncateToOperandWidth(lhs + 1, size_bits);
-        RecordIntegerAdditionFlags(state, lhs, 1, result, size_bits);
-    }
-    state.rflags = old_cf ? (state.rflags | kFlagCf) : (state.rflags & ~kFlagCf);
-    StoreStateLane(state, state_offset, result, size_bits);
+    const std::uint64_t preserved_carry = state.rflags & kFlagCf;
+    const std::uint64_t mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+    const std::uint64_t before = LoadStateLane(state, state_offset) & mask;
+    const AluOp operation = op == IncDecOp::Decrement ? AluOp::Subtract : AluOp::Add;
+    const IntegerAluOutcome outcome = EvaluateIntegerAlu(before, 1, operation, size_bits);
+    PublishIntegerAluFlags(state, before, 1, outcome, size_bits);
+    state.rflags = (state.rflags & ~kFlagCf) | preserved_carry;
+    StoreStateLane(state, state_offset, outcome.value, size_bits);
 }
-
-namespace {
-template <typename Fn>
-void ApplyMemoryLane(LsxMachineImage& state, void* target, const std::uint32_t size_bits, Fn&& fn) {
-    if (target == nullptr || size_bits == 0) {
-        return;
-    }
-    const std::uint32_t size_bytes = size_bits / 8;
-    std::uint64_t mem_value = 0;
-    std::memcpy(&mem_value, target, size_bytes);
-    LsxMachineImage temp = state;
-    StoreStateLane(temp, offsetof(LsxMachineImage, gpr), mem_value, size_bits);
-    fn(temp);
-    state.rflags = temp.rflags;
-    const std::uint64_t result = LoadStateLane(temp, offsetof(LsxMachineImage, gpr)) &
-                                 TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::memcpy(target, &result, size_bytes);
-}
-} // namespace
 
 void RotateMem(LsxMachineImage& state, void* target, const std::uint64_t count,
                const bool rotate_right, const std::uint32_t size_bits) {
-    ApplyMemoryLane(state, target, size_bits,
-                    [count, rotate_right, size_bits](LsxMachineImage& temp) {
-                        RotateRegisterOperand(temp, offsetof(LsxMachineImage, gpr), count,
-                               rotate_right, size_bits);
-                    });
+    TransformMemoryLaneThroughState(
+        state, target, size_bits,
+        [=](LsxMachineImage& scratch, const std::size_t lane) {
+            RotateRegisterOperand(scratch, lane, count, rotate_right, size_bits);
+        });
 }
 
 void AdjustMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits) {
-    ApplyMemoryLane(state, target, size_bits, [op, size_bits](LsxMachineImage& temp) {
-        AdjustRegisterByOne(temp, offsetof(LsxMachineImage, gpr), op, size_bits);
-    });
+    TransformMemoryLaneThroughState(
+        state, target, size_bits,
+        [=](LsxMachineImage& scratch, const std::size_t lane) {
+            AdjustRegisterByOne(scratch, lane, op, size_bits);
+        });
 }
 
 void AdjustAtomicMemoryByOne(LsxMachineImage& state, void* target, const IncDecOp op, const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
+    const auto arithmetic = op == IncDecOp::Decrement ? AluOp::Subtract : AluOp::Add;
+    const auto transform = [=](const std::uint64_t input) {
+        return EvaluateIntegerAlu(input, 1, arithmetic, size_bits).value;
+    };
+    std::uint64_t before = 0, after = 0;
+    if (!CommitAtomicMutation(target, size_bits, transform, before, after)) {
         return;
     }
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::uint64_t previous = 0;
-    std::uint64_t result = 0;
-    if (!AtomicReadModifyWrite(
-            target, size_bits,
-            [op, mask](const std::uint64_t observed) {
-                return op == IncDecOp::Decrement ? ((observed - 1u) & mask)
-                                           : ((observed + 1u) & mask);
-            },
-            previous, result)) {
-        std::lock_guard lock{g_locked_memory_mutex};
-        const std::uint32_t size_bytes = size_bits / 8;
-        std::memcpy(&previous, target, size_bytes);
-        result = op == IncDecOp::Decrement ? TruncateToOperandWidth(previous - 1u, size_bits)
-                                     : TruncateToOperandWidth(previous + 1u, size_bits);
-        std::memcpy(target, &result, size_bytes);
-    }
-    const std::uint64_t old_cf = state.rflags & kFlagCf;
-    if (op == IncDecOp::Decrement) {
-        RecordIntegerSubtractionFlags(state, previous, 1u, result, size_bits);
-    } else {
-        RecordIntegerAdditionFlags(state, previous, 1u, result, size_bits);
-    }
-    state.rflags = (state.rflags & ~kFlagCf) | old_cf;
+    const auto saved_carry = state.rflags & kFlagCf;
+    PublishIntegerAluFlags(state, before, 1, EvaluateIntegerAlu(before, 1, arithmetic, size_bits),
+                           size_bits);
+    state.rflags = (state.rflags & ~kFlagCf) | saved_carry;
 }
 
 void NegateRegisterOperand(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits) {
-    const std::uint64_t lhs = LoadStateLane(state, state_offset) & TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t result = TruncateToOperandWidth(0 - lhs, size_bits);
-    RecordIntegerSubtractionFlags(state, 0, lhs, result, size_bits);
-    StoreStateLane(state, state_offset, result, size_bits);
+    const auto operand = TruncateToOperandWidth(LoadStateLane(state, state_offset), size_bits);
+    const auto evaluated = EvaluateIntegerAlu(0, operand, AluOp::Subtract, size_bits);
+    PublishIntegerAluFlags(state, 0, operand, evaluated, size_bits);
+    StoreStateLane(state, state_offset, evaluated.value, size_bits);
 }
 
 void NegateMemoryOperand(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
-    ApplyMemoryLane(state, target, size_bits, [size_bits](LsxMachineImage& temp) {
-        NegateRegisterOperand(temp, offsetof(LsxMachineImage, gpr), size_bits);
-    });
+    TransformMemoryLaneThroughState(state, target, size_bits,
+        [=](LsxMachineImage& scratch, const std::size_t lane) {
+            NegateRegisterOperand(scratch, lane, size_bits);
+        });
 }
 
 void NegateAtomicMemoryOperand(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
+    const auto negation = [size_bits](const std::uint64_t observed) {
+        return TruncateToOperandWidth(std::uint64_t{0} - observed, size_bits);
+    };
     if (target == nullptr || size_bits == 0) {
         return;
     }
-    std::uint64_t previous = 0;
-    std::uint64_t result = 0;
-    if (!AtomicReadModifyWrite(
-            target, size_bits,
-            [size_bits](const std::uint64_t observed) {
-                return TruncateToOperandWidth(0u - observed, size_bits);
-            },
-            previous, result)) {
-        std::lock_guard lock{g_locked_memory_mutex};
-        const std::uint32_t size_bytes = size_bits / 8;
-        std::memcpy(&previous, target, size_bytes);
-        result = TruncateToOperandWidth(0u - previous, size_bits);
-        std::memcpy(target, &result, size_bytes);
+    std::uint64_t before = 0;
+    std::uint64_t after = 0;
+    if (!CommitAtomicMutation(target, size_bits, negation, before, after)) {
+        return;
     }
-    RecordIntegerSubtractionFlags(state, 0u, previous, result, size_bits);
+    const auto outcome = EvaluateIntegerAlu(0, before, AluOp::Subtract, size_bits);
+    PublishIntegerAluFlags(state, 0, before, outcome, size_bits);
 }
 
 void NotMemLocked(LsxMachineImage& state, void* target, const std::uint32_t size_bits) {
     (void)state;
-    if (target == nullptr || size_bits == 0) {
-        return;
-    }
-    std::uint64_t previous = 0;
-    std::uint64_t result = 0;
-    if (!AtomicReadModifyWrite(
-            target, size_bits,
-            [size_bits](const std::uint64_t observed) {
-                return TruncateToOperandWidth(~observed, size_bits);
-            },
-            previous, result)) {
-        std::lock_guard lock{g_locked_memory_mutex};
-        const std::uint32_t size_bytes = size_bits / 8;
-        std::memcpy(&previous, target, size_bytes);
-        result = TruncateToOperandWidth(~previous, size_bits);
-        std::memcpy(target, &result, size_bytes);
-    }
+    std::uint64_t discarded_before = 0, discarded_after = 0;
+    (void)CommitAtomicMutation(
+        target, size_bits,
+        [=](const std::uint64_t input) {
+            return TruncateToOperandWidth(input ^ UINT64_MAX, size_bits);
+        },
+        discarded_before, discarded_after);
 }
 
-void MultiplyAccumulatorPair(LsxMachineImage& state, const std::uint64_t operand, const std::uint32_t size_bits,
-            const bool is_signed) {
+namespace {
+struct AccumulatorProduct {
+    std::uint64_t lower_half{};
+    std::uint64_t upper_half{};
+    bool does_not_fit{};
+};
+
+std::int64_t SignExtendOperand(const std::uint64_t value, const std::uint32_t width) {
+    if (width == 64) {
+        return std::bit_cast<std::int64_t>(value);
+    }
+    const auto shift = 64u - width;
+    return static_cast<std::int64_t>(value << shift) >> shift;
+}
+
+AccumulatorProduct FormAccumulatorProduct(const std::uint64_t lhs, const std::uint64_t rhs,
+                                          const std::uint32_t width, const bool signed_inputs) {
+    const auto lane_mask = TruncateToOperandWidth(UINT64_MAX, width);
+    __uint128_t product_bits = 0;
     bool overflow = false;
-    switch (size_bits) {
-    case 8: {
-        std::uint64_t rax = ReadGuestGpr64(state, LsxGpr::Rax);
-        std::uint16_t product = 0;
-        if (is_signed) {
-            const auto lhs = static_cast<std::int8_t>(rax & 0xff);
-            const auto rhs = static_cast<std::int8_t>(operand & 0xff);
-            const std::int16_t signed_product = static_cast<std::int16_t>(lhs) * static_cast<std::int16_t>(rhs);
-            product = static_cast<std::uint16_t>(signed_product);
-            overflow = signed_product < INT8_MIN || signed_product > INT8_MAX;
-        } else {
-            product = static_cast<std::uint16_t>((rax & 0xff) * (operand & 0xff));
-            overflow = (product >> 8) != 0;
-        }
-        rax = (rax & ~std::uint64_t{0xffff}) | product;
-        WriteGuestGpr64(state, LsxGpr::Rax, rax);
-        break;
+    if (signed_inputs) {
+        const __int128 product = static_cast<__int128>(SignExtendOperand(lhs & lane_mask, width)) *
+                                 SignExtendOperand(rhs & lane_mask, width);
+        product_bits = static_cast<__uint128_t>(product);
+        const __int128 minimum = -(static_cast<__int128>(1) << (width - 1u));
+        const __int128 maximum = (static_cast<__int128>(1) << (width - 1u)) - 1;
+        overflow = product < minimum || product > maximum;
+    } else {
+        product_bits = static_cast<__uint128_t>(lhs & lane_mask) * (rhs & lane_mask);
+        overflow = (product_bits >> width) != 0;
     }
-    case 16: {
-        const std::uint64_t rax = ReadGuestGpr64(state, LsxGpr::Rax);
-        std::uint32_t product = 0;
-        if (is_signed) {
-            const auto lhs = static_cast<std::int16_t>(rax & 0xffff);
-            const auto rhs = static_cast<std::int16_t>(operand & 0xffff);
-            const std::int32_t signed_product = static_cast<std::int32_t>(lhs) * static_cast<std::int32_t>(rhs);
-            product = static_cast<std::uint32_t>(signed_product);
-            overflow = signed_product < INT16_MIN || signed_product > INT16_MAX;
-        } else {
-            product = static_cast<std::uint32_t>((rax & 0xffff) * (operand & 0xffff));
-            overflow = (product >> 16) != 0;
-        }
-        WriteGuestGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(product));
-        WriteGuestGpr16(state, LsxGpr::Rdx, static_cast<std::uint16_t>(product >> 16));
-        break;
-    }
-    case 32: {
-        const std::uint64_t rax = ReadGuestGpr64(state, LsxGpr::Rax);
-        std::uint64_t product = 0;
-        if (is_signed) {
-            const auto lhs = static_cast<std::int32_t>(rax & 0xffffffffu);
-            const auto rhs = static_cast<std::int32_t>(operand & 0xffffffffu);
-            const std::int64_t signed_product = static_cast<std::int64_t>(lhs) * static_cast<std::int64_t>(rhs);
-            product = static_cast<std::uint64_t>(signed_product);
-            overflow = signed_product < INT32_MIN || signed_product > INT32_MAX;
-        } else {
-            product = static_cast<std::uint64_t>(static_cast<std::uint32_t>(rax)) *
-                      static_cast<std::uint64_t>(static_cast<std::uint32_t>(operand));
-            overflow = (product >> 32) != 0;
-        }
-        WriteGuestGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(product));
-        WriteGuestGpr32(state, LsxGpr::Rdx, static_cast<std::uint32_t>(product >> 32));
-        break;
-    }
-    case 64: {
-        const std::uint64_t rax = ReadGuestGpr64(state, LsxGpr::Rax);
-        if (is_signed) {
-            const auto lhs = static_cast<__int128_t>(static_cast<std::int64_t>(rax));
-            const auto rhs = static_cast<__int128_t>(static_cast<std::int64_t>(operand));
-            const __int128_t product = lhs * rhs;
-            const auto low = static_cast<std::uint64_t>(product);
-            const auto high = static_cast<std::uint64_t>(static_cast<__uint128_t>(product) >> 64);
-            WriteGuestGpr64(state, LsxGpr::Rax, low);
-            WriteGuestGpr64(state, LsxGpr::Rdx, high);
-            overflow = product < static_cast<__int128_t>(INT64_MIN) ||
-                       product > static_cast<__int128_t>(INT64_MAX);
-        } else {
-            const auto product = static_cast<__uint128_t>(rax) * static_cast<__uint128_t>(operand);
-            WriteGuestGpr64(state, LsxGpr::Rax, static_cast<std::uint64_t>(product));
-            WriteGuestGpr64(state, LsxGpr::Rdx, static_cast<std::uint64_t>(product >> 64));
-            overflow = (product >> 64) != 0;
-        }
-        break;
-    }
-    default:
+    return {static_cast<std::uint64_t>(product_bits) & lane_mask,
+            static_cast<std::uint64_t>(product_bits >> width) & lane_mask, overflow};
+}
+
+void CommitAccumulatorProduct(LsxMachineImage& state, const AccumulatorProduct& product,
+                              const std::uint32_t width) {
+    if (width == 8) {
+        const auto packed_ax = product.lower_half | (product.upper_half << 8u);
+        WriteGuestGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(packed_ax));
         return;
     }
-
-    state.rflags &= ~(kFlagCf | kFlagOf);
-    if (overflow) {
-        state.rflags |= kFlagCf | kFlagOf;
+    if (width == 16) {
+        WriteGuestGpr16(state, LsxGpr::Rax, static_cast<std::uint16_t>(product.lower_half));
+        WriteGuestGpr16(state, LsxGpr::Rdx, static_cast<std::uint16_t>(product.upper_half));
+    } else if (width == 32) {
+        WriteGuestGpr32(state, LsxGpr::Rax, static_cast<std::uint32_t>(product.lower_half));
+        WriteGuestGpr32(state, LsxGpr::Rdx, static_cast<std::uint32_t>(product.upper_half));
+    } else {
+        WriteGuestGpr64(state, LsxGpr::Rax, product.lower_half);
+        WriteGuestGpr64(state, LsxGpr::Rdx, product.upper_half);
     }
+}
+} // namespace
+
+void MultiplyAccumulatorPair(LsxMachineImage& state, const std::uint64_t operand,
+                             const std::uint32_t size_bits, const bool is_signed) {
+    if (size_bits != 8 && size_bits != 16 && size_bits != 32 && size_bits != 64) {
+        return;
+    }
+    const auto product = FormAccumulatorProduct(ReadGuestGpr64(state, LsxGpr::Rax), operand,
+                                                size_bits, is_signed);
+    CommitAccumulatorProduct(state, product, size_bits);
+    const auto arithmetic_flags = product.does_not_fit ? kFlagCf | kFlagOf : UINT64_C(0);
+    state.rflags = (state.rflags & ~(kFlagCf | kFlagOf)) | arithmetic_flags;
 }
 
 void DivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, const std::uint32_t size_bits,
@@ -33415,93 +33374,117 @@ void DivideAccumulatorPair(LsxMachineImage& state, const std::uint64_t divisor, 
     }
 }
 
-void ExecuteCarryArithmetic(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t operand,
-            const bool subtract, const std::uint32_t size_bits) {
-    const bool carry = (state.rflags & kFlagCf) != 0;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t lhs = LoadStateLane(state, state_offset) & mask;
-    const std::uint64_t rhs = operand & mask;
-    std::uint64_t result = 0;
+namespace {
+struct CarryArithmeticResult {
+    std::uint64_t left{};
+    std::uint64_t right{};
+    std::uint64_t value{};
+    bool incoming_carry{};
+};
+
+CarryArithmeticResult EvaluateCarryArithmetic(const std::uint64_t left,
+                                              const std::uint64_t right,
+                                              const std::uint32_t width,
+                                              const bool subtract,
+                                              const bool incoming_carry) {
+    const auto width_mask = TruncateToOperandWidth(UINT64_MAX, width);
+    CarryArithmeticResult evaluated{left & width_mask, right & width_mask, 0,
+                                    incoming_carry};
+    const std::uint64_t carry_value = static_cast<std::uint64_t>(incoming_carry);
+    evaluated.value = TruncateToOperandWidth(
+        subtract ? evaluated.left - evaluated.right - carry_value
+                 : evaluated.left + evaluated.right + carry_value,
+        width);
+    return evaluated;
+}
+
+void PublishCarryArithmetic(LsxMachineImage& state, const CarryArithmeticResult& evaluated,
+                            const bool subtract, const std::uint32_t width) {
     if (subtract) {
-        result = TruncateToOperandWidth(lhs - rhs - (carry ? 1 : 0), size_bits);
-        RecordBorrowingSubtractionFlags(state, lhs, rhs, carry, result, size_bits);
-    } else {
-        result = TruncateToOperandWidth(lhs + rhs + (carry ? 1 : 0), size_bits);
-        RecordCarryingAdditionFlags(state, lhs, rhs, carry, result, size_bits);
+        RecordBorrowingSubtractionFlags(state, evaluated.left, evaluated.right,
+                                        evaluated.incoming_carry, evaluated.value, width);
+        return;
     }
-    StoreStateLane(state, state_offset, result, size_bits);
+    RecordCarryingAdditionFlags(state, evaluated.left, evaluated.right,
+                                evaluated.incoming_carry, evaluated.value, width);
+}
+} // namespace
+
+void ExecuteCarryArithmetic(LsxMachineImage& state, const std::size_t state_offset,
+                            const std::uint64_t operand, const bool subtract,
+                            const std::uint32_t size_bits) {
+    const auto evaluated = EvaluateCarryArithmetic(
+        LoadStateLane(state, state_offset), operand, size_bits, subtract,
+        (state.rflags & kFlagCf) != 0);
+    PublishCarryArithmetic(state, evaluated, subtract, size_bits);
+    StoreStateLane(state, state_offset, evaluated.value, size_bits);
 }
 
 void ExecuteCarryArithmeticMemory(LsxMachineImage& state, void* target, const std::uint64_t operand, const bool subtract,
                const std::uint32_t size_bits) {
-    ApplyMemoryLane(state, target, size_bits, [operand, subtract, size_bits](LsxMachineImage& temp) {
-        ExecuteCarryArithmetic(temp, offsetof(LsxMachineImage, gpr), operand, subtract, size_bits);
-    });
+    TransformMemoryLaneThroughState(
+        state, target, size_bits,
+        [=](LsxMachineImage& scratch, const std::size_t lane) {
+            ExecuteCarryArithmetic(scratch, lane, operand, subtract, size_bits);
+        });
 }
 
 void ExecuteCarryArithmeticAtomic(LsxMachineImage& state, void* target, const std::uint64_t operand,
                      const bool subtract, const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
+    const bool incoming = (state.rflags & kFlagCf) != 0;
+    const auto transform = [=](const std::uint64_t input) {
+        return EvaluateCarryArithmetic(input, operand, size_bits, subtract, incoming).value;
+    };
+    std::uint64_t before = 0, after = 0;
+    if (!CommitAtomicMutation(target, size_bits, transform, before, after)) {
         return;
     }
-    const bool carry = (state.rflags & kFlagCf) != 0;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t rhs = operand & mask;
-    std::uint64_t previous = 0;
-    std::uint64_t result = 0;
-    if (!AtomicReadModifyWrite(
-            target, size_bits,
-            [subtract, carry, rhs, mask](const std::uint64_t observed) {
-                return subtract ? ((observed - rhs - (carry ? 1u : 0u)) & mask)
-                                : ((observed + rhs + (carry ? 1u : 0u)) & mask);
-            },
-            previous, result)) {
-        std::lock_guard lock{g_locked_memory_mutex};
-        const std::uint32_t size_bytes = size_bits / 8;
-        std::memcpy(&previous, target, size_bytes);
-        result = subtract ? TruncateToOperandWidth(previous - rhs - (carry ? 1u : 0u), size_bits)
-                          : TruncateToOperandWidth(previous + rhs + (carry ? 1u : 0u), size_bits);
-        std::memcpy(target, &result, size_bytes);
-    }
-    if (subtract) {
-        RecordBorrowingSubtractionFlags(state, previous, rhs, carry, result, size_bits);
-    } else {
-        RecordCarryingAdditionFlags(state, previous, rhs, carry, result, size_bits);
-    }
+    const auto evaluated = EvaluateCarryArithmetic(before, operand, size_bits, subtract, incoming);
+    PublishCarryArithmetic(state, evaluated, subtract, size_bits);
 }
 
 void ComputeAndWithInvertedSource(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs_not,
           const std::uint64_t rhs, const std::uint32_t size_bits) {
-    const std::uint64_t result = TruncateToOperandWidth((~lhs_not) & rhs, size_bits);
-    RecordLogicalResultFlags(state, result, size_bits);
-    StoreStateLane(state, state_offset, result, size_bits);
+    const IntegerAluOutcome outcome{
+        .value = TruncateToOperandWidth((lhs_not ^ UINT64_MAX) & rhs, size_bits),
+        .flags = IntegerFlagClass::Logical,
+    };
+    PublishIntegerAluFlags(state, 0, 0, outcome, size_bits);
+    StoreStateLane(state, state_offset, outcome.value, size_bits);
 }
 
-void IsolateLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
-          const std::uint32_t size_bits) {
-    const std::uint64_t source = TruncateToOperandWidth(value, size_bits);
-    const std::uint64_t result = TruncateToOperandWidth(source & (0 - source), size_bits);
-    constexpr std::uint64_t clear_mask = kFlagCf | kFlagZf | kFlagSf | kFlagOf;
-    std::uint64_t flags = state.rflags & ~clear_mask;
-    if (source != 0) {
-        flags |= kFlagCf;
-    }
-    if (result == 0) {
-        flags |= kFlagZf;
-    }
-    if (size_bits != 0 && (result & (std::uint64_t{1} << (size_bits - 1))) != 0) {
-        flags |= kFlagSf;
-    }
-    state.rflags = flags;
-    StoreStateLane(state, state_offset, result, size_bits);
+namespace {
+enum class LowestBitTransform : std::uint8_t { Isolate, Clear };
+
+void ApplyLowestBitTransform(LsxMachineImage& state, const std::size_t destination,
+                             const std::uint64_t input, const std::uint32_t width,
+                             const LowestBitTransform transform) {
+    const auto source = TruncateToOperandWidth(input, width);
+    const auto transformed = transform == LowestBitTransform::Isolate
+                                 ? source & (std::uint64_t{0} - source)
+                                 : source & (source - std::uint64_t{1});
+    const auto result = TruncateToOperandWidth(transformed, width);
+    const bool carry = transform == LowestBitTransform::Isolate ? source != 0 : source == 0;
+    const bool negative = width != 0 && (result >> (width - 1u)) != 0;
+    const std::uint64_t replacement = (carry ? kFlagCf : 0) |
+                                      (result == 0 ? kFlagZf : 0) |
+                                      (negative ? kFlagSf : 0);
+    constexpr auto affected = kFlagCf | kFlagZf | kFlagSf | kFlagOf;
+    state.rflags = (state.rflags & ~affected) | replacement;
+    StoreStateLane(state, destination, result, width);
+}
+} // namespace
+
+void IsolateLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset,
+                                   const std::uint64_t value,
+                                   const std::uint32_t size_bits) {
+    ApplyLowestBitTransform(state, state_offset, value, size_bits,
+                            LowestBitTransform::Isolate);
 }
 
 void ChangeStringTraversalDirection(LsxMachineImage& state, const bool set) {
-    if (set) {
-        state.rflags |= kFlagDf;
-    } else {
-        state.rflags &= ~kFlagDf;
-    }
+    const std::uint64_t selected_direction = static_cast<std::uint64_t>(set) * kFlagDf;
+    state.rflags = (state.rflags & ~kFlagDf) | selected_direction;
 }
 
 namespace {
@@ -33665,335 +33648,276 @@ bool TryBulkStos(const std::uint64_t rdi, const std::uint64_t rax,
 
 } // namespace
 
-void CopyStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat) {
-    if (element_size == 0) {
-        return;
-    }
-    std::uint64_t count = repeat ? ReadGuestGpr64(state, LsxGpr::Rcx) : 1;
-    if (count == 0) {
-        return;
-    }
+namespace {
+enum class StringTransferKind : std::uint8_t { Copy, Fill };
 
-    std::uint64_t rsi = ReadGuestGpr64(state, LsxGpr::Rsi);
-    std::uint64_t rdi = ReadGuestGpr64(state, LsxGpr::Rdi);
-    const bool backward = (state.rflags & kFlagDf) != 0;
-    if (repeat && TryBulkMovs(rsi, rdi, element_size, count, backward)) {
-        const std::uint64_t delta = count * element_size;
-        WriteGuestGpr64(state, LsxGpr::Rsi, backward ? rsi - delta : rsi + delta);
-        WriteGuestGpr64(state, LsxGpr::Rdi, backward ? rdi - delta : rdi + delta);
-        WriteGuestGpr64(state, LsxGpr::Rcx, 0);
+void ExecuteStringTransfer(LsxMachineImage& state, const std::uint64_t element_bytes,
+                           const bool repeats, const StringTransferKind kind) {
+    if (element_bytes == 0 || element_bytes > sizeof(std::uint64_t)) {
         return;
     }
-    std::array<std::uint8_t, 8> lane{};
-    for (std::uint64_t i = 0; i < count; ++i) {
-        CopyBytesFromGuest(rsi, lane.data(), static_cast<std::uint32_t>(element_size));
-        CopyBytesToGuest(rdi, lane.data(), static_cast<std::uint32_t>(element_size));
-        if (backward) {
-            rsi -= element_size;
-            rdi -= element_size;
-        } else {
-            rsi += element_size;
-            rdi += element_size;
+    const auto iterations = repeats ? ReadGuestGpr64(state, LsxGpr::Rcx) : UINT64_C(1);
+    if (iterations == 0) {
+        return;
+    }
+    std::array<std::uint64_t, 2> cursor{
+        ReadGuestGpr64(state, LsxGpr::Rsi), ReadGuestGpr64(state, LsxGpr::Rdi)};
+    const bool descending = (state.rflags & kFlagDf) != 0;
+    const auto accumulator = ReadGuestGpr64(state, LsxGpr::Rax);
+    const bool bulk_completed = repeats &&
+        (kind == StringTransferKind::Copy
+             ? TryBulkMovs(cursor[0], cursor[1], element_bytes, iterations, descending)
+             : TryBulkStos(cursor[1], accumulator, element_bytes, iterations, descending));
+    const auto step = descending ? std::uint64_t{0} - element_bytes : element_bytes;
+    if (!bulk_completed) {
+        std::array<std::uint8_t, sizeof(std::uint64_t)> element{};
+        for (std::uint64_t iteration = 0; iteration != iterations; ++iteration) {
+            const void* payload = &accumulator;
+            if (kind == StringTransferKind::Copy) {
+                CopyBytesFromGuest(cursor[0], element.data(), static_cast<std::uint32_t>(element_bytes));
+                payload = element.data();
+                cursor[0] += step;
+            }
+            CopyBytesToGuest(cursor[1], payload, static_cast<std::uint32_t>(element_bytes));
+            cursor[1] += step;
+        }
+    } else {
+        const auto displacement = step * iterations;
+        cursor[1] += displacement;
+        if (kind == StringTransferKind::Copy) {
+            cursor[0] += displacement;
         }
     }
-    WriteGuestGpr64(state, LsxGpr::Rsi, rsi);
-    WriteGuestGpr64(state, LsxGpr::Rdi, rdi);
-    if (repeat) {
+    if (kind == StringTransferKind::Copy) {
+        WriteGuestGpr64(state, LsxGpr::Rsi, cursor[0]);
+    }
+    WriteGuestGpr64(state, LsxGpr::Rdi, cursor[1]);
+    if (repeats) {
         WriteGuestGpr64(state, LsxGpr::Rcx, 0);
     }
+}
+} // namespace
+
+void CopyStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat) {
+    ExecuteStringTransfer(state, element_size, repeat, StringTransferKind::Copy);
 }
 
 void FillStringUnit(LsxMachineImage& state, const std::uint64_t element_size, const bool repeat) {
-    if (element_size == 0 || element_size > sizeof(std::uint64_t)) {
-        return;
-    }
-    std::uint64_t count = repeat ? ReadGuestGpr64(state, LsxGpr::Rcx) : 1;
-    if (count == 0) {
-        return;
-    }
+    ExecuteStringTransfer(state, element_size, repeat, StringTransferKind::Fill);
+}
 
-    const std::uint64_t rax = ReadGuestGpr64(state, LsxGpr::Rax);
-    std::uint64_t rdi = ReadGuestGpr64(state, LsxGpr::Rdi);
-    const bool backward = (state.rflags & kFlagDf) != 0;
-    if (repeat && TryBulkStos(rdi, rax, element_size, count, backward)) {
-        const std::uint64_t delta = count * element_size;
-        WriteGuestGpr64(state, LsxGpr::Rdi, backward ? rdi - delta : rdi + delta);
-        WriteGuestGpr64(state, LsxGpr::Rcx, 0);
-        return;
-    }
-    for (std::uint64_t i = 0; i < count; ++i) {
-        CopyBytesToGuest(rdi, &rax, static_cast<std::uint32_t>(element_size));
-        if (backward) {
-            rdi -= element_size;
-        } else {
-            rdi += element_size;
-        }
-    }
-    WriteGuestGpr64(state, LsxGpr::Rdi, rdi);
-    if (repeat) {
-        WriteGuestGpr64(state, LsxGpr::Rcx, 0);
+namespace {
+std::uint32_t DecodeComparisonElementBytes(const LsxMnemonicCode encoded) {
+    switch (static_cast<X86Mnemonic>(encoded)) {
+    case X86_MNEMONIC_CMPSB: return 1;
+    case X86_MNEMONIC_CMPSW: return 2;
+    case X86_MNEMONIC_CMPSD: return 4;
+    case X86_MNEMONIC_CMPSQ: return 8;
+    default: return 0;
     }
 }
+
+bool RepeatComparisonAllowsNext(const bool repeat_while_equal,
+                                const bool repeat_while_different,
+                                const bool values_are_equal) {
+    if (!repeat_while_equal && !repeat_while_different) {
+        return false;
+    }
+    return repeat_while_equal ? values_are_equal : !values_are_equal;
+}
+} // namespace
 
 void CompareStringUnit(LsxMachineImage& state, const LsxMnemonicCode mnemonic_code,
-          const bool repeat_equal,
-          const bool repeat_not_equal) {
-    std::uint64_t element_size = 0;
-    const auto mnemonic = static_cast<X86Mnemonic>(mnemonic_code);
-    switch (mnemonic) {
-    case X86_MNEMONIC_CMPSB:
-        element_size = 1;
-        break;
-    case X86_MNEMONIC_CMPSW:
-        element_size = 2;
-        break;
-    case X86_MNEMONIC_CMPSD:
-        element_size = 4;
-        break;
-    case X86_MNEMONIC_CMPSQ:
-        element_size = 8;
-        break;
-    default:
+                       const bool repeat_equal, const bool repeat_not_equal) {
+    const auto element_bytes = DecodeComparisonElementBytes(mnemonic_code);
+    if (element_bytes == 0) {
         return;
     }
-    std::uint64_t count = (repeat_equal || repeat_not_equal) ? ReadGuestGpr64(state, LsxGpr::Rcx) : 1;
-    if (count == 0) {
-        return;
-    }
-
-    std::uint64_t rsi = ReadGuestGpr64(state, LsxGpr::Rsi);
-    std::uint64_t rdi = ReadGuestGpr64(state, LsxGpr::Rdi);
-    const bool backward = (state.rflags & kFlagDf) != 0;
-    const std::uint32_t size_bits = static_cast<std::uint32_t>(element_size * 8u);
-    while (count != 0) {
-        const std::uint64_t lhs = LoadGuestScalar(rsi, static_cast<std::uint32_t>(element_size));
-        const std::uint64_t rhs = LoadGuestScalar(rdi, static_cast<std::uint32_t>(element_size));
-        const std::uint64_t result = TruncateToOperandWidth(lhs - rhs, size_bits);
-        RecordIntegerSubtractionFlags(state, lhs, rhs, result, size_bits);
-
-        if (backward) {
-            rsi -= element_size;
-            rdi -= element_size;
-        } else {
-            rsi += element_size;
-            rdi += element_size;
-        }
-        --count;
-
-        if (repeat_equal || repeat_not_equal) {
-            const bool equal = (state.rflags & kFlagZf) != 0;
-            if ((repeat_equal && !equal) || (repeat_not_equal && equal)) {
-                break;
-            }
+    const bool repeats = repeat_equal || repeat_not_equal;
+    auto remaining = repeats ? ReadGuestGpr64(state, LsxGpr::Rcx) : UINT64_C(1);
+    std::array<std::uint64_t, 2> cursor{
+        ReadGuestGpr64(state, LsxGpr::Rsi), ReadGuestGpr64(state, LsxGpr::Rdi)};
+    const auto signed_step = (state.rflags & kFlagDf) != 0
+                                 ? std::uint64_t{0} - element_bytes
+                                 : static_cast<std::uint64_t>(element_bytes);
+    const auto operand_width = element_bytes << 3u;
+    while (remaining != 0) {
+        const std::array<std::uint64_t, 2> operands{
+            LoadGuestScalar(cursor[0], element_bytes),
+            LoadGuestScalar(cursor[1], element_bytes)};
+        const auto difference = TruncateToOperandWidth(operands[0] - operands[1], operand_width);
+        RecordIntegerSubtractionFlags(state, operands[0], operands[1], difference, operand_width);
+        std::transform(cursor.begin(), cursor.end(), cursor.begin(),
+                       [signed_step](const std::uint64_t address) { return address + signed_step; });
+        --remaining;
+        const bool equal = (state.rflags & kFlagZf) != 0;
+        if (remaining == 0 || !RepeatComparisonAllowsNext(repeat_equal, repeat_not_equal, equal)) {
+            break;
         }
     }
-
-    WriteGuestGpr64(state, LsxGpr::Rsi, rsi);
-    WriteGuestGpr64(state, LsxGpr::Rdi, rdi);
-    if (repeat_equal || repeat_not_equal) {
-        WriteGuestGpr64(state, LsxGpr::Rcx, count);
+    WriteGuestGpr64(state, LsxGpr::Rsi, cursor[0]);
+    WriteGuestGpr64(state, LsxGpr::Rdi, cursor[1]);
+    if (repeats) {
+        WriteGuestGpr64(state, LsxGpr::Rcx, remaining);
     }
 }
+
+namespace {
+bool IsProtectedHostCmpxchgTarget(void* target, const std::uint32_t width, const bool log) {
+    std::uint64_t image_begin = 0, image_end = 0;
+    const auto address = reinterpret_cast<std::uint64_t>(target);
+    const bool protected_target = JitOwnHostImageRange(image_begin, image_end) &&
+                                  address >= image_begin &&
+                                  address < image_end + UINT64_C(0x30000000);
+    if (!protected_target || !log) {
+        return protected_target;
+    }
+    static std::atomic<std::uint32_t> reports{0};
+    const auto report = reports.fetch_add(1, std::memory_order_relaxed);
+    if (report >= 64) {
+        return true;
+    }
+    const auto rip = CurrentPublishedFaultIr() != nullptr
+                         ? CurrentPublishedFaultIr()->guest_rip
+                         : g_active_block_rip;
+    JitLog("[EXECUTOR_JIT_CMPXCHG_INTO_HOST_IMAGE] n=%u target=0x%llx sizeBits=%u "
+           "rip=0x%llx image=[0x%llx,0x%llx)", report,
+           static_cast<unsigned long long>(address), width,
+           static_cast<unsigned long long>(rip),
+           static_cast<unsigned long long>(image_begin),
+           static_cast<unsigned long long>(image_end));
+    if (std::FILE* file = std::fopen(
+            "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a")) {
+        std::fprintf(file, "CMPXCHG_INTO_HOST_IMAGE target=0x%llx rip=0x%llx\n",
+                     static_cast<unsigned long long>(address),
+                     static_cast<unsigned long long>(rip));
+        std::fclose(file);
+    }
+    return true;
+}
+
+template <typename Lane>
+bool CompareExchangeLane(void* target, const std::uint64_t expected_value,
+                         const std::uint64_t replacement, std::uint64_t& observed) {
+    Lane expected = static_cast<Lane>(expected_value);
+    const bool exchanged = __atomic_compare_exchange_n(
+        reinterpret_cast<Lane*>(target), &expected, static_cast<Lane>(replacement), false,
+        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    observed = expected;
+    return exchanged;
+}
+
+bool TryCompareExchangeLane(void* target, const std::uint64_t expected,
+                            const std::uint64_t replacement, const std::uint32_t width,
+                            std::uint64_t& observed) {
+    switch (width) {
+    case 8: return CompareExchangeLane<std::uint8_t>(target, expected, replacement, observed);
+    case 16: return CompareExchangeLane<std::uint16_t>(target, expected, replacement, observed);
+    case 32: return CompareExchangeLane<std::uint32_t>(target, expected, replacement, observed);
+    case 64: return CompareExchangeLane<std::uint64_t>(target, expected, replacement, observed);
+    default: return false;
+    }
+}
+
+void PublishCompareExchangeResult(LsxMachineImage& state, const std::uint64_t expected,
+                                  const std::uint64_t observed, const std::uint32_t width,
+                                  const bool exchanged) {
+    const auto outcome = EvaluateIntegerAlu(expected, observed, AluOp::Compare, width);
+    PublishIntegerAluFlags(state, expected, observed, outcome, width);
+    if (!exchanged) {
+        StoreStateLane(state, offsetof(LsxMachineImage, gpr), observed, width);
+    }
+}
+} // namespace
 
 void CompareExchangeValue(LsxMachineImage& state, void* target, const bool target_is_register_lane,
-             const std::uint32_t target_shift, const std::size_t src_state_offset,
-             const std::uint32_t src_shift, const std::uint32_t size_bits) {
+                          const std::uint32_t target_shift, const std::size_t src_state_offset,
+                          const std::uint32_t src_shift, const std::uint32_t size_bits) {
     if (target == nullptr || size_bits == 0) {
         return;
     }
-    const std::uint32_t size_bytes = size_bits / 8;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-
-    std::uint64_t dest_value = 0;
+    const auto mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+    std::uint64_t observed = 0;
     if (target_is_register_lane) {
-        dest_value = (LoadUnaligned<std::uint64_t>(target) >> target_shift) & mask;
+        observed = (LoadUnaligned<std::uint64_t>(target) >> target_shift) & mask;
     } else {
-        std::memcpy(&dest_value, target, size_bytes);
-        dest_value &= mask;
+        std::memcpy(&observed, target, size_bits >> 3u);
+        observed &= mask;
     }
+    const auto expected = ReadGuestGpr64(state, LsxGpr::Rax) & mask;
+    const auto replacement = (LoadStateLane(state, src_state_offset) >> src_shift) & mask;
+    const bool exchanged = expected == observed;
+    if (exchanged && target_is_register_lane) {
+        const auto old_lane = LoadUnaligned<std::uint64_t>(target);
+        const auto field_mask = mask << target_shift;
+        const auto new_lane = size_bits == 32 && target_shift == 0
+                                  ? replacement
+                                  : (old_lane & ~field_mask) | (replacement << target_shift);
+        StoreUnaligned<std::uint64_t>(target, new_lane);
+    } else if (exchanged && !IsProtectedHostCmpxchgTarget(target, size_bits, true)) {
+        std::memcpy(target, &replacement, size_bits >> 3u);
+    }
+    PublishCompareExchangeResult(state, expected, observed, size_bits, exchanged);
+}
 
-    const std::uint64_t accumulator = ReadGuestGpr64(state, LsxGpr::Rax) & mask;
-    const std::uint64_t src_value = (LoadStateLane(state, src_state_offset) >> src_shift) & mask;
-    const std::uint64_t cmp_result = TruncateToOperandWidth(accumulator - dest_value, size_bits);
-    RecordIntegerSubtractionFlags(state, accumulator, dest_value, cmp_result, size_bits);
-
-    if (accumulator == dest_value) {
-        if (target_is_register_lane) {
-            if (size_bits == 32 && target_shift == 0) {
-                StoreUnaligned<std::uint64_t>(target, src_value & mask);
-            } else {
-                const std::uint64_t raw = LoadUnaligned<std::uint64_t>(target);
-                const std::uint64_t lane_mask = mask << target_shift;
-                StoreUnaligned<std::uint64_t>(
-                    target, (raw & ~lane_mask) | ((src_value & mask) << target_shift));
-            }
+void CompareExchangeMemoryAtomic(LsxMachineImage& state, void* target,
+                                 const bool target_is_register_lane,
+                                 const std::uint32_t target_shift,
+                                 const std::size_t src_state_offset,
+                                 const std::uint32_t src_shift,
+                                 const std::uint32_t size_bits) {
+    const auto bytes = size_bits >> 3u;
+    const auto address = reinterpret_cast<std::uintptr_t>(target);
+    const bool needs_serial_fallback = bytes == 0 || (address & (bytes - 1u)) != 0;
+    if (target == nullptr || target_is_register_lane || needs_serial_fallback ||
+        IsProtectedHostCmpxchgTarget(target, size_bits, false)) {
+        if (target != nullptr && !target_is_register_lane && needs_serial_fallback) {
+            std::scoped_lock serialized{g_locked_memory_mutex};
+            CompareExchangeValue(state, target, false, 0, src_state_offset, src_shift, size_bits);
         } else {
-            // Same host-image guard as ExchangeGuestMemoryAtomically: an atomic guest compare-exchange used
-            // for mutex acquisition must
-            // never atomic-write into our own loaded .so image. Skip the store (flags already set so
-            // the guest sees the CAS as succeeded) instead of corrupting a host mutex/BSS object.
-            std::uint64_t img_lo = 0, img_hi = 0;
-            const std::uint64_t taddr = reinterpret_cast<std::uint64_t>(target);
-            if (JitOwnHostImageRange(img_lo, img_hi) && taddr >= img_lo &&
-                taddr < img_hi + 0x30000000ull) {
-                static std::atomic<std::uint32_t> b{0};
-                const std::uint32_t n = b.fetch_add(1, std::memory_order_relaxed);
-                if (n < 64) {
-                    JitLog("[EXECUTOR_JIT_CMPXCHG_INTO_HOST_IMAGE] n=%u target=0x%llx "
-                                "sizeBits=%u rip=0x%llx image=[0x%llx,0x%llx)",
-                                n, static_cast<unsigned long long>(taddr), size_bits,
-                                static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
-                                                                    ? CurrentPublishedFaultIr()->guest_rip
-                                                                    : g_active_block_rip),
-                                static_cast<unsigned long long>(img_lo),
-                                static_cast<unsigned long long>(img_hi));
-                    std::FILE* cf = std::fopen("/data/data/app.lsx4.android/files/"
-                                               "lsx4-home/jit-checkfail.txt",
-                                               "a");
-                    if (cf != nullptr) {
-                        std::fprintf(cf, "CMPXCHG_INTO_HOST_IMAGE target=0x%llx rip=0x%llx\n",
-                                     static_cast<unsigned long long>(taddr),
-                                     static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
-                                                                         ? CurrentPublishedFaultIr()->guest_rip
-                                                                         : g_active_block_rip));
-                        std::fclose(cf);
-                    }
-                }
-            } else {
-                std::memcpy(target, &src_value, size_bytes);
-            }
+            CompareExchangeValue(state, target, target_is_register_lane, target_shift,
+                                 src_state_offset, src_shift, size_bits);
         }
         return;
     }
-
-    StoreStateLane(state, offsetof(LsxMachineImage, gpr), dest_value, size_bits);
-}
-
-void CompareExchangeMemoryAtomic(LsxMachineImage& state, void* target, const bool target_is_register_lane,
-                   const std::uint32_t target_shift, const std::size_t src_state_offset,
-                   const std::uint32_t src_shift, const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
-        return;
-    }
-    if (target_is_register_lane) {
-        CompareExchangeValue(state, target, true, target_shift, src_state_offset, src_shift,
-                size_bits);
-        return;
-    }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    const auto address = reinterpret_cast<std::uintptr_t>(target);
-    if (size_bytes == 0 || (address & (size_bytes - 1u)) != 0) {
-        // X86 permits a split/unaligned locked operand. AArch64 atomics do not, so retain the
-        // serialized fallback only for this rare form.
-        std::lock_guard lock{g_locked_memory_mutex};
-        CompareExchangeValue(state, target, false, 0, src_state_offset, src_shift, size_bits);
-        return;
-    }
-
-    std::uint64_t img_lo = 0;
-    std::uint64_t img_hi = 0;
-    if (JitOwnHostImageRange(img_lo, img_hi) && address >= img_lo &&
-        address < img_hi + 0x30000000ull) {
-        // Reuse the guarded non-atomic path: it observes the host value and refuses the write.
-        CompareExchangeValue(state, target, false, 0, src_state_offset, src_shift, size_bits);
-        return;
-    }
-
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t accumulator = ReadGuestGpr64(state, LsxGpr::Rax) & mask;
-    const std::uint64_t desired =
-        (LoadStateLane(state, src_state_offset) >> src_shift) & mask;
-    std::uint64_t observed = accumulator;
-    bool exchanged = false;
-    switch (size_bits) {
-    case 8: {
-        std::uint8_t expected = static_cast<std::uint8_t>(accumulator);
-        exchanged = __atomic_compare_exchange_n(
-            reinterpret_cast<std::uint8_t*>(target), &expected,
-            static_cast<std::uint8_t>(desired), false, __ATOMIC_SEQ_CST,
-            __ATOMIC_SEQ_CST);
-        observed = expected;
-        break;
-    }
-    case 16: {
-        std::uint16_t expected = static_cast<std::uint16_t>(accumulator);
-        exchanged = __atomic_compare_exchange_n(
-            reinterpret_cast<std::uint16_t*>(target), &expected,
-            static_cast<std::uint16_t>(desired), false, __ATOMIC_SEQ_CST,
-            __ATOMIC_SEQ_CST);
-        observed = expected;
-        break;
-    }
-    case 32: {
-        std::uint32_t expected = static_cast<std::uint32_t>(accumulator);
-        exchanged = __atomic_compare_exchange_n(
-            reinterpret_cast<std::uint32_t*>(target), &expected,
-            static_cast<std::uint32_t>(desired), false, __ATOMIC_SEQ_CST,
-            __ATOMIC_SEQ_CST);
-        observed = expected;
-        break;
-    }
-    case 64: {
-        std::uint64_t expected = accumulator;
-        exchanged = __atomic_compare_exchange_n(
-            reinterpret_cast<std::uint64_t*>(target), &expected, desired, false,
-            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-        observed = expected;
-        break;
-    }
-    default:
-        return;
-    }
-
-    const std::uint64_t cmp_result = TruncateToOperandWidth(accumulator - observed, size_bits);
-    RecordIntegerSubtractionFlags(state, accumulator, observed, cmp_result, size_bits);
-    if (!exchanged) {
-        StoreStateLane(state, offsetof(LsxMachineImage, gpr), observed, size_bits);
-    }
+    const auto mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+    const auto expected = ReadGuestGpr64(state, LsxGpr::Rax) & mask;
+    const auto replacement = (LoadStateLane(state, src_state_offset) >> src_shift) & mask;
+    std::uint64_t observed = expected;
+    const bool exchanged = TryCompareExchangeLane(target, expected, replacement,
+                                                  size_bits, observed);
+    PublishCompareExchangeResult(state, expected, observed, size_bits, exchanged);
 }
 
 void ExtractContiguousBits(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
            const std::uint32_t control, const std::uint32_t size_bits) {
-    const std::uint32_t start = control & 0xff;
-    const std::uint32_t length = (control >> 8) & 0xff;
-    std::uint64_t result = 0;
-    if (start < size_bits && length != 0) {
-        const std::uint32_t available = size_bits - start;
-        const std::uint32_t effective_length = length < available ? length : available;
-        result = TruncateToOperandWidth(value >> start, effective_length);
-    }
-    StoreStateLane(state, state_offset, result, size_bits);
-    RecordLogicalResultFlags(state, result, size_bits);
+    const std::array<std::uint32_t, 2> field{
+        control & UINT32_C(0xff), (control >> 8u) & UINT32_C(0xff)};
+    const bool start_is_valid = field[0] < size_bits;
+    const auto selected_width = start_is_valid
+                                    ? std::min(field[1], size_bits - field[0])
+                                    : 0u;
+    const auto shifted = start_is_valid ? value >> field[0] : std::uint64_t{0};
+    const auto extracted = TruncateToOperandWidth(shifted, selected_width);
+    RecordLogicalResultFlags(state, extracted, size_bits);
+    StoreStateLane(state, state_offset, extracted, size_bits);
 }
 
 void ClearLeastSignificantSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
           const std::uint32_t size_bits) {
-    const std::uint64_t source = TruncateToOperandWidth(value, size_bits);
-    const std::uint64_t result = TruncateToOperandWidth(source & (source - 1), size_bits);
-    constexpr std::uint64_t clear_mask = kFlagCf | kFlagZf | kFlagSf | kFlagOf;
-    std::uint64_t flags = state.rflags & ~clear_mask;
-    if (source == 0) {
-        flags |= kFlagCf;
-    }
-    if (result == 0) {
-        flags |= kFlagZf;
-    }
-    if (size_bits != 0 && (result & (std::uint64_t{1} << (size_bits - 1))) != 0) {
-        flags |= kFlagSf;
-    }
-    state.rflags = flags;
-    StoreStateLane(state, state_offset, result, size_bits);
+    ApplyLowestBitTransform(state, state_offset, value, size_bits,
+                            LowestBitTransform::Clear);
 }
 
 void ProbeRegisterBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t bit_index,
            const std::uint32_t size_bits) {
-    if (size_bits == 0) {
-        return;
+    const auto normalized_bit = size_bits == 0 ? 0 : bit_index % size_bits;
+    const auto carry_value = size_bits == 0
+                                 ? std::uint64_t{0}
+                                 : (LoadStateLane(state, state_offset) >> normalized_bit) & 1u;
+    if (size_bits != 0) {
+        state.rflags ^= (state.rflags ^ carry_value) & kFlagCf;
     }
-    const std::uint64_t value = LoadStateLane(state, state_offset);
-    const std::uint64_t bit = (value >> (bit_index % size_bits)) & 1u;
-    state.rflags = (state.rflags & ~kFlagCf) | bit;
 }
 
 namespace {
@@ -34011,6 +33935,45 @@ std::uint64_t ApplyBitTestOp(const std::uint64_t value, const std::uint64_t bit_
     }
     return value;
 }
+
+struct BitMemoryLocation {
+    void* lane{};
+    std::uint32_t byte_count{};
+    std::uint32_t bit{};
+};
+
+BitMemoryLocation ResolveBitMemoryLocation(const std::uintptr_t base_address,
+                                           const std::uint64_t encoded_index,
+                                           const bool unsigned_index,
+                                           const std::uint32_t width) {
+    if (base_address == 0 || width == 0 || (width & 7u) != 0) {
+        return {};
+    }
+    const auto bytes = width >> 3u;
+    std::int64_t lane_index = 0;
+    std::int64_t local_bit = 0;
+    if (unsigned_index) {
+        lane_index = static_cast<std::int64_t>(encoded_index / width);
+        local_bit = static_cast<std::int64_t>(encoded_index % width);
+    } else {
+        const auto signed_index = std::bit_cast<std::int64_t>(encoded_index);
+        lane_index = signed_index / static_cast<std::int64_t>(width);
+        local_bit = signed_index % static_cast<std::int64_t>(width);
+        if (local_bit < 0) {
+            local_bit += width;
+            --lane_index;
+        }
+    }
+    auto* base = reinterpret_cast<std::uint8_t*>(base_address);
+    return {base + lane_index * static_cast<std::int64_t>(bytes), bytes,
+            static_cast<std::uint32_t>(local_bit)};
+}
+
+void PublishBitCarry(LsxMachineImage& state, const std::uint64_t lane,
+                     const std::uint32_t bit) {
+    const auto carry = (lane >> bit) & UINT64_C(1);
+    state.rflags = (state.rflags & ~kFlagCf) | carry;
+}
 } // namespace
 
 void ModifyRegisterBit(LsxMachineImage& state, const std::uintptr_t state_offset_or_mem_ptr,
@@ -34020,63 +33983,38 @@ void ModifyRegisterBit(LsxMachineImage& state, const std::uintptr_t state_offset
     if (size_bits == 0) {
         return;
     }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    std::uint64_t value = 0;
-    std::uint64_t local_bit = 0;
-    void* mem_target = nullptr;
-
-    if (target_is_memory) {
-        if (state_offset_or_mem_ptr == 0 || size_bytes == 0) {
-            return;
-        }
-
-        const auto* base = reinterpret_cast<const std::uint8_t*>(state_offset_or_mem_ptr);
-        if (unsigned_memory_index) {
-            const std::uint64_t element_index = bit_index / size_bits;
-            local_bit = bit_index - element_index * size_bits;
-            mem_target = const_cast<std::uint8_t*>(base) + element_index * size_bytes;
-        } else {
-            const auto signed_index = static_cast<std::int64_t>(bit_index);
-            std::int64_t element_index = signed_index / static_cast<std::int64_t>(size_bits);
-            std::int64_t signed_bit = signed_index % static_cast<std::int64_t>(size_bits);
-            if (signed_bit < 0) {
-                --element_index;
-                signed_bit += static_cast<std::int64_t>(size_bits);
-            }
-            local_bit = static_cast<std::uint64_t>(signed_bit);
-            mem_target = const_cast<std::uint8_t*>(base) + element_index * static_cast<std::int64_t>(size_bytes);
-        }
-
-        std::memcpy(&value, mem_target, size_bytes);
-    } else {
-        local_bit = bit_index % size_bits;
-        value = LoadStateLane(state, state_offset_or_mem_ptr);
-        value &= TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
+    const auto location = target_is_memory
+                              ? ResolveBitMemoryLocation(state_offset_or_mem_ptr, bit_index,
+                                                         unsigned_memory_index, size_bits)
+                              : BitMemoryLocation{nullptr, size_bits >> 3u,
+                                                  static_cast<std::uint32_t>(bit_index % size_bits)};
+    if (target_is_memory && location.lane == nullptr) {
+        return;
     }
-
-    const std::uint64_t bit = (value >> local_bit) & 1u;
-    state.rflags = (state.rflags & ~kFlagCf) | bit;
+    std::uint64_t before = 0;
+    if (target_is_memory) {
+        std::memcpy(&before, location.lane, location.byte_count);
+    } else {
+        before = TruncateToOperandWidth(LoadStateLane(state, state_offset_or_mem_ptr), size_bits);
+    }
+    PublishBitCarry(state, before, location.bit);
     if (op == BitTestOp::Inspect) {
         return;
     }
-
-    const std::uint64_t bit_mask = std::uint64_t{1} << local_bit;
-    std::uint64_t result = ApplyBitTestOp(value, bit_mask, op);
-
+    const auto changed = ApplyBitTestOp(before, UINT64_C(1) << location.bit, op);
     if (target_is_memory) {
-        std::memcpy(mem_target, &result, size_bytes);
+        std::memcpy(location.lane, &changed, location.byte_count);
         return;
     }
-
+    auto register_result = changed;
     if (size_bits < 32) {
-        const std::uint64_t low_mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-        const std::uint64_t raw = LoadStateLane(state, state_offset_or_mem_ptr);
-        result = (raw & ~low_mask) | (result & low_mask);
+        const auto low_mask = TruncateToOperandWidth(UINT64_MAX, size_bits);
+        register_result = (LoadStateLane(state, state_offset_or_mem_ptr) & ~low_mask) |
+                          (changed & low_mask);
     } else {
-        result = TruncateToOperandWidth(result, size_bits);
+        register_result = TruncateToOperandWidth(changed, size_bits);
     }
-    StoreStateLane(state, state_offset_or_mem_ptr, result, size_bits);
+    StoreStateLane(state, state_offset_or_mem_ptr, register_result, size_bits);
 }
 
 void ModifyAtomicMemoryBit(LsxMachineImage& state, const std::uintptr_t state_offset_or_mem_ptr,
@@ -34088,270 +34026,218 @@ void ModifyAtomicMemoryBit(LsxMachineImage& state, const std::uintptr_t state_of
                 unsigned_memory_index, size_bits, op);
         return;
     }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    auto* base = reinterpret_cast<std::uint8_t*>(state_offset_or_mem_ptr);
-    std::uint64_t local_bit = 0;
-    void* mem_target = nullptr;
-    if (unsigned_memory_index) {
-        const std::uint64_t element_index = bit_index / size_bits;
-        local_bit = bit_index - element_index * size_bits;
-        mem_target = base + element_index * size_bytes;
-    } else {
-        const auto signed_index = static_cast<std::int64_t>(bit_index);
-        std::int64_t element_index = signed_index / static_cast<std::int64_t>(size_bits);
-        std::int64_t signed_bit = signed_index % static_cast<std::int64_t>(size_bits);
-        if (signed_bit < 0) {
-            --element_index;
-            signed_bit += static_cast<std::int64_t>(size_bits);
-        }
-        local_bit = static_cast<std::uint64_t>(signed_bit);
-        mem_target = base + element_index * static_cast<std::int64_t>(size_bytes);
+    const auto location = ResolveBitMemoryLocation(state_offset_or_mem_ptr, bit_index,
+                                                   unsigned_memory_index, size_bits);
+    if (location.lane == nullptr) {
+        return;
     }
-
-    const std::uint64_t bit_mask = std::uint64_t{1} << local_bit;
-    std::uint64_t previous = 0;
-    std::uint64_t result = 0;
-    bool completed = false;
+    const auto bit_mask = UINT64_C(1) << location.bit;
+    std::uint64_t before = 0, after = 0;
     if (op == BitTestOp::Inspect) {
-        completed = AtomicLoad(mem_target, size_bits, previous);
-        result = previous;
-    } else {
-        completed = AtomicReadModifyWrite(
-            mem_target, size_bits,
-            [bit_mask, op](const std::uint64_t observed) {
-                return ApplyBitTestOp(observed, bit_mask, op);
-            },
-            previous, result);
-    }
-    if (!completed) {
-        std::lock_guard lock{g_locked_memory_mutex};
-        std::memcpy(&previous, mem_target, size_bytes);
-        result = ApplyBitTestOp(previous, bit_mask, op);
-        if (op != BitTestOp::Inspect) {
-            std::memcpy(mem_target, &result, size_bytes);
+        if (!AtomicLoad(location.lane, size_bits, before)) {
+            std::scoped_lock serialized{g_locked_memory_mutex};
+            std::memcpy(&before, location.lane, location.byte_count);
         }
+    } else {
+        (void)CommitAtomicMutation(location.lane, size_bits,
+                                   [=](const std::uint64_t lane) {
+                                       return ApplyBitTestOp(lane, bit_mask, op);
+                                   },
+                                   before, after);
     }
-    state.rflags = (state.rflags & ~kFlagCf) |
-                   ((previous >> local_bit) & 1u);
+    PublishBitCarry(state, before, location.bit);
 }
 
 void LocateSetBit(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
              const bool reverse, const std::uint32_t size_bits) {
-    const std::uint64_t source = TruncateToOperandWidth(value, size_bits);
-    if (source == 0) {
+    const auto source = TruncateToOperandWidth(value, size_bits);
+    if (!source) {
         state.rflags |= kFlagZf;
         return;
     }
-
-    std::uint64_t result = 0;
-    if (reverse) {
-        for (std::int32_t bit = static_cast<std::int32_t>(size_bits) - 1; bit >= 0; --bit) {
-            if (((source >> bit) & 1u) != 0) {
-                result = static_cast<std::uint64_t>(bit);
-                break;
-            }
-        }
-    } else {
-        while (((source >> result) & 1u) == 0) {
-            ++result;
-        }
-    }
-    state.rflags &= ~kFlagZf;
-    StoreStateLane(state, state_offset, result, size_bits);
+    const auto low_position = static_cast<std::uint64_t>(std::countr_zero(source));
+    const auto high_position = UINT64_C(63) - std::countl_zero(source);
+    StoreStateLane(state, state_offset, reverse ? high_position : low_position, size_bits);
+    state.rflags = state.rflags & ~kFlagZf;
 }
 
 void ExchangeAddRegister(LsxMachineImage& state, const std::size_t dst_state_offset, const std::size_t src_state_offset,
           const std::uint32_t size_bits) {
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t dst = LoadStateLane(state, dst_state_offset) & mask;
-    const std::uint64_t src = LoadStateLane(state, src_state_offset) & mask;
-    const std::uint64_t result = TruncateToOperandWidth(dst + src, size_bits);
-    RecordIntegerAdditionFlags(state, dst, src, result, size_bits);
-    StoreStateLane(state, src_state_offset, dst, size_bits);
-    StoreStateLane(state, dst_state_offset, result, size_bits);
+    const auto destination_before = TruncateToOperandWidth(
+        LoadStateLane(state, dst_state_offset), size_bits);
+    const auto source_before = TruncateToOperandWidth(
+        LoadStateLane(state, src_state_offset), size_bits);
+    const auto evaluated = EvaluateIntegerAlu(destination_before, source_before,
+                                               AluOp::Add, size_bits);
+    PublishIntegerAluFlags(state, destination_before, source_before, evaluated, size_bits);
+    const std::array<std::pair<std::size_t, std::uint64_t>, 2> writes{{
+        {src_state_offset, destination_before}, {dst_state_offset, evaluated.value}}};
+    for (const auto& [offset, lane] : writes) {
+        StoreStateLane(state, offset, lane, size_bits);
+    }
 }
 
-void ExchangeAddMemory(LsxMachineImage& state, void* target, const std::size_t src_state_offset,
-             const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
-        return;
-    }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::uint64_t dst = 0;
-    std::memcpy(&dst, target, size_bytes);
-    dst &= mask;
-    const std::uint64_t src = LoadStateLane(state, src_state_offset) & mask;
-    const std::uint64_t result = TruncateToOperandWidth(dst + src, size_bits);
-    RecordIntegerAdditionFlags(state, dst, src, result, size_bits);
-    StoreStateLane(state, src_state_offset, dst, size_bits);
-    std::memcpy(target, &result, size_bytes);
+namespace {
+template <typename Lane>
+std::uint64_t FetchAddLane(void* target, const std::uint64_t addend) {
+    return __atomic_fetch_add(reinterpret_cast<Lane*>(target), static_cast<Lane>(addend),
+                              __ATOMIC_SEQ_CST);
 }
 
-void ExchangeAddMemoryAtomic(LsxMachineImage& state, void* target, const std::size_t src_state_offset,
-                   const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
+bool TryFetchAddLane(void* target, const std::uint64_t addend, const std::uint32_t width,
+                     std::uint64_t& previous) {
+    const auto bytes = width >> 3u;
+    if (target == nullptr || bytes == 0 ||
+        (reinterpret_cast<std::uintptr_t>(target) & (bytes - 1u)) != 0) {
+        return false;
+    }
+    switch (width) {
+    case 8: previous = FetchAddLane<std::uint8_t>(target, addend); break;
+    case 16: previous = FetchAddLane<std::uint16_t>(target, addend); break;
+    case 32: previous = FetchAddLane<std::uint32_t>(target, addend); break;
+    case 64: previous = FetchAddLane<std::uint64_t>(target, addend); break;
+    default: return false;
+    }
+    return true;
+}
+
+void ExecuteMemoryExchangeAdd(LsxMachineImage& state, void* target,
+                              const std::size_t source_offset, const std::uint32_t width,
+                              const bool atomic) {
+    if (target == nullptr || width == 0 || width > 64 || (width & 7u) != 0) {
         return;
     }
-
-    const std::uint32_t size_bytes = size_bits / 8;
-    const auto address = reinterpret_cast<std::uintptr_t>(target);
-    if ((size_bits != 8 && size_bits != 16 && size_bits != 32 && size_bits != 64) ||
-        size_bytes == 0 || (address & (size_bytes - 1u)) != 0) {
-        // AArch64 atomics require natural alignment. X86 also permits a split locked operand;
-        // retain the serialized byte-copy implementation for that uncommon form.
-        std::lock_guard lock{g_locked_memory_mutex};
-        ExchangeAddMemory(state, target, src_state_offset, size_bits);
-        return;
+    const auto source = TruncateToOperandWidth(LoadStateLane(state, source_offset), width);
+    std::uint64_t before = 0;
+    if (!atomic) {
+        std::memcpy(&before, target, width >> 3u);
+        const auto after = TruncateToOperandWidth(before + source, width);
+        std::memcpy(target, &after, width >> 3u);
+    } else if (!TryFetchAddLane(target, source, width, before)) {
+        std::scoped_lock serialized{g_locked_memory_mutex};
+        std::memcpy(&before, target, width >> 3u);
+        const auto after = TruncateToOperandWidth(before + source, width);
+        std::memcpy(target, &after, width >> 3u);
     }
+    before = TruncateToOperandWidth(before, width);
+    const auto evaluated = EvaluateIntegerAlu(before, source, AluOp::Add, width);
+    PublishIntegerAluFlags(state, before, source, evaluated, width);
+    StoreStateLane(state, source_offset, before, width);
+}
+} // namespace
 
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t source = LoadStateLane(state, src_state_offset) & mask;
-    std::uint64_t previous = 0;
-    switch (size_bits) {
-    case 8:
-        previous = __atomic_fetch_add(
-            reinterpret_cast<std::uint8_t*>(target), static_cast<std::uint8_t>(source),
-            __ATOMIC_SEQ_CST);
-        break;
-    case 16:
-        previous = __atomic_fetch_add(
-            reinterpret_cast<std::uint16_t*>(target), static_cast<std::uint16_t>(source),
-            __ATOMIC_SEQ_CST);
-        break;
-    case 32:
-        previous = __atomic_fetch_add(
-            reinterpret_cast<std::uint32_t*>(target), static_cast<std::uint32_t>(source),
-            __ATOMIC_SEQ_CST);
-        break;
-    case 64:
-        previous = __atomic_fetch_add(
-            reinterpret_cast<std::uint64_t*>(target), source, __ATOMIC_SEQ_CST);
-        break;
-    default:
-        return;
-    }
+void ExchangeAddMemory(LsxMachineImage& state, void* target,
+                       const std::size_t src_state_offset, const std::uint32_t size_bits) {
+    ExecuteMemoryExchangeAdd(state, target, src_state_offset, size_bits, false);
+}
 
-    previous &= mask;
-    const std::uint64_t result = TruncateToOperandWidth(previous + source, size_bits);
-    RecordIntegerAdditionFlags(state, previous, source, result, size_bits);
-    // XADD returns the pre-add destination through its register operand.
-    StoreStateLane(state, src_state_offset, previous, size_bits);
+void ExchangeAddMemoryAtomic(LsxMachineImage& state, void* target,
+                             const std::size_t src_state_offset,
+                             const std::uint32_t size_bits) {
+    ExecuteMemoryExchangeAdd(state, target, src_state_offset, size_bits, true);
 }
 
 void CountSetBits(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
             const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits) {
-    const std::uint64_t masked_source = TruncateToOperandWidth(value, src_size_bits);
-    const std::uint64_t result = static_cast<std::uint64_t>(__builtin_popcountll(masked_source));
-    StoreStateLane(state, state_offset, result, dst_size_bits);
-    StorePopcntFlags(state, masked_source);
+    const auto source = TruncateToOperandWidth(value, src_size_bits);
+    const auto population = static_cast<std::uint64_t>(std::popcount(source));
+    StorePopcntFlags(state, source);
+    StoreStateLane(state, state_offset, population, dst_size_bits);
 }
 
 void CountLeadingZeroes(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
            const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits) {
-    const std::uint64_t masked_source = TruncateToOperandWidth(value, src_size_bits);
-    std::uint64_t result = src_size_bits;
-    if (masked_source != 0) {
-        result = 0;
-        for (std::int32_t bit = static_cast<std::int32_t>(src_size_bits) - 1; bit >= 0; --bit) {
-            if (((masked_source >> bit) & 1u) != 0) {
-                break;
-            }
-            ++result;
-        }
-    }
-    StoreStateLane(state, state_offset, result, dst_size_bits);
-    StoreCountFlags(state, masked_source == 0, result);
+    const auto source = TruncateToOperandWidth(value, src_size_bits);
+    const auto host_leading = static_cast<std::uint32_t>(std::countl_zero(source));
+    const auto unused_host_bits = UINT32_C(64) - std::min(src_size_bits, UINT32_C(64));
+    const std::uint64_t guest_leading = source == 0
+                                            ? src_size_bits
+                                            : host_leading - unused_host_bits;
+    StoreCountFlags(state, source == 0, guest_leading);
+    StoreStateLane(state, state_offset, guest_leading, dst_size_bits);
 }
 
 void CountTrailingZeroes(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t value,
            const std::uint32_t src_size_bits, const std::uint32_t dst_size_bits) {
-    const std::uint64_t masked_source = TruncateToOperandWidth(value, src_size_bits);
-    std::uint64_t result = src_size_bits;
-    if (masked_source != 0) {
-        result = 0;
-        while (((masked_source >> result) & 1u) == 0) {
-            ++result;
-        }
-    }
-    StoreStateLane(state, state_offset, result, dst_size_bits);
-    StoreCountFlags(state, masked_source == 0, result);
+    const auto source = TruncateToOperandWidth(value, src_size_bits);
+    const auto trailing = source == 0
+                              ? static_cast<std::uint64_t>(src_size_bits)
+                              : static_cast<std::uint64_t>(std::countr_zero(source));
+    StoreCountFlags(state, source == 0, trailing);
+    StoreStateLane(state, state_offset, trailing, dst_size_bits);
 }
 
 void ReverseRegisterByteOrder(LsxMachineImage& state, const std::size_t state_offset, const std::uint32_t size_bits) {
-    const std::uint64_t value = LoadStateLane(state, state_offset);
-    const std::uint32_t bytes = size_bits == 64 ? 8 : 4;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    const std::uint64_t swapped = ByteSwapSized(value & mask, bytes);
-    StoreStateLane(state, state_offset, swapped, size_bits);
+    const auto bytes = size_bits == 64 ? UINT32_C(8) : UINT32_C(4);
+    const auto source = TruncateToOperandWidth(LoadStateLane(state, state_offset), size_bits);
+    std::uint64_t reversed = 0;
+    const EndianTransfer transfer{&source, &reversed, bytes};
+    if (CopyBytesInReverse(transfer)) {
+        StoreStateLane(state, state_offset, reversed, size_bits);
+    }
 }
 
 void ComplementMemoryOperand(void* target, const std::uint32_t size_bits) {
-    if (target == nullptr || size_bits == 0) {
+    const auto bytes = static_cast<std::size_t>(size_bits >> 3u);
+    if (target == nullptr || bytes == 0 || bytes > sizeof(std::uint64_t)) {
         return;
     }
-    const std::uint32_t size_bytes = size_bits / 8;
-    const std::uint64_t mask = TruncateToOperandWidth(~std::uint64_t{0}, size_bits);
-    std::uint64_t value = 0;
-    std::memcpy(&value, target, size_bytes);
-    value = (~value) & mask;
-    std::memcpy(target, &value, size_bytes);
+    std::array<std::uint8_t, sizeof(std::uint64_t)> image{};
+    std::memcpy(image.data(), target, bytes);
+    std::transform(image.begin(), image.begin() + bytes, image.begin(),
+                   [](const std::uint8_t lane) { return static_cast<std::uint8_t>(lane ^ 0xffu); });
+    std::memcpy(target, image.data(), bytes);
 }
+
+namespace {
+struct SignedProduct {
+    std::uint64_t low{};
+    bool overflow{};
+};
+
+template <typename Narrow, typename Wide>
+SignedProduct EvaluateNarrowSignedProduct(const std::uint64_t lhs, const std::uint64_t rhs) {
+    const Wide wide_product = static_cast<Wide>(static_cast<Narrow>(lhs)) *
+                              static_cast<Wide>(static_cast<Narrow>(rhs));
+    const auto narrowed = static_cast<Narrow>(wide_product);
+    return {static_cast<std::make_unsigned_t<Narrow>>(narrowed),
+            wide_product < static_cast<Wide>(std::numeric_limits<Narrow>::min()) ||
+                wide_product > static_cast<Wide>(std::numeric_limits<Narrow>::max())};
+}
+
+SignedProduct EvaluateSignedProduct(const std::uint64_t lhs, const std::uint64_t rhs,
+                                    const std::uint32_t width) {
+    switch (width) {
+    case 8:
+        return EvaluateNarrowSignedProduct<std::int8_t, std::int16_t>(lhs, rhs);
+    case 16:
+        return EvaluateNarrowSignedProduct<std::int16_t, std::int32_t>(lhs, rhs);
+    case 32:
+        return EvaluateNarrowSignedProduct<std::int32_t, std::int64_t>(lhs, rhs);
+    case 64: {
+        const __int128 product = static_cast<__int128>(static_cast<std::int64_t>(lhs)) *
+                                 static_cast<__int128>(static_cast<std::int64_t>(rhs));
+        return {static_cast<std::uint64_t>(product),
+                product < std::numeric_limits<std::int64_t>::min() ||
+                    product > std::numeric_limits<std::int64_t>::max()};
+    }
+    default:
+        return {};
+    }
+}
+} // namespace
 
 void MultiplySignedOperands(LsxMachineImage& state, const std::size_t state_offset, const std::uint64_t lhs,
           const std::uint64_t rhs, const std::uint32_t size_bits) {
-    if (size_bits == 0) {
+    const bool supported_width = size_bits == 8 || size_bits == 16 ||
+                                 size_bits == 32 || size_bits == 64;
+    if (!supported_width) {
         return;
     }
-
-    bool overflow = false;
-    std::uint64_t result = 0;
-
-    switch (size_bits) {
-    case 8: {
-        const auto a = static_cast<std::int8_t>(lhs & 0xff);
-        const auto b = static_cast<std::int8_t>(rhs & 0xff);
-        const std::int16_t product = static_cast<std::int16_t>(a) * static_cast<std::int16_t>(b);
-        result = static_cast<std::uint8_t>(product);
-        overflow = product < INT8_MIN || product > INT8_MAX;
-        break;
-    }
-    case 16: {
-        const auto a = static_cast<std::int16_t>(lhs & 0xffff);
-        const auto b = static_cast<std::int16_t>(rhs & 0xffff);
-        const std::int32_t product = static_cast<std::int32_t>(a) * static_cast<std::int32_t>(b);
-        result = static_cast<std::uint16_t>(product);
-        overflow = product < INT16_MIN || product > INT16_MAX;
-        break;
-    }
-    case 32: {
-        const auto a = static_cast<std::int32_t>(lhs & 0xffffffffu);
-        const auto b = static_cast<std::int32_t>(rhs & 0xffffffffu);
-        const std::int64_t product = static_cast<std::int64_t>(a) * static_cast<std::int64_t>(b);
-        result = static_cast<std::uint32_t>(product);
-        overflow = product < INT32_MIN || product > INT32_MAX;
-        break;
-    }
-    case 64: {
-        const auto a = static_cast<__int128_t>(static_cast<std::int64_t>(lhs));
-        const auto b = static_cast<__int128_t>(static_cast<std::int64_t>(rhs));
-        const __int128_t product = a * b;
-        result = static_cast<std::uint64_t>(product);
-        overflow = product < static_cast<__int128_t>(INT64_MIN) ||
-                   product > static_cast<__int128_t>(INT64_MAX);
-        break;
-    }
-    default:
-        return;
-    }
-
-    state.rflags &= ~(kFlagCf | kFlagOf);
-    if (overflow) {
-        state.rflags |= kFlagCf | kFlagOf;
-    }
-    StoreStateLane(state, state_offset, result, size_bits);
+    const auto product = EvaluateSignedProduct(lhs, rhs, size_bits);
+    const auto overflow_flags = product.overflow ? kFlagCf | kFlagOf : UINT64_C(0);
+    state.rflags = (state.rflags & ~(kFlagCf | kFlagOf)) | overflow_flags;
+    StoreStateLane(state, state_offset, product.low, size_bits);
 }
 
 RuntimeStatsSnapshot SnapshotTranslationTelemetry() noexcept {
@@ -34554,102 +34440,145 @@ std::string DescribeTranslationEngineJson() {
     return out.str();
 }
 
+namespace {
+
+constexpr std::size_t kSemanticVectorBytes = 32;
+
+struct SemanticVectorImage {
+    std::array<std::uint8_t, kSemanticVectorBytes> bytes{};
+
+    static SemanticVectorImage Capture(const void* source, const std::size_t width) {
+        SemanticVectorImage image{};
+        if (source != nullptr && width != 0) {
+            std::memcpy(image.bytes.data(), source,
+                        std::min(width, image.bytes.size()));
+        }
+        return image;
+    }
+
+    void Publish(void* destination, const std::size_t width) const {
+        if (destination != nullptr && width != 0) {
+            std::memcpy(destination, bytes.data(),
+                        std::min(width, bytes.size()));
+        }
+    }
+};
+
+bool IsSemanticVectorWidth(const std::size_t width) {
+    return width != 0 && width <= kSemanticVectorBytes;
+}
+
+void CopyVectorSlice(SemanticVectorImage& destination, const std::size_t destination_offset,
+                     const SemanticVectorImage& source, const std::size_t source_offset,
+                     const std::size_t width) {
+    if (destination_offset + width <= destination.bytes.size() &&
+        source_offset + width <= source.bytes.size()) {
+        std::copy_n(source.bytes.begin() + source_offset, width,
+                    destination.bytes.begin() + destination_offset);
+    }
+}
+
+template <typename Selector>
+SemanticVectorImage SelectVectorElements(const SemanticVectorImage& left,
+                                         const SemanticVectorImage& right,
+                                         const std::size_t width,
+                                         const std::size_t element_width,
+                                         Selector&& selector) {
+    SemanticVectorImage result{};
+    if (!IsSemanticVectorWidth(width) || element_width == 0 ||
+        (width % element_width) != 0) {
+        return result;
+    }
+    const std::size_t count = width / element_width;
+    for (std::size_t output = 0; output < count; ++output) {
+        const auto [use_right, input] = selector(output, count);
+        const auto& source = use_right ? right : left;
+        CopyVectorSlice(result, output * element_width, source,
+                        (input % count) * element_width, element_width);
+    }
+    return result;
+}
+
+} // namespace
+
 void ConvertScalarFormatLocal(std::array<std::uint8_t, 32>& dst,
                          const std::array<std::uint8_t, 16>& old_dst,
                          const void* src_scalar, const bool single_to_double) {
-    dst.fill(0);
-
-    // Start from the complete old XMM lane. single->double overwrites bytes
-    // 0..7; double->single overwrites only 0..3 and therefore preserves 4..15.
-    // The upper YMM half remains zero from dst.fill().
-    std::memcpy(dst.data(), old_dst.data(), old_dst.size());
+    auto result = SemanticVectorImage::Capture(old_dst.data(), old_dst.size());
     if (single_to_double) {
-        const float src = LoadUnaligned<float>(src_scalar);
-        StoreUnaligned<double>(dst.data(), static_cast<double>(src));
+        const double converted = static_cast<double>(LoadUnaligned<float>(src_scalar));
+        std::memcpy(result.bytes.data(), &converted, sizeof(converted));
     } else {
-        const double src = LoadUnaligned<double>(src_scalar);
-        StoreUnaligned<float>(dst.data(), static_cast<float>(src));
+        const float converted = static_cast<float>(LoadUnaligned<double>(src_scalar));
+        std::memcpy(result.bytes.data(), &converted, sizeof(converted));
     }
+    dst = result.bytes;
 }
 
-void TransferVectorValue(void* dst, const void* src, const std::size_t size, const bool zero_upper_ymm) {
-    if (dst == nullptr || src == nullptr) {
+void TransferVectorValue(void* dst, const void* src, const std::size_t size,
+                         const bool zero_upper_ymm) {
+    if (dst == nullptr || src == nullptr || !IsSemanticVectorWidth(size)) {
         return;
     }
-    std::memcpy(dst, src, size);
-    if (zero_upper_ymm && size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + size, 0, 32 - size);
-    }
+    const auto source = SemanticVectorImage::Capture(src, size);
+    source.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : size);
 }
 
-void TransferScalarVectorBits(void* vector, void* other, const std::size_t size, const std::uint32_t mode) {
+void TransferScalarVectorBits(void* vector, void* other, const std::size_t size,
+                              const std::uint32_t mode) {
     if (vector == nullptr || other == nullptr) {
         return;
     }
-
-    // Interpreter ABI: bit 0 loads and zero-extends into XMM, bit 1 stores
-    // through an eight-byte zero-extension lane, and zero is a direct store.
-    if ((mode & 1u) != 0) {
-        if (size > 16) {
-            return;
-        }
-        std::array<std::uint8_t, 16> lane{};
-        std::memcpy(lane.data(), other, size);
-        std::memcpy(vector, lane.data(), lane.size());
-    } else if ((mode & 2u) != 0) {
-        if (size > 8) {
-            return;
-        }
-        std::array<std::uint8_t, 8> lane{};
-        std::memcpy(lane.data(), vector, size);
-        std::memcpy(other, lane.data(), lane.size());
-    } else {
-        std::memcpy(other, vector, size);
+    const bool load_vector = (mode & 1u) != 0;
+    const bool wide_scalar_store = !load_vector && (mode & 2u) != 0;
+    const std::size_t limit = load_vector ? 16u : (wide_scalar_store ? 8u : size);
+    if (size > limit) {
+        return;
     }
+    const auto captured = SemanticVectorImage::Capture(load_vector ? other : vector, size);
+    captured.Publish(load_vector ? vector : other,
+                     load_vector ? 16u : (wide_scalar_store ? 8u : size));
 }
 
-void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src, const void* src, const bool high_qword,
-               const std::uint32_t mode) {
+void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src,
+                                    const void* src, const bool high_qword,
+                                    const std::uint32_t mode) {
     if (dst == nullptr || old_dst_or_src == nullptr || (mode == 2 && src == nullptr)) {
         return;
     }
-
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* lhs = static_cast<const std::uint8_t*>(old_dst_or_src);
-    const auto* rhs = static_cast<const std::uint8_t*>(src);
-    const std::size_t qword_offset = high_qword ? 8u : 0u;
-
+    const auto preserved = SemanticVectorImage::Capture(old_dst_or_src, 16);
+    const auto incoming = SemanticVectorImage::Capture(src, 8);
+    const std::size_t half = high_qword ? 8u : 0u;
     if (mode == 2) {
-        std::memcpy(out, lhs, 16);
-        std::memset(out + 16, 0, 16);
-        std::memcpy(out + qword_offset, rhs, 8);
+        auto result = preserved;
+        CopyVectorSlice(result, half, incoming, 0, 8);
+        result.Publish(dst, kSemanticVectorBytes);
     } else if (mode == 1) {
-        std::memcpy(out, lhs + qword_offset, 8);
+        std::memcpy(dst, preserved.bytes.data() + half, 8);
     } else {
-        std::memcpy(out + qword_offset, lhs, 8);
+        std::memcpy(static_cast<std::uint8_t*>(dst) + half, preserved.bytes.data(), 8);
     }
 }
 
-void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs, const bool high_selector,
-              const bool full_vector) {
+void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs,
+                                  const bool high_selector,
+                                  const bool full_vector) {
     if (dst == nullptr || lhs == nullptr || (full_vector && rhs == nullptr)) {
         return;
     }
-
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    if (full_vector) {
-        const auto* first = high_selector ? right + 8 : left;
-        const auto* second = high_selector ? left + 8 : right;
-        std::memcpy(out, first, 8);
-        std::memcpy(out + 8, second, 8);
-        std::memset(out + 16, 0, 16);
-    } else if (high_selector) {
-        std::memcpy(out, left + 8, 8);
-    } else {
-        std::memcpy(out + 8, left, 8);
+    const auto left = SemanticVectorImage::Capture(lhs, 16);
+    const auto right = SemanticVectorImage::Capture(rhs, 16);
+    if (!full_vector) {
+        std::memcpy(static_cast<std::uint8_t*>(dst) + (high_selector ? 0u : 8u),
+                    left.bytes.data() + (high_selector ? 8u : 0u), 8);
+        return;
     }
+    SemanticVectorImage result{};
+    CopyVectorSlice(result, 0, high_selector ? right : left,
+                    high_selector ? 8u : 0u, 8);
+    CopyVectorSlice(result, 8, high_selector ? left : right,
+                    high_selector ? 8u : 0u, 8);
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
@@ -34697,27 +34626,26 @@ void DuplicatePackedSingleLanes(void* dst, const void* src, const bool high_sour
 void BroadcastScalarLane(void* dst, const void* src, const std::size_t element_size,
                       const std::size_t total_size) {
     if (dst == nullptr || src == nullptr || element_size == 0 || element_size > 8 ||
-        total_size > 32) {
+        !IsSemanticVectorWidth(total_size) || total_size % element_size != 0) {
         return;
     }
-
-    std::array<std::uint8_t, 8> scalar{};
-    std::memcpy(scalar.data(), src, element_size);
-    auto* out = static_cast<std::uint8_t*>(dst);
-    for (std::size_t offset = 0; offset < total_size; offset += element_size) {
-        std::memcpy(out + offset, scalar.data(), element_size);
+    const auto scalar = SemanticVectorImage::Capture(src, element_size);
+    SemanticVectorImage result{};
+    for (std::size_t lane = 0; lane != total_size / element_size; ++lane) {
+        CopyVectorSlice(result, lane * element_size, scalar, 0, element_size);
     }
-    if (total_size < 32) {
-        std::memset(out + total_size, 0, 32 - total_size);
-    }
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void BroadcastVectorHalf(void* dst, const void* src) {
     if (dst == nullptr || src == nullptr) {
         return;
     }
-    std::memcpy(dst, src, 16);
-    std::memcpy(static_cast<std::uint8_t*>(dst) + 16, src, 16);
+    const auto half = SemanticVectorImage::Capture(src, 16);
+    SemanticVectorImage result{};
+    CopyVectorSlice(result, 0, half, 0, 16);
+    CopyVectorSlice(result, 16, half, 0, 16);
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 std::uint64_t CollectVectorSignBits(const void* src, const std::size_t lane_bytes,
@@ -34726,29 +34654,25 @@ std::uint64_t CollectVectorSignBits(const void* src, const std::size_t lane_byte
         return 0;
     }
 
-    const auto* bytes = static_cast<const std::uint8_t*>(src);
-    std::uint64_t mask = 0;
-    for (std::size_t lane = 0, offset = 0; offset < total_size && lane < 64;
-         ++lane, offset += lane_bytes) {
-        const std::uint8_t high_byte = bytes[offset + lane_bytes - 1];
-        if ((high_byte & 0x80u) != 0) {
-            mask |= std::uint64_t{1} << lane;
-        }
+    const auto image = SemanticVectorImage::Capture(src, total_size);
+    const std::size_t lanes = std::min<std::size_t>(64, total_size / lane_bytes);
+    std::uint64_t result = 0;
+    for (std::size_t lane = 0; lane != lanes; ++lane) {
+        const bool negative = std::bit_cast<std::int8_t>(
+                                  image.bytes[(lane + 1) * lane_bytes - 1]) < 0;
+        result |= static_cast<std::uint64_t>(negative) << lane;
     }
-    return mask;
+    return result;
 }
 
 void ExtractVectorDword(void* dst, const void* src, const std::uint32_t index, const bool store_qword) {
     if (dst == nullptr || src == nullptr) {
         return;
     }
-    const auto value = LoadUnaligned<std::uint32_t>(static_cast<const std::uint8_t*>(src) +
-                                                    ((index & 3u) * sizeof(std::uint32_t)));
-    if (store_qword) {
-        StoreUnaligned<std::uint64_t>(dst, value);
-    } else {
-        StoreUnaligned<std::uint32_t>(dst, value);
-    }
+    const auto image = SemanticVectorImage::Capture(src, 16);
+    std::uint64_t scalar = 0;
+    std::memcpy(&scalar, image.bytes.data() + (index % 4u) * 4u, 4);
+    std::memcpy(dst, &scalar, store_qword ? 8u : 4u);
 }
 
 void ExtractVectorLane(void* dst, const void* src, const std::uint32_t index,
@@ -34756,16 +34680,12 @@ void ExtractVectorLane(void* dst, const void* src, const std::uint32_t index,
     if (dst == nullptr || src == nullptr || element_size == 0 || element_size > 8) {
         return;
     }
-    const std::uint32_t element_count = static_cast<std::uint32_t>(16 / element_size);
-    const std::uint32_t masked_index = index & (element_count - 1);
-    std::uint64_t value = 0;
-    std::memcpy(&value, static_cast<const std::uint8_t*>(src) + masked_index * element_size,
-                element_size);
-    if (store_qword) {
-        StoreUnaligned<std::uint64_t>(dst, value);
-    } else {
-        std::memcpy(dst, &value, element_size);
-    }
+    const auto image = SemanticVectorImage::Capture(src, 16);
+    const std::size_t count = 16 / element_size;
+    std::array<std::uint8_t, 8> scalar{};
+    std::copy_n(image.bytes.begin() + (index % count) * element_size,
+                element_size, scalar.begin());
+    std::memcpy(dst, scalar.data(), store_qword ? scalar.size() : element_size);
 }
 
 void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
@@ -34774,19 +34694,17 @@ void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, con
         return;
     }
 
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, 16);
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
+    const auto incoming = SemanticVectorImage::Capture(src, 16);
     const std::size_t source_lane = src_is_memory ? 0u : ((imm >> 6u) & 3u);
     const std::size_t dest_lane = (imm >> 4u) & 3u;
-    std::memcpy(out.data() + dest_lane * sizeof(std::uint32_t),
-                static_cast<const std::uint8_t*>(src) + source_lane * sizeof(std::uint32_t),
-                sizeof(std::uint32_t));
+    CopyVectorSlice(result, dest_lane * 4u, incoming, source_lane * 4u, 4);
     for (std::size_t lane = 0; lane < 4; ++lane) {
         if ((imm & (1u << lane)) != 0) {
-            StoreUnaligned<std::uint32_t>(out.data() + lane * sizeof(std::uint32_t), 0);
+            std::fill_n(result.bytes.begin() + lane * 4u, 4u, std::uint8_t{0});
         }
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void InsertVectorIntegerLane(void* dst, const void* old_dst, const std::uint64_t value,
@@ -34794,22 +34712,20 @@ void InsertVectorIntegerLane(void* dst, const void* old_dst, const std::uint64_t
     if (dst == nullptr || old_dst == nullptr || element_size == 0 || element_size > 8) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, 16);
-    const std::uint32_t element_count = static_cast<std::uint32_t>(16 / element_size);
-    const std::uint32_t masked_index = index & (element_count - 1);
-    std::memcpy(out.data() + masked_index * element_size, &value, element_size);
-    std::memcpy(dst, out.data(), out.size());
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
+    const std::size_t lane = index % (16u / element_size);
+    std::memcpy(result.bytes.data() + lane * element_size, &value, element_size);
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void InsertVectorHalf(void* dst, const void* old_dst, const void* src, const std::uint32_t half_index) {
     if (dst == nullptr || old_dst == nullptr || src == nullptr) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, out.size());
-    std::memcpy(out.data() + ((half_index & 1u) * 16), src, 16);
-    std::memcpy(dst, out.data(), out.size());
+    auto result = SemanticVectorImage::Capture(old_dst, kSemanticVectorBytes);
+    const auto incoming = SemanticVectorImage::Capture(src, 16);
+    CopyVectorSlice(result, (half_index % 2u) * 16u, incoming, 0, 16);
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void ExtractVectorHalf(void* dst, const void* src, const std::uint32_t half_index,
@@ -34817,10 +34733,10 @@ void ExtractVectorHalf(void* dst, const void* src, const std::uint32_t half_inde
     if (dst == nullptr || src == nullptr) {
         return;
     }
-    std::memcpy(dst, static_cast<const std::uint8_t*>(src) + ((half_index & 1u) * 16), 16);
-    if (zero_upper_ymm) {
-        std::memset(static_cast<std::uint8_t*>(dst) + 16, 0, 16);
-    }
+    const auto source = SemanticVectorImage::Capture(src, kSemanticVectorBytes);
+    SemanticVectorImage result{};
+    CopyVectorSlice(result, 0, source, (half_index % 2u) * 16u, 16);
+    result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : 16u);
 }
 
 void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm) {
@@ -34828,21 +34744,17 @@ void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, const std:
         return;
     }
 
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    std::memset(out, 0, 32);
-    const auto copy_half = [&](const std::size_t dst_half, const std::uint8_t selector) {
-        const auto* source = (selector & 0x2u) != 0 ? right : left;
-        const std::size_t source_half = selector & 0x1u;
-        std::memcpy(out + dst_half * 16u, source + source_half * 16u, 16u);
-    };
-    if ((imm & 0x08u) == 0) {
-        copy_half(0, imm & 0x3u);
+    const auto left = SemanticVectorImage::Capture(lhs, kSemanticVectorBytes);
+    const auto right = SemanticVectorImage::Capture(rhs, kSemanticVectorBytes);
+    SemanticVectorImage result{};
+    for (std::size_t half = 0; half != 2; ++half) {
+        const std::uint32_t nibble = (imm >> (half * 4u)) & 0xfu;
+        if ((nibble & 8u) == 0) {
+            CopyVectorSlice(result, half * 16u, (nibble & 2u) ? right : left,
+                            (nibble & 1u) * 16u, 16u);
+        }
     }
-    if ((imm & 0x80u) == 0) {
-        copy_half(1, (imm >> 4u) & 0x3u);
-    }
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
@@ -34853,19 +34765,17 @@ void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, const std
         return;
     }
 
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    for (std::size_t lane = 0, offset = 0; offset < total_size; ++lane, offset += lane_bytes) {
-        const std::size_t mask_lane = repeat_mask_per_128
-            ? lane % (16u / lane_bytes)
-            : lane;
-        const auto* source = ((imm >> mask_lane) & 0x1u) ? right : left;
-        std::memcpy(out + offset, source + offset, lane_bytes);
-    }
-    if (total_size < 32) {
-        std::memset(out + total_size, 0, 32 - total_size);
-    }
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    const auto result = SelectVectorElements(
+        left, right, total_size, lane_bytes,
+        [&](const std::size_t lane, const std::size_t) {
+            const std::size_t bit = repeat_mask_per_128
+                                        ? lane % (16u / lane_bytes)
+                                        : lane;
+            return std::pair{((imm >> bit) & 1u) != 0, lane};
+        });
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
@@ -34875,24 +34785,29 @@ void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* 
         return;
     }
 
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    const auto* selector = static_cast<const std::uint8_t*>(mask);
-    for (std::size_t offset = 0; offset < total_size; offset += lane_bytes) {
-        const auto* source = static_cast<std::int8_t>(selector[offset + lane_bytes - 1]) < 0
-            ? right
-            : left;
-        std::memcpy(out + offset, source + offset, lane_bytes);
-    }
-    if (total_size < 32) {
-        std::memset(out + total_size, 0, 32 - total_size);
-    }
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    const auto selectors = SemanticVectorImage::Capture(mask, total_size);
+    const auto result = SelectVectorElements(
+        left, right, total_size, lane_bytes,
+        [&](const std::size_t lane, const std::size_t) {
+            const auto sign = std::bit_cast<std::int8_t>(
+                selectors.bytes[(lane + 1u) * lane_bytes - 1u]);
+            return std::pair{sign < 0, lane};
+        });
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void BlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
                const std::size_t total_size) {
-    BlendVectorByMask(dst, lhs, rhs, mask, 1, total_size);
+    constexpr auto byte_granularity = sizeof(std::uint8_t);
+    const std::array<const void*, 3> inputs{lhs, rhs, mask};
+    if (total_size > kSemanticVectorBytes ||
+        std::ranges::any_of(inputs, [](const void* input) { return input == nullptr; })) {
+        return;
+    }
+    BlendVectorByMask(dst, inputs[0], inputs[1], inputs[2], byte_granularity,
+                      total_size);
 }
 
 void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
@@ -34900,19 +34815,14 @@ void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, cons
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
         return;
     }
-    std::array<std::uint8_t, 32> left{};
-    std::array<std::uint8_t, 32> right{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(left.data(), lhs, total_size);
-    std::memcpy(right.data(), rhs, total_size);
-    const std::size_t word_count = total_size / sizeof(std::uint16_t);
-    for (std::size_t lane = 0; lane < word_count; ++lane) {
-        const auto& source = ((imm >> (lane & 7u)) & 1u) != 0 ? right : left;
-        std::memcpy(out.data() + lane * sizeof(std::uint16_t),
-                    source.data() + lane * sizeof(std::uint16_t),
-                    sizeof(std::uint16_t));
-    }
-    std::memcpy(dst, out.data(), out.size());
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    const auto result = SelectVectorElements(
+        left, right, total_size, sizeof(std::uint16_t),
+        [&](const std::size_t lane, const std::size_t) {
+            return std::pair{((imm >> (lane % 8u)) & 1u) != 0, lane};
+        });
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void PermuteBytesFromMask(void* dst, const void* src, const void* mask, const std::size_t total_size) {
@@ -34920,72 +34830,58 @@ void PermuteBytesFromMask(void* dst, const void* src, const void* mask, const st
         return;
     }
 
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    const auto* selector_bytes = static_cast<const std::uint8_t*>(mask);
-    std::memset(out, 0, total_size);
-    for (std::size_t base = 0; base < total_size; base += 16u) {
-        for (std::size_t lane = 0; lane < 16u && base + lane < total_size; ++lane) {
-            const std::uint8_t selector = selector_bytes[base + lane];
-            if ((selector & 0x80u) == 0) {
-                out[base + lane] = source[base + (selector & 0x0fu)];
-            }
+    const auto source = SemanticVectorImage::Capture(src, total_size);
+    const auto selectors = SemanticVectorImage::Capture(mask, total_size);
+    SemanticVectorImage result{};
+    for (std::size_t output = 0; output != total_size; ++output) {
+        const std::uint8_t selection = selectors.bytes[output];
+        if ((selection & 0x80u) == 0) {
+            const std::size_t lane_base = output & ~std::size_t{15};
+            result.bytes[output] = source.bytes[lane_base + (selection & 15u)];
         }
     }
+    result.Publish(dst, total_size);
 }
 
-void InterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs, const std::size_t element_bytes,
-            const bool high_half, const std::size_t total_size) {
+namespace {
+void InterleavePackedLanes(void* dst, const void* lhs, const void* rhs,
+                           const std::size_t element_bytes, const bool high_half,
+                           const std::size_t total_size, const bool clear_upper) {
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_bytes == 0 ||
-        total_size > 32) {
+        total_size > kSemanticVectorBytes) {
         return;
     }
-
-    std::array<std::uint8_t, 32> left{};
-    std::array<std::uint8_t, 32> right{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(left.data(), lhs, total_size);
-    std::memcpy(right.data(), rhs, total_size);
-    std::memcpy(out.data(), dst, out.size());
-    for (std::size_t base = 0; base < total_size; base += 16u) {
-        const std::size_t lane_size = std::min<std::size_t>(16u, total_size - base);
-        const std::size_t source_start = high_half ? lane_size / 2u : 0u;
-        const std::size_t pair_count = lane_size / (element_bytes * 2u);
-        for (std::size_t i = 0; i < pair_count; ++i) {
-            const std::size_t src = base + source_start + i * element_bytes;
-            const std::size_t dst_offset = base + i * element_bytes * 2u;
-            std::memcpy(out.data() + dst_offset, left.data() + src, element_bytes);
-            std::memcpy(out.data() + dst_offset + element_bytes,
-                        right.data() + src, element_bytes);
+    const std::array images{SemanticVectorImage::Capture(lhs, total_size),
+                            SemanticVectorImage::Capture(rhs, total_size)};
+    auto output = clear_upper ? SemanticVectorImage{}
+                              : SemanticVectorImage::Capture(dst, kSemanticVectorBytes);
+    constexpr std::size_t group_bytes = 16;
+    for (std::size_t group = 0; group != total_size; group += group_bytes) {
+        const auto active_bytes = std::min(group_bytes, total_size - group);
+        const auto first_input = group + (high_half ? active_bytes / 2u : 0u);
+        const auto output_elements = active_bytes / element_bytes;
+        for (std::size_t element = 0; element != output_elements; ++element) {
+            const auto source_number = element & 1u;
+            const auto source_element = element >> 1u;
+            CopyVectorSlice(output, group + element * element_bytes,
+                            images[source_number], first_input + source_element * element_bytes,
+                            element_bytes);
         }
     }
-    std::memcpy(dst, out.data(), total_size);
+    output.Publish(dst, clear_upper ? kSemanticVectorBytes : total_size);
+}
+} // namespace
+
+void InterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs,
+                                 const std::size_t element_bytes, const bool high_half,
+                                 const std::size_t total_size) {
+    InterleavePackedLanes(dst, lhs, rhs, element_bytes, high_half, total_size, false);
 }
 
-void InterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs, const std::size_t element_bytes,
-             const bool high_half, const std::size_t total_size) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_bytes == 0 ||
-        total_size > 32) {
-        return;
-    }
-    std::array<std::uint8_t, 32> left{};
-    std::array<std::uint8_t, 32> right{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(left.data(), lhs, total_size);
-    std::memcpy(right.data(), rhs, total_size);
-    for (std::size_t base = 0; base < total_size; base += 16u) {
-        const std::size_t lane_size = std::min<std::size_t>(16u, total_size - base);
-        const std::size_t source_start = high_half ? lane_size / 2u : 0u;
-        const std::size_t pair_count = lane_size / (element_bytes * 2u);
-        for (std::size_t i = 0; i < pair_count; ++i) {
-            const std::size_t src = base + source_start + i * element_bytes;
-            const std::size_t dst_offset = base + i * element_bytes * 2u;
-            std::memcpy(out.data() + dst_offset, left.data() + src, element_bytes);
-            std::memcpy(out.data() + dst_offset + element_bytes,
-                        right.data() + src, element_bytes);
-        }
-    }
-    std::memcpy(dst, out.data(), out.size());
+void InterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs,
+                                 const std::size_t element_bytes, const bool high_half,
+                                 const std::size_t total_size) {
+    InterleavePackedLanes(dst, lhs, rhs, element_bytes, high_half, total_size, true);
 }
 
 void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
@@ -34993,24 +34889,24 @@ void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_sr
     if (dst == nullptr || old_dst == nullptr || scalar_src == nullptr || scalar_size > 16) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, 16);
-    std::memcpy(out.data(), scalar_src, scalar_size);
-    std::memcpy(dst, out.data(), out.size());
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
+    const auto scalar = SemanticVectorImage::Capture(scalar_src, scalar_size);
+    CopyVectorSlice(result, 0, scalar, 0, scalar_size);
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void PermuteDwordsFromImmediate(void* dst, const void* src, const std::uint8_t imm) {
     if (dst == nullptr || src == nullptr) {
         return;
     }
-    std::array<std::uint32_t, 4> in{};
-    std::memcpy(in.data(), src, sizeof(in));
-    std::array<std::uint32_t, 4> out{};
-    out[0] = in[(imm >> 0) & 3u];
-    out[1] = in[(imm >> 2) & 3u];
-    out[2] = in[(imm >> 4) & 3u];
-    out[3] = in[(imm >> 6) & 3u];
-    std::memcpy(dst, out.data(), sizeof(out));
+    const auto input = SemanticVectorImage::Capture(src, 16);
+    const SemanticVectorImage empty{};
+    const auto result = SelectVectorElements(
+        input, empty, 16, 4,
+        [&](const std::size_t lane, const std::size_t) {
+            return std::pair{false, std::size_t{(imm >> (lane * 2u)) & 3u}};
+        });
+    result.Publish(dst, 16);
 }
 
 void PermutePackedWords(void* dst, const void* src, const std::uint8_t imm,
@@ -35019,20 +34915,17 @@ void PermutePackedWords(void* dst, const void* src, const std::uint8_t imm,
         return;
     }
 
-    std::array<std::uint8_t, 32> source{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(source.data(), src, total_size);
-    std::memcpy(out.data(), source.data(), total_size);
+    const auto source = SemanticVectorImage::Capture(src, total_size);
+    auto result = source;
     for (std::size_t vector_lane = 0; vector_lane < total_size; vector_lane += 16u) {
         const std::size_t base = vector_lane + (high_half ? 8u : 0u);
         for (std::size_t lane = 0; lane < 4; ++lane) {
             const std::size_t selector = (imm >> (lane * 2u)) & 0x3u;
-            std::memcpy(out.data() + base + lane * sizeof(std::uint16_t),
-                        source.data() + base + selector * sizeof(std::uint16_t),
-                        sizeof(std::uint16_t));
+            CopyVectorSlice(result, base + lane * 2u, source,
+                            base + selector * 2u, 2u);
         }
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void PermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm) {
@@ -35040,17 +34933,15 @@ void PermutePackedSingleLanes(void* dst, const void* lhs, const void* rhs, const
         return;
     }
 
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    auto* out = static_cast<std::uint8_t*>(dst);
-    StoreUnaligned<std::uint32_t>(
-        out, LoadUnaligned<std::uint32_t>(left + ((imm & 3u) * sizeof(std::uint32_t))));
-    StoreUnaligned<std::uint32_t>(
-        out + 4, LoadUnaligned<std::uint32_t>(left + (((imm >> 2u) & 3u) * sizeof(std::uint32_t))));
-    StoreUnaligned<std::uint32_t>(
-        out + 8, LoadUnaligned<std::uint32_t>(right + (((imm >> 4u) & 3u) * sizeof(std::uint32_t))));
-    StoreUnaligned<std::uint32_t>(
-        out + 12, LoadUnaligned<std::uint32_t>(right + (((imm >> 6u) & 3u) * sizeof(std::uint32_t))));
+    const auto left = SemanticVectorImage::Capture(lhs, 16);
+    const auto right = SemanticVectorImage::Capture(rhs, 16);
+    const auto result = SelectVectorElements(
+        left, right, 16, 4,
+        [&](const std::size_t lane, const std::size_t) {
+            return std::pair{lane >= 2u,
+                             std::size_t{(imm >> (lane * 2u)) & 3u}};
+        });
+    result.Publish(dst, 16);
 }
 
 void PermuteVectorPairs(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm,
@@ -35059,84 +34950,67 @@ void PermuteVectorPairs(void* dst, const void* lhs, const void* rhs, const std::
         return;
     }
 
-    std::array<std::uint8_t, 32> left{};
-    std::array<std::uint8_t, 32> right{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(left.data(), lhs, total_size);
-    std::memcpy(right.data(), rhs, total_size);
-    for (std::size_t base = 0, lane = 0; base < total_size; base += 16u, ++lane) {
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    SemanticVectorImage result{};
+    for (std::size_t base = 0, group = 0; base < total_size; base += 16u, ++group) {
         if (double_lane) {
-            const std::size_t left_selector = (imm >> (lane * 2u)) & 1u;
-            const std::size_t right_selector = (imm >> (lane * 2u + 1u)) & 1u;
-            std::memcpy(out.data() + base,
-                        left.data() + base + left_selector * sizeof(std::uint64_t),
-                        sizeof(std::uint64_t));
-            std::memcpy(out.data() + base + 8u,
-                        right.data() + base + right_selector * sizeof(std::uint64_t),
-                        sizeof(std::uint64_t));
+            const std::size_t low = (imm >> (group * 2u)) & 1u;
+            const std::size_t high = (imm >> (group * 2u + 1u)) & 1u;
+            CopyVectorSlice(result, base, left, base + low * 8u, 8u);
+            CopyVectorSlice(result, base + 8u, right, base + high * 8u, 8u);
         } else {
-            StoreUnaligned<std::uint32_t>(
-                out.data() + base,
-                LoadUnaligned<std::uint32_t>(left.data() + base +
-                                             ((imm & 3u) * sizeof(std::uint32_t))));
-            StoreUnaligned<std::uint32_t>(
-                out.data() + base + 4u,
-                LoadUnaligned<std::uint32_t>(left.data() + base +
-                                             (((imm >> 2u) & 3u) * sizeof(std::uint32_t))));
-            StoreUnaligned<std::uint32_t>(
-                out.data() + base + 8u,
-                LoadUnaligned<std::uint32_t>(right.data() + base +
-                                             (((imm >> 4u) & 3u) * sizeof(std::uint32_t))));
-            StoreUnaligned<std::uint32_t>(
-                out.data() + base + 12u,
-                LoadUnaligned<std::uint32_t>(right.data() + base +
-                                             (((imm >> 6u) & 3u) * sizeof(std::uint32_t))));
+            for (std::size_t output = 0; output != 4; ++output) {
+                const auto& source = output < 2 ? left : right;
+                const std::size_t input = (imm >> (output * 2u)) & 3u;
+                CopyVectorSlice(result, base + output * 4u, source,
+                                base + input * 4u, 4u);
+            }
         }
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 namespace {
 std::uint64_t SignExtendElement(std::uint64_t value, const std::size_t size_bytes) {
     return ExtendSignedOperand(value, static_cast<std::uint32_t>(size_bytes * 8));
 }
+
+void ExpandPackedLanes(void* destination, const void* source,
+                       const std::size_t narrow_width,
+                       const std::size_t wide_width,
+                       const std::size_t output_width,
+                       const bool sign_extend) {
+    if (destination == nullptr || source == nullptr || narrow_width == 0 ||
+        wide_width == 0 || narrow_width > 8 || wide_width > 8 ||
+        !IsSemanticVectorWidth(output_width) || output_width % wide_width != 0) {
+        return;
+    }
+    const std::size_t lane_count = output_width / wide_width;
+    const auto input = SemanticVectorImage::Capture(source, lane_count * narrow_width);
+    SemanticVectorImage result{};
+    for (std::size_t lane = 0; lane != lane_count; ++lane) {
+        std::uint64_t scalar = 0;
+        std::memcpy(&scalar, input.bytes.data() + lane * narrow_width, narrow_width);
+        if (sign_extend) {
+            scalar = SignExtendElement(scalar, narrow_width);
+        }
+        std::memcpy(result.bytes.data() + lane * wide_width, &scalar, wide_width);
+    }
+    result.Publish(destination, kSemanticVectorBytes);
+}
 } // namespace
 
 void ExtendPackedUnsignedLanes(void* dst, const void* src, const std::size_t src_element_size,
                        const std::size_t dst_element_size, const std::size_t total_size) {
-    if (dst == nullptr || src == nullptr || src_element_size == 0 || dst_element_size == 0 ||
-        src_element_size > 8 || dst_element_size > 8 || total_size > 32) {
-        return;
-    }
-    std::array<std::uint8_t, 32> source{};
-    std::array<std::uint8_t, 32> out{};
-    const std::size_t element_count = total_size / dst_element_size;
-    std::memcpy(source.data(), src, element_count * src_element_size);
-    for (std::size_t i = 0; i < element_count; ++i) {
-        std::uint64_t value = 0;
-        std::memcpy(&value, source.data() + i * src_element_size, src_element_size);
-        std::memcpy(out.data() + i * dst_element_size, &value, dst_element_size);
-    }
-    std::memcpy(dst, out.data(), out.size());
+    ExpandPackedLanes(dst, src, src_element_size, dst_element_size,
+                      total_size, false);
 }
 
 void ExtendPackedSignedLanes(void* dst, const void* src, const std::size_t src_element_size,
                        const std::size_t dst_element_size, const std::size_t total_size) {
-    if (dst == nullptr || src == nullptr || src_element_size == 0 || dst_element_size == 0 ||
-        src_element_size > 8 || dst_element_size > 8 || total_size > 32) {
-        return;
-    }
-    std::array<std::uint8_t, 32> source{};
-    std::array<std::uint8_t, 32> out{};
-    const std::size_t element_count = total_size / dst_element_size;
-    std::memcpy(source.data(), src, element_count * src_element_size);
-    for (std::size_t i = 0; i < element_count; ++i) {
-        std::uint64_t value = 0;
-        std::memcpy(&value, source.data() + i * src_element_size, src_element_size);
-        value = SignExtendElement(value, src_element_size);
-        std::memcpy(out.data() + i * dst_element_size, &value, dst_element_size);
-    }
-    std::memcpy(dst, out.data(), out.size());
+    ExpandPackedLanes(dst, src, src_element_size, dst_element_size,
+                      total_size, true);
 }
 
 namespace {
@@ -35148,52 +35022,58 @@ void ConvertIntegerToScalar(void* dst, const void* old_dst, const std::uint64_t 
     if (dst == nullptr || old_dst == nullptr) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
-    // The interpreter seeds the complete legacy XMM lane before replacing the
-    // scalar.  In particular, CVTSI2SS preserves bytes 4..15, not only 8..15.
-    std::memcpy(out.data(), old_dst, 16);
-    const auto signed_value = source_size_bits == 64 ? static_cast<std::int64_t>(value)
-                                                     : static_cast<std::int32_t>(value);
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
+    const std::int64_t signed_value = source_size_bits == 64
+                                          ? std::bit_cast<std::int64_t>(value)
+                                          : static_cast<std::int32_t>(value);
     if (integer_to_double) {
-        StoreUnaligned<double>(out.data(), static_cast<double>(signed_value));
+        const double converted = static_cast<double>(signed_value);
+        std::memcpy(result.bytes.data(), &converted, sizeof(converted));
     } else {
-        StoreUnaligned<float>(out.data(), static_cast<float>(signed_value));
+        const float converted = static_cast<float>(signed_value);
+        std::memcpy(result.bytes.data(), &converted, sizeof(converted));
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
+
+namespace {
+std::uint64_t ConvertRoundedScalarToInteger(const double rounded, const std::uint32_t width) {
+    const auto indefinite = width == 64 ? UINT64_C(0x8000000000000000)
+                                        : UINT64_C(0x80000000);
+    if (!std::isfinite(rounded)) {
+        return indefinite;
+    }
+    if (width == 32) {
+        const bool outside = rounded < std::numeric_limits<std::int32_t>::min() ||
+                             rounded > std::numeric_limits<std::int32_t>::max();
+        return outside ? indefinite
+                       : static_cast<std::uint32_t>(static_cast<std::int32_t>(rounded));
+    }
+    const auto extended = static_cast<long double>(rounded);
+    const bool outside = extended < std::numeric_limits<std::int64_t>::min() ||
+                         extended > std::numeric_limits<std::int64_t>::max();
+    return outside ? indefinite
+                   : static_cast<std::uint64_t>(static_cast<std::int64_t>(rounded));
+}
+} // namespace
 
 void ConvertScalarToInteger(LsxMachineImage& state, const std::size_t state_offset, const void* scalar_src,
                      const std::uint32_t dst_size_bits, const bool source_is_double,
                      const bool use_current_rounding) {
-    if (scalar_src == nullptr || (dst_size_bits != 32 && dst_size_bits != 64)) {
+    const bool supported_destination = dst_size_bits == 32 || dst_size_bits == 64;
+    if (scalar_src == nullptr || !supported_destination) {
         return;
     }
-
-    const double source = source_is_double ? LoadUnaligned<double>(scalar_src)
-                                           : static_cast<double>(LoadUnaligned<float>(scalar_src));
-    double rounded = use_current_rounding
-                         ? ApplyScalarRound(source, (state.mxcsr >> 13u) & 3u)
-                         : std::trunc(source);
-    std::uint64_t result = 0;
-    if (!std::isfinite(rounded)) {
-        result = dst_size_bits == 64 ? std::uint64_t{0x8000000000000000ull} : std::uint64_t{0x80000000u};
-    } else if (dst_size_bits == 32) {
-        if (rounded < static_cast<double>(INT32_MIN) || rounded > static_cast<double>(INT32_MAX)) {
-            result = 0x80000000u;
-        } else {
-            result = static_cast<std::uint32_t>(static_cast<std::int32_t>(rounded));
-        }
-    } else {
-        constexpr long double min_i64 = static_cast<long double>(INT64_MIN);
-        constexpr long double max_i64 = static_cast<long double>(INT64_MAX);
-        const long double wide = static_cast<long double>(rounded);
-        if (wide < min_i64 || wide > max_i64) {
-            result = 0x8000000000000000ull;
-        } else {
-            result = static_cast<std::uint64_t>(static_cast<std::int64_t>(rounded));
-        }
-    }
-    StoreStateLane(state, state_offset, result, dst_size_bits);
+    const auto input = source_is_double
+                           ? LoadUnaligned<double>(scalar_src)
+                           : static_cast<double>(LoadUnaligned<float>(scalar_src));
+    const auto rounding_mode = static_cast<std::uint32_t>((state.mxcsr >> 13u) & 3u);
+    const auto integral_value = use_current_rounding
+                                    ? ApplyScalarRound(input, rounding_mode)
+                                    : std::trunc(input);
+    StoreStateLane(state, state_offset,
+                   ConvertRoundedScalarToInteger(integral_value, dst_size_bits),
+                   dst_size_bits);
 }
 
 void CompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void* rhs, const bool compare_double) {
@@ -35201,25 +35081,17 @@ void CompareOrderedScalarFp(LsxMachineImage& state, const void* lhs, const void*
         return;
     }
 
-    const double a = compare_double ? LoadUnaligned<double>(lhs)
-                                    : static_cast<double>(LoadUnaligned<float>(lhs));
-    const double b = compare_double ? LoadUnaligned<double>(rhs)
-                                    : static_cast<double>(LoadUnaligned<float>(rhs));
-    const bool unordered = std::isnan(a) || std::isnan(b);
-    const bool equal = !unordered && a == b;
-    const bool less = !unordered && a < b;
-
-    std::uint64_t comparison_flags = 0;
-    if (unordered || equal) {
-        comparison_flags |= kFlagZf;
-    }
-    if (unordered) {
-        comparison_flags |= kFlagPf;
-    }
-    if (unordered || less) {
-        comparison_flags |= kFlagCf;
-    }
-    StoreStatusFlags(state, comparison_flags);
+    const auto read = [compare_double](const void* value) {
+        return compare_double ? LoadUnaligned<double>(value)
+                              : static_cast<double>(LoadUnaligned<float>(value));
+    };
+    const double left = read(lhs);
+    const double right = read(rhs);
+    const bool unordered = std::isunordered(left, right);
+    const std::uint64_t zf = static_cast<std::uint64_t>(unordered || left == right) * kFlagZf;
+    const std::uint64_t pf = static_cast<std::uint64_t>(unordered) * kFlagPf;
+    const std::uint64_t cf = static_cast<std::uint64_t>(unordered || left < right) * kFlagCf;
+    StoreStatusFlags(state, zf | pf | cf);
 }
 
 namespace {
@@ -35295,32 +35167,36 @@ double ApplyScalarRound(const double value, const std::uint32_t mode) {
 }
 } // namespace
 
-void ComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, const ScalarArithOp op,
-                  const bool operate_double) {
-    if (dst == nullptr || lhs_old_dst == nullptr || rhs == nullptr) {
+namespace {
+template <typename Float, typename Bits>
+void EvaluateScalarFloatingLane(SemanticVectorImage& output, const void* left_source,
+                                const void* right_source, const ScalarArithOp operation) {
+    const bool selects_operand = operation == ScalarArithOp::Minimum ||
+                                 operation == ScalarArithOp::Maximum;
+    if (selects_operand) {
+        StoreScalarMinMax<Float, Bits>(output.bytes.data(), left_source, right_source, operation);
         return;
     }
+    const auto left = LoadUnaligned<Float>(left_source);
+    const auto right = LoadUnaligned<Float>(right_source);
+    StoreUnaligned<Float>(output.bytes.data(), ApplyScalarArith(left, right, operation));
+}
+} // namespace
 
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), lhs_old_dst, 16);
-    if (operate_double) {
-        if (op == ScalarArithOp::Minimum || op == ScalarArithOp::Maximum) {
-            StoreScalarMinMax<double, std::uint64_t>(out.data(), lhs_old_dst, rhs, op);
-        } else {
-            const double lhs = LoadUnaligned<double>(lhs_old_dst);
-            const double rhs_value = LoadUnaligned<double>(rhs);
-            StoreUnaligned<double>(out.data(), ApplyScalarArith(lhs, rhs_value, op));
-        }
-    } else {
-        if (op == ScalarArithOp::Minimum || op == ScalarArithOp::Maximum) {
-            StoreScalarMinMax<float, std::uint32_t>(out.data(), lhs_old_dst, rhs, op);
-        } else {
-            const float lhs = LoadUnaligned<float>(lhs_old_dst);
-            const float rhs_value = LoadUnaligned<float>(rhs);
-            StoreUnaligned<float>(out.data(), ApplyScalarArith(lhs, rhs_value, op));
-        }
+void ComputeScalarFloating(void* dst, const void* lhs_old_dst, const void* rhs, const ScalarArithOp op,
+                  const bool operate_double) {
+    const std::array<const void*, 2> sources{lhs_old_dst, rhs};
+    if (dst == nullptr || std::ranges::any_of(
+                              sources, [](const void* source) { return source == nullptr; })) {
+        return;
     }
-    std::memcpy(dst, out.data(), out.size());
+    auto result = SemanticVectorImage::Capture(sources.front(), 16);
+    if (operate_double) {
+        EvaluateScalarFloatingLane<double, std::uint64_t>(result, sources[0], sources[1], op);
+    } else {
+        EvaluateScalarFloatingLane<float, std::uint32_t>(result, sources[0], sources[1], op);
+    }
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, const bool operate_double) {
@@ -35328,14 +35204,15 @@ void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, c
         return;
     }
 
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, 16);
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
     if (operate_double) {
-        StoreUnaligned<double>(out.data(), std::sqrt(LoadUnaligned<double>(src)));
+        const double value = std::sqrt(LoadUnaligned<double>(src));
+        std::memcpy(result.bytes.data(), &value, sizeof(value));
     } else {
-        StoreUnaligned<float>(out.data(), std::sqrt(LoadUnaligned<float>(src)));
+        const float value = std::sqrt(LoadUnaligned<float>(src));
+        std::memcpy(result.bytes.data(), &value, sizeof(value));
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void RoundScalarFloating(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
@@ -35344,16 +35221,16 @@ void RoundScalarFloating(void* dst, const void* old_dst, const void* src, const 
         return;
     }
 
-    const std::uint32_t mode = (imm & 4u) == 0 ? (imm & 0xffu) : ((mxcsr >> 13u) & 3u);
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, 16);
+    const std::uint32_t mode = (imm & 4u) != 0 ? ((mxcsr >> 13u) & 3u) : (imm & 3u);
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
     if (operate_double) {
-        StoreUnaligned<double>(out.data(), ApplyScalarRound(LoadUnaligned<double>(src), mode));
+        const double value = ApplyScalarRound(LoadUnaligned<double>(src), mode);
+        std::memcpy(result.bytes.data(), &value, sizeof(value));
     } else {
-        StoreUnaligned<float>(out.data(),
-                              static_cast<float>(ApplyScalarRound(LoadUnaligned<float>(src), mode)));
+        const float value = static_cast<float>(ApplyScalarRound(LoadUnaligned<float>(src), mode));
+        std::memcpy(result.bytes.data(), &value, sizeof(value));
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 namespace {
@@ -35428,12 +35305,24 @@ void VPackSaturating(void* dst, const void* lhs, const void* rhs,
 }
 } // namespace
 
+namespace {
+enum class PackedSaturationSource : std::size_t { Words = 2, Dwords = 4 };
+
+void SaturatePackedUnsigned(const std::array<const void*, 2>& sources, void* destination,
+                            const std::size_t bytes, const PackedSaturationSource source_type) {
+    const auto element_width = static_cast<std::size_t>(source_type);
+    VPackSaturating(destination, sources.front(), sources.back(), bytes, element_width,
+                    /*unsigned_destination=*/true);
+}
+} // namespace
+
 void SaturateWordToUnsignedByte(void* dst, const void* lhs, const void* rhs, const std::size_t total_size) {
-    VPackSaturating(dst, lhs, rhs, total_size, 2, true);
+    SaturatePackedUnsigned({lhs, rhs}, dst, total_size, PackedSaturationSource::Words);
 }
 
 void SaturateDwordToUnsignedWord(void* dst, const void* lhs, const void* rhs, const std::size_t total_size) {
-    VPackSaturating(dst, lhs, rhs, total_size, 4, true);
+    const std::array<const void*, 2> operands{lhs, rhs};
+    SaturatePackedUnsigned(operands, dst, total_size, PackedSaturationSource::Dwords);
 }
 
 namespace {
@@ -35470,13 +35359,27 @@ void VPackedElementShift(void* dst, const void* src, const std::uint64_t count,
 
 void ShiftPackedQuadwords(void* dst, const void* src, const std::uint64_t count, const bool left,
                    const std::size_t total_size) {
-    VPackedElementShift(dst, src, count, 8, left, false, total_size);
+    const std::size_t lane_width = sizeof(std::uint64_t);
+    VPackedElementShift(dst, src, count, lane_width, left,
+                        /*arithmetic_right=*/false, total_size);
 }
 
 void ShiftPackedWordGroups(void* dst, const void* src, const std::uint64_t count,
                       const std::size_t element_bytes, const bool left,
                       const bool arithmetic_right, const std::size_t total_size) {
-    VPackedElementShift(dst, src, count, element_bytes, left, arithmetic_right, total_size);
+    struct ShiftDescription {
+        void* output;
+        const void* input;
+        std::uint64_t distance;
+        std::size_t lane_bytes;
+        std::size_t vector_bytes;
+        bool toward_high_bits;
+        bool sign_filling;
+    };
+    const ShiftDescription request{dst, src, count, element_bytes, total_size, left,
+                                   arithmetic_right && !left};
+    VPackedElementShift(request.output, request.input, request.distance, request.lane_bytes,
+                        request.toward_high_bits, request.sign_filling, request.vector_bytes);
 }
 
 void ShiftWholeVectorBytes(void* dst, const void* src, const std::size_t shift, const bool left,
@@ -35485,47 +35388,51 @@ void ShiftWholeVectorBytes(void* dst, const void* src, const std::size_t shift, 
         return;
     }
 
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    std::memset(out, 0, 32);
-    const std::size_t clamped = std::min<std::size_t>(shift, 16u);
+    const auto source = SemanticVectorImage::Capture(src, total_size);
+    SemanticVectorImage result{};
+    const std::size_t distance = std::min<std::size_t>(shift, 16u);
     for (std::size_t base = 0; base < total_size; base += 16u) {
-        for (std::size_t lane = 0; lane < 16u && base + lane < total_size; ++lane) {
-            if (left) {
-                if (lane >= clamped) {
-                    out[base + lane] = source[base + lane - clamped];
-                }
-            } else if (lane + clamped < 16u) {
-                out[base + lane] = source[base + lane + clamped];
+        const std::size_t lane_width = std::min<std::size_t>(16u, total_size - base);
+        for (std::size_t output = 0; output != lane_width; ++output) {
+            const std::ptrdiff_t input = left
+                                             ? static_cast<std::ptrdiff_t>(output) -
+                                                   static_cast<std::ptrdiff_t>(distance)
+                                             : static_cast<std::ptrdiff_t>(output) +
+                                                   static_cast<std::ptrdiff_t>(distance);
+            if (input >= 0 && static_cast<std::size_t>(input) < lane_width) {
+                result.bytes[base + output] = source.bytes[base + input];
             }
         }
     }
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void ShiftPackedLegacyImmediate(void* dst, const void* src, const std::uint64_t count,
            const std::size_t element_bytes, const bool left, const bool arithmetic_right,
            const std::size_t total_size) {
-    if (dst == nullptr || src == nullptr || total_size > 32) {
+    if (dst == nullptr || src == nullptr || total_size > kSemanticVectorBytes) {
         return;
     }
-    std::array<std::uint8_t, 32> shifted{};
-    if (element_bytes == 8u) {
-        ShiftPackedQuadwords(shifted.data(), src, count, left, total_size);
-    } else {
-        ShiftPackedWordGroups(shifted.data(), src, count, element_bytes, left, arithmetic_right,
-                         total_size);
-    }
-    std::memcpy(dst, shifted.data(), total_size);
+    SemanticVectorImage output{};
+    const bool signed_shift = element_bytes != sizeof(std::uint64_t) &&
+                              arithmetic_right && !left;
+    VPackedElementShift(output.bytes.data(), src, count, element_bytes, left,
+                        signed_shift, total_size);
+    std::copy_n(output.bytes.begin(), total_size, static_cast<std::uint8_t*>(dst));
 }
 
 void ShiftPackedVectorImmediate(void* dst, const void* src, const std::uint64_t count,
             const std::size_t element_bytes, const bool left, const bool arithmetic_right,
             const std::size_t total_size) {
-    if (element_bytes == 8u) {
-        ShiftPackedQuadwords(dst, src, count, left, total_size);
-    } else {
-        ShiftPackedWordGroups(dst, src, count, element_bytes, left, arithmetic_right, total_size);
+    const auto dispatch = element_bytes == sizeof(std::uint64_t)
+                              ? &ShiftPackedQuadwords
+                              : nullptr;
+    if (dispatch != nullptr) {
+        dispatch(dst, src, count, left, total_size);
+        return;
     }
+    ShiftPackedWordGroups(dst, src, count, element_bytes, left,
+                          arithmetic_right, total_size);
 }
 
 void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::uint32_t mode,
@@ -35533,25 +35440,32 @@ void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, const s
     if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    SemanticVectorImage result{};
     if (mode == 0) {
-        for (std::size_t offset = 0; offset < total_size; offset += sizeof(std::uint32_t)) {
-            const auto l = LoadUnaligned<std::uint32_t>(static_cast<const std::uint8_t*>(lhs) + offset);
-            const auto r = LoadUnaligned<std::uint32_t>(static_cast<const std::uint8_t*>(rhs) + offset);
-            StoreUnaligned<std::uint32_t>(out.data() + offset, l * r);
+        for (std::size_t lane = 0; lane != total_size / 4u; ++lane) {
+            const std::uint32_t product =
+                LoadUnaligned<std::uint32_t>(left.bytes.data() + lane * 4u) *
+                LoadUnaligned<std::uint32_t>(right.bytes.data() + lane * 4u);
+            std::memcpy(result.bytes.data() + lane * 4u, &product, 4u);
         }
     } else {
-        for (std::size_t offset = 0; offset < total_size; offset += sizeof(std::uint64_t)) {
-            const auto l = LoadUnaligned<std::uint32_t>(static_cast<const std::uint8_t*>(lhs) + offset);
-            const auto r = LoadUnaligned<std::uint32_t>(static_cast<const std::uint8_t*>(rhs) + offset);
-            const std::uint64_t product = mode == 2
-                ? static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(l)) *
-                                             static_cast<std::int64_t>(static_cast<std::int32_t>(r)))
-                : static_cast<std::uint64_t>(l) * static_cast<std::uint64_t>(r);
-            StoreUnaligned<std::uint64_t>(out.data() + offset, product);
+        for (std::size_t lane = 0; lane != total_size / 8u; ++lane) {
+            const std::size_t offset = lane * 8u;
+            const std::uint32_t left_word = LoadUnaligned<std::uint32_t>(left.bytes.data() + offset);
+            const std::uint32_t right_word = LoadUnaligned<std::uint32_t>(right.bytes.data() + offset);
+            const std::uint64_t product = mode == 2u
+                                              ? static_cast<std::uint64_t>(
+                                                    static_cast<std::int64_t>(
+                                                        static_cast<std::int32_t>(left_word)) *
+                                                    static_cast<std::int64_t>(
+                                                        static_cast<std::int32_t>(right_word)))
+                                              : std::uint64_t{left_word} * right_word;
+            std::memcpy(result.bytes.data() + offset, &product, 8u);
         }
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
@@ -35560,25 +35474,25 @@ void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, con
         element_size > 8 || total_size > 32) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
-    for (std::size_t offset = 0; offset < total_size; offset += element_size) {
-        bool choose_rhs = false;
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    const auto result = SelectVectorElements(
+        left, right, total_size, element_size,
+        [&](const std::size_t lane, const std::size_t) {
+        const std::size_t offset = lane * element_size;
+        bool choose_right = false;
         if (compare_signed) {
-            const auto l = LoadElementSigned(static_cast<const std::uint8_t*>(lhs) + offset, element_size);
-            const auto r = LoadElementSigned(static_cast<const std::uint8_t*>(rhs) + offset, element_size);
-            choose_rhs = select_max ? (l < r) : !(l < r);
+            const auto a = LoadElementSigned(left.bytes.data() + offset, element_size);
+            const auto b = LoadElementSigned(right.bytes.data() + offset, element_size);
+            choose_right = select_max ? a < b : a >= b;
         } else {
-            const auto l = LoadElementUnsigned(static_cast<const std::uint8_t*>(lhs) + offset,
-                                               element_size);
-            const auto r = LoadElementUnsigned(static_cast<const std::uint8_t*>(rhs) + offset,
-                                               element_size);
-            choose_rhs = select_max ? (l < r) : !(l < r);
+            const auto a = LoadElementUnsigned(left.bytes.data() + offset, element_size);
+            const auto b = LoadElementUnsigned(right.bytes.data() + offset, element_size);
+            choose_right = select_max ? a < b : a >= b;
         }
-        const auto* chosen = choose_rhs ? static_cast<const std::uint8_t*>(rhs) + offset
-                                        : static_cast<const std::uint8_t*>(lhs) + offset;
-        std::memcpy(out.data() + offset, chosen, element_size);
-    }
-    std::memcpy(dst, out.data(), out.size());
+        return std::pair{choose_right, lane};
+    });
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
@@ -35587,83 +35501,111 @@ void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, const st
         element_size > 8 || total_size > 32) {
         return;
     }
-    std::array<std::uint8_t, 32> out{};
-    for (std::size_t offset = 0; offset < total_size; offset += element_size) {
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    SemanticVectorImage result{};
+    for (std::size_t lane = 0; lane != total_size / element_size; ++lane) {
+        const std::size_t offset = lane * element_size;
         bool match = false;
         if (signed_greater_than) {
-            const auto l = LoadElementSigned(static_cast<const std::uint8_t*>(lhs) + offset, element_size);
-            const auto r = LoadElementSigned(static_cast<const std::uint8_t*>(rhs) + offset, element_size);
-            match = l > r;
+            match = LoadElementSigned(left.bytes.data() + offset, element_size) >
+                    LoadElementSigned(right.bytes.data() + offset, element_size);
         } else {
-            match = std::memcmp(static_cast<const std::uint8_t*>(lhs) + offset,
-                                static_cast<const std::uint8_t*>(rhs) + offset,
-                                element_size) == 0;
+            match = std::equal(left.bytes.begin() + offset,
+                               left.bytes.begin() + offset + element_size,
+                               right.bytes.begin() + offset);
         }
-        std::memset(out.data() + offset, match ? 0xff : 0x00, element_size);
+        std::fill_n(result.bytes.begin() + offset, element_size,
+                    match ? std::uint8_t{0xff} : std::uint8_t{0});
     }
-    std::memcpy(dst, out.data(), out.size());
+    result.Publish(dst, kSemanticVectorBytes);
 }
+
+namespace {
+
+template <typename Float, typename Transform>
+void TransformPackedUnary(void* destination, const void* source,
+                          const std::size_t width, const bool publish_full,
+                          Transform&& transform) {
+    if (destination == nullptr || source == nullptr ||
+        !IsSemanticVectorWidth(width) || width % sizeof(Float) != 0) {
+        return;
+    }
+    const auto input = SemanticVectorImage::Capture(source, width);
+    SemanticVectorImage result{};
+    for (std::size_t lane = 0; lane != width / sizeof(Float); ++lane) {
+        const Float value = LoadUnaligned<Float>(input.bytes.data() + lane * sizeof(Float));
+        const Float output = transform(value, lane);
+        std::memcpy(result.bytes.data() + lane * sizeof(Float), &output, sizeof(output));
+    }
+    result.Publish(destination, publish_full ? kSemanticVectorBytes : width);
+}
+
+template <typename Float, typename Transform>
+void TransformPackedBinary(void* destination, const void* left_source,
+                           const void* right_source, const std::size_t width,
+                           Transform&& transform) {
+    if (destination == nullptr || left_source == nullptr || right_source == nullptr ||
+        !IsSemanticVectorWidth(width) || width % sizeof(Float) != 0) {
+        return;
+    }
+    const auto left = SemanticVectorImage::Capture(left_source, width);
+    const auto right = SemanticVectorImage::Capture(right_source, width);
+    SemanticVectorImage result{};
+    for (std::size_t lane = 0; lane != width / sizeof(Float); ++lane) {
+        const auto* left_lane = left.bytes.data() + lane * sizeof(Float);
+        const auto* right_lane = right.bytes.data() + lane * sizeof(Float);
+        transform(result.bytes.data() + lane * sizeof(Float), left_lane,
+                  right_lane, lane);
+    }
+    result.Publish(destination, kSemanticVectorBytes);
+}
+
+template <typename Float, typename Bits>
+void ComputePackedArithmetic(void* destination, const void* left, const void* right,
+                             const ScalarArithOp operation, const std::size_t width) {
+    TransformPackedBinary<Float>(
+        destination, left, right, width,
+        [operation](std::uint8_t* output, const std::uint8_t* left_lane,
+                    const std::uint8_t* right_lane, const std::size_t lane) {
+            if (operation == ScalarArithOp::Minimum ||
+                operation == ScalarArithOp::Maximum) {
+                StoreScalarMinMax<Float, Bits>(output, left_lane, right_lane, operation);
+                return;
+            }
+            Float rhs = LoadUnaligned<Float>(right_lane);
+            if (operation == ScalarArithOp::AlternatingDifferenceSum && (lane % 2u) == 0) {
+                rhs = -rhs;
+            }
+            const Float value = ApplyScalarArith(LoadUnaligned<Float>(left_lane), rhs,
+                                                 operation);
+            std::memcpy(output, &value, sizeof(value));
+        });
+}
+
+} // namespace
 
 void ComputePackedFloating(void* dst, const void* lhs, const void* rhs, const ScalarArithOp op,
                        const bool operate_double, const std::size_t total_size) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
-        return;
+    if (operate_double) {
+        ComputePackedArithmetic<double, std::uint64_t>(dst, lhs, rhs, op, total_size);
+    } else {
+        ComputePackedArithmetic<float, std::uint32_t>(dst, lhs, rhs, op, total_size);
     }
-    std::array<std::uint8_t, 32> out{};
-    const std::size_t step = operate_double ? sizeof(double) : sizeof(float);
-    for (std::size_t offset = 0; offset < total_size; offset += step) {
-        if (operate_double) {
-            const auto* lhs_lane = static_cast<const std::uint8_t*>(lhs) + offset;
-            const auto* rhs_lane = static_cast<const std::uint8_t*>(rhs) + offset;
-            if (op == ScalarArithOp::Minimum || op == ScalarArithOp::Maximum) {
-                StoreScalarMinMax<double, std::uint64_t>(out.data() + offset,
-                                                         lhs_lane, rhs_lane, op);
-                continue;
-            }
-            const double l = LoadUnaligned<double>(lhs_lane);
-            double r = LoadUnaligned<double>(rhs_lane);
-            if (op == ScalarArithOp::AlternatingDifferenceSum && (offset & 8u) == 0) {
-                r = -r;
-            }
-            StoreUnaligned<double>(out.data() + offset, ApplyScalarArith(l, r, op));
-        } else {
-            const auto* lhs_lane = static_cast<const std::uint8_t*>(lhs) + offset;
-            const auto* rhs_lane = static_cast<const std::uint8_t*>(rhs) + offset;
-            if (op == ScalarArithOp::Minimum || op == ScalarArithOp::Maximum) {
-                StoreScalarMinMax<float, std::uint32_t>(out.data() + offset,
-                                                        lhs_lane, rhs_lane, op);
-                continue;
-            }
-            const float l = LoadUnaligned<float>(lhs_lane);
-            float r = LoadUnaligned<float>(rhs_lane);
-            if (op == ScalarArithOp::AlternatingDifferenceSum && (offset & 4u) == 0) {
-                r = -r;
-            }
-            StoreUnaligned<float>(out.data() + offset, ApplyScalarArith(l, r, op));
-        }
-    }
-    std::memcpy(dst, out.data(), out.size());
 }
 
 void SquareRootPackedFloating(void* dst, const void* src, const bool operate_double,
                  const std::size_t total_size, const bool zero_upper_ymm) {
-    if (dst == nullptr || src == nullptr || total_size > 32) {
-        return;
-    }
-    std::array<std::uint8_t, 32> out{};
-    const std::size_t step = operate_double ? sizeof(double) : sizeof(float);
-    for (std::size_t offset = 0; offset < total_size; offset += step) {
-        if (operate_double) {
-            StoreUnaligned<double>(out.data() + offset,
-                                   std::sqrt(LoadUnaligned<double>(static_cast<const std::uint8_t*>(src) + offset)));
-        } else {
-            StoreUnaligned<float>(out.data() + offset,
-                                  std::sqrt(LoadUnaligned<float>(static_cast<const std::uint8_t*>(src) + offset)));
-        }
-    }
-    std::memcpy(dst, out.data(), total_size);
-    if (zero_upper_ymm && total_size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + total_size, 0, 32 - total_size);
+    if (operate_double) {
+        TransformPackedUnary<double>(dst, src, total_size, zero_upper_ymm,
+                                     [](double value, std::size_t) {
+                                         return std::sqrt(value);
+                                     });
+    } else {
+        TransformPackedUnary<float>(dst, src, total_size, zero_upper_ymm,
+                                    [](float value, std::size_t) {
+                                        return std::sqrt(value);
+                                    });
     }
 }
 
@@ -35743,65 +35685,54 @@ bool EvaluateFloatComparePredicate(const double lhs, const double rhs, const std
 
 void ComparePackedFloating(void* dst, const void* lhs, const void* rhs, const std::uint32_t predicate,
                          const bool operate_double, const std::size_t total_size) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
-        return;
+    const auto compare_double = [predicate](std::uint8_t* output,
+                                            const std::uint8_t* left,
+                                            const std::uint8_t* right,
+                                            std::size_t) {
+        const double a = LoadUnaligned<double>(left);
+        const double b = LoadUnaligned<double>(right);
+        std::memset(output, EvaluateFloatComparePredicate(a, b, predicate) ? 0xff : 0,
+                    sizeof(double));
+    };
+    if (operate_double) {
+        TransformPackedBinary<double>(dst, lhs, rhs, total_size, compare_double);
+    } else {
+        TransformPackedBinary<float>(
+            dst, lhs, rhs, total_size,
+            [predicate](std::uint8_t* output, const std::uint8_t* left,
+                        const std::uint8_t* right, std::size_t) {
+                const double a = LoadUnaligned<float>(left);
+                const double b = LoadUnaligned<float>(right);
+                std::memset(output,
+                            EvaluateFloatComparePredicate(a, b, predicate) ? 0xff : 0,
+                            sizeof(float));
+            });
     }
-    std::array<std::uint8_t, 32> out{};
-    const std::size_t step = operate_double ? sizeof(double) : sizeof(float);
-    for (std::size_t offset = 0; offset < total_size; offset += step) {
-        const double l = operate_double
-            ? LoadUnaligned<double>(static_cast<const std::uint8_t*>(lhs) + offset)
-            : static_cast<double>(LoadUnaligned<float>(static_cast<const std::uint8_t*>(lhs) + offset));
-        const double r = operate_double
-            ? LoadUnaligned<double>(static_cast<const std::uint8_t*>(rhs) + offset)
-            : static_cast<double>(LoadUnaligned<float>(static_cast<const std::uint8_t*>(rhs) + offset));
-        std::memset(out.data() + offset, EvaluateFloatComparePredicate(l, r, predicate) ? 0xff : 0x00,
-                    step);
-    }
-    std::memcpy(dst, out.data(), out.size());
 }
 
 void EstimatePackedReciprocal(void* dst, const void* src, const bool reciprocal_sqrt,
                                const std::size_t total_size, const bool zero_upper_ymm) {
-    if (dst == nullptr || src == nullptr || total_size > 32) {
-        return;
-    }
-
-    std::array<std::uint8_t, 32> out{};
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    for (std::size_t offset = 0; offset < total_size; offset += sizeof(float)) {
-        float value = LoadUnaligned<float>(source + offset);
-        if (reciprocal_sqrt) {
-            value = std::sqrt(value);
-        }
-        StoreUnaligned<float>(out.data() + offset, 1.0f / value);
-    }
-    std::memcpy(dst, out.data(), total_size);
-    if (zero_upper_ymm && total_size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + total_size, 0, 32 - total_size);
-    }
+    TransformPackedUnary<float>(
+        dst, src, total_size, zero_upper_ymm,
+        [reciprocal_sqrt](const float value, std::size_t) {
+            const float denominator = reciprocal_sqrt ? std::sqrt(value) : value;
+            return 1.0f / denominator;
+        });
 }
 
 void RoundPackedFloating(void* dst, const void* src, const std::uint32_t imm, const bool operate_double,
                   const std::size_t total_size, const bool zero_upper_ymm, const std::uint32_t mxcsr) {
-    if (dst == nullptr || src == nullptr || total_size > 32) {
-        return;
-    }
-    const std::uint32_t mode = (imm & 4u) == 0 ? (imm & 0xffu) : ((mxcsr >> 13u) & 3u);
-    std::array<std::uint8_t, 32> out{};
-    const std::size_t step = operate_double ? sizeof(double) : sizeof(float);
-    for (std::size_t offset = 0; offset < total_size; offset += step) {
-        if (operate_double) {
-            StoreUnaligned<double>(out.data() + offset,
-                                   ApplyScalarRound(LoadUnaligned<double>(static_cast<const std::uint8_t*>(src) + offset), mode));
-        } else {
-            StoreUnaligned<float>(out.data() + offset,
-                                  static_cast<float>(ApplyScalarRound(LoadUnaligned<float>(static_cast<const std::uint8_t*>(src) + offset), mode)));
-        }
-    }
-    std::memcpy(dst, out.data(), total_size);
-    if (zero_upper_ymm && total_size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + total_size, 0, 32 - total_size);
+    const std::uint32_t mode = (imm & 4u) != 0 ? (mxcsr >> 13u) & 3u : imm & 3u;
+    if (operate_double) {
+        TransformPackedUnary<double>(
+            dst, src, total_size, zero_upper_ymm,
+            [mode](double value, std::size_t) { return ApplyScalarRound(value, mode); });
+    } else {
+        TransformPackedUnary<float>(
+            dst, src, total_size, zero_upper_ymm,
+            [mode](float value, std::size_t) {
+                return static_cast<float>(ApplyScalarRound(value, mode));
+            });
     }
 }
 
@@ -35845,71 +35776,65 @@ double HorizontalDoublePair(double lhs, double rhs, const bool subtract) {
     return lhs + rhs;
 #endif
 }
+
+template <typename Float, typename Combine>
+void TransformHorizontalPairs(void* destination, const void* left_source,
+                              const void* right_source, const std::size_t width,
+                              const bool publish_full, Combine&& combine) {
+    if (destination == nullptr || left_source == nullptr || right_source == nullptr ||
+        !IsSemanticVectorWidth(width)) {
+        return;
+    }
+    const auto left = SemanticVectorImage::Capture(left_source, width);
+    const auto right = SemanticVectorImage::Capture(right_source, width);
+    SemanticVectorImage result{};
+    constexpr std::size_t element_width = sizeof(Float);
+    const std::size_t pairs_per_source = 8u / element_width;
+    for (std::size_t group = 0; group != width / 16u; ++group) {
+        const std::size_t base = group * 16u;
+        for (std::size_t pair = 0; pair != pairs_per_source; ++pair) {
+            const std::size_t input = base + pair * element_width * 2u;
+            const Float a = LoadUnaligned<Float>(left.bytes.data() + input);
+            const Float b = LoadUnaligned<Float>(left.bytes.data() + input + element_width);
+            const Float c = LoadUnaligned<Float>(right.bytes.data() + input);
+            const Float d = LoadUnaligned<Float>(right.bytes.data() + input + element_width);
+            const Float low = combine(a, b);
+            const Float high = combine(c, d);
+            std::memcpy(result.bytes.data() + base + pair * element_width,
+                        &low, element_width);
+            std::memcpy(result.bytes.data() + base + 8u + pair * element_width,
+                        &high, element_width);
+        }
+    }
+    result.Publish(destination, publish_full ? kSemanticVectorBytes : width);
+}
 } // namespace
 
 void AddHorizontalPackedFloating(void* dst, const void* lhs, const void* rhs,
                                const bool double_lane, const bool subtract,
                                const std::size_t total_size, const bool zero_upper_ymm) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
-        return;
-    }
-
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    std::array<std::uint8_t, 32> result{};
-    auto* out = result.data();
-    for (std::size_t base = 0; base < total_size; base += 16u) {
-        if (double_lane) {
-            const double a0 = LoadUnaligned<double>(left + base);
-            const double a1 = LoadUnaligned<double>(left + base + 8);
-            const double b0 = LoadUnaligned<double>(right + base);
-            const double b1 = LoadUnaligned<double>(right + base + 8);
-            StoreUnaligned<double>(out + base, HorizontalDoublePair(a0, a1, subtract));
-            StoreUnaligned<double>(out + base + 8, HorizontalDoublePair(b0, b1, subtract));
-        } else {
-            const float a0 = LoadUnaligned<float>(left + base);
-            const float a1 = LoadUnaligned<float>(left + base + 4);
-            const float a2 = LoadUnaligned<float>(left + base + 8);
-            const float a3 = LoadUnaligned<float>(left + base + 12);
-            const float b0 = LoadUnaligned<float>(right + base);
-            const float b1 = LoadUnaligned<float>(right + base + 4);
-            const float b2 = LoadUnaligned<float>(right + base + 8);
-            const float b3 = LoadUnaligned<float>(right + base + 12);
-            StoreUnaligned<float>(out + base, HorizontalFloatPair(a0, a1, subtract));
-            StoreUnaligned<float>(out + base + 4, HorizontalFloatPair(a2, a3, subtract));
-            StoreUnaligned<float>(out + base + 8, HorizontalFloatPair(b0, b1, subtract));
-            StoreUnaligned<float>(out + base + 12, HorizontalFloatPair(b2, b3, subtract));
-        }
-    }
-    std::memcpy(dst, out, total_size);
-    if (zero_upper_ymm && total_size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + total_size, 0, 32 - total_size);
+    if (double_lane) {
+        TransformHorizontalPairs<double>(
+            dst, lhs, rhs, total_size, zero_upper_ymm,
+            [subtract](double a, double b) {
+                return HorizontalDoublePair(a, b, subtract);
+            });
+    } else {
+        TransformHorizontalPairs<float>(
+            dst, lhs, rhs, total_size, zero_upper_ymm,
+            [subtract](float a, float b) {
+                return HorizontalFloatPair(a, b, subtract);
+            });
     }
 }
 
 void AddHorizontalPackedDwords(void* dst, const void* lhs, const void* rhs, const std::size_t total_size) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
-        return;
-    }
-
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    std::memset(out, 0, 32);
-    for (std::size_t base = 0; base < total_size; base += 16u) {
-        const std::int32_t a0 = LoadUnaligned<std::int32_t>(left + base);
-        const std::int32_t a1 = LoadUnaligned<std::int32_t>(left + base + 4);
-        const std::int32_t a2 = LoadUnaligned<std::int32_t>(left + base + 8);
-        const std::int32_t a3 = LoadUnaligned<std::int32_t>(left + base + 12);
-        const std::int32_t b0 = LoadUnaligned<std::int32_t>(right + base);
-        const std::int32_t b1 = LoadUnaligned<std::int32_t>(right + base + 4);
-        const std::int32_t b2 = LoadUnaligned<std::int32_t>(right + base + 8);
-        const std::int32_t b3 = LoadUnaligned<std::int32_t>(right + base + 12);
-        StoreUnaligned<std::int32_t>(out + base, a0 + a1);
-        StoreUnaligned<std::int32_t>(out + base + 4, a2 + a3);
-        StoreUnaligned<std::int32_t>(out + base + 8, b0 + b1);
-        StoreUnaligned<std::int32_t>(out + base + 12, b2 + b3);
-    }
+    TransformHorizontalPairs<std::int32_t>(
+        dst, lhs, rhs, total_size, /*publish_full=*/true,
+        [](std::int32_t a, std::int32_t b) {
+            return static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(a) + static_cast<std::uint32_t>(b));
+        });
 }
 
 void FindMinimumUnsignedWord(void* dst, const void* src, const bool zero_upper_ymm) {
@@ -35917,22 +35842,18 @@ void FindMinimumUnsignedWord(void* dst, const void* src, const bool zero_upper_y
         return;
     }
 
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    std::uint16_t min_value = LoadUnaligned<std::uint16_t>(source);
-    std::uint16_t min_index = 0;
-    for (std::uint16_t i = 1; i < 8; ++i) {
-        const auto value = LoadUnaligned<std::uint16_t>(source + i * 2u);
-        if (value < min_value) {
-            min_value = value;
-            min_index = i;
-        }
+    const auto source = SemanticVectorImage::Capture(src, 16);
+    std::array<std::uint16_t, 8> words{};
+    for (std::size_t lane = 0; lane != words.size(); ++lane) {
+        words[lane] = LoadUnaligned<std::uint16_t>(source.bytes.data() + lane * 2u);
     }
-    std::memset(dst, 0, 16);
-    StoreUnaligned<std::uint16_t>(dst, min_value);
-    StoreUnaligned<std::uint16_t>(static_cast<std::uint8_t*>(dst) + 2, min_index);
-    if (zero_upper_ymm) {
-        std::memset(static_cast<std::uint8_t*>(dst) + 16, 0, 16);
-    }
+    const auto position = std::min_element(words.begin(), words.end());
+    SemanticVectorImage result{};
+    const std::uint16_t value = *position;
+    const std::uint16_t index = static_cast<std::uint16_t>(position - words.begin());
+    std::memcpy(result.bytes.data(), &value, sizeof(value));
+    std::memcpy(result.bytes.data() + sizeof(value), &index, sizeof(index));
+    result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : 16u);
 }
 
 void DotProductPackedSingle(void* dst, const void* lhs, const void* rhs, const std::uint8_t imm,
@@ -35941,59 +35862,48 @@ void DotProductPackedSingle(void* dst, const void* lhs, const void* rhs, const s
         return;
     }
 
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    std::array<std::uint8_t, 32> result{};
-    auto* out = result.data();
+    const auto left = SemanticVectorImage::Capture(lhs, total_size);
+    const auto right = SemanticVectorImage::Capture(rhs, total_size);
+    SemanticVectorImage result{};
     for (std::size_t base = 0; base < total_size; base += 16u) {
-        float sum = 0.0f;
+        std::array<float, 4> products{};
         for (std::size_t lane = 0; lane < 4; ++lane) {
             if ((imm & (0x10u << lane)) != 0) {
-                sum += LoadUnaligned<float>(left + base + lane * 4u) *
-                       LoadUnaligned<float>(right + base + lane * 4u);
+                products[lane] = LoadUnaligned<float>(left.bytes.data() + base + lane * 4u) *
+                                 LoadUnaligned<float>(right.bytes.data() + base + lane * 4u);
             }
+        }
+        float sum = 0.0f;
+        for (const float product : products) {
+            sum += product;
         }
         for (std::size_t lane = 0; lane < 4; ++lane) {
             if ((imm & (0x01u << lane)) != 0) {
-                StoreUnaligned<float>(out + base + lane * 4u, sum);
+                std::memcpy(result.bytes.data() + base + lane * 4u, &sum, sizeof(sum));
             }
         }
     }
-    std::memcpy(dst, out, total_size);
-    if (zero_upper_ymm && total_size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + total_size, 0, 32 - total_size);
-    }
+    result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : total_size);
 }
 
 void ConvertPackedIntegerFloat(void* dst, const void* src, const bool int_to_float,
                         const bool truncate, const std::size_t total_size,
                         const std::uint32_t mxcsr) {
-    if (dst == nullptr || src == nullptr || total_size > 32) {
-        return;
-    }
-
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    std::memset(out, 0, 32);
-    for (std::size_t offset = 0; offset < total_size; offset += 4u) {
-        if (int_to_float) {
-            StoreUnaligned<float>(
-                out + offset,
-                static_cast<float>(LoadUnaligned<std::int32_t>(source + offset)));
-            continue;
-        }
-
-        const float value = LoadUnaligned<float>(source + offset);
-        const double rounded = truncate ? std::trunc(static_cast<double>(value))
-                                        : ApplyScalarRound(static_cast<double>(value),
-                                                           (mxcsr >> 13u) & 3u);
-        std::uint32_t result = 0x80000000u;
-        if (std::isfinite(rounded) && rounded >= static_cast<double>(INT32_MIN) &&
-            rounded <= static_cast<double>(INT32_MAX)) {
-            result = static_cast<std::uint32_t>(static_cast<std::int32_t>(rounded));
-        }
-        StoreUnaligned<std::uint32_t>(out + offset, result);
-    }
+    const auto rounding_mode = (mxcsr >> 13u) & 3u;
+    TransformPackedUnary<std::uint32_t>(
+        dst, src, total_size, /*publish_full=*/true,
+        [=](const std::uint32_t bits, const std::size_t) {
+            if (int_to_float) {
+                const auto integer = std::bit_cast<std::int32_t>(bits);
+                return std::bit_cast<std::uint32_t>(static_cast<float>(integer));
+            }
+            const auto floating = std::bit_cast<float>(bits);
+            const auto integral = truncate
+                                      ? std::trunc(static_cast<double>(floating))
+                                      : ApplyScalarRound(static_cast<double>(floating), rounding_mode);
+            return static_cast<std::uint32_t>(
+                ConvertRoundedScalarToInteger(integral, /*width=*/32));
+        });
 }
 
 void CompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* lhs, const void* rhs,
@@ -36002,15 +35912,17 @@ void CompareScalarFloatingPredicate(void* dst, const void* old_dst, const void* 
         return;
     }
 
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), old_dst, 16);
-    const double left = operate_double ? LoadUnaligned<double>(lhs)
-                                       : static_cast<double>(LoadUnaligned<float>(lhs));
-    const double right = operate_double ? LoadUnaligned<double>(rhs)
-                                        : static_cast<double>(LoadUnaligned<float>(rhs));
+    auto result = SemanticVectorImage::Capture(old_dst, 16);
+    const auto read = [operate_double](const void* source) {
+        return operate_double ? LoadUnaligned<double>(source)
+                              : static_cast<double>(LoadUnaligned<float>(source));
+    };
+    const double left = read(lhs);
+    const double right = read(rhs);
     const bool match = EvaluateFloatComparePredicate(left, right, predicate);
-    std::memset(out.data(), match ? 0xff : 0x00, operate_double ? 8u : 4u);
-    std::memcpy(dst, out.data(), out.size());
+    std::fill_n(result.bytes.begin(), operate_double ? 8u : 4u,
+                match ? std::uint8_t{0xff} : std::uint8_t{0});
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void PermuteVectorLanes(void* dst, const void* src, const void* control, const std::uint8_t imm,
@@ -36021,27 +35933,28 @@ void PermuteVectorLanes(void* dst, const void* src, const void* control, const s
         return;
     }
 
-    auto* out = static_cast<std::uint8_t*>(dst);
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    const auto* selector_bytes = static_cast<const std::uint8_t*>(control);
-    std::memset(out, 0, 32);
+    const auto source = SemanticVectorImage::Capture(src, total_size);
+    const auto selectors = SemanticVectorImage::Capture(control, total_size);
+    SemanticVectorImage result{};
+    const std::size_t element_width = double_lane ? 8u : 4u;
+    const std::size_t elements_per_group = 16u / element_width;
     for (std::size_t base = 0; base < total_size; base += 16u) {
-        if (double_lane) {
-            for (std::size_t lane = 0; lane < 2; ++lane) {
-                const std::size_t selector = immediate_control
-                    ? ((imm >> (base / 8u + lane)) & 0x1u)
-                    : (LoadUnaligned<std::uint64_t>(selector_bytes + base + lane * 8u) & 0x1u);
-                std::memcpy(out + base + lane * 8u, source + base + selector * 8u, 8u);
-            }
-        } else {
-            for (std::size_t lane = 0; lane < 4; ++lane) {
-                const std::size_t selector = immediate_control
-                    ? ((imm >> (lane * 2u)) & 0x3u)
-                    : (LoadUnaligned<std::uint32_t>(selector_bytes + base + lane * 4u) & 0x3u);
-                std::memcpy(out + base + lane * 4u, source + base + selector * 4u, 4u);
-            }
+        for (std::size_t lane = 0; lane != elements_per_group; ++lane) {
+            const std::size_t output = base + lane * element_width;
+            const std::size_t selection = immediate_control
+                                              ? (imm >> (double_lane
+                                                             ? (base / 8u + lane)
+                                                             : lane * 2u)) &
+                                                    (elements_per_group - 1u)
+                                              : LoadElementUnsigned(
+                                                    selectors.bytes.data() + output,
+                                                    element_width) &
+                                                    (elements_per_group - 1u);
+            CopyVectorSlice(result, output, source,
+                            base + selection * element_width, element_width);
         }
     }
+    result.Publish(dst, kSemanticVectorBytes);
 }
 
 void TransferVectorBySignMask(void* vector, const void* mask, void* other, const std::size_t total_size,
@@ -36051,28 +35964,23 @@ void TransferVectorBySignMask(void* vector, const void* mask, void* other, const
         return;
     }
 
-    std::array<std::uint8_t, 32> vector_snapshot{};
-    std::array<std::uint8_t, 32> other_snapshot{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(vector_snapshot.data(), vector, total_size);
-    std::memcpy(other_snapshot.data(), other, total_size);
-    const auto* selector = static_cast<const std::uint8_t*>(mask);
-    for (std::size_t offset = 0; offset < total_size; offset += lane_bytes) {
-        if ((selector[offset + lane_bytes - 1] & 0x80u) != 0) {
-            const auto& source = store_direction ? vector_snapshot : other_snapshot;
-            std::memcpy(out.data() + offset, source.data() + offset, lane_bytes);
-        }
-    }
+    const auto vector_image = SemanticVectorImage::Capture(vector, total_size);
+    const auto memory_image = SemanticVectorImage::Capture(other, total_size);
+    const auto selectors = SemanticVectorImage::Capture(mask, total_size);
+    SemanticVectorImage result{};
     if (store_direction) {
-        auto* memory = static_cast<std::uint8_t*>(other);
-        for (std::size_t offset = 0; offset < total_size; offset += lane_bytes) {
-            if ((selector[offset + lane_bytes - 1] & 0x80u) != 0) {
-                std::memcpy(memory + offset, out.data() + offset, lane_bytes);
-            }
-        }
-    } else {
-        std::memcpy(vector, out.data(), out.size());
+        result = memory_image;
     }
+    for (std::size_t lane = 0; lane != total_size / lane_bytes; ++lane) {
+        const std::size_t offset = lane * lane_bytes;
+        if ((selectors.bytes[offset + lane_bytes - 1u] & 0x80u) != 0) {
+            CopyVectorSlice(result, offset,
+                            store_direction ? vector_image : memory_image,
+                            offset, lane_bytes);
+        }
+    }
+    result.Publish(store_direction ? other : vector,
+                   store_direction ? total_size : kSemanticVectorBytes);
 }
 
 std::string ExerciseTranslationEngineJson() {
