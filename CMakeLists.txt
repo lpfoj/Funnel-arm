@@ -1172,6 +1172,8 @@ add_library(lsx4_executor_android SHARED
     src/executor/jit/lsx_translation_engine.cpp
     src/executor/jit/jit_ir_cache.cpp
     src/executor/jit/machine_code_lens.cpp
+    src/executor/jit/native_vector_plan.cpp
+    src/executor/jit/vector_semantic_kernel.cpp
     src/executor/runtime_death_catcher.cpp
 )
 

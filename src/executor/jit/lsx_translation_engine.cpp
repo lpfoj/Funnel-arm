@@ -4,6 +4,8 @@
 #include "executor/jit/lsx_translation_engine.h"
 #include "executor/jit/jit_ir_cache.h"
 #include "executor/jit/machine_code_lens.h"
+#include "executor/jit/native_vector_plan.h"
+#include "executor/jit/vector_semantic_kernel.h"
 #include "jit_native_cache_abi.h"
 #include "common/content_fingerprint.h"
 #include "core/aerolib/stubs.h"
@@ -1275,6 +1277,8 @@ std::size_t PackedExtendDestinationElementBytes(X86Mnemonic mnemonic);
 bool IsVectorExtractF128Mnemonic(X86Mnemonic mnemonic);
 bool IsPshufbMnemonic(X86Mnemonic mnemonic);
 bool IsVexPshufbMnemonic(X86Mnemonic mnemonic);
+bool IsMoveDupMnemonic(X86Mnemonic mnemonic);
+bool IsPackedTestMnemonic(X86Mnemonic mnemonic);
 bool IsVectorImmediateBlendMnemonic(X86Mnemonic mnemonic);
 bool IsVexVectorImmediateBlendMnemonic(X86Mnemonic mnemonic);
 std::size_t VectorImmediateBlendLaneBytes(X86Mnemonic mnemonic);
@@ -1721,6 +1725,7 @@ inline void RecordJitCheckedNativeHit() {
 std::atomic<std::uint64_t> g_jit_native_simd_fast_instructions{0};
 std::atomic<std::uint64_t> g_jit_native_simd_semantic_instructions{0};
 std::atomic<std::uint64_t> g_jit_native_simd_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_fully_direct_blocks{0};
 // Compile-time coverage for blocks which keep written SIMD state in q16-q23 across ordinary
 // guest-memory operations. This is not a dynamic hot-path counter.
 std::atomic<std::uint64_t> g_jit_native_simd_faultable_writeback_blocks{0};
@@ -8074,6 +8079,9 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
             is_native_scalar_precision_convert(ir) ||
             is_native_trunc_scalar_float_to_int(ir) ||
             is_native_scalar_float_v4(ir)) {
+            return true;
+        }
+        if (PlanDirectVectorKernel(ir)) {
             return true;
         }
         return ir.can_execute_vector &&
@@ -18119,6 +18127,112 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                         emitted_simd_fast += emitted ? 1u : 0u;
                         continue;
                     }
+                    const DirectVectorPlan direct_vector_plan =
+                        PlanDirectVectorKernel(ir);
+                    if (direct_vector_plan.kernel ==
+                        DirectVectorKernel::PackedBitTest) {
+                        std::uint32_t lhs_width = 0;
+                        std::uint32_t rhs_width = 0;
+                        emitted = emit_vector_load_pair(
+                                      ir, ir.operands[0], code->q0, code->q1,
+                                      lhs_width) &&
+                                  emit_vector_load_pair(
+                                      ir, ir.operands[1], code->q2, code->q3,
+                                      rhs_width) &&
+                                  lhs_width == rhs_width &&
+                                  lhs_width == direct_vector_plan.width_bytes;
+                        if (emitted) {
+                            // PTEST/VPTEST only publish CF/ZF. Reduce the two predicates
+                            // independently so neither a host call nor a temporary vector
+                            // writeback is needed.
+                            code->and_(code->v4.b16, code->v0.b16,
+                                       code->v2.b16);
+                            code->bic(code->v5.b16, code->v2.b16,
+                                      code->v0.b16);
+                            if (lhs_width == 32) {
+                                code->and_(code->v6.b16, code->v1.b16,
+                                           code->v3.b16);
+                                code->orr(code->v4.b16, code->v4.b16,
+                                          code->v6.b16);
+                                code->bic(code->v6.b16, code->v3.b16,
+                                          code->v1.b16);
+                                code->orr(code->v5.b16, code->v5.b16,
+                                          code->v6.b16);
+                            }
+                            code->umaxv(code->b4, code->v4.b16);
+                            code->umaxv(code->b5, code->v5.b16);
+                            code->umov(code->w10, code->v4.b16[0]);
+                            code->umov(code->w11, code->v5.b16[0]);
+                            code->ldr(code->x12,
+                                      Xbyak_aarch64::ptr(
+                                          code->x19, kStateRflagsOffset));
+                            code->mov(code->x13, kArithmeticStatusBits);
+                            code->bic(code->x12, code->x12, code->x13);
+                            code->cmp(code->w10, 0);
+                            code->cset(code->x13, Xbyak_aarch64::EQ);
+                            code->lsl(code->x13, code->x13, kZfBit);
+                            code->orr(code->x12, code->x12, code->x13);
+                            code->cmp(code->w11, 0);
+                            code->cset(code->x13, Xbyak_aarch64::EQ);
+                            code->orr(code->x12, code->x12, code->x13);
+                            code->str(code->x12,
+                                      Xbyak_aarch64::ptr(
+                                          code->x19, kStateRflagsOffset));
+                        }
+                        emitted_simd_fast += emitted ? 1u : 0u;
+                        continue;
+                    }
+                    if (direct_vector_plan.kernel != DirectVectorKernel::None) {
+                        std::uint32_t source_width = 0;
+                        emitted = emit_vector_load_pair(
+                                      ir, ir.operands[1], code->q0, code->q1,
+                                      source_width) &&
+                                  source_width == direct_vector_plan.width_bytes;
+                        if (emitted) {
+                            switch (direct_vector_plan.kernel) {
+                            case DirectVectorKernel::DuplicateEvenDwords:
+                                code->uzp1(code->v4.s4, code->v0.s4,
+                                           code->v0.s4);
+                                code->zip1(code->v0.s4, code->v4.s4,
+                                           code->v4.s4);
+                                if (source_width == 32) {
+                                    code->uzp1(code->v4.s4, code->v1.s4,
+                                               code->v1.s4);
+                                    code->zip1(code->v1.s4, code->v4.s4,
+                                               code->v4.s4);
+                                }
+                                break;
+                            case DirectVectorKernel::DuplicateOddDwords:
+                                code->uzp2(code->v4.s4, code->v0.s4,
+                                           code->v0.s4);
+                                code->zip1(code->v0.s4, code->v4.s4,
+                                           code->v4.s4);
+                                if (source_width == 32) {
+                                    code->uzp2(code->v4.s4, code->v1.s4,
+                                               code->v1.s4);
+                                    code->zip1(code->v1.s4, code->v4.s4,
+                                               code->v4.s4);
+                                }
+                                break;
+                            case DirectVectorKernel::DuplicateLowQwords:
+                                code->dup(code->v0.d2, code->v0.d2[0]);
+                                if (source_width == 32) {
+                                    code->dup(code->v1.d2, code->v1.d2[0]);
+                                }
+                                break;
+                            default:
+                                emitted = false;
+                                break;
+                            }
+                        }
+                        if (emitted) {
+                            emitted = emit_vector_store_pair(
+                                ir, ir.operands[0], code->q0, code->q1,
+                                source_width);
+                        }
+                        emitted_simd_fast += emitted ? 1u : 0u;
+                        continue;
+                    }
                     if (is_native_vector_bitwise(mnemonic)) {
                         const bool vex_three_operand = ir.operand_count == 3;
                         const std::uint8_t lhs_index = vex_three_operand ? 1u : 0u;
@@ -19801,6 +19915,11 @@ Arm64BlockEntry Aarch64CodeArena::EmitNativeControlFlowBlock(
                             g_jit_native_simd_faultable_writeback_blocks.fetch_add(
                                 1, std::memory_order_relaxed);
                         }
+                    }
+                    if (emitted_simd_fast != 0 && emitted_simd_semantic == 0 &&
+                        emitted_scalar_semantic == 0) {
+                        g_jit_native_fully_direct_blocks.fetch_add(
+                            1, std::memory_order_relaxed);
                     }
                     const std::uint64_t emitted_scalar_direct =
                         generic_scalar_instruction_count - emitted_simd_fast -
@@ -26322,27 +26441,17 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
     }
 
     if (IsMoveDupMnemonic(mnemonic)) {
-        // Fixed unary duplicate shuffle (no immediate), 128-bit lane. Source = operands[1].
         if (!ReadVector128(state, ir.decoded, ir.operands[1], rhs)) {
             return false;
         }
-        result.fill(0);
-        std::uint32_t in32[4];
-        std::uint64_t in64[2];
-        std::memcpy(in32, rhs.data(), 16);
-        std::memcpy(in64, rhs.data(), 16);
-        std::uint32_t out32[4] = {0, 0, 0, 0};
-        std::uint64_t out64[2] = {0, 0};
+        const std::size_t width = VectorOperandBytes(ir.operands[0]);
         if (mnemonic == X86_MNEMONIC_MOVSLDUP || mnemonic == X86_MNEMONIC_VMOVSLDUP) {
-            out32[0] = in32[0]; out32[1] = in32[0]; out32[2] = in32[2]; out32[3] = in32[2];
-            std::memcpy(result.data(), out32, 16);
+            DuplicatePackedSingleLanes(result.data(), rhs.data(), false, width);
         } else if (mnemonic == X86_MNEMONIC_MOVSHDUP ||
                    mnemonic == X86_MNEMONIC_VMOVSHDUP) {
-            out32[0] = in32[1]; out32[1] = in32[1]; out32[2] = in32[3]; out32[3] = in32[3];
-            std::memcpy(result.data(), out32, 16);
-        } else {  // movddup: duplicate low 64 bits
-            out64[0] = in64[0]; out64[1] = in64[0];
-            std::memcpy(result.data(), out64, 16);
+            DuplicatePackedSingleLanes(result.data(), rhs.data(), true, width);
+        } else {
+            DuplicatePackedDoubleLanes(result.data(), rhs.data(), width, true);
         }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
@@ -33569,6 +33678,8 @@ std::string LsxEngineStatusJson() {
         << R"("nativeSimd":{)"
         << R"("blocks":)" << g_jit_native_simd_blocks.load(std::memory_order_relaxed)
         << ","
+        << R"("fullyDirectBlocks":)"
+        << g_jit_native_fully_direct_blocks.load(std::memory_order_relaxed) << ","
         << R"("fastInstructions":)"
         << g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) << ","
         << R"("semanticInstructions":)"
@@ -33745,87 +33856,37 @@ void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs, c
     }
 }
 
-namespace {
-std::uint64_t ApplyVectorLogicWord(const std::uint64_t lhs, const std::uint64_t rhs,
-                                   const VectorLogicOp op, const bool sse_in_place_order) {
-    switch (op) {
-    case VectorLogicOp::Xor:
-        return lhs ^ rhs;
-    case VectorLogicOp::And:
-        return lhs & rhs;
-    case VectorLogicOp::Or:
-        return lhs | rhs;
-    case VectorLogicOp::AndNot:
-        (void)sse_in_place_order;
-        return rhs & ~lhs;
-    }
-    return lhs ^ rhs;
-}
-} // namespace
-
 void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
               const VectorLogicOp op) {
-    for (std::size_t offset = 0; offset < dst.size(); offset += sizeof(std::uint64_t)) {
-        const auto lhs = LoadUnaligned<std::uint64_t>(dst.data() + offset);
-        const auto rhs = LoadUnaligned<std::uint64_t>(src.data() + offset);
-        StoreUnaligned<std::uint64_t>(dst.data() + offset,
-                                      ApplyVectorLogicWord(lhs, rhs, op, true));
-    }
+    ExecuteVectorBoolean(dst.data(), dst.data(), src.data(), op, dst.size());
 }
 
 void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, const VectorLogicOp op,
             const std::size_t size) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || size > 32) {
-        return;
-    }
-
-    std::array<std::uint8_t, 32> left{};
-    std::array<std::uint8_t, 32> right{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(left.data(), lhs, size);
-    std::memcpy(right.data(), rhs, size);
-    if (size < sizeof(std::uint64_t)) {
-        for (std::size_t i = 0; i < size; ++i) {
-            out[i] = static_cast<std::uint8_t>(
-                ApplyVectorLogicWord(left[i], right[i], op, false));
+    using VectorSemantic::BooleanOperation;
+    const auto semantic_op = [op]() {
+        switch (op) {
+        case VectorLogicOp::Xor: return BooleanOperation::ExclusiveOr;
+        case VectorLogicOp::And: return BooleanOperation::Conjunction;
+        case VectorLogicOp::Or: return BooleanOperation::Disjunction;
+        case VectorLogicOp::AndNot:
+            return BooleanOperation::ConjunctionWithInvertedLeft;
         }
-    } else {
-        const std::size_t qwords = size / sizeof(std::uint64_t);
-        for (std::size_t i = 0; i < qwords; ++i) {
-            const auto l = LoadUnaligned<std::uint64_t>(left.data() + i * sizeof(std::uint64_t));
-            const auto r = LoadUnaligned<std::uint64_t>(right.data() + i * sizeof(std::uint64_t));
-            StoreUnaligned<std::uint64_t>(out.data() + i * sizeof(std::uint64_t),
-                                          ApplyVectorLogicWord(l, r, op, false));
-        }
-        for (std::size_t i = qwords * sizeof(std::uint64_t); i < size; ++i) {
-            out[i] = static_cast<std::uint8_t>(
-                ApplyVectorLogicWord(left[i], right[i], op, false));
-        }
-    }
-    std::memcpy(dst, out.data(), size);
-    if (size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + size, 0, 32 - size);
-    }
+        return BooleanOperation::ExclusiveOr;
+    }();
+    (void)VectorSemantic::ApplyBoolean(dst, lhs, rhs, size, semantic_op);
 }
 
 void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, const std::size_t size) {
-    if (lhs == nullptr || rhs == nullptr || size > 32) {
+    if (lhs == nullptr || rhs == nullptr || size == 0 || size > 32) {
         return;
     }
-
-    const auto* left = static_cast<const std::uint8_t*>(lhs);
-    const auto* right = static_cast<const std::uint8_t*>(rhs);
-    bool and_any = false;
-    bool andn_any = false;
-    for (std::size_t i = 0; i < size; ++i) {
-        and_any = and_any || ((left[i] & right[i]) != 0);
-        andn_any = andn_any || (((~left[i]) & right[i]) != 0);
-    }
+    const auto result = VectorSemantic::TestPackedBits(lhs, rhs, size);
     std::uint64_t flags = 0;
-    if (!and_any) {
+    if (result.intersection_is_zero) {
         flags |= kFlagZf;
     }
-    if (!andn_any) {
+    if (result.masked_complement_is_zero) {
         flags |= kFlagCf;
     }
     StoreStatusFlags(state, flags);
@@ -33833,53 +33894,14 @@ void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* r
 
 void DuplicatePackedSingleLanes(void* dst, const void* src, const bool high_source_elements,
                           const std::size_t size) {
-    if (dst == nullptr || src == nullptr || size > 32) {
-        return;
-    }
-
-    std::array<std::uint8_t, 32> source{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(source.data(), src, size);
-    const std::size_t first_offset = high_source_elements ? 4 : 0;
-    const std::size_t second_offset = high_source_elements ? 12 : 8;
-    for (std::size_t lane = 0; lane < size; lane += 16) {
-        if (lane + second_offset + sizeof(std::uint32_t) > source.size()) {
-            break;
-        }
-        const auto first = LoadUnaligned<std::uint32_t>(source.data() + lane + first_offset);
-        const auto second = LoadUnaligned<std::uint32_t>(source.data() + lane + second_offset);
-        StoreUnaligned<std::uint32_t>(out.data() + lane, first);
-        StoreUnaligned<std::uint32_t>(out.data() + lane + 4, first);
-        StoreUnaligned<std::uint32_t>(out.data() + lane + 8, second);
-        StoreUnaligned<std::uint32_t>(out.data() + lane + 12, second);
-    }
-    std::memcpy(dst, out.data(), size);
-    if (size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + size, 0, 32 - size);
-    }
+    (void)VectorSemantic::DuplicateDwordParity(
+        dst, src, size, high_source_elements);
 }
 
 void DuplicatePackedDoubleLanes(void* dst, const void* src, const std::size_t size,
                           const bool zero_upper_ymm) {
-    if (dst == nullptr || src == nullptr || size > 32) {
-        return;
-    }
-
-    std::array<std::uint8_t, 32> source{};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(source.data(), src, size);
-    for (std::size_t lane = 0; lane < size; lane += 16) {
-        if (lane + sizeof(std::uint64_t) > source.size()) {
-            break;
-        }
-        const auto value = LoadUnaligned<std::uint64_t>(source.data() + lane);
-        StoreUnaligned<std::uint64_t>(out.data() + lane, value);
-        StoreUnaligned<std::uint64_t>(out.data() + lane + 8, value);
-    }
-    std::memcpy(dst, out.data(), size);
-    if (zero_upper_ymm && size < 32) {
-        std::memset(static_cast<std::uint8_t*>(dst) + size, 0, 32 - size);
-    }
+    (void)VectorSemantic::DuplicateLowQwordPerLane(
+        dst, src, size, zero_upper_ymm);
 }
 
 void BroadcastScalarLane(void* dst, const void* src, const std::size_t element_size,
@@ -34562,19 +34584,8 @@ void StoreElement(std::uint8_t* ptr, std::uint64_t value, const std::size_t elem
 
 void AddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
                    const bool subtract, const std::size_t total_size) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_size == 0 ||
-        element_size > 8 || total_size > 32) {
-        return;
-    }
-    std::array<std::uint8_t, 32> out{};
-    for (std::size_t offset = 0; offset < total_size; offset += element_size) {
-        const std::uint64_t l = LoadElementUnsigned(static_cast<const std::uint8_t*>(lhs) + offset,
-                                                    element_size);
-        const std::uint64_t r = LoadElementUnsigned(static_cast<const std::uint8_t*>(rhs) + offset,
-                                                    element_size);
-        StoreElement(out.data() + offset, subtract ? (l - r) : (l + r), element_size);
-    }
-    std::memcpy(dst, out.data(), out.size());
+    (void)VectorSemantic::AddOrSubtractPacked(
+        dst, lhs, rhs, element_size, total_size, subtract);
 }
 
 namespace {
@@ -41321,6 +41332,163 @@ std::string LsxEngineSelfTestJson() {
                     std::memory_order_relaxed) > faultable_simd_writeback_before;
         }
 
+        // VECTOR_KERNEL_DIRECT_DIFFERENTIAL_GATE: these formerly entered the
+        // instruction-local C++ semantic leaf. The block mixes flag-only and
+        // register-writing kernels, a VEX.128 upper-half clear and a faultable
+        // final store. Counter deltas prove that all five vector instructions
+        // are now direct AArch64 and that the block contains no semantic BLR.
+        const std::uint64_t vector_kernel_fast_before =
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
+        const std::uint64_t vector_kernel_semantic_before =
+            g_jit_native_simd_semantic_instructions.load(
+                std::memory_order_relaxed);
+        const std::uint64_t fully_direct_blocks_before =
+            g_jit_native_fully_direct_blocks.load(std::memory_order_relaxed);
+        const std::array<std::uint8_t, 24> generic_vector_kernels = {
+            0xc4, 0xe2, 0x7d, 0x17, 0xc1, // vptest ymm0,ymm1
+            0xc5, 0xfe, 0x12, 0xe5,       // vmovsldup ymm4,ymm5
+            0xc5, 0xfa, 0x16, 0xf7,       // vmovshdup xmm6,xmm7
+            0xc4, 0x41, 0x7f, 0x12, 0xc1, // vmovddup ymm8,ymm9
+            0xc5, 0xfe, 0x7f, 0x20,       // vmovdqu [rax],ymm4
+            0xeb, 0x00,
+        };
+        const bool generic_vector_kernel_result_ok = run_generic_simd_case(
+            generic_vector_kernels, 6, 4,
+            [](LsxMachineImage& state,
+               std::array<std::uint8_t, 128>& memory) {
+                state.rflags = 0xad7u;
+                state.mxcsr = 0x5f80u;
+                SetGpr64(state, LsxGpr::Rax,
+                         reinterpret_cast<std::uint64_t>(memory.data()));
+                state.ymm[0].fill(0x0fu);
+                state.ymm[1].fill(0xf0u);
+                for (std::uint32_t lane = 0; lane < 8; ++lane) {
+                    StoreUnaligned<std::uint32_t>(
+                        state.ymm[5].data() + lane * 4,
+                        0x100u + lane);
+                }
+                for (std::uint32_t lane = 0; lane < 4; ++lane) {
+                    StoreUnaligned<std::uint32_t>(
+                        state.ymm[7].data() + lane * 4,
+                        0x200u + lane);
+                }
+                state.ymm[7][16] = 0xeeu;
+                for (std::uint32_t lane = 0; lane < 4; ++lane) {
+                    StoreUnaligned<std::uint64_t>(
+                        state.ymm[9].data() + lane * 8,
+                        0x300000000ull + lane);
+                }
+            },
+            [](const LsxMachineImage& state,
+               const std::array<std::uint8_t, 128>& memory) {
+                constexpr std::array<std::uint32_t, 8> even_dwords = {
+                    0x100u, 0x100u, 0x102u, 0x102u,
+                    0x104u, 0x104u, 0x106u, 0x106u,
+                };
+                constexpr std::array<std::uint32_t, 4> odd_dwords = {
+                    0x201u, 0x201u, 0x203u, 0x203u,
+                };
+                constexpr std::array<std::uint64_t, 4> low_qwords = {
+                    0x300000000ull, 0x300000000ull,
+                    0x300000002ull, 0x300000002ull,
+                };
+                const std::uint64_t expected_flags =
+                    (0xad7u & ~kStatusMask) | kFlagZf;
+                return state.rflags == expected_flags &&
+                       state.mxcsr == 0x5f80u &&
+                       std::memcmp(state.ymm[4].data(), even_dwords.data(), 32) == 0 &&
+                       std::memcmp(memory.data(), even_dwords.data(), 32) == 0 &&
+                       std::memcmp(state.ymm[6].data(), odd_dwords.data(), 16) == 0 &&
+                       std::all_of(state.ymm[6].begin() + 16,
+                                   state.ymm[6].end(),
+                                   [](const std::uint8_t value) {
+                                       return value == 0;
+                                   }) &&
+                       std::memcmp(state.ymm[8].data(), low_qwords.data(), 32) == 0;
+            });
+        const bool generic_vector_kernel_counter_ok =
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
+                vector_kernel_fast_before + 5u &&
+            g_jit_native_simd_semantic_instructions.load(
+                std::memory_order_relaxed) == vector_kernel_semantic_before &&
+            g_jit_native_fully_direct_blocks.load(std::memory_order_relaxed) ==
+                fully_direct_blocks_before + 1u;
+        const bool generic_vector_kernel_native_ok =
+            generic_vector_kernel_result_ok && generic_vector_kernel_counter_ok;
+        std::uint64_t vector_kernel_semantic_ns = 0;
+        std::uint64_t vector_kernel_native_ns = 0;
+        std::uint64_t vector_kernel_speedup_milli = 0;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            LsxDecodedRegion decoded = BuildLsxCodeRegion(
+                reinterpret_cast<std::uint64_t>(generic_vector_kernels.data()),
+                generic_vector_kernels.size());
+            Arm64BlockEntry direct_entry = nullptr;
+            Arm64BlockEntry native_entry =
+                arena.EmitNativeControlFlowBlock(decoded, nullptr, &direct_entry);
+            alignas(32) std::array<std::uint8_t, 64> semantic_memory{};
+            alignas(32) std::array<std::uint8_t, 64> native_memory{};
+            LsxMachineImage semantic_state{};
+            LsxMachineImage native_state{};
+            const auto initialize = [](LsxMachineImage& state,
+                                       std::array<std::uint8_t, 64>& memory) {
+                state.rflags = 0xad7u;
+                state.mxcsr = 0x5f80u;
+                SetGpr64(state, LsxGpr::Rax,
+                         reinterpret_cast<std::uint64_t>(memory.data()));
+                state.ymm[0].fill(0x0fu);
+                state.ymm[1].fill(0xf0u);
+                for (std::uint32_t lane = 0; lane < 8; ++lane) {
+                    StoreUnaligned<std::uint32_t>(
+                        state.ymm[5].data() + lane * 4, lane + 1u);
+                }
+                for (std::uint32_t lane = 0; lane < 4; ++lane) {
+                    StoreUnaligned<std::uint32_t>(
+                        state.ymm[7].data() + lane * 4, lane + 11u);
+                    StoreUnaligned<std::uint64_t>(
+                        state.ymm[9].data() + lane * 8, lane + 21u);
+                }
+            };
+            initialize(semantic_state, semantic_memory);
+            initialize(native_state, native_memory);
+            if (native_entry != nullptr && direct_entry != nullptr &&
+                decoded.instructions.size() == 6) {
+                constexpr std::uint32_t kWarmIterations = 512;
+                constexpr std::uint32_t kMeasuredIterations = 100000;
+                for (std::uint32_t iteration = 0;
+                     iteration < kWarmIterations; ++iteration) {
+                    (void)native_entry(&native_state);
+                }
+                const auto semantic_begin = std::chrono::steady_clock::now();
+                for (std::uint32_t iteration = 0;
+                     iteration < kMeasuredIterations; ++iteration) {
+                    for (std::size_t instruction = 0; instruction < 4;
+                         ++instruction) {
+                        (void)ExecuteNativeSimdSemanticInstruction(
+                            &semantic_state, &decoded.instructions[instruction]);
+                    }
+                }
+                const auto semantic_end = std::chrono::steady_clock::now();
+                const auto native_begin = std::chrono::steady_clock::now();
+                for (std::uint32_t iteration = 0;
+                     iteration < kMeasuredIterations; ++iteration) {
+                    (void)native_entry(&native_state);
+                }
+                const auto native_end = std::chrono::steady_clock::now();
+                vector_kernel_semantic_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        semantic_end - semantic_begin).count());
+                vector_kernel_native_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        native_end - native_begin).count());
+                if (vector_kernel_native_ns != 0) {
+                    vector_kernel_speedup_milli =
+                        (vector_kernel_semantic_ns * 1000u) /
+                        vector_kernel_native_ns;
+                }
+            }
+        }
+
         // LDDQU_VLDDQU_DIRECT_DIFFERENTIAL_GATE: cover the complete architectural family,
         // not just the first Bloodborne spelling.  The first instruction is the exact frontier
         // bytes (vlddqu xmm1,[rsi]); the remaining instructions prove the 256-bit VEX form,
@@ -42817,6 +42985,7 @@ std::string LsxEngineSelfTestJson() {
             g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 simd_semantic_before;
         const bool generic_simd_native_ok = generic_simd_ymm_native_ok &&
+            generic_vector_kernel_native_ok &&
             generic_lddqu_vlddqu_native_ok && generic_maskmovdqu_native_ok &&
             generic_psadbw_vpsadbw_native_ok &&
             generic_saturating_packed_native_ok && generic_simd_xmm_fp_native_ok &&
@@ -44334,6 +44503,18 @@ std::string LsxEngineSelfTestJson() {
             << (generic_faultable_simd_writeback_ok ? "true" : "false") << ","
             << R"("genericSimdYmmNativeOk":)"
             << (generic_simd_ymm_native_ok ? "true" : "false") << ","
+            << R"("genericVectorKernelNativeOk":)"
+            << (generic_vector_kernel_native_ok ? "true" : "false") << ","
+            << R"("genericVectorKernelResultOk":)"
+            << (generic_vector_kernel_result_ok ? "true" : "false") << ","
+            << R"("genericVectorKernelCounterOk":)"
+            << (generic_vector_kernel_counter_ok ? "true" : "false") << ","
+            << R"("genericVectorKernelSemanticNs":)"
+            << vector_kernel_semantic_ns << ","
+            << R"("genericVectorKernelNativeNs":)"
+            << vector_kernel_native_ns << ","
+            << R"("genericVectorKernelSpeedupMilli":)"
+            << vector_kernel_speedup_milli << ","
             << R"("genericLddquVlddquNativeOk":)"
             << (generic_lddqu_vlddqu_native_ok ? "true" : "false") << ","
             << R"("genericLddquVlddquResultOk":)"
