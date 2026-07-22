@@ -1554,33 +1554,31 @@ void JitMaybeReportRipProbe(const std::uint64_t rip, const LsxMachineImage& stat
             : 0;
     const std::string rdi_text = TraceCStringOrEmpty(rdi, 96);
     const std::string rsi_text = TraceCStringOrEmpty(rsi, 96);
-    JitLog(
-        "[EXECUTOR_JIT_RIP_PROBE] n=%llu rip=0x%llx return=0x%llx "
-        "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx rdi=0x%llx "
-        "r8=0x%llx r9=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx "
-        "rsp=0x%llx rbxQ00=0x%llx rbxQ18=0x%llx rbxQ20=0x%llx rbxQ28=0x%llx "
-        "rdiText=\"%s\" rsiText=\"%s\"",
-        static_cast<unsigned long long>(current),
-        static_cast<unsigned long long>(rip),
-        static_cast<unsigned long long>(return_rip),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rax)),
-        static_cast<unsigned long long>(rbx),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rcx)),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rdx)),
-        static_cast<unsigned long long>(rsi),
-        static_cast<unsigned long long>(rdi),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R8)),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R9)),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R12)),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R13)),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R14)),
-        static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R15)),
-        static_cast<unsigned long long>(rsp),
-        static_cast<unsigned long long>(rbx_qword_00),
-        static_cast<unsigned long long>(rbx_qword_18),
-        static_cast<unsigned long long>(rbx_qword_20),
-        static_cast<unsigned long long>(rbx_qword_28),
-        rdi_text.c_str(), rsi_text.c_str());
+    const auto probe = static_cast<unsigned long long>(current);
+    JitLog("[LSX4_PC_PROBE] sample=%llu pc=0x%llx return_pc=0x%llx stack=0x%llx",
+           probe, static_cast<unsigned long long>(rip),
+           static_cast<unsigned long long>(return_rip),
+           static_cast<unsigned long long>(rsp));
+    JitLog("[LSX4_PC_PROBE_LOW] sample=%llu a=0x%llx b=0x%llx c=0x%llx d=0x%llx di=0x%llx si=0x%llx",
+           probe, static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rax)),
+           static_cast<unsigned long long>(rbx),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rcx)),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rdx)),
+           static_cast<unsigned long long>(rdi), static_cast<unsigned long long>(rsi));
+    JitLog("[LSX4_PC_PROBE_SAVED] sample=%llu v8=0x%llx v9=0x%llx v12=0x%llx v13=0x%llx v14=0x%llx v15=0x%llx",
+           probe, static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R8)),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R9)),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R12)),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R13)),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R14)),
+           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R15)));
+    JitLog("[LSX4_PC_PROBE_MEMORY] sample=%llu b_00=0x%llx b_18=0x%llx b_20=0x%llx b_28=0x%llx",
+           probe, static_cast<unsigned long long>(rbx_qword_00),
+           static_cast<unsigned long long>(rbx_qword_18),
+           static_cast<unsigned long long>(rbx_qword_20),
+           static_cast<unsigned long long>(rbx_qword_28));
+    JitLog("[LSX4_PC_PROBE_TEXT] sample=%llu di=\"%s\" si=\"%s\"",
+           probe, rdi_text.c_str(), rsi_text.c_str());
 #else
     (void)rip;
     (void)state;
@@ -18910,36 +18908,39 @@ extern "C" void executor_jit_dump_thread_states(const char* reason) {
             };
         }
     }
-    JitLog("[EXECUTOR_JIT_LIVE_DUMP] reason=%s count=%zu",
-           reason && reason[0] ? reason : "<none>", live_count);
+    const char* snapshot_cause = reason && reason[0] ? reason : "unspecified";
+    JitLog("[LSX4_LIVE_SNAPSHOT] cause=%s threads=%zu", snapshot_cause, live_count);
     for (std::size_t i = 0; i < live_count; ++i) {
         const auto& live = live_snapshot[i];
         const auto& state = live.machine;
-        JitLog(
-            "[EXECUTOR_JIT_LIVE_THREAD] reason=%s tid=%u rip=0x%llx "
-            "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
-            "rdi=0x%llx rsi=0x%llx rsp=0x%llx rbp=0x%llx "
-            "r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx "
-            "r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx fs=0x%llx",
-            reason && reason[0] ? reason : "<none>", live.host_tid,
-            static_cast<unsigned long long>(state.rip_or_exit),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rax)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbx)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rcx)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rdx)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rdi)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rsi)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rsp)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbp)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R8)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R9)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R10)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R11)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R12)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R13)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R14)),
-            static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R15)),
-            static_cast<unsigned long long>(state.fs_base));
+        JitLog("[LSX4_LIVE_THREAD] cause=%s host_tid=%u pc=0x%llx fs_base=0x%llx",
+               snapshot_cause, live.host_tid,
+               static_cast<unsigned long long>(state.rip_or_exit),
+               static_cast<unsigned long long>(state.fs_base));
+        JitLog("[LSX4_LIVE_LOW] host_tid=%u a=0x%llx b=0x%llx c=0x%llx d=0x%llx",
+               live.host_tid,
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rax)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbx)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rcx)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rdx)));
+        JitLog("[LSX4_LIVE_FRAME] host_tid=%u di=0x%llx si=0x%llx sp=0x%llx bp=0x%llx",
+               live.host_tid,
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rdi)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rsi)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rsp)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbp)));
+        JitLog("[LSX4_LIVE_EXTENDED] host_tid=%u v8=0x%llx v9=0x%llx v10=0x%llx v11=0x%llx",
+               live.host_tid,
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R8)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R9)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R10)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R11)));
+        JitLog("[LSX4_LIVE_SAVED] host_tid=%u v12=0x%llx v13=0x%llx v14=0x%llx v15=0x%llx",
+               live.host_tid,
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R12)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R13)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R14)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R15)));
     }
 #endif
 }
