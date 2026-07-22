@@ -16,6 +16,7 @@
 #include "executor/dynamic_translation/region_registry.h"
 #include "executor/dynamic_translation/scalar_ir_builder.h"
 #include "executor/dynamic_translation/scalar_semantics.h"
+#include "executor/dynamic_translation/translation_service.h"
 #include "executor/dynamic_translation/value_residency.h"
 #include "executor/dynamic_translation/vector_semantics.h"
 #include "executor/dynamic_translation/x87_state.h"
@@ -52,6 +53,7 @@ enum CheckBit : std::uint64_t {
     MxcsrTransfer = 1ull << 18,
     X87State = 1ull << 19,
     X87Semantics = 1ull << 20,
+    TranslationOrchestration = 1ull << 21,
 };
 
 struct FetchContext {
@@ -617,6 +619,67 @@ bool CheckX87Semantics() {
            frame.x87_data_address == image.base + 32;
 }
 
+bool CheckTranslationOrchestration() {
+    std::array<std::uint8_t, 10> fixture{
+        0xb8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x07, 0xeb, 0x02};
+    constexpr std::uint64_t code_base = 0xf800;
+    FetchContext context{code_base, fixture};
+    const ReadGuestBytes reader = [&fixture](const std::uint64_t address,
+                                              const std::span<std::uint8_t> output) {
+        if (address < code_base || address - code_base > fixture.size()) {
+            return false;
+        }
+        const std::size_t offset = static_cast<std::size_t>(address - code_base);
+        if (output.size() > fixture.size() - offset) {
+            return false;
+        }
+        std::memcpy(output.data(), fixture.data() + offset, output.size());
+        return true;
+    };
+    TranslationService service{64 * 1024};
+    const AcquireResult first =
+        service.Acquire(code_base, FetchFixture, &context, reader, 8);
+    const AcquireResult reused =
+        service.Acquire(code_base, FetchFixture, &context, reader, 8);
+    if (first.status != AcquireStatus::Ready || !first.region ||
+        reused.status != AcquireStatus::Ready || !reused.region ||
+        reused.region->Publication() != first.region->Publication() ||
+        first.region->Payload().outgoing_edges.size() != 1) {
+        return false;
+    }
+#if defined(__aarch64__)
+    CpuFrame frame{};
+    const auto entry = reinterpret_cast<NativeRegionEntry>(
+        first.region->Payload().entry_address);
+    if (entry(&frame) != code_base + 12 || frame.integer[0] != 12) {
+        return false;
+    }
+#endif
+    fixture[1] = 6;
+    service.NotifyMutation(code_base + 1, 1);
+    if (service.RegionCount() != 0) {
+        return false;
+    }
+    const AcquireResult replacement =
+        service.Acquire(code_base, FetchFixture, &context, reader, 8);
+    if (replacement.status != AcquireStatus::Ready || !replacement.region ||
+        replacement.region->Publication() == first.region->Publication()) {
+        return false;
+    }
+#if defined(__aarch64__)
+    CpuFrame changed{};
+    const auto replacement_entry = reinterpret_cast<NativeRegionEntry>(
+        replacement.region->Payload().entry_address);
+    if (replacement_entry(&changed) != code_base + 12 || changed.integer[0] != 13) {
+        return false;
+    }
+#endif
+    const TranslationServiceCounters counters = service.Counters();
+    return counters.lookup_hits == 1 && counters.compiled_regions == 2 &&
+           counters.invalidated_regions == 1 && service.RegionCount() == 1 &&
+           service.NativeBytes() != 0;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -737,6 +800,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(MxcsrTransfer, CheckMxcsrTransfer());
     run(X87State, CheckX87State());
     run(X87Semantics, CheckX87Semantics());
+    run(TranslationOrchestration, CheckTranslationOrchestration());
     return report;
 }
 
