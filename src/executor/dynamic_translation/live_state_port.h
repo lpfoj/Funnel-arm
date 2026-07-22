@@ -9,6 +9,13 @@
 
 namespace Lsx4::Translation {
 
+enum class FrameScalar : std::uint8_t {
+    Resume,
+    GsOrigin,
+    FsOrigin,
+    Conditions,
+};
+
 class LiveStateView {
 public:
     constexpr LiveStateView() noexcept = default;
@@ -21,6 +28,9 @@ public:
     void Write(IntegerRegister id, std::uint64_t value) const noexcept;
     [[nodiscard]] std::uint64_t ResumeAddress() const noexcept;
     void SetResumeAddress(std::uint64_t address) const noexcept;
+    [[nodiscard]] std::uint64_t ReadScalar(FrameScalar id) const noexcept;
+    void WriteScalar(FrameScalar id, std::uint64_t value) const noexcept;
+    [[nodiscard]] std::uintptr_t StorageAddress() const noexcept;
     [[nodiscard]] bool CopyTo(CpuFrame& destination) const noexcept;
     [[nodiscard]] bool ReplaceWith(const CpuFrame& source) const noexcept;
 

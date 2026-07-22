@@ -11,7 +11,7 @@
 #include "core/libraries/libs.h"
 #include "core/signals.h"
 #ifdef __ANDROID__
-#include "executor/jit/lsx_translation_engine.h"
+#include "executor/dynamic_translation/live_state_port.h"
 #endif
 
 #include <cerrno>
@@ -454,7 +454,7 @@ static void RecordJitSignalProbeEntry(const s32 orbis_signal,
         !ExecutorJitSignalParityActive()) {
         return;
     }
-    auto* state = Executor::Jit::FindActiveMachineImage();
+    const auto state = Lsx4::Translation::PublishedLiveState();
     const auto next_sequence =
         g_jit_signal_probe_sequence.load(std::memory_order_relaxed) + 1;
     g_jit_signal_probe_linux_tid.store(CurrentKernelTidForSignalTrace(),
@@ -466,9 +466,9 @@ static void RecordJitSignalProbeEntry(const s32 orbis_signal,
             ? HandlerKinds[orbis_signal]
             : std::uint8_t{0},
         std::memory_order_relaxed);
-    g_jit_signal_probe_guest_state.store(reinterpret_cast<std::uintptr_t>(state),
+    g_jit_signal_probe_guest_state.store(state.StorageAddress(),
                                                std::memory_order_relaxed);
-    g_jit_signal_probe_guest_rip.store(state != nullptr ? state->rip_or_exit : 0,
+    g_jit_signal_probe_guest_rip.store(state.ResumeAddress(),
                                              std::memory_order_relaxed);
 #if defined(__aarch64__)
     g_jit_signal_probe_host_pc.store(
@@ -536,23 +536,18 @@ static void TraceLiveSignal(const char* stage, s32 orbis_sig, s32 native_sig,
     if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
         return;
     }
-    const auto* guest_state = Executor::Jit::FindActiveMachineImage();
-    const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
-    const std::uint64_t guest_rsp = guest_state != nullptr
-                                        ? Executor::Jit::ReadGuestGpr64(
-                                              *guest_state, Executor::Jit::LsxGpr::Rsp)
-                                        : 0;
-    const auto guest_gpr = [guest_state](const Executor::Jit::LsxGpr reg) {
-        return guest_state != nullptr ? Executor::Jit::ReadGuestGpr64(*guest_state, reg) : 0;
-    };
-    const std::uint64_t guest_rdi = guest_gpr(Executor::Jit::LsxGpr::Rdi);
-    const std::uint64_t guest_rsi = guest_gpr(Executor::Jit::LsxGpr::Rsi);
-    const std::uint64_t guest_rbp = guest_gpr(Executor::Jit::LsxGpr::Rbp);
-    const std::uint64_t guest_rax = guest_gpr(Executor::Jit::LsxGpr::Rax);
-    const std::uint64_t guest_r12 = guest_gpr(Executor::Jit::LsxGpr::R12);
-    const std::uint64_t guest_r13 = guest_gpr(Executor::Jit::LsxGpr::R13);
-    const std::uint64_t guest_r14 = guest_gpr(Executor::Jit::LsxGpr::R14);
-    const std::uint64_t guest_r15 = guest_gpr(Executor::Jit::LsxGpr::R15);
+    using Lsx4::Translation::IntegerRegister;
+    const auto guest_state = Lsx4::Translation::PublishedLiveState();
+    const std::uint64_t guest_rip = guest_state.ResumeAddress();
+    const std::uint64_t guest_rsp = guest_state.Read(IntegerRegister::Stack);
+    const std::uint64_t guest_rdi = guest_state.Read(IntegerRegister::Destination);
+    const std::uint64_t guest_rsi = guest_state.Read(IntegerRegister::Source);
+    const std::uint64_t guest_rbp = guest_state.Read(IntegerRegister::Frame);
+    const std::uint64_t guest_rax = guest_state.Read(IntegerRegister::A);
+    const std::uint64_t guest_r12 = guest_state.Read(IntegerRegister::R12);
+    const std::uint64_t guest_r13 = guest_state.Read(IntegerRegister::R13);
+    const std::uint64_t guest_r14 = guest_state.Read(IntegerRegister::R14);
+    const std::uint64_t guest_r15 = guest_state.Read(IntegerRegister::R15);
     __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
                         "[EXECUTOR_LIVE_SIGNAL] stage=%s curThread=%s tid=%ld target=%p "
                         "targetName=%s targetNative=0x%zx sig=%d native=%d handler=%p "
@@ -661,34 +656,36 @@ static void TraceLightOracleThreadSnapshot(const char* reason, PthreadT target, 
 }
 
 static bool CaptureJitGuestUcontext(Ucontext& ctx) {
-    const auto* state = Executor::Jit::FindActiveMachineImage();
-    if (state == nullptr) {
+    using Lsx4::Translation::FrameScalar;
+    using Lsx4::Translation::IntegerRegister;
+    const auto state = Lsx4::Translation::PublishedLiveState();
+    if (!state) {
         return false;
     }
-    using Executor::Jit::ReadGuestGpr64;
-    using Executor::Jit::LsxGpr;
-    ctx.uc_mcontext.mc_rax = ReadGuestGpr64(*state, LsxGpr::Rax);
-    ctx.uc_mcontext.mc_rcx = ReadGuestGpr64(*state, LsxGpr::Rcx);
-    ctx.uc_mcontext.mc_rdx = ReadGuestGpr64(*state, LsxGpr::Rdx);
-    ctx.uc_mcontext.mc_rbx = ReadGuestGpr64(*state, LsxGpr::Rbx);
-    ctx.uc_mcontext.mc_rsp = ReadGuestGpr64(*state, LsxGpr::Rsp);
-    ctx.uc_mcontext.mc_rbp = ReadGuestGpr64(*state, LsxGpr::Rbp);
-    ctx.uc_mcontext.mc_rsi = ReadGuestGpr64(*state, LsxGpr::Rsi);
-    ctx.uc_mcontext.mc_rdi = ReadGuestGpr64(*state, LsxGpr::Rdi);
-    ctx.uc_mcontext.mc_r8 = ReadGuestGpr64(*state, LsxGpr::R8);
-    ctx.uc_mcontext.mc_r9 = ReadGuestGpr64(*state, LsxGpr::R9);
-    ctx.uc_mcontext.mc_r10 = ReadGuestGpr64(*state, LsxGpr::R10);
-    ctx.uc_mcontext.mc_r11 = ReadGuestGpr64(*state, LsxGpr::R11);
-    ctx.uc_mcontext.mc_r12 = ReadGuestGpr64(*state, LsxGpr::R12);
-    ctx.uc_mcontext.mc_r13 = ReadGuestGpr64(*state, LsxGpr::R13);
-    ctx.uc_mcontext.mc_r14 = ReadGuestGpr64(*state, LsxGpr::R14);
-    ctx.uc_mcontext.mc_r15 = ReadGuestGpr64(*state, LsxGpr::R15);
-    ctx.uc_mcontext.mc_rip = state->rip_or_exit;
-    ctx.uc_mcontext.mc_rflags = state->rflags;
-    ctx.uc_mcontext.mc_fs = static_cast<u16>(state->fs_base & 0xffffu);
-    ctx.uc_mcontext.mc_gs = static_cast<u16>(state->gs_base & 0xffffu);
-    ctx.uc_mcontext.mc_fsbase = state->fs_base;
-    ctx.uc_mcontext.mc_gsbase = state->gs_base;
+    ctx.uc_mcontext.mc_rax = state.Read(IntegerRegister::A);
+    ctx.uc_mcontext.mc_rcx = state.Read(IntegerRegister::C);
+    ctx.uc_mcontext.mc_rdx = state.Read(IntegerRegister::D);
+    ctx.uc_mcontext.mc_rbx = state.Read(IntegerRegister::B);
+    ctx.uc_mcontext.mc_rsp = state.Read(IntegerRegister::Stack);
+    ctx.uc_mcontext.mc_rbp = state.Read(IntegerRegister::Frame);
+    ctx.uc_mcontext.mc_rsi = state.Read(IntegerRegister::Source);
+    ctx.uc_mcontext.mc_rdi = state.Read(IntegerRegister::Destination);
+    ctx.uc_mcontext.mc_r8 = state.Read(IntegerRegister::R8);
+    ctx.uc_mcontext.mc_r9 = state.Read(IntegerRegister::R9);
+    ctx.uc_mcontext.mc_r10 = state.Read(IntegerRegister::R10);
+    ctx.uc_mcontext.mc_r11 = state.Read(IntegerRegister::R11);
+    ctx.uc_mcontext.mc_r12 = state.Read(IntegerRegister::R12);
+    ctx.uc_mcontext.mc_r13 = state.Read(IntegerRegister::R13);
+    ctx.uc_mcontext.mc_r14 = state.Read(IntegerRegister::R14);
+    ctx.uc_mcontext.mc_r15 = state.Read(IntegerRegister::R15);
+    ctx.uc_mcontext.mc_rip = state.ReadScalar(FrameScalar::Resume);
+    ctx.uc_mcontext.mc_rflags = state.ReadScalar(FrameScalar::Conditions);
+    const std::uint64_t fs = state.ReadScalar(FrameScalar::FsOrigin);
+    const std::uint64_t gs = state.ReadScalar(FrameScalar::GsOrigin);
+    ctx.uc_mcontext.mc_fs = static_cast<u16>(fs & 0xffffu);
+    ctx.uc_mcontext.mc_gs = static_cast<u16>(gs & 0xffffu);
+    ctx.uc_mcontext.mc_fsbase = fs;
+    ctx.uc_mcontext.mc_gsbase = gs;
     return true;
 }
 
@@ -736,36 +733,38 @@ static bool ApplyGuestUcontextToBackend(s32 orbis_sig, s32 native_sig,
                                         OrbisKernelExceptionHandler handler,
                                         const Ucontext& ctx, void* fault_addr) {
     if (ExecutorJitSignalParityActive()) {
-        auto* state = Executor::Jit::FindActiveMachineImage();
-        if (state == nullptr) {
+        using Lsx4::Translation::FrameScalar;
+        using Lsx4::Translation::IntegerRegister;
+        const auto state = Lsx4::Translation::PublishedLiveState();
+        if (!state) {
             TraceLiveSignal("handler_guest_ucontext_apply_no_state", orbis_sig, native_sig,
                             handler, nullptr, -1, 0, fault_addr);
             return false;
         }
-        using Executor::Jit::WriteGuestGpr64;
-        using Executor::Jit::LsxGpr;
-        WriteGuestGpr64(*state, LsxGpr::Rax, ctx.uc_mcontext.mc_rax);
-        WriteGuestGpr64(*state, LsxGpr::Rcx, ctx.uc_mcontext.mc_rcx);
-        WriteGuestGpr64(*state, LsxGpr::Rdx, ctx.uc_mcontext.mc_rdx);
-        WriteGuestGpr64(*state, LsxGpr::Rbx, ctx.uc_mcontext.mc_rbx);
-        WriteGuestGpr64(*state, LsxGpr::Rsp, ctx.uc_mcontext.mc_rsp);
-        WriteGuestGpr64(*state, LsxGpr::Rbp, ctx.uc_mcontext.mc_rbp);
-        WriteGuestGpr64(*state, LsxGpr::Rsi, ctx.uc_mcontext.mc_rsi);
-        WriteGuestGpr64(*state, LsxGpr::Rdi, ctx.uc_mcontext.mc_rdi);
-        WriteGuestGpr64(*state, LsxGpr::R8, ctx.uc_mcontext.mc_r8);
-        WriteGuestGpr64(*state, LsxGpr::R9, ctx.uc_mcontext.mc_r9);
-        WriteGuestGpr64(*state, LsxGpr::R10, ctx.uc_mcontext.mc_r10);
-        WriteGuestGpr64(*state, LsxGpr::R11, ctx.uc_mcontext.mc_r11);
-        WriteGuestGpr64(*state, LsxGpr::R12, ctx.uc_mcontext.mc_r12);
-        WriteGuestGpr64(*state, LsxGpr::R13, ctx.uc_mcontext.mc_r13);
-        WriteGuestGpr64(*state, LsxGpr::R14, ctx.uc_mcontext.mc_r14);
-        WriteGuestGpr64(*state, LsxGpr::R15, ctx.uc_mcontext.mc_r15);
-        state->rip_or_exit = ctx.uc_mcontext.mc_rip;
-        state->rflags = ctx.uc_mcontext.mc_rflags;
-        state->fs_base = ctx.uc_mcontext.mc_fsbase != 0 ? ctx.uc_mcontext.mc_fsbase
-                                                        : ctx.uc_mcontext.mc_fs;
-        state->gs_base = ctx.uc_mcontext.mc_gsbase != 0 ? ctx.uc_mcontext.mc_gsbase
-                                                        : ctx.uc_mcontext.mc_gs;
+        state.Write(IntegerRegister::A, ctx.uc_mcontext.mc_rax);
+        state.Write(IntegerRegister::C, ctx.uc_mcontext.mc_rcx);
+        state.Write(IntegerRegister::D, ctx.uc_mcontext.mc_rdx);
+        state.Write(IntegerRegister::B, ctx.uc_mcontext.mc_rbx);
+        state.Write(IntegerRegister::Stack, ctx.uc_mcontext.mc_rsp);
+        state.Write(IntegerRegister::Frame, ctx.uc_mcontext.mc_rbp);
+        state.Write(IntegerRegister::Source, ctx.uc_mcontext.mc_rsi);
+        state.Write(IntegerRegister::Destination, ctx.uc_mcontext.mc_rdi);
+        state.Write(IntegerRegister::R8, ctx.uc_mcontext.mc_r8);
+        state.Write(IntegerRegister::R9, ctx.uc_mcontext.mc_r9);
+        state.Write(IntegerRegister::R10, ctx.uc_mcontext.mc_r10);
+        state.Write(IntegerRegister::R11, ctx.uc_mcontext.mc_r11);
+        state.Write(IntegerRegister::R12, ctx.uc_mcontext.mc_r12);
+        state.Write(IntegerRegister::R13, ctx.uc_mcontext.mc_r13);
+        state.Write(IntegerRegister::R14, ctx.uc_mcontext.mc_r14);
+        state.Write(IntegerRegister::R15, ctx.uc_mcontext.mc_r15);
+        state.WriteScalar(FrameScalar::Resume, ctx.uc_mcontext.mc_rip);
+        state.WriteScalar(FrameScalar::Conditions, ctx.uc_mcontext.mc_rflags);
+        state.WriteScalar(FrameScalar::FsOrigin,
+                          ctx.uc_mcontext.mc_fsbase != 0 ? ctx.uc_mcontext.mc_fsbase
+                                                        : ctx.uc_mcontext.mc_fs);
+        state.WriteScalar(FrameScalar::GsOrigin,
+                          ctx.uc_mcontext.mc_gsbase != 0 ? ctx.uc_mcontext.mc_gsbase
+                                                        : ctx.uc_mcontext.mc_gs);
         TraceLiveSignal("handler_guest_ucontext_apply_direct", orbis_sig, native_sig, handler,
                         nullptr, 0, 0, fault_addr);
         return true;
@@ -1095,7 +1094,7 @@ executor_lsx4_android_dispatch_deferred_guest_signal(
     ucontext_t raw_context{};
 #if defined(__aarch64__)
     // Probe/trace consumers receive the guest RIP as the synthetic PC; no native signal frame
-    // remains by design, and DispatchGuestSignal replaces this with the exact LsxMachineImage image.
+    // remains by design, and DispatchGuestSignal replaces this with the exact active-frame image.
     raw_context.uc_mcontext.pc = guest_rip;
 #endif
     const JitDeferredSignalMetadata deferred{guest_rip, is_write != 0};

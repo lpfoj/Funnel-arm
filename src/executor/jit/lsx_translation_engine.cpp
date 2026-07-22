@@ -6,6 +6,7 @@
 #include "executor/jit/machine_code_lens.h"
 #include "executor/jit/native_vector_plan.h"
 #include "executor/jit/vector_semantic_kernel.h"
+#include "executor/dynamic_translation/live_state_port.h"
 #include "jit_native_cache_abi.h"
 #include "common/content_fingerprint.h"
 #include "core/aerolib/stubs.h"
@@ -5966,12 +5967,14 @@ std::mutex g_locked_memory_mutex;
 class ScopedCurrentPostHleState {
 public:
     explicit ScopedCurrentPostHleState(const LsxMachineImage& state)
-        : previous_{g_current_post_hle_state} {
+        : previous_{g_current_post_hle_state},
+          previous_storage_{Lsx4::Translation::ExchangeContinuationStorage(&state)} {
         g_current_post_hle_state = &state;
     }
 
     ~ScopedCurrentPostHleState() {
         g_current_post_hle_state = previous_;
+        (void)Lsx4::Translation::ExchangeContinuationStorage(previous_storage_);
     }
 
     ScopedCurrentPostHleState(const ScopedCurrentPostHleState&) = delete;
@@ -5979,6 +5982,7 @@ public:
 
 private:
     const LsxMachineImage* previous_;
+    const void* previous_storage_;
 };
 
 OutboundEdgeState* BindIndirectEdgeFanout(IndirectEdgeFanout* site,
@@ -22251,6 +22255,7 @@ bool SnapshotGuestStateAfterBridge(LsxMachineImage& destination) {
 
 LsxMachineImage* ExchangeDiagnosticMachineImage(LsxMachineImage* state) {
     auto* previous = g_guest_machine_binding.machine;
+    (void)Lsx4::Translation::ExchangeLiveStateStorage(state);
     // A signal between these stores observes an invalid seal and treats the binding as absent,
     // rather than consuming a pointer from a partially published diagnostic transition.
     g_guest_machine_binding.machine = state;

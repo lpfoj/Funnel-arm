@@ -41,6 +41,20 @@ const std::byte* Field(const void* storage, const std::size_t offset) noexcept {
     return static_cast<const std::byte*>(storage) + offset;
 }
 
+std::size_t ScalarOffset(const FrameScalar id) noexcept {
+    switch (id) {
+    case FrameScalar::Resume:
+        return offsetof(CpuFrame, resume_address);
+    case FrameScalar::GsOrigin:
+        return offsetof(CpuFrame, gs_origin);
+    case FrameScalar::FsOrigin:
+        return offsetof(CpuFrame, fs_origin);
+    case FrameScalar::Conditions:
+        return offsetof(CpuFrame, condition_word);
+    }
+    return sizeof(CpuFrame);
+}
+
 } // namespace
 
 std::uint64_t LiveStateView::Read(const IntegerRegister id) const noexcept {
@@ -64,19 +78,32 @@ void LiveStateView::Write(const IntegerRegister id,
 }
 
 std::uint64_t LiveStateView::ResumeAddress() const noexcept {
+    return ReadScalar(FrameScalar::Resume);
+}
+
+void LiveStateView::SetResumeAddress(const std::uint64_t address) const noexcept {
+    WriteScalar(FrameScalar::Resume, address);
+}
+
+std::uint64_t LiveStateView::ReadScalar(const FrameScalar id) const noexcept {
     std::uint64_t value{};
-    if (storage_ != nullptr) {
-        std::memcpy(&value, Field(storage_, offsetof(CpuFrame, resume_address)),
-                    sizeof(value));
+    const std::size_t offset = ScalarOffset(id);
+    if (storage_ != nullptr && offset < sizeof(CpuFrame)) {
+        std::memcpy(&value, Field(storage_, offset), sizeof(value));
     }
     return value;
 }
 
-void LiveStateView::SetResumeAddress(const std::uint64_t address) const noexcept {
-    if (storage_ != nullptr) {
-        std::memcpy(Field(storage_, offsetof(CpuFrame, resume_address)), &address,
-                    sizeof(address));
+void LiveStateView::WriteScalar(const FrameScalar id,
+                                const std::uint64_t value) const noexcept {
+    const std::size_t offset = ScalarOffset(id);
+    if (storage_ != nullptr && offset < sizeof(CpuFrame)) {
+        std::memcpy(Field(storage_, offset), &value, sizeof(value));
     }
+}
+
+std::uintptr_t LiveStateView::StorageAddress() const noexcept {
+    return reinterpret_cast<std::uintptr_t>(storage_);
 }
 
 bool LiveStateView::CopyTo(CpuFrame& destination) const noexcept {
