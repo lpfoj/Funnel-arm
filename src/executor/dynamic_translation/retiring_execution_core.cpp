@@ -8877,45 +8877,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         }
     }
 
-    // Hot Unity/Mono metadata-table scan in FlusterCluck. This is emitted from decoded bytes,
-    // not from the raw RIP, so identical blocks elsewhere take the same native path.
-    static constexpr std::array<std::uint8_t, 9> kIncEdxCmpEdxEcxJge = {
-        0xff, 0xc2, 0x39, 0xca, 0x7d, 0x0d, 0x48, 0x39, 0x30,
-    };
-    if (block_bytes_match(kIncEdxCmpEdxEcxJge.data(), kIncEdxCmpEdxEcxJge.size())) {
-        const std::uint64_t fallthrough = block.start_rip + 9;
-        const std::uint64_t taken = block.start_rip + 0x13;
-        auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-        Xbyak_aarch64::Label take;
-        Xbyak_aarch64::Label not_equal;
-        Xbyak_aarch64::Label done_flags;
-        code->ldr(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
-        code->add(code->w10, code->w10, 1);
-        code->str(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
-        code->ldr(code->x11, Xbyak_aarch64::ptr(code->x0, kStateRcxOffset));
-        code->cmp(code->w10, code->w11);
-        code->bge(take);
-        code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-        code->ldr(code->x10, Xbyak_aarch64::ptr(code->x9));
-        code->ldr(code->x11, Xbyak_aarch64::ptr(code->x0, kStateRsiOffset));
-        code->cmp(code->x10, code->x11);
-        code->bne(not_equal);
-        code->mov(code->x12, std::uint64_t{1} << kZfBit);
-        code->b(done_flags);
-        code->L(not_equal);
-        code->mov(code->x12, 0);
-        code->L(done_flags);
-        code->str(code->x12, Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
-        code->mov(code->x0, fallthrough);
-        code->ret();
-        code->L(take);
-        code->mov(code->x0, taken);
-        code->ret();
-        code->ready();
-        auto* entry = CommitCode(std::move(code));
-        return finish_direct_native(entry);
-    }
-
     // Sonic Mania's RSDK audio mixer executes these three scalar blocks millions of times per
     // second. Match the complete decoded byte sequence rather than a game RIP: the lowering is
     // valid for an identical block at any guest address, and relative branches are resolved from
@@ -9440,118 +9401,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             code->orr(code->x9, code->x9, code->x20);
             code->str(code->x9, Xbyak_aarch64::ptr(code->x19, kStateRflagsOffset));
 
-            code->tbz(code->x9, kZfBit, take);
-            emit_return(fallthrough);
-            code->L(take);
-            emit_return(taken);
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
-    // Sonic Mania level startup clears a bank of interleaved scalar/vector records with this
-    // 0x60-byte loop body (the first entry at 0x80006d923 only seeds YMM0/YMM1/YMM2 and ECX).
-    // VMOVLPS was the first previously unpublished interpreter instruction in this block; once the
-    // complete instruction family is available, keeping the remaining twelve stores in the helper
-    // would still make every level load needlessly expensive.  Match the complete byte stream, not
-    // the game RIP, and preserve the exact guest store order so a synchronous fault observes the
-    // same partial memory image as x86-64.
-    static constexpr std::array<std::uint8_t, 96> kLevelVectorClearJnePattern = {
-        0xc5, 0xf8, 0x13, 0x44, 0x48, 0x82, 0xc5, 0xf8,
-        0x13, 0x44, 0x48, 0x8a, 0xc5, 0xf8, 0x13, 0x44,
-        0x48, 0x92, 0xc5, 0xf8, 0x13, 0x44, 0x48, 0x9a,
-        0xc5, 0xfc, 0x11, 0x8c, 0xc8, 0x00, 0x08, 0x00,
-        0x00, 0xc5, 0xfc, 0x11, 0x8c, 0xc8, 0x20, 0x08,
-        0x00, 0x00, 0xc5, 0xfc, 0x11, 0x8c, 0xc8, 0x40,
-        0x08, 0x00, 0x00, 0xc5, 0xfc, 0x11, 0x8c, 0xc8,
-        0x60, 0x08, 0x00, 0x00, 0xc5, 0xfc, 0x11, 0x14,
-        0xc8, 0xc5, 0xfc, 0x11, 0x54, 0xc8, 0x20, 0xc5,
-        0xfc, 0x11, 0x54, 0xc8, 0x40, 0xc5, 0xfc, 0x11,
-        0x54, 0xc8, 0x60, 0x48, 0x83, 0xc1, 0x10, 0x48,
-        0x81, 0xf9, 0x41, 0x01, 0x00, 0x00, 0x75, 0xa0,
-    };
-    if (block_bytes_match(kLevelVectorClearJnePattern.data(),
-                          kLevelVectorClearJnePattern.size()) &&
-        block.instructions.size() == 15) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            Xbyak_aarch64::Label take;
-            const auto emit_return = [&](const std::uint64_t target) {
-                code->mov(code->x0, target);
-                code->ldp(code->x19, code->x20,
-                          Xbyak_aarch64::ptr(code->sp, 16));
-                code->ldp(code->x29, code->x30,
-                          Xbyak_aarch64::post_ptr(code->sp, 32));
-                code->ret();
-            };
-
-            code->stp(code->x29, code->x30,
-                      Xbyak_aarch64::pre_ptr(code->sp, -32));
-            code->stp(code->x19, code->x20,
-                      Xbyak_aarch64::ptr(code->sp, 16));
-            code->mov(code->x29, code->sp);
-            code->mov(code->x19, code->x0);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
-            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x19, kStateRcxOffset));
-
-            // Four adjacent VMOVLPS stores: base = RAX + RCX*2 - 0x7e.
-            code->lsl(code->x11, code->x10, 1);
-            code->add(code->x14, code->x9, code->x11);
-            code->sub(code->x14, code->x14, 0x7e);
-            code->ldr(code->x12,
-                      Xbyak_aarch64::ptr(code->x19, kStateYmm0Offset));
-            code->str(code->x12, Xbyak_aarch64::ptr(code->x14, 0));
-            code->str(code->x12, Xbyak_aarch64::ptr(code->x14, 8));
-            code->str(code->x12, Xbyak_aarch64::ptr(code->x14, 16));
-            code->str(code->x12, Xbyak_aarch64::ptr(code->x14, 24));
-
-            // Eight VMOVUPS YMM stores at RAX + RCX*8.  Load each guest source once, but keep
-            // the architectural write sequence YMM1[+0x800..+0x860], then YMM2[+0..+0x60].
-            code->lsl(code->x11, code->x10, 3);
-            code->add(code->x14, code->x9, code->x11);
-            code->ldr(code->q0,
-                      Xbyak_aarch64::ptr(code->x19, kStateYmm0Offset + 32));
-            code->ldr(code->q1,
-                      Xbyak_aarch64::ptr(code->x19, kStateYmm0Offset + 48));
-            code->str(code->q0, Xbyak_aarch64::ptr(code->x14, 0x800));
-            code->str(code->q1, Xbyak_aarch64::ptr(code->x14, 0x810));
-            code->str(code->q0, Xbyak_aarch64::ptr(code->x14, 0x820));
-            code->str(code->q1, Xbyak_aarch64::ptr(code->x14, 0x830));
-            code->str(code->q0, Xbyak_aarch64::ptr(code->x14, 0x840));
-            code->str(code->q1, Xbyak_aarch64::ptr(code->x14, 0x850));
-            code->str(code->q0, Xbyak_aarch64::ptr(code->x14, 0x860));
-            code->str(code->q1, Xbyak_aarch64::ptr(code->x14, 0x870));
-            code->ldr(code->q2,
-                      Xbyak_aarch64::ptr(code->x19, kStateYmm0Offset + 64));
-            code->ldr(code->q3,
-                      Xbyak_aarch64::ptr(code->x19, kStateYmm0Offset + 80));
-            code->str(code->q2, Xbyak_aarch64::ptr(code->x14, 0x00));
-            code->str(code->q3, Xbyak_aarch64::ptr(code->x14, 0x10));
-            code->str(code->q2, Xbyak_aarch64::ptr(code->x14, 0x20));
-            code->str(code->q3, Xbyak_aarch64::ptr(code->x14, 0x30));
-            code->str(code->q2, Xbyak_aarch64::ptr(code->x14, 0x40));
-            code->str(code->q3, Xbyak_aarch64::ptr(code->x14, 0x50));
-            code->str(code->q2, Xbyak_aarch64::ptr(code->x14, 0x60));
-            code->str(code->q3, Xbyak_aarch64::ptr(code->x14, 0x70));
-
-            code->add(code->x10, code->x10, 0x10);
-            code->str(code->x10,
-                      Xbyak_aarch64::ptr(code->x19, kStateRcxOffset));
-            code->sub(code->x11, code->x10, 0x141);
-            code->mov(code->x0, code->x19);
-            code->mov(code->x1, code->x10);
-            code->mov(code->x2, 0x141);
-            code->mov(code->x3, code->x11);
-            code->mov(code->x4, 64);
-            EmitJitRelocatablePointer(
-                *code, code->x16, reinterpret_cast<std::uint64_t>(&RecordIntegerSubtractionFlags));
-            code->blr(code->x16);
-            code->ldr(code->x9,
-                      Xbyak_aarch64::ptr(code->x19, kStateRflagsOffset));
             code->tbz(code->x9, kZfBit, take);
             emit_return(fallthrough);
             code->L(take);
@@ -13014,107 +12863,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         }
     }
 
-    // A second RSDK hot loop copies sixteen little-endian words, advances both pointers by one
-    // 32-byte row, and repeats while (--ESI) > 1.  It was the largest remaining individual helper
-    // after the texture-decode lowerings (12.00% of mapped helper frames).  Keep the x86 load/store
-    // alternation instead of vectorizing it so overlapping source/destination ranges retain exact
-    // behavior and synchronous stores happen in guest order.
-    static constexpr std::array<std::uint8_t, 145> kWordRowCopyJgPattern = {
-        0x0f, 0xb7, 0x17, 0xff, 0xce, 0x66, 0x89, 0x10,
-        0x0f, 0xb7, 0x57, 0x02, 0x66, 0x89, 0x50, 0x02,
-        0x0f, 0xb7, 0x57, 0x04, 0x66, 0x89, 0x50, 0x04,
-        0x0f, 0xb7, 0x57, 0x06, 0x66, 0x89, 0x50, 0x06,
-        0x0f, 0xb7, 0x57, 0x08, 0x66, 0x89, 0x50, 0x08,
-        0x0f, 0xb7, 0x57, 0x0a, 0x66, 0x89, 0x50, 0x0a,
-        0x0f, 0xb7, 0x57, 0x0c, 0x66, 0x89, 0x50, 0x0c,
-        0x0f, 0xb7, 0x57, 0x0e, 0x66, 0x89, 0x50, 0x0e,
-        0x0f, 0xb7, 0x57, 0x10, 0x66, 0x89, 0x50, 0x10,
-        0x0f, 0xb7, 0x57, 0x12, 0x66, 0x89, 0x50, 0x12,
-        0x0f, 0xb7, 0x57, 0x14, 0x66, 0x89, 0x50, 0x14,
-        0x0f, 0xb7, 0x57, 0x16, 0x66, 0x89, 0x50, 0x16,
-        0x0f, 0xb7, 0x57, 0x18, 0x66, 0x89, 0x50, 0x18,
-        0x0f, 0xb7, 0x57, 0x1a, 0x66, 0x89, 0x50, 0x1a,
-        0x0f, 0xb7, 0x57, 0x1c, 0x66, 0x89, 0x50, 0x1c,
-        0x0f, 0xb7, 0x57, 0x1e, 0x48, 0x83, 0xc7, 0x20,
-        0x66, 0x89, 0x50, 0x1e, 0x48, 0x83, 0xc0, 0x20,
-        0x83, 0xfe, 0x01, 0x0f, 0x8f, 0x6f, 0xff, 0xff,
-        0xff,
-    };
-    if (block_bytes_match(kWordRowCopyJgPattern.data(),
-                          kWordRowCopyJgPattern.size())) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(8192);
-            Xbyak_aarch64::Label take;
-            Xbyak_aarch64::Label fall;
-            const auto emit_return = [&](const std::uint64_t target) {
-                code->mov(code->x0, target);
-                code->ldp(code->x19, code->x20,
-                          Xbyak_aarch64::ptr(code->sp, 16));
-                code->ldp(code->x29, code->x30,
-                          Xbyak_aarch64::post_ptr(code->sp, 32));
-                code->ret();
-            };
-            code->stp(code->x29, code->x30,
-                      Xbyak_aarch64::pre_ptr(code->sp, -32));
-            code->stp(code->x19, code->x20,
-                      Xbyak_aarch64::ptr(code->sp, 16));
-            code->mov(code->x29, code->sp);
-            code->mov(code->x19, code->x0);
-            code->ldr(code->x10,
-                      Xbyak_aarch64::ptr(code->x19, kStateRdiOffset));
-            code->ldr(code->x11,
-                      Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
-            code->ldr(code->w12,
-                      Xbyak_aarch64::ptr(code->x19, kStateRsiOffset));
-            for (std::uint32_t i = 0; i < 16; ++i) {
-                const std::uint32_t offset = i * 2;
-                code->ldrh(code->w9, Xbyak_aarch64::ptr(code->x10, offset));
-                code->str(code->x9,
-                          Xbyak_aarch64::ptr(code->x19, kStateRdxOffset));
-                if (i == 0) {
-                    code->sub(code->w12, code->w12, 1);
-                    code->str(code->x12,
-                              Xbyak_aarch64::ptr(code->x19, kStateRsiOffset));
-                }
-                if (i == 15) {
-                    code->add(code->x10, code->x10, 0x20);
-                    code->str(code->x10,
-                              Xbyak_aarch64::ptr(code->x19, kStateRdiOffset));
-                }
-                code->strh(code->w9, Xbyak_aarch64::ptr(code->x11, offset));
-            }
-            code->add(code->x11, code->x11, 0x20);
-            code->str(code->x11,
-                      Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
-            code->sub(code->w13, code->w12, 1);
-            code->mov(code->x0, code->x19);
-            code->mov(code->x1, code->x12);
-            code->mov(code->x2, 1);
-            code->mov(code->x3, code->x13);
-            code->mov(code->x4, 32);
-            EmitJitRelocatablePointer(
-                *code, code->x16, reinterpret_cast<std::uint64_t>(&RecordIntegerSubtractionFlags));
-            code->blr(code->x16);
-            code->ldr(code->x9,
-                      Xbyak_aarch64::ptr(code->x19, kStateRflagsOffset));
-            code->tbnz(code->x9, kZfBit, fall);
-            code->ubfx(code->x10, code->x9, kSfBit, 1);
-            code->ubfx(code->x11, code->x9, kOfBit, 1);
-            code->cmp(code->x10, code->x11);
-            code->beq(take);
-            code->L(fall);
-            emit_return(fallthrough);
-            code->L(take);
-            emit_return(taken);
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
     // Sonic Mania's steady-state RGB565 blend loop.  This was the largest helper left after
     // the row-copy and packed-pixel families were lowered.  Match the complete 146-byte shape,
     // but derive both the RIP-relative palette base and the JNE target from the decoded block so
@@ -13912,52 +13660,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             code->str(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
             code->mov(code->x11, 0x940);
             emit_inline_sub64_flags(*code, code->x9, code->x11, code->x12);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
-            code->tbz(code->x9, kZfBit, take);
-            code->mov(code->x0, fallthrough);
-            code->ret();
-            code->L(take);
-            code->mov(code->x0, taken);
-            code->ret();
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
-    static constexpr std::array<std::uint8_t, 27> kWordCountJnePattern = {
-        0x31, 0xf6, 0x66, 0x39, 0x3c, 0x0a, 0x40, 0x0f,
-        0x94, 0xc6, 0x48, 0x81, 0xc1, 0x58, 0x08, 0x00,
-        0x00, 0x01, 0xf0, 0x81, 0xf9, 0x36, 0x2e, 0x4d,
-        0x00, 0x75, 0xe5,
-    };
-    if (block_bytes_match(kWordCountJnePattern.data(),
-                          kWordCountJnePattern.size())) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            Xbyak_aarch64::Label take;
-            code->mov(code->w9, 0);
-            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRsiOffset));
-            emit_inline_test32_flags(*code, code->w9); // XOR ESI,ESI before faulting load
-            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
-            code->ldr(code->x11, Xbyak_aarch64::ptr(code->x0, kStateRcxOffset));
-            code->add(code->x12, code->x10, code->x11);
-            code->ldrh(code->w13, Xbyak_aarch64::ptr(code->x12));
-            code->ldr(code->w12, Xbyak_aarch64::ptr(code->x0, kStateRdiOffset));
-            code->uxth(code->w12, code->w12);
-            code->cmp(code->w13, code->w12);
-            code->cset(code->w13, Xbyak_aarch64::EQ);
-            code->str(code->x13, Xbyak_aarch64::ptr(code->x0, kStateRsiOffset));
-            code->add(code->x9, code->x11, 0x858);
-            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRcxOffset));
-            code->ldr(code->w10, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->add(code->w10, code->w10, code->w13);
-            code->str(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->mov(code->w11, 0x4d2e36);
-            emit_inline_sub32_flags(*code, code->w9, code->w11, code->w12);
             code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
             code->tbz(code->x9, kZfBit, take);
             code->mov(code->x0, fallthrough);
@@ -37789,109 +37491,6 @@ std::string ExerciseTranslationEngineJson() {
             vmovlps_load_ok && vmovlps_store_ok && vmovhps_load_ok && vmovhps_store_ok &&
             vmovlpd_load_ok && vmovlpd_store_ok && vmovhpd_load_ok && vmovhpd_store_ok;
 
-        const std::array<std::uint8_t, 96> level_vector_clear = {
-            0xc5, 0xf8, 0x13, 0x44, 0x48, 0x82, 0xc5, 0xf8,
-            0x13, 0x44, 0x48, 0x8a, 0xc5, 0xf8, 0x13, 0x44,
-            0x48, 0x92, 0xc5, 0xf8, 0x13, 0x44, 0x48, 0x9a,
-            0xc5, 0xfc, 0x11, 0x8c, 0xc8, 0x00, 0x08, 0x00,
-            0x00, 0xc5, 0xfc, 0x11, 0x8c, 0xc8, 0x20, 0x08,
-            0x00, 0x00, 0xc5, 0xfc, 0x11, 0x8c, 0xc8, 0x40,
-            0x08, 0x00, 0x00, 0xc5, 0xfc, 0x11, 0x8c, 0xc8,
-            0x60, 0x08, 0x00, 0x00, 0xc5, 0xfc, 0x11, 0x14,
-            0xc8, 0xc5, 0xfc, 0x11, 0x54, 0xc8, 0x20, 0xc5,
-            0xfc, 0x11, 0x54, 0xc8, 0x40, 0xc5, 0xfc, 0x11,
-            0x54, 0xc8, 0x60, 0x48, 0x83, 0xc1, 0x10, 0x48,
-            0x81, 0xf9, 0x41, 0x01, 0x00, 0x00, 0x75, 0xa0,
-        };
-        const auto run_level_vector_clear_case = [&](const std::uint64_t initial_rcx) {
-            std::vector<std::uint8_t> interpreter_memory(0x3000, 0x5a);
-            std::vector<std::uint8_t> native_memory = interpreter_memory;
-            const auto initialize_state = [&](LsxMachineImage& state,
-                                              std::vector<std::uint8_t>& memory) {
-                state.rflags = 0xa93;
-                state.mxcsr = 0x3f80;
-                WriteGuestGpr64(state, LsxGpr::Rax,
-                         reinterpret_cast<std::uint64_t>(memory.data() + 0x100));
-                WriteGuestGpr64(state, LsxGpr::Rcx, initial_rcx);
-                for (std::size_t reg = 0; reg < 3; ++reg) {
-                    for (std::size_t i = 0; i < state.ymm[reg].size(); ++i) {
-                        state.ymm[reg][i] = static_cast<std::uint8_t>(
-                            0x20u + reg * 0x30u + i);
-                    }
-                }
-            };
-            LsxMachineImage interpreter_state{};
-            LsxMachineImage native_state{};
-            initialize_state(interpreter_state, interpreter_memory);
-            initialize_state(native_state, native_memory);
-            LsxDecodedRegion decoded = DecodeGuestBasicRegion(
-                reinterpret_cast<std::uint64_t>(level_vector_clear.data()), 32);
-            Arm64BlockEntry native_direct = nullptr;
-            Arm64BlockEntry native_entry =
-                arena.EmitNativeControlFlowBlock(decoded, nullptr, &native_direct);
-            const std::uint64_t interpreter_result =
-                InterpretDecodedRegion(&interpreter_state, &decoded);
-            const std::uint64_t native_result =
-                native_entry != nullptr ? native_entry(&native_state) : 0;
-
-            LsxMachineImage canonical_interpreter = interpreter_state;
-            LsxMachineImage canonical_native = native_state;
-            WriteGuestGpr64(canonical_interpreter, LsxGpr::Rax, 0);
-            WriteGuestGpr64(canonical_native, LsxGpr::Rax, 0);
-            canonical_interpreter.rip_or_exit = 0;
-            canonical_native.rip_or_exit = 0;
-            const std::uint64_t final_rcx = initial_rcx + 0x10;
-            LsxMachineImage expected_flags{};
-            expected_flags.rflags = 0xa93;
-            RecordIntegerSubtractionFlags(expected_flags, final_rcx, 0x141,
-                           final_rcx - 0x141, 64);
-            const std::uint64_t code_base =
-                reinterpret_cast<std::uint64_t>(level_vector_clear.data());
-            const std::uint64_t expected_result =
-                final_rcx != 0x141 ? code_base : code_base + level_vector_clear.size();
-            const bool decoded_ok = !decoded.HasDecodeFailure() &&
-                                    decoded.instructions.size() == 15;
-            const bool interpreter_capable = CanInterpretRegion(decoded);
-            const bool emitted_ok = native_entry != nullptr && native_direct != nullptr;
-            const bool result_ok = interpreter_result == expected_result &&
-                                   native_result == expected_result;
-            const bool memory_ok = interpreter_memory == native_memory;
-            const bool state_ok =
-                std::memcmp(&canonical_interpreter, &canonical_native,
-                            sizeof(LsxMachineImage)) == 0;
-            const bool rcx_ok = ReadGuestGpr64(native_state, LsxGpr::Rcx) == final_rcx;
-            const bool flags_ok = native_state.rflags == expected_flags.rflags;
-            const bool case_ok = decoded_ok && interpreter_capable && emitted_ok && result_ok &&
-                                 memory_ok && state_ok && rcx_ok && flags_ok;
-            if (!case_ok) {
-                JitLog("[EXECUTOR_JIT_LEVEL_CLEAR_SELFTEST_FAIL] "
-                            "initialRcx=0x%llx decoded=%d insns=%zu canRef=%d entry=%d direct=%d "
-                            "refResult=0x%llx nativeResult=0x%llx expectedResult=0x%llx "
-                            "memory=%d state=%d rcx=0x%llx expectedRcx=0x%llx "
-                            "flags=0x%llx expectedFlags=0x%llx",
-                            static_cast<unsigned long long>(initial_rcx),
-                            decoded_ok ? 1 : 0, decoded.instructions.size(),
-                            interpreter_capable ? 1 : 0, native_entry != nullptr ? 1 : 0,
-                            native_direct != nullptr ? 1 : 0,
-                            static_cast<unsigned long long>(interpreter_result),
-                            static_cast<unsigned long long>(native_result),
-                            static_cast<unsigned long long>(expected_result),
-                            memory_ok ? 1 : 0, state_ok ? 1 : 0,
-                            static_cast<unsigned long long>(
-                                ReadGuestGpr64(native_state, LsxGpr::Rcx)),
-                            static_cast<unsigned long long>(final_rcx),
-                            static_cast<unsigned long long>(native_state.rflags),
-                            static_cast<unsigned long long>(expected_flags.rflags));
-            }
-            return case_ok;
-        };
-        const bool level_vector_clear_taken_ok =
-            run_level_vector_clear_case(0x41);
-        const bool level_vector_clear_fallthrough_ok =
-            run_level_vector_clear_case(0x131);
-        const bool level_vector_clear_native_ok =
-            level_vector_clear_taken_ok && level_vector_clear_fallthrough_ok;
-
         // Differential proof for the measured 0x80022dda0 texture-index block.  Each side owns
         // an independent relocated image because the block materializes a RIP-relative byte-table
         // pointer into guest RSI.  Canonicalize those image-relative pointers only after execution;
@@ -38949,79 +38548,6 @@ std::string ExerciseTranslationEngineJson() {
         const bool packed_tail_full_ok =
             packed_tail_case(true, 0, false, false);
 
-        const std::array<std::uint8_t, 145> word_row_copy = {
-            0x0f, 0xb7, 0x17, 0xff, 0xce, 0x66, 0x89, 0x10,
-            0x0f, 0xb7, 0x57, 0x02, 0x66, 0x89, 0x50, 0x02,
-            0x0f, 0xb7, 0x57, 0x04, 0x66, 0x89, 0x50, 0x04,
-            0x0f, 0xb7, 0x57, 0x06, 0x66, 0x89, 0x50, 0x06,
-            0x0f, 0xb7, 0x57, 0x08, 0x66, 0x89, 0x50, 0x08,
-            0x0f, 0xb7, 0x57, 0x0a, 0x66, 0x89, 0x50, 0x0a,
-            0x0f, 0xb7, 0x57, 0x0c, 0x66, 0x89, 0x50, 0x0c,
-            0x0f, 0xb7, 0x57, 0x0e, 0x66, 0x89, 0x50, 0x0e,
-            0x0f, 0xb7, 0x57, 0x10, 0x66, 0x89, 0x50, 0x10,
-            0x0f, 0xb7, 0x57, 0x12, 0x66, 0x89, 0x50, 0x12,
-            0x0f, 0xb7, 0x57, 0x14, 0x66, 0x89, 0x50, 0x14,
-            0x0f, 0xb7, 0x57, 0x16, 0x66, 0x89, 0x50, 0x16,
-            0x0f, 0xb7, 0x57, 0x18, 0x66, 0x89, 0x50, 0x18,
-            0x0f, 0xb7, 0x57, 0x1a, 0x66, 0x89, 0x50, 0x1a,
-            0x0f, 0xb7, 0x57, 0x1c, 0x66, 0x89, 0x50, 0x1c,
-            0x0f, 0xb7, 0x57, 0x1e, 0x48, 0x83, 0xc7, 0x20,
-            0x66, 0x89, 0x50, 0x1e, 0x48, 0x83, 0xc0, 0x20,
-            0x83, 0xfe, 0x01, 0x0f, 0x8f, 0x6f, 0xff, 0xff,
-            0xff,
-        };
-        const auto word_row_copy_case = [&](const std::uint32_t initial_esi,
-                                             const bool overlap) {
-            return run_same_image_native_case(
-                overlap ? "word-row-overlap" :
-                    (initial_esi == 2 ? "word-row-fallthrough" : "word-row-taken"),
-                word_row_copy,
-                [&](auto& memory) {
-                    for (std::size_t i = 0; i < 64; ++i) {
-                        memory[0x100 + i] = static_cast<std::uint8_t>(0x20u + i);
-                    }
-                },
-                [&](LsxMachineImage& state, auto& memory) {
-                    state.rflags = 0xad7;
-                    WriteGuestGpr64(state, LsxGpr::Rdi,
-                             reinterpret_cast<std::uint64_t>(memory.data() + 0x100));
-                    WriteGuestGpr64(state, LsxGpr::Rax,
-                             reinterpret_cast<std::uint64_t>(
-                                 memory.data() + (overlap ? 0x102 : 0x200)));
-                    WriteGuestGpr64(state, LsxGpr::Rsi,
-                             0xdeadbeef00000000ull | initial_esi);
-                    WriteGuestGpr64(state, LsxGpr::Rdx, 0x1122334455667788ull);
-                },
-                [&](const LsxMachineImage& state, const auto& memory,
-                    const std::uint64_t result, const LsxDecodedRegion& decoded) {
-                    std::uint64_t taken = 0;
-                    const bool target_ok =
-                        TryResolveBranchTarget(decoded.instructions.back(), taken);
-                    const std::uint32_t final_esi = initial_esi - 1;
-                    const std::uint64_t expected =
-                        static_cast<std::int32_t>(final_esi) > 1
-                            ? taken
-                            : decoded.end_rip;
-                    LsxMachineImage expected_flags{};
-                    expected_flags.rflags = 0xad7;
-                    RecordIntegerSubtractionFlags(expected_flags, final_esi, 1, final_esi - 1, 32);
-                    return target_ok && result == expected &&
-                           ReadGuestGpr64(state, LsxGpr::Rdi) ==
-                               reinterpret_cast<std::uint64_t>(memory.data() + 0x120) &&
-                           ReadGuestGpr64(state, LsxGpr::Rax) ==
-                               reinterpret_cast<std::uint64_t>(
-                                   memory.data() + (overlap ? 0x122 : 0x220)) &&
-                           ReadGuestGpr64(state, LsxGpr::Rsi) == final_esi &&
-                           state.rflags == expected_flags.rflags;
-                });
-        };
-        const bool word_row_copy_taken_ok = word_row_copy_case(3, false);
-        const bool word_row_copy_fallthrough_ok = word_row_copy_case(2, false);
-        const bool word_row_copy_overlap_ok = word_row_copy_case(3, true);
-        const bool word_row_copy_native_ok =
-            word_row_copy_taken_ok && word_row_copy_fallthrough_ok &&
-            word_row_copy_overlap_ok;
-
         const std::array<std::uint8_t, 146> rgb565_blend = {
             0x4c, 0x89, 0xf0, 0x44, 0x0f, 0xb7, 0x26, 0xbb,
             0x06, 0x05, 0x00, 0x00, 0x48, 0xc1, 0xe0, 0x09,
@@ -39576,71 +39102,9 @@ std::string ExerciseTranslationEngineJson() {
             hot_rsi_rdx_taken_ok && hot_rsi_rdx_fallthrough_ok &&
             hot_rsi_rdx_wrap_ok;
 
-        const std::array<std::uint8_t, 27> hot_word_count = {
-            0x31, 0xf6, 0x66, 0x39, 0x3c, 0x0a, 0x40, 0x0f,
-            0x94, 0xc6, 0x48, 0x81, 0xc1, 0x58, 0x08, 0x00,
-            0x00, 0x01, 0xf0, 0x81, 0xf9, 0x36, 0x2e, 0x4d,
-            0x00, 0x75, 0xe5,
-        };
-        const auto hot_word_count_case = [&](const bool match,
-                                              const std::uint64_t initial_rcx,
-                                              const std::uint32_t initial_eax) {
-            return run_same_image_native_case(
-                initial_rcx == 0x12345678fffffff0ull ? "hot-word-count-wrap" :
-                    initial_rcx == 0x12345678004d25ddull ? "hot-word-count-taken" :
-                    match ? "hot-word-count-match" : "hot-word-count-mismatch",
-                hot_word_count,
-                [&](auto& memory) {
-                    const std::uint16_t word = match ? 0xbeef : 0xbeee;
-                    std::memcpy(memory.data() + 0x101, &word, sizeof(word));
-                },
-                [&](LsxMachineImage& state, auto& memory) {
-                    state.rflags = 0xad7;
-                    const std::uint64_t address =
-                        reinterpret_cast<std::uint64_t>(memory.data() + 0x101);
-                    WriteGuestGpr64(state, LsxGpr::Rax,
-                             0xdeadbeef00000000ull | initial_eax);
-                    WriteGuestGpr64(state, LsxGpr::Rcx, initial_rcx);
-                    WriteGuestGpr64(state, LsxGpr::Rdx, address - initial_rcx);
-                    WriteGuestGpr64(state, LsxGpr::Rsi, 0x1122334455667788ull);
-                    WriteGuestGpr64(state, LsxGpr::Rdi, 0xaabbccddeeffbeefull);
-                },
-                [&](const LsxMachineImage& state, const auto&,
-                    const std::uint64_t result, const LsxDecodedRegion& decoded) {
-                    std::uint64_t taken = 0;
-                    const bool target_ok =
-                        TryResolveBranchTarget(decoded.instructions.back(), taken);
-                    const std::uint64_t final_rcx = initial_rcx + 0x858;
-                    const std::uint32_t final_ecx = static_cast<std::uint32_t>(final_rcx);
-                    const std::uint32_t addend = match ? 1u : 0u;
-                    const std::uint32_t final_eax = initial_eax + addend;
-                    LsxMachineImage expected_flags{};
-                    expected_flags.rflags = 0xad7;
-                    RecordIntegerSubtractionFlags(expected_flags, final_ecx, 0x4d2e36,
-                                   final_ecx - 0x4d2e36, 32);
-                    const std::uint64_t expected_result =
-                        final_ecx != 0x4d2e36 ? taken : decoded.end_rip;
-                    return target_ok && result == expected_result &&
-                           ReadGuestGpr64(state, LsxGpr::Rsi) == addend &&
-                           ReadGuestGpr64(state, LsxGpr::Rcx) == final_rcx &&
-                           ReadGuestGpr64(state, LsxGpr::Rax) == final_eax &&
-                           state.rflags == expected_flags.rflags;
-                });
-        };
-        const bool hot_word_count_match_ok = hot_word_count_case(
-            true, 0x12345678004d25deull, 0xffffffffu);
-        const bool hot_word_count_mismatch_ok = hot_word_count_case(
-            false, 0x12345678004d25deull, 7);
-        const bool hot_word_count_taken_ok = hot_word_count_case(
-            true, 0x12345678004d25ddull, 41);
-        const bool hot_word_count_wrap_ok = hot_word_count_case(
-            true, 0x12345678fffffff0ull, 0xffffffffu);
-        const bool hot_word_count_native_ok =
-            hot_word_count_match_ok && hot_word_count_mismatch_ok &&
-            hot_word_count_taken_ok && hot_word_count_wrap_ok;
         const bool hot_iteration_batch_native_ok =
             hot_r13_record_native_ok && hot_ecx_record_native_ok &&
-            hot_rsi_rdx_native_ok && hot_word_count_native_ok;
+            hot_rsi_rdx_native_ok;
 
         const bool packed_pixel_family_native_ok =
             packed_seed_taken_ok && packed_seed_fallthrough_ok &&
@@ -45161,11 +44625,9 @@ std::string ExerciseTranslationEngineJson() {
                              fpu_state_isolation_ok && x87_sqrt_contract_ok &&
                              interpreter_compiler_smoke_ok &&
                              partial_packed_move_native_ok &&
-                             level_vector_clear_native_ok &&
                              texture_decoder_native_ok &&
                              texture_unrolled_native_ok &&
                              packed_pixel_family_native_ok &&
-                             word_row_copy_native_ok &&
                              rgb565_blend_native_ok &&
                              rgb565_table_native_ok &&
                              hot_iteration_batch_native_ok &&
@@ -45359,12 +44821,6 @@ std::string ExerciseTranslationEngineJson() {
             << ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rax) << std::dec << R"(",)"
             << R"("partialPackedMoveNativeOk":)"
             << (partial_packed_move_native_ok ? "true" : "false") << ","
-            << R"("levelVectorClearNativeOk":)"
-            << (level_vector_clear_native_ok ? "true" : "false") << ","
-            << R"("levelVectorClearTakenOk":)"
-            << (level_vector_clear_taken_ok ? "true" : "false") << ","
-            << R"("levelVectorClearFallthroughOk":)"
-            << (level_vector_clear_fallthrough_ok ? "true" : "false") << ","
             << R"("textureDecoderNativeOk":)"
             << (texture_decoder_native_ok ? "true" : "false") << ","
             << R"("textureIndexNativeOk":)"
@@ -45439,14 +44895,6 @@ std::string ExerciseTranslationEngineJson() {
             << (packed_tail_fallthrough_ok ? "true" : "false") << ","
             << R"("packedTailFullOk":)"
             << (packed_tail_full_ok ? "true" : "false") << ","
-            << R"("wordRowCopyNativeOk":)"
-            << (word_row_copy_native_ok ? "true" : "false") << ","
-            << R"("wordRowCopyTakenOk":)"
-            << (word_row_copy_taken_ok ? "true" : "false") << ","
-            << R"("wordRowCopyFallthroughOk":)"
-            << (word_row_copy_fallthrough_ok ? "true" : "false") << ","
-            << R"("wordRowCopyOverlapOk":)"
-            << (word_row_copy_overlap_ok ? "true" : "false") << ","
             << R"("rgb565BlendNativeOk":)"
             << (rgb565_blend_native_ok ? "true" : "false") << ","
             << R"("rgb565BlendTakenOk":)"
@@ -45493,16 +44941,6 @@ std::string ExerciseTranslationEngineJson() {
             << (hot_rsi_rdx_fallthrough_ok ? "true" : "false") << ","
             << R"("hotRsiRdxWrapOk":)"
             << (hot_rsi_rdx_wrap_ok ? "true" : "false") << ","
-            << R"("hotWordCountNativeOk":)"
-            << (hot_word_count_native_ok ? "true" : "false") << ","
-            << R"("hotWordCountMatchOk":)"
-            << (hot_word_count_match_ok ? "true" : "false") << ","
-            << R"("hotWordCountMismatchOk":)"
-            << (hot_word_count_mismatch_ok ? "true" : "false") << ","
-            << R"("hotWordCountTakenOk":)"
-            << (hot_word_count_taken_ok ? "true" : "false") << ","
-            << R"("hotWordCountWrapOk":)"
-            << (hot_word_count_wrap_ok ? "true" : "false") << ","
             << R"("hotScalarNativeOk":)" << (hot_scalar_native_ok ? "true" : "false") << ","
             << R"("hotByteMixFallthroughOk":)"
             << (hot_byte_mix_fallthrough_ok ? "true" : "false") << ","
