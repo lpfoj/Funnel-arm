@@ -83,6 +83,20 @@ bool IsProcessImageMemory(const std::uint64_t address,
            OverlapsOwningImage(address, byte_count);
 }
 
+bool QueryProcessImageBounds(std::uint64_t& first,
+                             std::uint64_t& last) noexcept {
+#if defined(__linux__)
+    const auto bounds = OwningImageRange();
+    first = bounds.first;
+    last = bounds.second;
+    return last > first;
+#else
+    first = 0;
+    last = 0;
+    return false;
+#endif
+}
+
 bool ReadProcessGuestMemory(const std::uint64_t address, void* const destination,
                             const std::size_t byte_count) noexcept {
     if (destination == nullptr || !AddressRangeExists(address, byte_count)) {

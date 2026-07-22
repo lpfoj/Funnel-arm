@@ -66,6 +66,11 @@ struct ArithmeticFlags {
     std::uint64_t bits{};
 };
 
+[[nodiscard]] constexpr std::uint64_t ReplaceArithmeticFlags(
+    const std::uint64_t condition_word, const std::uint64_t bits) noexcept {
+    return condition_word ^ ((condition_word ^ bits) & ArithmeticFlagMask);
+}
+
 [[nodiscard]] constexpr std::uint64_t WidthMask(std::uint32_t width) noexcept {
     return width >= 64 ? ~std::uint64_t{} : ((std::uint64_t{1} << width) - 1);
 }
@@ -107,6 +112,16 @@ struct ArithmeticFlags {
     bits |= ((left ^ right ^ result) & 0x10) != 0 ? AuxiliaryFlag : 0;
     bits |= left < right ? CarryFlag : 0;
     bits |= (((left ^ right) & (left ^ result) & sign) != 0) ? OverflowFlag : 0;
+    return {bits};
+}
+
+[[nodiscard]] constexpr ArithmeticFlags FlagsForLogicalResult(
+    const std::uint64_t value, const std::uint32_t width) noexcept {
+    const std::uint64_t narrowed = value & WidthMask(width);
+    const std::uint64_t sign = std::uint64_t{1} << (width - 1);
+    std::uint64_t bits = EvenLowByteParity(narrowed) ? ParityFlag : 0;
+    bits |= narrowed == 0 ? ZeroFlag : 0;
+    bits |= (narrowed & sign) != 0 ? SignFlag : 0;
     return {bits};
 }
 

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 PS4Run Project
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "executor/dynamic_translation/decode_bridge.h"
@@ -127,6 +127,29 @@ bool HasMachineInstruction(const std::span<const std::uint8_t> bytes) noexcept {
 
 const char* MachineRegisterName(const std::uint32_t code) noexcept {
     return X86RegisterGetString(static_cast<X86Register>(code));
+}
+
+bool UsesSignExtendedMoveImmediate(const LsxDecodedOp& operation) noexcept {
+    if (operation.mnemonic != X86_MNEMONIC_MOV || operation.operand_count < 2) {
+        return false;
+    }
+    const auto& destination = operation.operands[0];
+    const auto& source = operation.operands[1];
+    if (destination.size != 64 || source.type != X86_OPERAND_TYPE_IMMEDIATE ||
+        source.imm.size != 32) {
+        return false;
+    }
+
+    for (std::size_t cursor = 0; cursor < operation.length; ++cursor) {
+        const std::uint8_t octet = operation.bytes[cursor];
+        const bool legacy_prefix =
+            octet == 0x66 || octet == 0x67 || octet == 0xf2 || octet == 0xf3;
+        const bool rex_prefix = (octet & 0xf0u) == 0x40u;
+        if (!legacy_prefix && !rex_prefix) {
+            return octet == 0xc7;
+        }
+    }
+    return false;
 }
 
 } // namespace Executor::Jit

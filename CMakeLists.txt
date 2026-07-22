@@ -1174,6 +1174,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/code_witness.cpp
     src/executor/dynamic_translation/code_memory.cpp
     src/executor/dynamic_translation/decode_frontend.cpp
+    src/executor/dynamic_translation/diagnostic_probe_policy.cpp
     src/executor/dynamic_translation/edge_portal.cpp
     src/executor/dynamic_translation/execution_context.cpp
     src/executor/dynamic_translation/execution_driver.cpp
@@ -1181,7 +1182,10 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/process_memory.cpp
     src/executor/dynamic_translation/stack_windows.cpp
     src/executor/dynamic_translation/foundation_checks.cpp
+    src/executor/dynamic_translation/floating_relation.cpp
+    src/executor/dynamic_translation/instruction_diagnostics.cpp
     src/executor/dynamic_translation/integer_math.cpp
+    src/executor/dynamic_translation/json_text.cpp
     src/executor/dynamic_translation/machine_state.cpp
     src/executor/dynamic_translation/native_encoder.cpp
     src/executor/dynamic_translation/native_compiler.cpp

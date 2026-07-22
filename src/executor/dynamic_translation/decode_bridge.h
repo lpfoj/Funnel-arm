@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 PS4Run Project
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -17,7 +17,7 @@ enum class ByteLensResult : std::uint8_t {
 };
 
 // Vendor-neutral decode boundary used by the translation engine. The implementation owns the
-// concrete decoder and publishes only PS4Run's retained operation model.
+// concrete decoder and publishes only LSX4's retained operation model.
 [[nodiscard]] ByteLensResult LiftOneMachineInstruction(
     std::span<const std::uint8_t> bytes, LsxDecodedOp& operation) noexcept;
 
@@ -27,5 +27,10 @@ enum class ByteLensResult : std::uint8_t {
 
 // Diagnostic spelling for an architectural register code retained in LsxOperandRecord.
 [[nodiscard]] const char* MachineRegisterName(std::uint32_t code) noexcept;
+
+// Identifies the C7 /0 long-mode form whose 32-bit immediate is sign-extended
+// into a 64-bit destination. Decoder metadata intentionally does not collapse
+// this encoding distinction.
+[[nodiscard]] bool UsesSignExtendedMoveImmediate(const LsxDecodedOp& operation) noexcept;
 
 } // namespace Executor::Jit

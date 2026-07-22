@@ -4,10 +4,16 @@
 #include "executor/dynamic_translation/retiring_execution_core.h"
 #include "executor/dynamic_translation/artifact_repository.h"
 #include "executor/dynamic_translation/decode_bridge.h"
+#include "executor/dynamic_translation/diagnostic_probe_policy.h"
+#include "executor/dynamic_translation/floating_relation.h"
 #include "executor/dynamic_translation/vector_lowering_policy.h"
 #include "executor/dynamic_translation/packed_lane_ops.h"
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "executor/dynamic_translation/integer_math.h"
+#include "executor/dynamic_translation/instruction_diagnostics.h"
+#include "executor/dynamic_translation/json_text.h"
+#include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "native_artifact_layout.h"
 #include "common/content_fingerprint.h"
@@ -1352,31 +1358,7 @@ void StoreUnaligned(void* ptr, T value) {
 }
 
 std::string JsonEscape(std::string_view value) {
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (const char c : value) {
-        switch (c) {
-        case '\\':
-            out += "\\\\";
-            break;
-        case '"':
-            out += "\\\"";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            out += c;
-            break;
-        }
-    }
-    return out;
+    return Lsx4::Translation::EscapeJsonText(value);
 }
 
 } // namespace
@@ -21769,35 +21751,9 @@ constexpr std::uint64_t kFlagZf = 1u << 6;
 constexpr std::uint64_t kFlagSf = 1u << 7;
 constexpr std::uint64_t kFlagDf = 1u << 10;
 constexpr std::uint64_t kFlagOf = 1u << 11;
-constexpr std::uint64_t kStatusMask = kFlagCf | kFlagPf | kFlagAf | kFlagZf | kFlagSf | kFlagOf;
-
-[[nodiscard]] inline std::uint64_t MergeStatusFlags(const std::uint64_t previous,
-                                                    const std::uint64_t replacement) noexcept {
-    // XOR only the status lanes that actually differ. This expresses replacement without the
-    // inherited complemented-mask immediate while leaving every non-status RFLAGS bit untouched.
-#if defined(__aarch64__)
-    // Keep the Android machine-code contract explicit. LLVM is otherwise allowed to canonicalize
-    // the equivalent C++ expression back into an AND with the old complemented-mask immediate.
-    std::uint64_t delta = 0;
-    std::uint64_t merged = 0;
-    asm("eor %0, %2, %3\n\t"
-        "and %0, %0, %4\n\t"
-        "eor %1, %2, %0"
-        : "=&r"(delta), "=&r"(merged)
-        : "r"(previous), "r"(replacement), "r"(kStatusMask));
-    return merged;
-#else
-    const std::uint64_t delta = (previous ^ replacement) & kStatusMask;
-    return previous ^ delta;
-#endif
-}
-
-bool EvenParity8(const std::uint64_t value) {
-    return (__builtin_popcount(static_cast<unsigned>(static_cast<std::uint8_t>(value))) & 1u) == 0;
-}
 
 void StoreStatusFlags(LsxMachineImage& state, const std::uint64_t flags) {
-    state.rflags = MergeStatusFlags(state.rflags, flags);
+    state.rflags = Lsx4::Translation::ReplaceArithmeticFlags(state.rflags, flags);
 }
 } // namespace
 
@@ -21806,35 +21762,8 @@ void RecordIntegerAdditionFlags(LsxMachineImage& state, const std::uint64_t lhs,
     if (size_bits == 0) {
         return;
     }
-    const std::uint64_t mask = size_bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << size_bits) - 1);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-    const std::uint64_t masked_lhs = lhs & mask;
-    const std::uint64_t masked_rhs = rhs & mask;
-    const std::uint64_t masked_result = result & mask;
-
-    std::uint64_t flags = 0;
-    if (masked_result < masked_lhs) {
-        flags |= kFlagCf;
-    }
-    if (((masked_lhs ^ masked_rhs ^ masked_result) & 0x10) != 0) {
-        flags |= kFlagAf;
-    }
-    if (masked_result == 0) {
-        flags |= kFlagZf;
-    }
-    if (masked_result & sign) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(masked_result)) {
-        flags |= kFlagPf;
-    }
-
-    const std::uint64_t overflow = (~(lhs ^ rhs) & (lhs ^ result) & sign);
-    if (overflow != 0) {
-        flags |= kFlagOf;
-    }
-
-    StoreStatusFlags(state, flags);
+    (void)result;
+    StoreStatusFlags(state, Lsx4::Translation::FlagsForAddition(lhs, rhs, size_bits).bits);
 }
 
 void RecordIntegerSubtractionFlags(LsxMachineImage& state, const std::uint64_t lhs, const std::uint64_t rhs,
@@ -21842,33 +21771,8 @@ void RecordIntegerSubtractionFlags(LsxMachineImage& state, const std::uint64_t l
     if (size_bits == 0) {
         return;
     }
-    const std::uint64_t mask = size_bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << size_bits) - 1);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-    const std::uint64_t masked_lhs = lhs & mask;
-    const std::uint64_t masked_rhs = rhs & mask;
-    const std::uint64_t masked_result = result & mask;
-
-    std::uint64_t flags = 0;
-    if (masked_lhs < masked_rhs) {
-        flags |= kFlagCf;
-    }
-    if (((masked_lhs ^ masked_rhs ^ masked_result) & 0x10) != 0) {
-        flags |= kFlagAf;
-    }
-    if (masked_result == 0) {
-        flags |= kFlagZf;
-    }
-    if (masked_result & sign) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(masked_result)) {
-        flags |= kFlagPf;
-    }
-    if (((masked_lhs ^ masked_rhs) & (masked_lhs ^ masked_result) & sign) != 0) {
-        flags |= kFlagOf;
-    }
-
-    StoreStatusFlags(state, flags);
+    (void)result;
+    StoreStatusFlags(state, Lsx4::Translation::FlagsForSubtraction(lhs, rhs, size_bits).bits);
 }
 
 void RecordCarryingAdditionFlags(LsxMachineImage& state, const std::uint64_t lhs, const std::uint64_t rhs,
@@ -21876,36 +21780,9 @@ void RecordCarryingAdditionFlags(LsxMachineImage& state, const std::uint64_t lhs
     if (size_bits == 0) {
         return;
     }
-    const std::uint64_t c = carry ? 1 : 0;
-    const std::uint64_t mask = size_bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << size_bits) - 1);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-    const std::uint64_t masked_lhs = lhs & mask;
-    const std::uint64_t masked_rhs = rhs & mask;
-    const std::uint64_t masked_result = result & mask;
-
-    std::uint64_t flags = 0;
-    if (masked_result < masked_lhs || (c != 0 && masked_result == masked_lhs)) {
-        flags |= kFlagCf;
-    }
-    // AF is the carry out of bit 3 for the complete ADC operation.  The
-    // canonical x86 identity deliberately uses the original RHS: folding the
-    // carry-in into RHS first loses the nibble carry when RHS ends in 0xf.
-    if (((masked_lhs ^ masked_rhs ^ masked_result) & 0x10) != 0) {
-        flags |= kFlagAf;
-    }
-    if (masked_result == 0) {
-        flags |= kFlagZf;
-    }
-    if (masked_result & sign) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(masked_result)) {
-        flags |= kFlagPf;
-    }
-    if ((~(masked_lhs ^ masked_rhs) & (masked_lhs ^ masked_result) & sign) != 0) {
-        flags |= kFlagOf;
-    }
-    StoreStatusFlags(state, flags);
+    const auto outcome = Lsx4::Translation::AddWithCarry(lhs, rhs, carry, size_bits);
+    (void)result;
+    StoreStatusFlags(state, outcome.flag_bits);
 }
 
 void RecordBorrowingSubtractionFlags(LsxMachineImage& state, const std::uint64_t lhs, const std::uint64_t rhs,
@@ -21913,55 +21790,17 @@ void RecordBorrowingSubtractionFlags(LsxMachineImage& state, const std::uint64_t
     if (size_bits == 0) {
         return;
     }
-    const std::uint64_t b = borrow ? 1 : 0;
-    const std::uint64_t mask = size_bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << size_bits) - 1);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-    const std::uint64_t masked_lhs = lhs & mask;
-    const std::uint64_t masked_rhs = rhs & mask;
-    const std::uint64_t masked_result = result & mask;
-
-    std::uint64_t flags = 0;
-    if (masked_lhs < masked_rhs || (b != 0 && masked_lhs == masked_rhs)) {
-        flags |= kFlagCf;
-    }
-    // As with ADC, SBB flag identities use the original source operand; the
-    // borrow-in is already represented by the final result.
-    if (((masked_lhs ^ masked_rhs ^ masked_result) & 0x10) != 0) {
-        flags |= kFlagAf;
-    }
-    if (masked_result == 0) {
-        flags |= kFlagZf;
-    }
-    if (masked_result & sign) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(masked_result)) {
-        flags |= kFlagPf;
-    }
-    if (((masked_lhs ^ masked_rhs) & (masked_lhs ^ masked_result) & sign) != 0) {
-        flags |= kFlagOf;
-    }
-    StoreStatusFlags(state, flags);
+    const auto outcome = Lsx4::Translation::SubtractWithBorrow(lhs, rhs, borrow, size_bits);
+    (void)result;
+    StoreStatusFlags(state, outcome.flag_bits);
 }
 
 void RecordLogicalResultFlags(LsxMachineImage& state, const std::uint64_t result, const std::uint32_t size_bits) {
     if (size_bits == 0) {
         return;
     }
-    const std::uint64_t masked_result = TruncateToOperandWidth(result, size_bits);
-    const std::uint64_t sign = std::uint64_t{1} << (size_bits - 1);
-
-    std::uint64_t flags = 0;
-    if (masked_result == 0) {
-        flags |= kFlagZf;
-    }
-    if (masked_result & sign) {
-        flags |= kFlagSf;
-    }
-    if (EvenParity8(masked_result)) {
-        flags |= kFlagPf;
-    }
-    StoreStatusFlags(state, flags);
+    StoreStatusFlags(
+        state, Lsx4::Translation::FlagsForLogicalResult(result, size_bits).bits);
 }
 
 std::uint64_t LoadGuestScalar(const std::uint64_t guest_va, const std::uint32_t size_bytes) {
@@ -21999,67 +21838,8 @@ void StoreGuestScalar(const std::uint64_t guest_va, const std::uint64_t value, c
     CopyBytesToGuest(guest_va, &value, size_bytes);
 }
 
-// [lo,hi) of our own loaded host image (this .so), from /proc/self/maps (union of all mappings that
-// contain the address of a function known to live in this image). Cached once. A guest store landing
-// in this range is always a codegen bug (garbage host-address base).
 static bool JitOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi) {
-#if defined(__ANDROID__) || defined(__linux__)
-    static std::uint64_t s_lo = 0;
-    static std::uint64_t s_hi = 0;
-    static std::once_flag s_once;
-    std::call_once(s_once, [] {
-        const std::uint64_t self_addr =
-            reinterpret_cast<std::uint64_t>(&JitOwnHostImageRange);
-        std::ifstream maps("/proc/self/maps");
-        std::string line;
-        std::string self_path;
-        while (std::getline(maps, line)) {
-            unsigned long long begin = 0, end = 0;
-            char perms[8] = {};
-            int path_off = 0;
-            if (std::sscanf(line.c_str(), "%llx-%llx %7s %*x %*x:%*x %*u %n", &begin, &end, perms,
-                            &path_off) < 3) {
-                continue;
-            }
-            if (self_addr >= begin && self_addr < end && path_off > 0 &&
-                static_cast<std::size_t>(path_off) < line.size()) {
-                self_path = line.substr(static_cast<std::size_t>(path_off));
-                while (!self_path.empty() &&
-                       (self_path.back() == '\n' || self_path.back() == ' ')) {
-                    self_path.pop_back();
-                }
-                break;
-            }
-        }
-        if (self_path.empty()) {
-            return;
-        }
-        std::ifstream maps2("/proc/self/maps");
-        std::uint64_t min_begin = ~std::uint64_t{0}, max_end = 0;
-        while (std::getline(maps2, line)) {
-            if (line.find(self_path) == std::string::npos) {
-                continue;
-            }
-            unsigned long long begin = 0, end = 0;
-            if (std::sscanf(line.c_str(), "%llx-%llx", &begin, &end) != 2) {
-                continue;
-            }
-            min_begin = std::min<std::uint64_t>(min_begin, begin);
-            max_end = std::max<std::uint64_t>(max_end, end);
-        }
-        if (max_end > min_begin) {
-            s_lo = min_begin;
-            s_hi = max_end;
-        }
-    });
-    lo = s_lo;
-    hi = s_hi;
-    return s_hi > s_lo;
-#else
-    (void)lo;
-    (void)hi;
-    return false;
-#endif
+    return Lsx4::Translation::QueryProcessImageBounds(lo, hi);
 }
 
 void CopyBytesToGuest(const std::uint64_t guest_va, const void* src, const std::uint32_t size_bytes) {
@@ -22720,81 +22500,21 @@ void AppendRecentBlocks(std::ostringstream& error) {
 }
 
 void AppendGprDump(std::ostringstream& error, const LsxMachineImage& state) {
-    error << " rflags=0x" << state.rflags
-          << " rax=0x" << ReadGuestGpr64(state, LsxGpr::Rax)
-          << " rbx=0x" << ReadGuestGpr64(state, LsxGpr::Rbx)
-          << " rcx=0x" << ReadGuestGpr64(state, LsxGpr::Rcx)
-          << " rdx=0x" << ReadGuestGpr64(state, LsxGpr::Rdx)
-          << " rsi=0x" << ReadGuestGpr64(state, LsxGpr::Rsi)
-          << " rdi=0x" << ReadGuestGpr64(state, LsxGpr::Rdi)
-          << " rbp=0x" << ReadGuestGpr64(state, LsxGpr::Rbp)
-          << " rsp=0x" << ReadGuestGpr64(state, LsxGpr::Rsp)
-          << " r8=0x" << ReadGuestGpr64(state, LsxGpr::R8)
-          << " r9=0x" << ReadGuestGpr64(state, LsxGpr::R9)
-          << " r10=0x" << ReadGuestGpr64(state, LsxGpr::R10)
-          << " r11=0x" << ReadGuestGpr64(state, LsxGpr::R11)
-          << " r12=0x" << ReadGuestGpr64(state, LsxGpr::R12)
-          << " r13=0x" << ReadGuestGpr64(state, LsxGpr::R13)
-          << " r14=0x" << ReadGuestGpr64(state, LsxGpr::R14)
-          << " r15=0x" << ReadGuestGpr64(state, LsxGpr::R15)
-          << " fs=0x" << SegmentBase(state, X86_REGISTER_FS)
-          << " gs=0x" << SegmentBase(state, X86_REGISTER_GS);
+    error << Lsx4::Translation::RenderRegisterEvent(state);
 }
 
 void AppendDecodedBlockDump(std::ostringstream& error, const LsxDecodedRegion* block) {
     if (block == nullptr) {
         return;
     }
-    error << " blockInsns=[";
-    for (std::size_t n = 0; n < block->instructions.size(); ++n) {
-        const auto& insn = block->instructions[n];
-        if (n != 0) {
-            error << ";";
+    error << " decoded={";
+    for (std::size_t index = 0; index < block->instructions.size(); ++index) {
+        if (index != 0) {
+            error << ',';
         }
-        const char* mnemonic = X86MnemonicGetString(static_cast<X86Mnemonic>(insn.mnemonic));
-        error << "0x" << std::hex << insn.guest_rip
-              << ":" << (mnemonic != nullptr ? mnemonic : "<unknown>")
-              << ":";
-        for (std::uint8_t i = 0; i < insn.length && i < insn.bytes.size(); ++i) {
-            const auto byte = static_cast<unsigned>(insn.bytes[i]);
-            if (byte < 0x10) {
-                error << '0';
-            }
-            error << byte;
-        }
-        error << ":can=" << std::dec << (CanInterpretInstruction(insn) ? 1 : 0)
-              << ":ops=" << static_cast<unsigned>(insn.operand_count) << std::hex;
-        const std::uint8_t operand_count =
-            insn.operand_count < insn.operands.size()
-                ? insn.operand_count
-                : static_cast<std::uint8_t>(insn.operands.size());
-        for (std::uint8_t i = 0; i < operand_count; ++i) {
-            const auto& operand = insn.operands[i];
-            error << ",op" << std::dec << static_cast<unsigned>(i)
-                  << "{t=" << static_cast<int>(operand.type)
-                  << ",sz=" << operand.size << std::hex;
-            if (operand.type == X86_OPERAND_TYPE_REGISTER) {
-                const char* reg = MachineRegisterName(operand.reg.value);
-                error << ",reg=" << (reg != nullptr ? reg : "<unknown>");
-            } else if (operand.type == X86_OPERAND_TYPE_MEMORY) {
-                const char* base = MachineRegisterName(operand.mem.base);
-                const char* index = MachineRegisterName(operand.mem.index);
-                const char* segment = MachineRegisterName(operand.mem.segment);
-                error << ",seg=" << (segment != nullptr ? segment : "none")
-                      << ",base=" << (base != nullptr ? base : "none")
-                      << ",index=" << (index != nullptr ? index : "none")
-                      << ",scale=0x" << static_cast<std::uint32_t>(operand.mem.scale)
-                      << ",disp=0x" << static_cast<std::uint64_t>(operand.mem.disp.value);
-            } else if (operand.type == X86_OPERAND_TYPE_IMMEDIATE) {
-                error << ",imm=0x"
-                      << (operand.imm.is_signed
-                              ? static_cast<std::uint64_t>(operand.imm.value.s)
-                              : operand.imm.value.u);
-            }
-            error << "}";
-        }
+        error << Lsx4::Translation::RenderInstructionEvent(block->instructions[index]);
     }
-    error << "]";
+    error << '}';
 }
 
 void AppendRecentDecodedBlockDumps(std::ostringstream& error) {
@@ -22927,24 +22647,7 @@ std::uint64_t LoadOperandValue(const LsxMachineImage& state,
 }
 
 bool IsMovR64Imm32SignExtendForm(const LsxDecodedOp& ir) {
-    if (ir.mnemonic != X86_MNEMONIC_MOV || ir.operand_count < 2 ||
-        ir.operands[0].size != 64 ||
-        ir.operands[1].type != X86_OPERAND_TYPE_IMMEDIATE ||
-        ir.operands[1].imm.size != 32) {
-        return false;
-    }
-
-    std::uint8_t pos = 0;
-    while (pos < ir.length) {
-        const std::uint8_t byte = ir.bytes[pos];
-        if (byte == 0x66 || byte == 0x67 || byte == 0xf2 || byte == 0xf3 ||
-            (byte >= 0x40 && byte <= 0x4f)) {
-            ++pos;
-            continue;
-        }
-        return byte == 0xc7;
-    }
-    return false;
+    return UsesSignExtendedMoveImmediate(ir);
 }
 
 void StoreOperandValue(LsxMachineImage& state, const DecodeSummary& instruction,
@@ -22962,92 +22665,18 @@ void StoreOperandValue(LsxMachineImage& state, const DecodeSummary& instruction,
         if (allow_side_effects) {
             const std::uint64_t address = ResolveGuestOperandAddress(state, instruction, operand);
             if (address < 0x10000 || address >= 0xffff000000000000ull) {
-                const char* mnemonic =
-                    X86MnemonicGetString(static_cast<X86Mnemonic>(instruction.mnemonic));
-                const char* base_name = operand.mem.base != X86_REGISTER_NONE
-                    ? MachineRegisterName(operand.mem.base)
-                    : "none";
-                const char* index_name = operand.mem.index != X86_REGISTER_NONE
-                    ? MachineRegisterName(operand.mem.index)
-                    : "none";
-                const auto gpr = [&](LsxGpr reg) {
-                    return ReadGuestGpr64(state, reg);
-                };
-                std::ostringstream error;
-                const auto append_qwords = [&](const char* name, const std::uint64_t base,
-                                               const std::uint32_t count) {
-                    error << " " << name << "@0x" << base << "=[";
-                    const std::uint64_t bytes =
-                        static_cast<std::uint64_t>(count) * sizeof(std::uint64_t);
-                    if (base >= 0x10000 && count != 0 && IsTraceReadableAddress(base, bytes)) {
-                        for (std::uint32_t i = 0; i < count; ++i) {
-                            if (i != 0) {
-                                error << ",";
-                            }
-                            const std::uint64_t address = base + (static_cast<std::uint64_t>(i) * 8);
-                            error << "+0x" << (i * 8) << ":0x" << TraceQwordSafe(address);
-                        }
-                    } else if (base >= 0x10000 && count != 0) {
-                        error << "<unreadable>";
-                    }
-                    error << "]";
-                };
-                error << "JIT low guest memory write rip=0x" << std::hex
-                      << state.rip_or_exit << " address=0x" << address
-                      << " size=0x" << OperandSizeBytes(operand)
-                      << " mnemonic=" << (mnemonic != nullptr ? mnemonic : "<unknown>")
-                      << " base=" << (base_name != nullptr ? base_name : "<unknown>")
-                      << " index=" << (index_name != nullptr ? index_name : "<unknown>")
-                      << " scale=0x" << static_cast<std::uint32_t>(operand.mem.scale)
-                      << " disp=0x" << static_cast<std::uint64_t>(operand.mem.disp.value)
-                      << " rflags=0x" << state.rflags
-                      << " rax=0x" << gpr(LsxGpr::Rax)
-                      << " rbx=0x" << gpr(LsxGpr::Rbx)
-                      << " rcx=0x" << gpr(LsxGpr::Rcx)
-                      << " rdx=0x" << gpr(LsxGpr::Rdx)
-                      << " rsi=0x" << gpr(LsxGpr::Rsi)
-                      << " rdi=0x" << gpr(LsxGpr::Rdi)
-                      << " rbp=0x" << gpr(LsxGpr::Rbp)
-                      << " rsp=0x" << gpr(LsxGpr::Rsp)
-                      << " r8=0x" << gpr(LsxGpr::R8)
-                      << " r9=0x" << gpr(LsxGpr::R9)
-                      << " r10=0x" << gpr(LsxGpr::R10)
-                      << " r11=0x" << gpr(LsxGpr::R11)
-                      << " r12=0x" << gpr(LsxGpr::R12)
-                      << " r13=0x" << gpr(LsxGpr::R13)
-                      << " r14=0x" << gpr(LsxGpr::R14)
-                      << " r15=0x" << gpr(LsxGpr::R15)
-                      << " activeBlock=0x" << g_active_block_rip
-                      << " activeBytes=" << HexBytesAt(g_active_block_rip, 64)
-                      << " ripBytes=" << HexBytesAt(state.rip_or_exit, 32)
-                      << " recentBlocks=[";
-                const std::uint32_t recent_count =
-                    g_recent_block_count < g_recent_block_rips.size()
-                        ? g_recent_block_count
-                        : static_cast<std::uint32_t>(g_recent_block_rips.size());
-                for (std::uint32_t idx = 0; idx < recent_count; ++idx) {
-                    const std::uint32_t slot = g_recent_block_count < g_recent_block_rips.size()
-                        ? idx
-                        : (g_recent_block_cursor + idx) % g_recent_block_rips.size();
-                    if (idx != 0) {
-                        error << ",";
-                    }
-                    error << "0x" << g_recent_block_rips[slot];
-                }
-                error << "]";
-                append_qwords("r12hdr", gpr(LsxGpr::R12), 5);
-                append_qwords("rbp+10", gpr(LsxGpr::Rbp) + 0x10, 4);
-                append_qwords("rsp", gpr(LsxGpr::Rsp), 6);
-                // Iterative diagnostic: don't abort the whole run on a low/unmapped write. Log the
-                // full register dump (to tell whether e.g. rax=0 is a codegen miscalc vs a real
-                // guest null-write) and soft-skip the write so the native game (Sonic/RSDK) keeps
-                // running toward a frame; bounded to avoid log spam.
                 static std::atomic<std::uint32_t> s_low_write_budget{0};
                 const std::uint32_t low_write_n =
                     s_low_write_budget.fetch_add(1, std::memory_order_relaxed);
                 if (low_write_n < 64) {
-                    JitLog("[EXECUTOR_JIT_LOW_WRITE_SKIP] n=%u %s", low_write_n,
-                                error.str().c_str());
+                    const std::string registers =
+                        Lsx4::Translation::RenderRegisterEvent(state);
+                    JitLog("[LSX4_TRANSLATION_WRITE_REJECTED] sequence=%u pc=%llx "
+                           "address=%llx width=%u%s",
+                           low_write_n,
+                           static_cast<unsigned long long>(state.rip_or_exit),
+                           static_cast<unsigned long long>(address),
+                           OperandSizeBytes(operand), registers.c_str());
                 }
                 return;
             }
@@ -23145,234 +22774,11 @@ bool TryResolveBranchTarget(const LsxDecodedOp& ir, std::uint64_t& target) {
 }
 
 bool IsAllocatorTraceOffset(const std::uint64_t offset) {
-    switch (offset) {
-    case 0xf786e:
-    case 0xf7873:
-    case 0xf78ba:
-    case 0xf78c1:
-    case 0xa376:
-    case 0xa37b:
-    case 0xa3f8:
-    case 0xa400:
-    case 0xa4e3:
-    case 0xa4e6:
-    case 0xa521:
-    case 0xa526:
-    case 0xb040:
-    case 0xb394:
-    case 0xaf80:
-    case 0xafa0:
-    case 0xafb6:
-    case 0xafbb:
-    case 0xafc6:
-    case 0xc450:
-    case 0xc459:
-    case 0x4c93f:
-    case 0x4c970:
-    case 0x4d730:
-    case 0x4d7e3:
-    case 0x58070:
-    case 0x58095:
-    case 0x5e480:
-    case 0x5e5f0:
-    case 0x5e6a2:
-    case 0x5e740:
-    case 0x5e7b4:
-    case 0x5e896:
-    case 0x5e910:
-    case 0x5e9f2:
-    case 0x62a50:
-    case 0x62b23:
-    case 0x62c91:
-    case 0x62cf7:
-    case 0x646c0:
-    case 0x64810:
-    case 0x64be0:
-    case 0x64c57:
-    case 0x64c68:
-    case 0x64cab:
-    case 0x64cc1:
-    case 0x64cc6:
-    case 0x64ccf:
-    case 0x64cd5:
-    case 0x64d3b:
-    case 0x65105:
-    case 0x679f0:
-    case 0x67a36:
-    case 0x67a3b:
-    case 0x67a4e:
-    case 0x67a53:
-    case 0x67a68:
-    case 0x67a70:
-    case 0x67a7a:
-    case 0x67a9f:
-    case 0x67ab1:
-    case 0x68190:
-    case 0x68293:
-    case 0x683b4:
-    case 0x683c1:
-    case 0x683ca:
-    case 0x68431:
-    case 0x6865b:
-    case 0x68666:
-    case 0x68670:
-    case 0x6867d:
-    case 0x686f7:
-    case 0x6877c:
-    case 0x68781:
-    case 0x68797:
-    case 0x687d8:
-    case 0x68829:
-    case 0x6885a:
-    case 0x688c1:
-    case 0x688d6:
-    case 0x688eb:
-    case 0x68971:
-    case 0x1f2a060:
-    case 0x1f2a11f:
-    case 0x1f2a124:
-    case 0x1f2a213:
-    case 0x1f2a225:
-    case 0x20f57f0:
-    case 0x20f57f6:
-    case 0x20f4e90:
-        return true;
-    default:
-        break;
-    }
-    return false;
+    return Lsx4::Translation::TraceAllocatorOffset(offset);
 }
 
 bool IsJitBlockProbeOffset(const std::uint64_t offset) {
-    switch (offset) {
-    case 0x1b8300:
-    case 0x1b8338:
-    case 0x1b8374:
-    case 0x1b8397:
-    case 0x1b83a0:
-    case 0x1b83a6:
-    case 0x1b83d6:
-    case 0x1b83f6:
-    case 0x1b8400:
-    case 0x1b8408:
-    case 0x1b840d:
-    case 0x1b8421:
-    case 0x1b8444:
-    case 0x1b844c:
-    case 0x7c6f0:
-    case 0x7c703:
-    case 0x7c71d:
-    case 0x7c729:
-    case 0x7c820:
-    case 0x7c853:
-    case 0x7c872:
-    case 0x7c887:
-    case 0x7c88c:
-    case 0x7c89a:
-    case 0x7c8a1:
-    case 0x7c8a7:
-    case 0x7c8bd:
-    case 0x7c8cb:
-    case 0x7c8cd:
-    case 0x7c8dc:
-    case 0x7c8f3:
-    case 0x7c8f6:
-    case 0x7c929:
-    case 0x7c92a:
-    case 0x7c957:
-    case 0x7c985:
-    case 0x7c9ba:
-    case 0x7c9f9:
-    case 0x7ca2e:
-    case 0x7ca63:
-    case 0x7ca9b:
-    case 0x7cad0:
-    case 0x7da6e:
-    case 0x7da72:
-    case 0x7da85:
-    case 0x7da8f:
-    case 0x7dabd:
-    case 0x7dac9:
-    case 0x7dad3:
-    case 0x7dadc:
-    case 0x7daed:
-    case 0x7db14:
-    case 0x7db37:
-    case 0x7db40:
-    case 0x7db43:
-    case 0x7db48:
-    case 0x7db83:
-    case 0x7db92:
-    case 0x7db97:
-    case 0x7dba0:
-    case 0x7dda5:
-    case 0x7ddfb:
-    case 0x7de47:
-    case 0x7de57:
-    case 0x7de5d:
-    case 0x82ac0:
-    case 0x82ad0:
-    case 0x82ad7:
-    case 0x82adc:
-    case 0x82ae3:
-    case 0xd7a0:
-    case 0xd7a3:
-    case 0xd7a6:
-    case 0x8d700:
-    case 0x8d70b:
-    case 0x8d717:
-    case 0x8d71a:
-    case 0x8d71f:
-    case 0x8d722:
-    case 0x8d728:
-    case 0x8d74f:
-    case 0x8d75e:
-    case 0x8d768:
-    case 0x8d76c:
-    case 0x8d790:
-    case 0x8d793:
-    case 0x8d7a7:
-    case 0x8d7c8:
-    case 0x8d7cb:
-    case 0x8d7e1:
-    case 0x8d7e5:
-    case 0x8d7f0:
-    case 0x8d815:
-    case 0x8d823:
-    case 0x8d848:
-    case 0x8d861:
-    case 0x8d972:
-    case 0x8d9a7:
-    case 0x8d9c4:
-    case 0x8da14:
-    case 0x8da21:
-    case 0x8da2c:
-    case 0x8da4d:
-    case 0x8dbd0:
-    case 0x8dc40:
-    case 0x8dc8b:
-    case 0x8dcf0:
-    case 0x8dd07:
-    case 0x8de16:
-    case 0x8dec7:
-    case 0x8dee0:
-    case 0x8def1:
-    case 0x8df0a:
-    case 0x94cd0:
-    case 0x11da0:
-    case 0x11dbb:
-    case 0x11dd1:
-    case 0x11dfc:
-    case 0x11e06:
-    case 0x11e26:
-    case 0x11e2d:
-    case 0x11f10:
-    case 0x11f17:
-    case 0x126ad:
-        return true;
-    default:
-        return false;
-    }
+    return Lsx4::Translation::TraceTranslationOffset(offset);
 }
 
 
@@ -33186,7 +32592,7 @@ void PublishShiftFlags(LsxMachineImage& state, const ShiftOutcome& outcome,
     std::uint64_t flags = outcome.carry ? kFlagCf : 0;
     flags |= outcome.value == 0 ? kFlagZf : 0;
     flags |= (outcome.value & sign) != 0 ? kFlagSf : 0;
-    flags |= EvenParity8(outcome.value) ? kFlagPf : 0;
+    flags |= Lsx4::Translation::EvenLowByteParity(outcome.value) ? kFlagPf : 0;
     flags |= outcome.overflow ? kFlagOf : 0;
     StoreStatusFlags(state, flags);
 }
@@ -36225,75 +35631,7 @@ void SquareRootPackedFloating(void* argument0, const void* argument1, const bool
 
 namespace {
 bool EvaluateFloatComparePredicate(const double lhs, const double rhs, const std::uint32_t predicate) {
-    const bool unordered = std::isnan(lhs) || std::isnan(rhs);
-    const std::uint32_t pred = predicate & 0x1f;
-    switch (pred) {
-    case 0x00:
-        return !unordered && lhs == rhs;
-    case 0x01:
-        return !unordered && lhs < rhs;
-    case 0x02:
-        return !unordered && lhs <= rhs;
-    case 0x03:
-        return unordered;
-    case 0x04:
-        return unordered || lhs != rhs;
-    case 0x05:
-        return unordered || !(lhs < rhs);
-    case 0x06:
-        return unordered || !(lhs <= rhs);
-    case 0x07:
-        return !unordered;
-    case 0x08:
-        return unordered || lhs == rhs;
-    case 0x09:
-        return unordered || lhs < rhs;
-    case 0x0a:
-        return unordered || lhs <= rhs;
-    case 0x0b:
-        return false;
-    case 0x0c:
-        return !unordered && lhs != rhs;
-    case 0x0d:
-        return !unordered && !(lhs < rhs);
-    case 0x0e:
-        return !unordered && !(lhs <= rhs);
-    case 0x0f:
-        return true;
-    case 0x10:
-        return !unordered && lhs == rhs;
-    case 0x11:
-        return !unordered && lhs < rhs;
-    case 0x12:
-        return !unordered && lhs <= rhs;
-    case 0x13:
-        return unordered;
-    case 0x14:
-        return unordered || lhs != rhs;
-    case 0x15:
-        return unordered || !(lhs < rhs);
-    case 0x16:
-        return unordered || !(lhs <= rhs);
-    case 0x17:
-        return !unordered;
-    case 0x18:
-        return unordered || lhs == rhs;
-    case 0x19:
-        return unordered || lhs < rhs;
-    case 0x1a:
-        return unordered || lhs <= rhs;
-    case 0x1b:
-        return false;
-    case 0x1c:
-        return !unordered && lhs != rhs;
-    case 0x1d:
-        return !unordered && !(lhs < rhs);
-    case 0x1e:
-        return !unordered && !(lhs <= rhs);
-    case 0x1f:
-        return true;
-    }
-    return false;
+    return Lsx4::Translation::FloatingRelationMatches(lhs, rhs, predicate);
 }
 } // namespace
 
@@ -42487,7 +41825,8 @@ std::string ExerciseTranslationEngineJson() {
                  GprSlot(LsxGpr::R12) * sizeof(std::uint64_t),
              1u, 1u, 32u);
         const std::uint64_t generic_shld_expected_flags =
-            MergeStatusFlags(0x602u, kFlagCf | kFlagPf | kFlagZf | kFlagOf);
+            Lsx4::Translation::ReplaceArithmeticFlags(
+                0x602u, kFlagCf | kFlagPf | kFlagZf | kFlagOf);
         const bool generic_shld_semantic_ok =
             ReadGuestGpr64(generic_shld_semantic_state, LsxGpr::R12) == 0 &&
             generic_shld_semantic_state.rflags == generic_shld_expected_flags;
@@ -42874,7 +42213,7 @@ std::string ExerciseTranslationEngineJson() {
                     0x300000002ull, 0x300000002ull,
                 };
                 const std::uint64_t expected_flags =
-                    (0xad7u & ~kStatusMask) | kFlagZf;
+                    Lsx4::Translation::ReplaceArithmeticFlags(0xad7u, kFlagZf);
                 return state.rflags == expected_flags &&
                        state.mxcsr == 0x5f80u &&
                        std::memcmp(state.ymm[4].data(), even_dwords.data(), 32) == 0 &&
