@@ -32483,43 +32483,11 @@ void RoundPackedFloating(void* argument0, const void* argument1, const std::uint
 
 namespace {
 float HorizontalFloatPair(float lhs, float rhs, const bool subtract) {
-#if defined(__aarch64__)
-    if (subtract) {
-        asm volatile("fsub %s[lhs], %s[lhs], %s[rhs]"
-                     : [lhs] "+w"(lhs)
-                     : [rhs] "w"(rhs));
-    } else {
-        asm volatile("fadd %s[lhs], %s[lhs], %s[rhs]"
-                     : [lhs] "+w"(lhs)
-                     : [rhs] "w"(rhs));
-    }
-    return lhs;
-#else
-    return subtract ? lhs - rhs : lhs + rhs;
-#endif
+    return VectorSemantic::CombineHorizontalSingle(lhs, rhs, subtract);
 }
 
 double HorizontalDoublePair(double lhs, double rhs, const bool subtract) {
-#if defined(__aarch64__)
-    if (subtract) {
-        // The interpreter double-lane path is deliberately FNEG+FADD rather
-        // than FSUB.  The distinction is byte-visible for NaN sign/payloads.
-        asm volatile("fneg %d[rhs], %d[rhs]\n\t"
-                     "fadd %d[lhs], %d[lhs], %d[rhs]"
-                     : [lhs] "+w"(lhs), [rhs] "+w"(rhs));
-    } else {
-        asm volatile("fadd %d[lhs], %d[lhs], %d[rhs]"
-                     : [lhs] "+w"(lhs)
-                     : [rhs] "w"(rhs));
-    }
-    return lhs;
-#else
-    if (subtract) {
-        auto rhs_bits = std::bit_cast<std::uint64_t>(rhs) ^ (std::uint64_t{1} << 63u);
-        rhs = std::bit_cast<double>(rhs_bits);
-    }
-    return lhs + rhs;
-#endif
+    return VectorSemantic::CombineHorizontalDouble(lhs, rhs, subtract);
 }
 
 template <typename Float, typename Combine>

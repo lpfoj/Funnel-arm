@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 
@@ -63,6 +64,39 @@ bool SignedLaneGreater(const std::uint8_t* const left,
 }
 
 } // namespace
+
+float CombineHorizontalSingle(const float left, const float right,
+                              const bool subtract) noexcept {
+#if defined(__aarch64__)
+    const float32x2_t left_lane = vdup_n_f32(left);
+    const float32x2_t right_lane = vdup_n_f32(right);
+    const float32x2_t result = subtract ? vsub_f32(left_lane, right_lane)
+                                        : vadd_f32(left_lane, right_lane);
+    return vget_lane_f32(result, 0);
+#else
+    return subtract ? left - right : left + right;
+#endif
+}
+
+double CombineHorizontalDouble(const double left, const double right,
+                               const bool subtract) noexcept {
+#if defined(__aarch64__)
+    const float64x1_t left_lane = vdup_n_f64(left);
+    float64x1_t right_lane = vdup_n_f64(right);
+    if (subtract) {
+        right_lane = vneg_f64(right_lane);
+    }
+    return vget_lane_f64(vadd_f64(left_lane, right_lane), 0);
+#else
+    double adjusted_right = right;
+    if (subtract) {
+        const auto bits = std::bit_cast<std::uint64_t>(right) ^
+                          (std::uint64_t{1} << 63u);
+        adjusted_right = std::bit_cast<double>(bits);
+    }
+    return left + adjusted_right;
+#endif
+}
 
 PackedBitTestResult TestPackedBits(const void* const left,
                                    const void* const right,

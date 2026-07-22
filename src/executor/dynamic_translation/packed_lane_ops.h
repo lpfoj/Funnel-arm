@@ -58,5 +58,7 @@ bool Permute128BitHalves(void* destination, const void* left,
 bool InsertSinglePrecisionElement(void* destination, const void* original,
                                   const void* source, std::uint32_t control,
                                   bool source_is_memory) noexcept;
+float CombineHorizontalSingle(float left, float right, bool subtract) noexcept;
+double CombineHorizontalDouble(double left, double right, bool subtract) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic
