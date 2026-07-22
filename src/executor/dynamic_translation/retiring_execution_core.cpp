@@ -237,8 +237,6 @@ void ExtractVectorDword(void* dst, const void* src, std::uint32_t index, bool st
 std::uint64_t CollectVectorSignBits(const void* src, std::size_t lane_bytes, std::size_t total_size);
 void BroadcastVectorHalf(void* dst, const void* src);
 void BroadcastScalarLane(void* dst, const void* src, std::size_t element_size, std::size_t total_size);
-void DuplicatePackedSingleLanes(void* dst, const void* src, bool high_source_elements, std::size_t size);
-void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, std::size_t size);
 void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs, bool high_selector,
               bool full_vector);
 void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src, const void* src, bool high_qword,
@@ -23885,7 +23883,12 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
             return false;
         }
         const std::size_t width = VectorOperandBytes(lhs_operand);
-        TestPackedVectorBits(state, lhs.data(), rhs.data(), width);
+        const auto bit_test = VectorSemantic::TestPackedBits(
+            lhs.data(), rhs.data(), width);
+        std::uint64_t status = 0;
+        status |= bit_test.intersection_is_zero ? kFlagZf : 0;
+        status |= bit_test.masked_complement_is_zero ? kFlagCf : 0;
+        StoreStatusFlags(state, status);
         return true;
     }
 
@@ -23899,10 +23902,16 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
         if (mnemonic == X86_MNEMONIC_MOVSLDUP || mnemonic == X86_MNEMONIC_VMOVSLDUP) {
-            DuplicatePackedSingleLanes(result.data(), rhs.data(), false, width);
+            if (!VectorSemantic::DuplicateDwordParity(
+                    result.data(), rhs.data(), width, false)) {
+                return false;
+            }
         } else if (mnemonic == X86_MNEMONIC_MOVSHDUP ||
                    mnemonic == X86_MNEMONIC_VMOVSHDUP) {
-            DuplicatePackedSingleLanes(result.data(), rhs.data(), true, width);
+            if (!VectorSemantic::DuplicateDwordParity(
+                    result.data(), rhs.data(), width, true)) {
+                return false;
+            }
         } else {
             (void)VectorSemantic::DuplicateLowQwordPerLane(
                 result.data(), rhs.data(), width, true);
@@ -31553,35 +31562,6 @@ void MergePackedSingleHighFromLow64(void* argument0, const void* argument1, cons
 
 void MergePackedSingleLowFromHigh(void* argument0, const void* argument1, const void* argument2, const bool argument3, const bool argument4) {
     SemanticKernelMergePackedSingleLowFromHigh(argument0, argument1, argument2, argument3, argument4);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelTestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, const std::size_t size){
-    if (lhs == nullptr || rhs == nullptr || size == 0 || size > 32) {
-        return;
-    }
-    const auto result = VectorSemantic::TestPackedBits(lhs, rhs, size);
-    std::uint64_t flags = 0;
-    if (result.intersection_is_zero) {
-        flags |= kFlagZf;
-    }
-    if (result.masked_complement_is_zero) {
-        flags |= kFlagCf;
-    }
-    StoreStatusFlags(state, flags);
-}
-
-void TestPackedVectorBits(LsxMachineImage& argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
-    SemanticKernelTestPackedVectorBits(argument0, argument1, argument2, argument3);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelDuplicatePackedSingleLanes(void* dst, const void* src, const bool high_source_elements,
-                          const std::size_t size){
-    (void)VectorSemantic::DuplicateDwordParity(
-        dst, src, size, high_source_elements);
-}
-
-void DuplicatePackedSingleLanes(void* argument0, const void* argument1, const bool argument2, const std::size_t argument3) {
-    SemanticKernelDuplicatePackedSingleLanes(argument0, argument1, argument2, argument3);
 }
 
 [[gnu::always_inline]] static inline void SemanticKernelBroadcastScalarLane(void* dst, const void* src, const std::size_t element_size,
