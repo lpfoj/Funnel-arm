@@ -11459,28 +11459,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         }
     }
 
-    const auto emit_pixel_row_counter_tail = [&]
-        (Xbyak_aarch64::CodeGenerator& code, const std::uint32_t counter_offset,
-         const std::uint64_t fallthrough, const std::uint64_t taken) {
-        Xbyak_aarch64::Label take;
-        code.ldr(code.x9, Xbyak_aarch64::ptr(code.x0, kStateRcxOffset));
-        code.add(code.x9, code.x9, 1);
-        code.str(code.x9, Xbyak_aarch64::ptr(code.x0, kStateRcxOffset));
-        code.ldr(code.x10, Xbyak_aarch64::ptr(code.x0, kStateRsiOffset));
-        code.mov(code.x12, 2);
-        emit_inline_add64_flags(code, code.x10, code.x12, code.x11);
-        code.str(code.x11, Xbyak_aarch64::ptr(code.x0, kStateRsiOffset));
-        code.ldr(code.w9, Xbyak_aarch64::ptr(code.x0, counter_offset));
-        emit_inline_inc32_flags_preserve_cf(code, code.w9, code.w11);
-        code.str(code.x11, Xbyak_aarch64::ptr(code.x0, counter_offset));
-        code.cbnz(code.w11, take);
-        code.mov(code.x0, fallthrough);
-        code.ret();
-        code.L(take);
-        code.mov(code.x0, taken);
-        code.ret();
-    };
-
     static constexpr std::array<std::uint8_t, 28> kPixelRowDecBodyJnePattern = {
         0x48, 0x89, 0xeb, 0x48, 0xc1, 0xe3, 0x09, 0x48,
         0x01, 0xf3, 0x0f, 0xb7, 0x3c, 0x7b, 0x66, 0x89,
@@ -11552,101 +11530,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             code->L(take);
             code->mov(code->x0, taken);
             code->ret();
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
-    bool pixel_row_body = false;
-    bool pixel_row_tail = false;
-    std::uint32_t pixel_row_counter_offset = 0;
-    static constexpr std::array<std::uint8_t, 17> kPixelRowLookupBodyPattern = {
-        0x4c, 0x89, 0xf0, 0x48, 0xc1, 0xe0, 0x09, 0x4c,
-        0x01, 0xe8, 0x0f, 0xb7, 0x04, 0x68, 0x66, 0x89,
-        0x06,
-    };
-    if (block.instructions.size() == 9 &&
-        std::memcmp(block.instructions.front().bytes.data(),
-                    kPixelRowLookupBodyPattern.data(),
-                    block.instructions.front().length) == 0) {
-        std::array<std::uint8_t, 28> bytes{};
-        std::size_t offset = 0;
-        for (const auto& ir : block.instructions) {
-            if (offset + ir.length <= bytes.size()) {
-                std::memcpy(bytes.data() + offset, ir.bytes.data(), ir.length);
-            }
-            offset += ir.length;
-        }
-        if (offset == bytes.size() &&
-            std::memcmp(bytes.data(), kPixelRowLookupBodyPattern.data(),
-                        kPixelRowLookupBodyPattern.size()) == 0 &&
-            std::memcmp(bytes.data() + 17,
-                        std::array<std::uint8_t, 7>{
-                            0x48, 0xff, 0xc1, 0x48, 0x83, 0xc6, 0x02}.data(),
-                        7) == 0 && bytes[24] == 0xff &&
-            (bytes[25] == 0xc2 || bytes[25] == 0xc3) &&
-            bytes[26] == 0x75 && bytes[27] == 0xdc) {
-            pixel_row_body = true;
-            pixel_row_counter_offset =
-                bytes[25] == 0xc2 ? kStateRdxOffset : kStateRbxOffset;
-        }
-    }
-    if (pixel_row_body) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateR14Offset));
-            code->lsl(code->x10, code->x9, 9);
-            code->ldr(code->x11, Xbyak_aarch64::ptr(code->x0, kStateR13Offset));
-            emit_inline_add64_flags(*code, code->x10, code->x11, code->x12);
-            code->str(code->x12, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->ldr(code->x13, Xbyak_aarch64::ptr(code->x0, kStateRbpOffset));
-            code->lsl(code->x13, code->x13, 1);
-            code->add(code->x14, code->x12, code->x13);
-            code->ldrh(code->w9, Xbyak_aarch64::ptr(code->x14));
-            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRsiOffset));
-            code->strh(code->w9, Xbyak_aarch64::ptr(code->x10));
-            emit_pixel_row_counter_tail(*code, pixel_row_counter_offset,
-                                              fallthrough, taken);
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
-    if (block.instructions.size() == 4) {
-        std::array<std::uint8_t, 11> bytes{};
-        std::size_t offset = 0;
-        for (const auto& ir : block.instructions) {
-            if (offset + ir.length <= bytes.size()) {
-                std::memcpy(bytes.data() + offset, ir.bytes.data(), ir.length);
-            }
-            offset += ir.length;
-        }
-        if (offset == bytes.size() &&
-            std::memcmp(bytes.data(),
-                        std::array<std::uint8_t, 7>{
-                            0x48, 0xff, 0xc1, 0x48, 0x83, 0xc6, 0x02}.data(),
-                        7) == 0 && bytes[7] == 0xff &&
-            (bytes[8] == 0xc2 || bytes[8] == 0xc3) &&
-            bytes[9] == 0x75 && bytes[10] == 0xdc) {
-            pixel_row_tail = true;
-            pixel_row_counter_offset =
-                bytes[8] == 0xc2 ? kStateRdxOffset : kStateRbxOffset;
-        }
-    }
-    if (pixel_row_tail) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            emit_pixel_row_counter_tail(*code, pixel_row_counter_offset,
-                                              fallthrough, taken);
             code->ready();
             auto* entry = CommitCode(std::move(code));
             return finish_direct_native(entry);
