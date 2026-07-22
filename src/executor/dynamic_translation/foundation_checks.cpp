@@ -19,6 +19,7 @@
 #include "executor/dynamic_translation/value_residency.h"
 #include "executor/dynamic_translation/vector_semantics.h"
 #include "executor/dynamic_translation/x87_state.h"
+#include "executor/dynamic_translation/x87_semantics.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +51,7 @@ enum CheckBit : std::uint64_t {
     ScalarFloating = 1ull << 17,
     MxcsrTransfer = 1ull << 18,
     X87State = 1ull << 19,
+    X87Semantics = 1ull << 20,
 };
 
 struct FetchContext {
@@ -581,6 +583,40 @@ bool CheckX87State() {
                static_cast<std::uint16_t>(frame.x87_stack_cursor << 11);
 }
 
+bool CheckX87Semantics() {
+    constexpr std::array<std::uint8_t, 8> fixture{
+        0xdd, 0x07, 0xdd, 0x06, 0xde, 0xc1, 0xdd, 0x1a};
+    constexpr std::uint64_t code_base = 0xf400;
+    SemanticMemoryImage image{.base = 0x190000};
+    const double first = 1.25;
+    const double second = 2.5;
+    std::memcpy(image.bytes.data(), &first, sizeof(first));
+    std::memcpy(image.bytes.data() + 16, &second, sizeof(second));
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+    WriteInteger(frame, IntegerRegister::Source, image.base + 16, 64);
+    WriteInteger(frame, IntegerRegister::D, image.base + 32, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 4; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+                DecodeOutcome::Complete ||
+            ExecuteX87Instruction(instruction, frame, memory).stop !=
+                X87Stop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    double stored = 0;
+    std::memcpy(&stored, image.bytes.data() + 32, sizeof(stored));
+    return offset == fixture.size() && stored == 3.75 && X87Depth(frame) == 0 &&
+           frame.x87_code_address == code_base + 6 &&
+           frame.x87_data_address == image.base + 32;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -700,6 +736,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(ScalarFloating, CheckScalarFloating());
     run(MxcsrTransfer, CheckMxcsrTransfer());
     run(X87State, CheckX87State());
+    run(X87Semantics, CheckX87Semantics());
     return report;
 }
 
