@@ -23001,14 +23001,14 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto force_interpret_audio_sentinel =
         std::filesystem::path(g_root) / "run-force-interpret-audio";
     if (std::filesystem::exists(force_interpret_audio_sentinel)) {
-        setenv("EXECUTOR_FORCE_INTERPRET_LO", "0x8001e0000", 1);
-        setenv("EXECUTOR_FORCE_INTERPRET_HI", "0x801700000", 1);
+        setenv("LSX4_TRANSLATION_INTERPRET_LO", "0x8001e0000", 1);
+        setenv("LSX4_TRANSLATION_INTERPRET_HI", "0x801700000", 1);
         const bool thread2_only = std::filesystem::exists(
             std::filesystem::path(g_root) / "run-force-interpret-audio-thread2");
         if (thread2_only) {
-            setenv("EXECUTOR_FORCE_INTERPRET_THREAD", "Thread2", 1);
+            setenv("LSX4_TRANSLATION_INTERPRET_THREAD", "Thread2", 1);
         } else {
-            unsetenv("EXECUTOR_FORCE_INTERPRET_THREAD");
+            unsetenv("LSX4_TRANSLATION_INTERPRET_THREAD");
         }
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_FORCE_INTERPRET_AUDIO] source=sentinel path=%s lo=0x8001e0000 "
@@ -23027,12 +23027,12 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         const std::uint64_t lo_value = std::strtoull(lo.c_str(), nullptr, 0);
         const std::uint64_t hi_value = std::strtoull(hi.c_str(), nullptr, 0);
         if (lo_value != 0 && hi_value > lo_value) {
-            setenv("EXECUTOR_FORCE_INTERPRET_LO", lo.c_str(), 1);
-            setenv("EXECUTOR_FORCE_INTERPRET_HI", hi.c_str(), 1);
+            setenv("LSX4_TRANSLATION_INTERPRET_LO", lo.c_str(), 1);
+            setenv("LSX4_TRANSLATION_INTERPRET_HI", hi.c_str(), 1);
             if (!thread.empty()) {
-                setenv("EXECUTOR_FORCE_INTERPRET_THREAD", thread.c_str(), 1);
+                setenv("LSX4_TRANSLATION_INTERPRET_THREAD", thread.c_str(), 1);
             } else {
-                unsetenv("EXECUTOR_FORCE_INTERPRET_THREAD");
+                unsetenv("LSX4_TRANSLATION_INTERPRET_THREAD");
             }
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_FORCE_INTERPRET_RANGE] source=%s lo=%s hi=%s thread=%s",
@@ -23481,8 +23481,8 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     const auto force_interpret_all_sentinel =
         std::filesystem::path(g_root) / "run-force-interpret-all";
     if (std::filesystem::exists(force_interpret_all_sentinel)) {
-        setenv("EXECUTOR_FORCE_INTERPRET_LO", "0x800000000", 1);
-        setenv("EXECUTOR_FORCE_INTERPRET_HI", "0x810000000", 1);
+        setenv("LSX4_TRANSLATION_INTERPRET_LO", "0x800000000", 1);
+        setenv("LSX4_TRANSLATION_INTERPRET_HI", "0x810000000", 1);
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_FORCE_INTERPRET_ALL] source=sentinel path=%s lo=0x800000000 "
                   "hi=0x810000000",

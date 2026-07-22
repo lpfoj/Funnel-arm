@@ -1283,7 +1283,8 @@ void JitReportWatchedStore(const std::uint64_t guest_rip, const std::uint64_t ad
 // stores through ExecutorJitWriteGuestBytes, which rejects+logs any store landing in our host
 // image — so forcing the RSDK audio worker's hot block range here both PREVENTS the shape-shifting
 // host-memory corruption AND pins the guest PC of the offending store (GUEST_STORE_INTO_HOST_IMAGE),
-// while letting the render main thread keep native codegen. Range from EXECUTOR_FORCE_INTERPRET_LO/HI
+// while letting the render main thread keep native codegen. Range from
+// LSX4_TRANSLATION_INTERPRET_LO/HI
 // (hex), evaluated once.
 bool JitForceInterpretRip(std::uint64_t rip) {
 #ifdef __ANDROID__
@@ -1294,13 +1295,13 @@ bool JitForceInterpretRip(std::uint64_t rip) {
     };
     static const Range range = [] {
         Range r;
-        const char* lo = std::getenv("EXECUTOR_FORCE_INTERPRET_LO");
-        const char* hi = std::getenv("EXECUTOR_FORCE_INTERPRET_HI");
+        const char* lo = std::getenv("LSX4_TRANSLATION_INTERPRET_LO");
+        const char* hi = std::getenv("LSX4_TRANSLATION_INTERPRET_HI");
         if (lo != nullptr && hi != nullptr) {
             r.lo = std::strtoull(lo, nullptr, 0);
             r.hi = std::strtoull(hi, nullptr, 0);
         }
-        if (const char* thread = std::getenv("EXECUTOR_FORCE_INTERPRET_THREAD")) {
+        if (const char* thread = std::getenv("LSX4_TRANSLATION_INTERPRET_THREAD")) {
             r.thread = thread;
         }
         return r;
@@ -4620,7 +4621,7 @@ public:
         const bool production_native_mode =
             !JitForceHelperEnabled() &&
             !JitLiveCheckedNativeEnabled() &&
-            std::getenv("EXECUTOR_FORCE_INTERPRET_LO") == nullptr;
+            std::getenv("LSX4_TRANSLATION_INTERPRET_LO") == nullptr;
         if (!production_native_mode) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
                         "reason=diagnostic_or_interpreter_mode");
@@ -18555,12 +18556,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
 
     if (mnemonic == X86_MNEMONIC_JMP) {
         if (ir.operand_count != 1) {
-            log_control_native_miss("jmp_operand_count");
+            log_control_native_miss("indirect-jump arity");
             return nullptr;
         }
         auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
         if (!emit_native_target_load(*code, ir, ir.operands[0], code->x10)) {
-            log_control_native_miss("jmp_target_load");
+            log_control_native_miss("indirect-jump target-read");
             return nullptr;
         }
         std::uint64_t static_target = 0;
@@ -18576,13 +18577,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
 
     if (mnemonic == X86_MNEMONIC_CALL) {
         if (ir.operand_count != 1) {
-            log_control_native_miss("call_operand_count");
+            log_control_native_miss("indirect-call arity");
             return nullptr;
         }
         const std::uint64_t return_rip = ir.guest_rip + ir.length;
         auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
         if (!emit_native_target_load(*code, ir, ir.operands[0], code->x10)) {
-            log_control_native_miss("call_target_load");
+            log_control_native_miss("indirect-call target-read");
             return nullptr;
         }
         code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRspOffset));
@@ -28832,7 +28833,7 @@ LsxDecodedRegion DecodeGuestBasicRegion(const std::uint64_t guest_rip, const std
         // Split at the last fully decoded instruction and let the execute loop
         // continue at block.end_rip.  This keeps decode/compile/hash work
         // bounded without rejecting valid straight-line guest code.
-        block.diagnostic = "instruction_limit_fallthrough_split";
+        block.diagnostic = "decode_budget_continuation";
     }
     block.SelectInitialNativeTier(RegionAcceptsNativeTier(block));
     // Decode grows the instruction vector geometrically.  Once lowering starts, generated code
@@ -35311,9 +35312,9 @@ std::string ExerciseTranslationEngineJson() {
                    CheckedNativeStateMatches(native_state, interpreter_state);
         };
         const bool mono_string_hash_nonempty_ok =
-            mono_string_hash_case("System.Collections.Generic", 0x13579bdfu);
+            mono_string_hash_case("LSX4.Dynamic.Collections", 0x4c535834u);
         const bool mono_string_hash_empty_ok =
-            mono_string_hash_case("", 0x2468ace0u);
+            mono_string_hash_case("", 0x584c5334u);
         const bool mono_string_hash_native_ok =
             mono_string_hash_nonempty_ok && mono_string_hash_empty_ok;
 
@@ -35360,7 +35361,7 @@ std::string ExerciseTranslationEngineJson() {
         };
         const bool mono_strlen_empty_ok = mono_strlen_case("");
         const bool mono_strlen_nonempty_ok =
-            mono_strlen_case("System.Collections.Generic.Dictionary");
+            mono_strlen_case("LSX4.Dynamic.Collections.Map");
         const bool mono_strlen_native_ok =
             mono_strlen_empty_ok && mono_strlen_nonempty_ok;
 
@@ -40236,7 +40237,7 @@ std::string ExerciseTranslationEngineJson() {
             capped_block.instructions.size() == 4 &&
             capped_block.end_rip == bounded_split_rip + 4 &&
             !capped_block.instructions.back().terminates_block &&
-            capped_block.diagnostic == "instruction_limit_fallthrough_split" &&
+            capped_block.diagnostic == "decode_budget_continuation" &&
             bounded_split_first_result == capped_block.end_rip &&
             !bounded_split_continuation.HasDecodeFailure() &&
             bounded_split_continuation.SupportsInitialNativeTier() &&
