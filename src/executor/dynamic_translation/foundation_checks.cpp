@@ -18,6 +18,7 @@
 #include "executor/dynamic_translation/scalar_semantics.h"
 #include "executor/dynamic_translation/value_residency.h"
 #include "executor/dynamic_translation/vector_semantics.h"
+#include "executor/dynamic_translation/x87_state.h"
 
 #include <algorithm>
 #include <array>
@@ -48,6 +49,7 @@ enum CheckBit : std::uint64_t {
     VectorShifts = 1ull << 16,
     ScalarFloating = 1ull << 17,
     MxcsrTransfer = 1ull << 18,
+    X87State = 1ull << 19,
 };
 
 struct FetchContext {
@@ -559,6 +561,26 @@ bool CheckMxcsrTransfer() {
            stored == expected;
 }
 
+bool CheckX87State() {
+    CpuFrame frame{};
+    if (PushX87(frame, 1.25L) != X87StackOutcome::Complete ||
+        PushX87(frame, -2.5L) != X87StackOutcome::Complete || X87Depth(frame) != 2) {
+        return false;
+    }
+    const auto top = ReadX87(frame, 0);
+    const auto next = ReadX87(frame, 1);
+    if (!top || !next || *top != -2.5L || *next != 1.25L ||
+        ExchangeX87(frame, 1) != X87StackOutcome::Complete) {
+        return false;
+    }
+    long double removed = 0;
+    return PopX87(frame, &removed) == X87StackOutcome::Complete &&
+           removed == 1.25L && X87Depth(frame) == 1 && ReadX87(frame, 0) &&
+           *ReadX87(frame, 0) == -2.5L &&
+           (frame.x87_status & (7u << 11)) ==
+               static_cast<std::uint16_t>(frame.x87_stack_cursor << 11);
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -677,6 +699,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(VectorShifts, CheckVectorShifts());
     run(ScalarFloating, CheckScalarFloating());
     run(MxcsrTransfer, CheckMxcsrTransfer());
+    run(X87State, CheckX87State());
     return report;
 }
 
