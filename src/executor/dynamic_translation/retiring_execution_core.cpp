@@ -8877,96 +8877,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         }
     }
 
-    // Sonic Mania's RSDK audio mixer executes these three scalar blocks millions of times per
-    // second. Match the complete decoded byte sequence rather than a game RIP: the lowering is
-    // valid for an identical block at any guest address, and relative branches are resolved from
-    // the decoded terminator. Each sequence ends in CMP, so all earlier flag writes are dead; the
-    // emitted block publishes the exact final x86 status flags through RecordIntegerSubtractionFlags.
-    static constexpr std::array<std::uint8_t, 39> kByteMixCmpJnePattern = {
-        0x0f, 0xb6, 0x83, 0x52, 0x40, 0x00, 0x00, 0x89, 0xc9, 0x32,
-        0x44, 0x0b, 0x10, 0x0f, 0xb6, 0x8b, 0x51, 0x40, 0x00, 0x00,
-        0x32, 0x84, 0x0b, 0x40, 0x40, 0x00, 0x00, 0x41, 0x88, 0x07,
-        0x83, 0xbb, 0x24, 0x40, 0x00, 0x00, 0x01, 0x75, 0x06,
-    };
-    if (block_bytes_match(kByteMixCmpJnePattern.data(), kByteMixCmpJnePattern.size())) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            Xbyak_aarch64::Label take;
-            const auto address_with_offset = [&](const XReg& dst, const XReg& base,
-                                                 const std::uint64_t offset) {
-                code->mov(code->x15, offset);
-                code->add(dst, base, code->x15);
-            };
-            const auto update_cmp_flags = [&](const XReg& lhs, const std::uint64_t rhs,
-                                              const XReg& result, const std::uint32_t bits) {
-                code->mov(code->x0, code->x19);
-                code->mov(code->x1, lhs);
-                code->mov(code->x2, rhs);
-                code->mov(code->x3, result);
-                code->mov(code->x4, bits);
-                EmitJitRelocatablePointer(
-                    *code, code->x16, reinterpret_cast<std::uint64_t>(&RecordIntegerSubtractionFlags));
-                code->blr(code->x16);
-            };
-            const auto emit_return = [&](const std::uint64_t target) {
-                code->mov(code->x0, target);
-                code->ldp(code->x19, code->x20, Xbyak_aarch64::ptr(code->sp, 16));
-                code->ldp(code->x29, code->x30, Xbyak_aarch64::post_ptr(code->sp, 32));
-                code->ret();
-            };
-
-            code->stp(code->x29, code->x30, Xbyak_aarch64::pre_ptr(code->sp, -32));
-            code->stp(code->x19, code->x20, Xbyak_aarch64::ptr(code->sp, 16));
-            code->mov(code->x29, code->sp);
-            code->mov(code->x19, code->x0);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x19, kStateRbxOffset));
-
-            address_with_offset(code->x14, code->x9, 0x4052);
-            code->ldrb(code->w10, Xbyak_aarch64::ptr(code->x14));
-            code->str(code->x10, Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
-
-            // mov ecx,ecx zero-extends the architectural register before it indexes the table.
-            code->ldr(code->w11, Xbyak_aarch64::ptr(code->x19, kStateRcxOffset));
-            code->str(code->x11, Xbyak_aarch64::ptr(code->x19, kStateRcxOffset));
-            code->add(code->x14, code->x9, code->x11);
-            code->add(code->x14, code->x14, 0x10);
-            code->ldrb(code->w12, Xbyak_aarch64::ptr(code->x14));
-            code->eor(code->w10, code->w10, code->w12);
-
-            address_with_offset(code->x14, code->x9, 0x4051);
-            code->ldrb(code->w11, Xbyak_aarch64::ptr(code->x14));
-            code->str(code->x11, Xbyak_aarch64::ptr(code->x19, kStateRcxOffset));
-            code->add(code->x14, code->x9, code->x11);
-            code->mov(code->x15, 0x4040);
-            code->add(code->x14, code->x14, code->x15);
-            code->ldrb(code->w12, Xbyak_aarch64::ptr(code->x14));
-            code->eor(code->w10, code->w10, code->w12);
-            code->str(code->x10, Xbyak_aarch64::ptr(code->x19, kStateRaxOffset));
-
-            code->ldr(code->x13, Xbyak_aarch64::ptr(code->x19, kStateR15Offset));
-            code->strb(code->w10, Xbyak_aarch64::ptr(code->x13));
-
-            address_with_offset(code->x14, code->x9, 0x4024);
-            code->ldr(code->w11, Xbyak_aarch64::ptr(code->x14));
-            code->sub(code->w12, code->w11, 1);
-            update_cmp_flags(code->x11, 1, code->x12, 32);
-
-            // Decide JNE from the committed guest ZF. Reloading guest memory here would allow a
-            // concurrent writer to race the already-completed x86 CMP.
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x19, kStateRflagsOffset));
-            code->tbz(code->x9, kZfBit, take);
-            emit_return(fallthrough);
-            code->L(take);
-            emit_return(taken);
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
 
     // The next texture-decoder stage expands sixteen byte codes into sixteen words.  The compiler
     // unrolled slots 1..15 into the same five-instruction shape; a zero code branches directly
@@ -35865,53 +35775,6 @@ std::string ExerciseTranslationEngineJson() {
                    validate(native_state, native_memory, native_result, hot_block);
         };
 
-        const std::array<std::uint8_t, 39> hot_byte_mix = {
-            0x0f, 0xb6, 0x83, 0x52, 0x40, 0x00, 0x00, 0x89, 0xc9, 0x32,
-            0x44, 0x0b, 0x10, 0x0f, 0xb6, 0x8b, 0x51, 0x40, 0x00, 0x00,
-            0x32, 0x84, 0x0b, 0x40, 0x40, 0x00, 0x00, 0x41, 0x88, 0x07,
-            0x83, 0xbb, 0x24, 0x40, 0x00, 0x00, 0x01, 0x75, 0x06,
-        };
-        const auto hot_byte_mix_case = [&](const std::uint32_t compare_value) {
-            return run_hot_scalar_case(
-                hot_byte_mix,
-                [&](std::vector<std::uint8_t>& memory) {
-                    memory[0x4052] = 0x3c;
-                    memory[0x15] = 0xa5;
-                    memory[0x4051] = 0x07;
-                    memory[0x4047] = 0x5a;
-                    std::memcpy(memory.data() + 0x4024, &compare_value,
-                                sizeof(compare_value));
-                },
-                [&](LsxMachineImage& state, std::vector<std::uint8_t>& memory) {
-                    state.rflags = 0x602;
-                    WriteGuestGpr64(state, LsxGpr::Rax, 0xfeedfacecafebeefull);
-                    WriteGuestGpr64(state, LsxGpr::Rbx,
-                             reinterpret_cast<std::uint64_t>(memory.data()));
-                    WriteGuestGpr64(state, LsxGpr::Rcx, 0xdeadbeef00000005ull);
-                    WriteGuestGpr64(state, LsxGpr::R15,
-                             reinterpret_cast<std::uint64_t>(memory.data() + 0x100));
-                },
-                [&](const LsxMachineImage& state, const std::vector<std::uint8_t>& memory,
-                    const std::uint64_t result, const LsxDecodedRegion& decoded) {
-                    LsxMachineImage expected_flags{};
-                    expected_flags.rflags = 0x602;
-                    RecordIntegerSubtractionFlags(expected_flags, compare_value, 1, compare_value - 1, 32);
-                    std::uint64_t taken = 0;
-                    const bool target_ok =
-                        TryResolveBranchTarget(decoded.instructions.back(), taken);
-                    const std::uint64_t expected_result = compare_value != 1
-                        ? taken
-                        : decoded.instructions.back().guest_rip +
-                              decoded.instructions.back().length;
-                    return target_ok && result == expected_result &&
-                           ReadGuestGpr64(state, LsxGpr::Rax) == 0xc3 &&
-                           ReadGuestGpr64(state, LsxGpr::Rcx) == 0x07 &&
-                           state.rflags == expected_flags.rflags && memory[0x100] == 0xc3;
-                },
-                true);
-        };
-        const bool hot_byte_mix_fallthrough_ok = hot_byte_mix_case(1);
-        const bool hot_byte_mix_taken_ok = hot_byte_mix_case(2);
 
         const std::array<std::uint8_t, 15> mono_string_hash_loop = {
             0x0f, 0xbe, 0x0f, 0x6b, 0xc0, 0x1f, 0x29, 0xc8,
@@ -36930,7 +36793,6 @@ std::string ExerciseTranslationEngineJson() {
         const bool mono_interface_copy_native_ok =
             mono_interface_copy_60_ok && mono_interface_copy_78_ok;
         const bool hot_scalar_native_ok =
-            hot_byte_mix_fallthrough_ok && hot_byte_mix_taken_ok &&
             mono_string_hash_native_ok && mono_strlen_native_ok &&
             mono_string_equal_native_ok && fast_guest_strcmp_native_ok &&
             fast_guest_strncmp_native_ok && fast_guest_memcmp_native_ok &&
@@ -41194,9 +41056,6 @@ std::string ExerciseTranslationEngineJson() {
             << R"("hotRsiRdxWrapOk":)"
             << (hot_rsi_rdx_wrap_ok ? "true" : "false") << ","
             << R"("hotScalarNativeOk":)" << (hot_scalar_native_ok ? "true" : "false") << ","
-            << R"("hotByteMixFallthroughOk":)"
-            << (hot_byte_mix_fallthrough_ok ? "true" : "false") << ","
-            << R"("hotByteMixTakenOk":)" << (hot_byte_mix_taken_ok ? "true" : "false") << ","
             << R"("monoStringHashNativeOk":)"
             << (mono_string_hash_native_ok ? "true" : "false") << ","
             << R"("monoStringHashNonemptyOk":)"
