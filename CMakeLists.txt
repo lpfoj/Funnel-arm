@@ -1169,6 +1169,7 @@ set(LSX4_NATIVE_CORE_SOURCES
 add_library(lsx4_executor_android SHARED
     ${LSX4_NATIVE_CORE_SOURCES}
     src/executor/native_runtime_api.cpp
+    src/executor/dynamic_translation/code_memory.cpp
     src/executor/dynamic_translation/decode_frontend.cpp
     src/executor/dynamic_translation/machine_state.cpp
     src/executor/dynamic_translation/region_plan.cpp
