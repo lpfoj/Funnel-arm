@@ -29,6 +29,7 @@
 #include "core/loader/elf.h"
 #include "core/memory.h"
 #include "core/tls.h"
+#include "executor/dynamic_translation/foundation_checks.h"
 #include "executor/jit/lsx_translation_engine.h"
 #include "input/controller.h"
 #include "sdl_window.h"
@@ -24665,12 +24666,18 @@ extern "C" const char* executor_lsx4_runtime_jit_selftest() {
     static std::string status;
     status = Executor::Jit::ExerciseTranslationEngineJson();
     const bool guest_range_ok = executor_jit_guest_range_selftest() != 0;
+    const auto foundation = Lsx4::Translation::RunFoundationChecks();
     if (!status.empty() && status.back() == '}') {
         status.pop_back();
         status += R"(,"guestReadableRangeOk":)";
-        status += guest_range_ok ? "true}" : "false}";
+        status += guest_range_ok ? "true" : "false";
+        status += R"(,"dynamicTranslationFoundationOk":)";
+        status += foundation.AllPassed() ? "true" : "false";
+        status += R"(,"dynamicTranslationFoundationFailed":)";
+        status += std::to_string(foundation.failed);
+        status += "}";
     }
-    if (!guest_range_ok) {
+    if (!guest_range_ok || !foundation.AllPassed()) {
         const std::size_t ok = status.find(R"("ok":true)");
         if (ok != std::string::npos) {
             status.replace(ok, sizeof(R"("ok":true)") - 1, R"("ok":false)");
