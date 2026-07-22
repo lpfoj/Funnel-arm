@@ -10753,134 +10753,67 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         }
     }
 
-    // Four compact RSDK iteration blocks account for another large slice of steady-state
-    // gameplay helpers.  Keep these byte-shape based: the relative terminator supplies the
-    // target and an identical block at any guest RIP is equally valid.  The two store-bearing
-    // loops publish the last live arithmetic flags before the first potentially faulting store,
-    // retain x86's partial-register rules, and preserve the original store order for aliasing.
-    const auto emit_inline_sub64_flags = [&]
-        (Xbyak_aarch64::CodeGenerator& code, const XReg& lhs, const XReg& rhs,
-         const XReg& result) {
-        NativeStatus::EmitSubtract64(code, lhs, rhs, result, inline_flag_layout);
-    };
-
-    static constexpr std::array<std::uint8_t, 33> kR13RecordAdvanceJbPattern = {
-        0x41, 0xff, 0xc5, 0x48, 0x05, 0x58, 0x08, 0x00,
-        0x00, 0x41, 0x0f, 0xb7, 0xcd, 0x49, 0x89, 0x07,
-        0x66, 0x45, 0x89, 0x6f, 0x26, 0x81, 0xf9, 0x40,
-        0x09, 0x00, 0x00, 0x0f, 0x82, 0x6f, 0xfd, 0xff,
-        0xff,
-    };
-    if (block_bytes_match(kR13RecordAdvanceJbPattern.data(),
-                          kR13RecordAdvanceJbPattern.size())) {
-        const LsxDecodedOp& terminator = block.instructions.back();
+    // Fuse a register-only induction tail by decoded meaning rather than by guest bytes.  This
+    // covers the common `INC index; ADD cursor,stride; CMP index,limit; JNE loop` family for any
+    // pair of 64-bit registers and any immediates.  The first two status results are dead because
+    // CMP unconditionally replaces the complete arithmetic status image before the branch.
+    if (block.instructions.size() == 4) {
+        const LsxDecodedOp& advance_index = block.instructions[0];
+        const LsxDecodedOp& advance_cursor = block.instructions[1];
+        const LsxDecodedOp& compare_limit = block.instructions[2];
+        const LsxDecodedOp& repeat = block.instructions[3];
+        const bool induction_shape =
+            static_cast<X86Mnemonic>(advance_index.mnemonic) == X86_MNEMONIC_INC &&
+            static_cast<X86Mnemonic>(advance_cursor.mnemonic) == X86_MNEMONIC_ADD &&
+            static_cast<X86Mnemonic>(compare_limit.mnemonic) == X86_MNEMONIC_CMP &&
+            static_cast<X86Mnemonic>(repeat.mnemonic) == X86_MNEMONIC_JNZ &&
+            advance_index.operand_count == 1 &&
+            advance_cursor.operand_count == 2 && compare_limit.operand_count == 2 &&
+            advance_index.operands[0].type == X86_OPERAND_TYPE_REGISTER &&
+            advance_cursor.operands[0].type == X86_OPERAND_TYPE_REGISTER &&
+            advance_cursor.operands[1].type == X86_OPERAND_TYPE_IMMEDIATE &&
+            compare_limit.operands[0].type == X86_OPERAND_TYPE_REGISTER &&
+            compare_limit.operands[1].type == X86_OPERAND_TYPE_IMMEDIATE &&
+            advance_index.operands[0].reg.value ==
+                compare_limit.operands[0].reg.value;
+        std::uint32_t index_offset = 0;
+        std::uint32_t index_width = 0;
+        std::uint32_t cursor_offset = 0;
+        std::uint32_t cursor_width = 0;
         std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
+        if (induction_shape &&
+            register_state_offset(advance_index.operands[0].reg.value,
+                                  index_offset, index_width) &&
+            register_state_offset(advance_cursor.operands[0].reg.value,
+                                  cursor_offset, cursor_width) &&
+            index_width == 64 && cursor_width == 64 &&
+            TryResolveBranchTarget(repeat, taken)) {
+            const std::uint64_t stride = advance_cursor.operands[1].imm.value.u;
+            const std::uint64_t limit = compare_limit.operands[1].imm.value.u;
+            const std::uint64_t fallthrough = repeat.guest_rip + repeat.length;
             auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            Xbyak_aarch64::Label take;
-            code->ldr(code->w9, Xbyak_aarch64::ptr(code->x0, kStateR13Offset));
-            code->add(code->w9, code->w9, 1);
-            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateR13Offset));
-            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->mov(code->x12, 0x858);
-            emit_inline_add64_flags(*code, code->x10, code->x12, code->x11);
-            code->str(code->x11, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->uxth(code->w12, code->w9);
-            code->str(code->x12, Xbyak_aarch64::ptr(code->x0, kStateRcxOffset));
-            code->ldr(code->x13, Xbyak_aarch64::ptr(code->x0, kStateR15Offset));
-            code->str(code->x11, Xbyak_aarch64::ptr(code->x13));
-            code->strh(code->w9, Xbyak_aarch64::ptr(code->x13, 0x26));
-            code->mov(code->w10, 0x940);
-            emit_inline_sub32_flags(*code, code->w12, code->w10, code->w11);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
-            code->tbnz(code->x9, kCfBit, take);
-            code->mov(code->x0, fallthrough);
-            code->ret();
-            code->L(take);
-            code->mov(code->x0, taken);
-            code->ret();
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
+            Xbyak_aarch64::Label branch_taken;
 
-    static constexpr std::array<std::uint8_t, 31> kEcxRecordAdvanceJbPattern = {
-        0xff, 0xc1, 0xc6, 0x40, 0x55, 0x00, 0x48, 0x05,
-        0x58, 0x08, 0x00, 0x00, 0x0f, 0xb7, 0xd1, 0x49,
-        0x89, 0x07, 0x66, 0x41, 0x89, 0x4f, 0x26, 0x81,
-        0xfa, 0x40, 0x09, 0x00, 0x00, 0x72, 0xba,
-    };
-    if (block_bytes_match(kEcxRecordAdvanceJbPattern.data(),
-                          kEcxRecordAdvanceJbPattern.size())) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            Xbyak_aarch64::Label take;
-            code->ldr(code->w9, Xbyak_aarch64::ptr(code->x0, kStateRcxOffset));
-            emit_inline_inc32_flags_preserve_cf(*code, code->w9, code->w10);
-            code->str(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRcxOffset));
-            code->ldr(code->x11, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->add(code->x13, code->x11, 0x55);
-            code->mov(code->w12, 0);
-            code->strb(code->w12, Xbyak_aarch64::ptr(code->x13));
-            code->mov(code->x12, 0x858);
-            emit_inline_add64_flags(*code, code->x11, code->x12, code->x13);
-            code->str(code->x13, Xbyak_aarch64::ptr(code->x0, kStateRaxOffset));
-            code->uxth(code->w9, code->w10);
-            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
-            code->ldr(code->x11, Xbyak_aarch64::ptr(code->x0, kStateR15Offset));
-            code->str(code->x13, Xbyak_aarch64::ptr(code->x11));
-            code->strh(code->w10, Xbyak_aarch64::ptr(code->x11, 0x26));
-            code->mov(code->w12, 0x940);
-            emit_inline_sub32_flags(*code, code->w9, code->w12, code->w13);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
-            code->tbnz(code->x9, kCfBit, take);
-            code->mov(code->x0, fallthrough);
-            code->ret();
-            code->L(take);
-            code->mov(code->x0, taken);
-            code->ret();
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
-        }
-    }
-
-    static constexpr std::array<std::uint8_t, 23> kRsiRdxAdvanceJnePattern = {
-        0x48, 0xff, 0xc6, 0x48, 0x81, 0xc2, 0x58, 0x08,
-        0x00, 0x00, 0x48, 0x81, 0xfe, 0x40, 0x09, 0x00,
-        0x00, 0x0f, 0x85, 0x79, 0xff, 0xff, 0xff,
-    };
-    if (block_bytes_match(kRsiRdxAdvanceJnePattern.data(),
-                          kRsiRdxAdvanceJnePattern.size())) {
-        const LsxDecodedOp& terminator = block.instructions.back();
-        std::uint64_t taken = 0;
-        if (TryResolveBranchTarget(terminator, taken)) {
-            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            Xbyak_aarch64::Label take;
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRsiOffset));
+            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, index_offset));
             code->add(code->x9, code->x9, 1);
-            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRsiOffset));
-            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
-            code->add(code->x10, code->x10, 0x858);
-            code->str(code->x10, Xbyak_aarch64::ptr(code->x0, kStateRdxOffset));
-            code->mov(code->x11, 0x940);
-            emit_inline_sub64_flags(*code, code->x9, code->x11, code->x12);
-            code->ldr(code->x9, Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
-            code->tbz(code->x9, kZfBit, take);
+            code->str(code->x9, Xbyak_aarch64::ptr(code->x0, index_offset));
+            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x0, cursor_offset));
+            code->mov(code->x11, stride);
+            code->add(code->x10, code->x10, code->x11);
+            code->str(code->x10, Xbyak_aarch64::ptr(code->x0, cursor_offset));
+            code->mov(code->x11, limit);
+            NativeStatus::EmitSubtract64(*code, code->x9, code->x11, code->x12,
+                                         inline_flag_layout);
+            code->ldr(code->x12,
+                      Xbyak_aarch64::ptr(code->x0, kStateRflagsOffset));
+            code->tbz(code->x12, kZfBit, branch_taken);
             code->mov(code->x0, fallthrough);
             code->ret();
-            code->L(take);
+            code->L(branch_taken);
             code->mov(code->x0, taken);
             code->ret();
             code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
+            return finish_direct_native(CommitCode(std::move(code)));
         }
     }
 
