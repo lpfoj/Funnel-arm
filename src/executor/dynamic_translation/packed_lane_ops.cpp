@@ -3,6 +3,7 @@
 
 #include "executor/dynamic_translation/packed_lane_ops.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 
@@ -279,6 +280,31 @@ bool AddOrSubtractPacked(void* const destination, const void* const left,
     }
 #endif
     std::memcpy(destination, result.data(), result.size());
+    return true;
+}
+
+bool ReplicateElement(void* const destination, const void* const element,
+                      const std::size_t element_width,
+                      const std::size_t total_width) noexcept {
+    const bool supported_element = element_width == 1 || element_width == 2 ||
+                                   element_width == 4 || element_width == 8 ||
+                                   element_width == 16;
+    if (destination == nullptr || element == nullptr || !supported_element ||
+        (total_width != 16 && total_width != 32) ||
+        element_width > total_width) {
+        return false;
+    }
+
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(output.data(), element, element_width);
+    std::size_t initialized = element_width;
+    while (initialized < total_width) {
+        const std::size_t copy_count =
+            std::min(initialized, total_width - initialized);
+        std::memcpy(output.data() + initialized, output.data(), copy_count);
+        initialized += copy_count;
+    }
+    std::memcpy(destination, output.data(), output.size());
     return true;
 }
 

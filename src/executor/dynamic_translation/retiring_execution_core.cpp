@@ -24613,30 +24613,29 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
     if (IsVectorBroadcastMnemonic(mnemonic)) {
         const std::size_t element_bytes = VectorBroadcastElementBytes(mnemonic);
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
-        result.fill(0);
+        std::array<std::uint8_t, kXmmRegisterBytes> element{};
         if (element_bytes == 16u) {
-            if (!ReadVector128(state, ir.decoded, ir.operands[1], lhs)) {
+            if (!ReadVector128(state, ir.decoded, ir.operands[1], element)) {
                 return false;
             }
-            for (std::size_t offset = 0; offset < width; offset += 16u) {
-                std::memcpy(result.data() + offset, lhs.data(), 16u);
-            }
         } else {
-            std::uint64_t value = 0;
             if (element_bytes == 8u) {
+                std::uint64_t value = 0;
                 if (!ReadScalar64(state, ir.decoded, ir.operands[1], value)) {
                     return false;
                 }
+                std::memcpy(element.data(), &value, sizeof(value));
             } else {
                 std::uint32_t value32 = 0;
                 if (!ReadScalar32(state, ir.decoded, ir.operands[1], value32)) {
                     return false;
                 }
-                value = value32;
+                std::memcpy(element.data(), &value32, sizeof(value32));
             }
-            for (std::size_t offset = 0; offset < width; offset += element_bytes) {
-                std::memcpy(result.data() + offset, &value, element_bytes);
-            }
+        }
+        if (!VectorSemantic::ReplicateElement(result.data(), element.data(),
+                                              element_bytes, width)) {
+            return false;
         }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }

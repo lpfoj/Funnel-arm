@@ -35,5 +35,8 @@ bool DuplicateLowQwordPerLane(void* destination, const void* source,
 bool AddOrSubtractPacked(void* destination, const void* left, const void* right,
                          std::size_t element_width, std::size_t total_width,
                          bool subtract) noexcept;
+bool ReplicateElement(void* destination, const void* element,
+                      std::size_t element_width,
+                      std::size_t total_width) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic
