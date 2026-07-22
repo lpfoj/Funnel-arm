@@ -19972,6 +19972,24 @@ bool ReadFloatingPair(const LsxMachineImage& state, const DecodeSummary& instruc
     return true;
 }
 
+bool ReadScalarLaneBits(const LsxMachineImage& state, const DecodeSummary& instruction,
+                        const LsxOperandRecord& operand, const std::uint32_t byte_width,
+                        std::uint64_t& bits) {
+    bits = 0;
+    if (byte_width == sizeof(std::uint64_t)) {
+        return ReadScalar64(state, instruction, operand, bits);
+    }
+    if (byte_width != sizeof(std::uint32_t)) {
+        return false;
+    }
+    std::uint32_t low = 0;
+    if (!ReadScalar32(state, instruction, operand, low)) {
+        return false;
+    }
+    bits = low;
+    return true;
+}
+
 bool WriteVector128(LsxMachineImage& state, const DecodeSummary& instruction,
                     const LsxOperandRecord& operand,
                     const std::array<std::uint8_t, kXmmRegisterBytes>& value) {
@@ -22285,30 +22303,20 @@ bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& i
                               mnemonic == X86_MNEMONIC_VMOVSD;
         const bool double_scalar = mnemonic == X86_MNEMONIC_MOVSD ||
                                    mnemonic == X86_MNEMONIC_VMOVSD;
-        const auto& merge_operand = vex_form && ir.operand_count >= 3 ? ir.operands[1]
-                                                                      : ir.operands[0];
-        const auto& source_operand = vex_form && ir.operand_count >= 3 ? ir.operands[2]
-                                                                       : ir.operands[1];
-        std::uint64_t scalar64 = 0;
-        if (ir.operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-            const bool ok = double_scalar
-                ? ReadScalar64(state, ir.decoded, source_operand, scalar64)
-                : ReadScalar32(state, ir.decoded, source_operand, scalar_bits);
-            if (!ok) {
-                return false;
-            }
-            StoreGuestScalar(ResolveGuestOperandAddress(state, ir.decoded, ir.operands[0]),
-                        double_scalar ? scalar64 : scalar_bits, double_scalar ? 8 : 4);
-            return true;
-        }
-
-        const bool ok = double_scalar
-            ? ReadScalar64(state, ir.decoded, source_operand, scalar64)
-            : ReadScalar32(state, ir.decoded, source_operand, scalar_bits);
-        if (!ok) {
+        const bool three_operand_form = vex_form && ir.operand_count >= 3;
+        const auto& merge_operand = ir.operands[three_operand_form ? 1 : 0];
+        const auto& source_operand = ir.operands[three_operand_form ? 2 : 1];
+        const std::uint32_t scalar_width = double_scalar ? 8u : 4u;
+        std::uint64_t lane_bits = 0;
+        if (!ReadScalarLaneBits(state, ir.decoded, source_operand, scalar_width,
+                                lane_bits)) {
             return false;
         }
-
+        if (ir.operands[0].type == X86_OPERAND_TYPE_MEMORY) {
+            StoreGuestScalar(ResolveGuestOperandAddress(state, ir.decoded, ir.operands[0]),
+                             lane_bits, scalar_width);
+            return true;
+        }
         if (source_operand.type == X86_OPERAND_TYPE_MEMORY) {
             // MOVSS/MOVSD and VMOVSS/VMOVSD memory loads all zero the unused part of XMM.
             // VEX upper-YMM clearing is applied by WriteVector128.
@@ -22316,11 +22324,7 @@ bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& i
         } else if (!ReadVector128(state, ir.decoded, merge_operand, dst)) {
             return false;
         }
-        if (double_scalar) {
-            StoreUnaligned<std::uint64_t>(dst.data(), scalar64);
-        } else {
-            StoreUnaligned<std::uint32_t>(dst.data(), scalar_bits);
-        }
+        std::memcpy(dst.data(), &lane_bits, scalar_width);
         return WriteVector128(state, ir.decoded, ir.operands[0], dst);
     }
 
