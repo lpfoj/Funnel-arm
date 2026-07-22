@@ -22328,44 +22328,31 @@ bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& i
         return WriteVector128(state, ir.decoded, ir.operands[0], dst);
     }
 
-    if (IsScalarSqrtMnemonic(mnemonic)) {
-        const bool vex_form = IsVexScalarSqrtMnemonic(mnemonic);
-        const bool operate_double = ScalarSqrtDoubleLane(mnemonic);
-        const auto& old_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& source_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, old_operand, dst)) {
+    if (const auto root_plan =
+            Lsx4::Translation::DescribeScalarRootOperation(ir.mnemonic)) {
+        if (!ReadVector128(state, ir.decoded,
+                           ir.operands[root_plan->merge_operand], dst)) {
             return false;
         }
+        const auto& source_operand = ir.operands[root_plan->source_operand];
         std::uint64_t scalar64 = 0;
-        if (operate_double) {
+        if (root_plan->double_precision) {
             if (!ReadScalar64(state, ir.decoded, source_operand, scalar64)) {
                 return false;
             }
-            StoreUnaligned<double>(dst.data(),
-                                   std::sqrt(LoadUnaligned<double>(&scalar64)));
+            const double input = LoadUnaligned<double>(&scalar64);
+            StoreUnaligned<double>(
+                dst.data(), Lsx4::Translation::EvaluateScalarRoot(
+                                root_plan->operation, input));
         } else {
             if (!ReadScalar32(state, ir.decoded, source_operand, scalar_bits)) {
                 return false;
             }
-            StoreUnaligned<float>(dst.data(),
-                                  std::sqrt(LoadUnaligned<float>(&scalar_bits)));
+            const float input = LoadUnaligned<float>(&scalar_bits);
+            const float output =
+                Lsx4::Translation::EvaluateScalarRoot(root_plan->operation, input);
+            StoreUnaligned<float>(dst.data(), output);
         }
-        return WriteVector128(state, ir.decoded, ir.operands[0], dst);
-    }
-
-    if (IsScalarReciprocalEstimateMnemonic(mnemonic)) {
-        const bool vex_form = IsVexScalarReciprocalEstimateMnemonic(mnemonic);
-        const auto& merge_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& source_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, merge_operand, dst) ||
-            !ReadScalar32(state, ir.decoded, source_operand, scalar_bits)) {
-            return false;
-        }
-        const float source = LoadUnaligned<float>(&scalar_bits);
-        const float estimate = ScalarReciprocalEstimateSqrt(mnemonic)
-            ? 1.0f / std::sqrt(source)
-            : 1.0f / source;
-        StoreUnaligned<float>(dst.data(), estimate);
         return WriteVector128(state, ir.decoded, ir.operands[0], dst);
     }
 

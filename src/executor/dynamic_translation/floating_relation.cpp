@@ -3,6 +3,8 @@
 
 #include "executor/dynamic_translation/floating_relation.h"
 
+#include "common/x86_decoder.h"
+
 #include <array>
 #include <cmath>
 
@@ -75,6 +77,61 @@ double RoundFloatingValue(const double value, const std::uint32_t mode) noexcept
         static_cast<double (*)(double)>(std::trunc),
     };
     return operations[mode & 3u](value);
+}
+
+std::optional<ScalarRootPlan> DescribeScalarRootOperation(
+    const std::uint32_t mnemonic_code) noexcept {
+    const auto mnemonic = static_cast<X86Mnemonic>(mnemonic_code);
+    const bool sqrt_single = mnemonic == X86_MNEMONIC_SQRTSS ||
+                             mnemonic == X86_MNEMONIC_VSQRTSS;
+    const bool sqrt_double = mnemonic == X86_MNEMONIC_SQRTSD ||
+                             mnemonic == X86_MNEMONIC_VSQRTSD;
+    const bool reciprocal = mnemonic == X86_MNEMONIC_RCPSS ||
+                            mnemonic == X86_MNEMONIC_VRCPSS;
+    const bool reciprocal_root = mnemonic == X86_MNEMONIC_RSQRTSS ||
+                                 mnemonic == X86_MNEMONIC_VRSQRTSS;
+    if (!sqrt_single && !sqrt_double && !reciprocal && !reciprocal_root) {
+        return std::nullopt;
+    }
+
+    const bool vector_prefix = mnemonic == X86_MNEMONIC_VSQRTSS ||
+                               mnemonic == X86_MNEMONIC_VSQRTSD ||
+                               mnemonic == X86_MNEMONIC_VRCPSS ||
+                               mnemonic == X86_MNEMONIC_VRSQRTSS;
+    return ScalarRootPlan{
+        .operation = reciprocal_root ? ScalarRootOperation::ReciprocalSquareRoot
+                                     : reciprocal ? ScalarRootOperation::Reciprocal
+                                                  : ScalarRootOperation::SquareRoot,
+        .merge_operand = static_cast<std::uint8_t>(vector_prefix ? 1u : 0u),
+        .source_operand = static_cast<std::uint8_t>(vector_prefix ? 2u : 1u),
+        .double_precision = sqrt_double,
+    };
+}
+
+double EvaluateScalarRoot(const ScalarRootOperation operation,
+                          const double value) noexcept {
+    switch (operation) {
+    case ScalarRootOperation::SquareRoot:
+        return std::sqrt(value);
+    case ScalarRootOperation::Reciprocal:
+        return 1.0 / value;
+    case ScalarRootOperation::ReciprocalSquareRoot:
+        return 1.0 / std::sqrt(value);
+    }
+    return value;
+}
+
+float EvaluateScalarRoot(const ScalarRootOperation operation,
+                         const float value) noexcept {
+    switch (operation) {
+    case ScalarRootOperation::SquareRoot:
+        return std::sqrt(value);
+    case ScalarRootOperation::Reciprocal:
+        return 1.0f / value;
+    case ScalarRootOperation::ReciprocalSquareRoot:
+        return 1.0f / std::sqrt(value);
+    }
+    return value;
 }
 
 } // namespace Lsx4::Translation
