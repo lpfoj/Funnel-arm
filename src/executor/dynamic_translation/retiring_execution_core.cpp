@@ -6,6 +6,7 @@
 #include "executor/dynamic_translation/decode_bridge.h"
 #include "executor/dynamic_translation/diagnostic_probe_policy.h"
 #include "executor/dynamic_translation/floating_relation.h"
+#include "executor/dynamic_translation/guest_capability_profile.h"
 #include "executor/dynamic_translation/vector_lowering_policy.h"
 #include "executor/dynamic_translation/packed_lane_ops.h"
 #include "executor/dynamic_translation/live_state_port.h"
@@ -27928,73 +27929,11 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
     case X86_MNEMONIC_CPUID: {
         const std::uint32_t leaf = ReadGuestGpr32(*state, LsxGpr::Rax);
         const std::uint32_t subleaf = ReadGuestGpr32(*state, LsxGpr::Rcx);
-        std::uint32_t eax = 0;
-        std::uint32_t ebx = 0;
-        std::uint32_t ecx = 0;
-        std::uint32_t edx = 0;
-
-        switch (leaf) {
-        case 0x00000000:
-            eax = 0x00000007;
-            ebx = 0x68747541; // "Auth"
-            edx = 0x69746e65; // "enti"
-            ecx = 0x444d4163; // "cAMD"
-            break;
-        case 0x00000001:
-            eax = 0x00630f01;
-            ebx = 0x00000800;
-            ecx = (1u << 0)  | // SSE3
-                  (1u << 9)  | // SSSE3
-                  (1u << 19) | // SSE4.1
-                  (1u << 20) | // SSE4.2
-                  (1u << 22) | // MOVBE
-                  (1u << 23) | // POPCNT
-                  (1u << 25) | // AES
-                  (1u << 26) | // XSAVE
-                  (1u << 27) | // OSXSAVE
-                  (1u << 28) | // AVX
-                  (1u << 29);  // F16C
-            edx = (1u << 0)  | // FPU
-                  (1u << 4)  | // TSC
-                  (1u << 5)  | // MSR
-                  (1u << 8)  | // CX8
-                  (1u << 15) | // CMOV
-                  (1u << 23) | // MMX
-                  (1u << 24) | // FXSR
-                  (1u << 25) | // SSE
-                  (1u << 26);  // SSE2
-            break;
-        case 0x00000007:
-            if (subleaf == 0) {
-                eax = 0;
-                ebx = (1u << 3)  | // BMI1
-                      (1u << 5)  | // AVX2
-                      (1u << 8)  | // BMI2
-                      (1u << 13);  // FCS/FDS deprecated: saved selectors are zero.
-            }
-            break;
-        case 0x80000000:
-            eax = 0x80000008;
-            break;
-        case 0x80000001:
-            ecx = (1u << 5);   // LZCNT/ABM
-            edx = (1u << 11) |  // SYSCALL/SYSRET
-                  (1u << 20) |  // NX
-                  (1u << 26) |  // 1GB pages
-                  (1u << 27) |  // RDTSCP
-                  (1u << 29);   // Long mode
-            break;
-        case 0x80000008:
-            eax = 0x00003030;
-            break;
-        default:
-            break;
-        }
-
-        WriteGuestGpr32(*state, LsxGpr::Rax, eax);
-        WriteGuestGpr32(*state, LsxGpr::Rbx, ebx);
-        WriteGuestGpr32(*state, LsxGpr::Rcx, ecx);
-        WriteGuestGpr32(*state, LsxGpr::Rdx, edx);
+        const auto page = Lsx4::Translation::QueryGuestCapabilityPage(leaf, subleaf);
+        WriteGuestGpr32(*state, LsxGpr::Rax, page.registers[0]);
+        WriteGuestGpr32(*state, LsxGpr::Rbx, page.registers[1]);
+        WriteGuestGpr32(*state, LsxGpr::Rcx, page.registers[2]);
+        WriteGuestGpr32(*state, LsxGpr::Rdx, page.registers[3]);
         return 0;
     }
     case X86_MNEMONIC_RDTSC:

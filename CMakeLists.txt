@@ -1183,6 +1183,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/stack_windows.cpp
     src/executor/dynamic_translation/foundation_checks.cpp
     src/executor/dynamic_translation/floating_relation.cpp
+    src/executor/dynamic_translation/guest_capability_profile.cpp
     src/executor/dynamic_translation/instruction_diagnostics.cpp
     src/executor/dynamic_translation/integer_math.cpp
     src/executor/dynamic_translation/json_text.cpp
