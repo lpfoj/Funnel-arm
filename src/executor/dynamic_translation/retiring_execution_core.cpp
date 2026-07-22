@@ -40298,13 +40298,13 @@ std::string ExerciseTranslationEngineJson() {
                               generic_memory_rmw_native_ok &&
                               hle_fp_bridge_ok &&
                              decoder_cap_contract_ok && rep_stos_short_bulk_ok;
-        out << "{"
+        out << R"({"schema":"lsx4.translation.selftest.v2",)"
             << R"("ok":)" << (full_ok ? "true" : "false") << ","
             << R"("retValue":")" << std::hex << ret_value << std::dec << R"(",)"
-            << R"("helperCompiled":)" << (helper_block != nullptr ? "true" : "false") << ","
-            << R"("helperNext":")" << std::hex << helper_next << std::dec << R"(",)"
+            << R"("semanticBridgeCompiled":)" << (helper_block != nullptr ? "true" : "false") << ","
+            << R"("semanticBridgeNext":")" << std::hex << helper_next << std::dec << R"(",)"
             << R"("rax":)" << ReadGuestGpr64(state, LsxGpr::Rax) << ","
-            << R"("manualLast":")" << std::hex << manual_last << std::dec << R"(",)"
+            << R"("manualDispatchLast":")" << std::hex << manual_last << std::dec << R"(",)"
             << R"("manualRax":)" << manual_rax << ","
             << R"("manualOk":)" << (manual_ok ? "true" : "false") << ","
             << R"("repStosShortBulkOk":)"
@@ -40316,27 +40316,27 @@ std::string ExerciseTranslationEngineJson() {
             << (unwind_stop_frames_ok ? "true" : "false") << ","
             << R"("nestedStackIsolationOk":)"
             << (nested_stack_isolation_ok ? "true" : "false") << ","
-            << R"("mappedCanJit":)" << (mapped_block.SupportsInitialNativeTier() ? "true" : "false") << ","
-            << R"("mappedInsnCount":)" << mapped_block.instructions.size() << ","
-            << R"("executeLoopResult":)" << execute_loop_result << ","
-            << R"("executeLoopOk":)" << (execute_loop_ok ? "true" : "false") << ","
-            << R"("executeLoopException":")" << JsonEscape(execute_loop_exception) << R"(",)"
+            << R"("mappedSupportsNative":)" << (mapped_block.SupportsInitialNativeTier() ? "true" : "false") << ","
+            << R"("mappedInstructionCount":)" << mapped_block.instructions.size() << ","
+            << R"("dispatchLoopResult":)" << execute_loop_result << ","
+            << R"("dispatchLoopOk":)" << (execute_loop_ok ? "true" : "false") << ","
+            << R"("dispatchExceptionText":")" << JsonEscape(execute_loop_exception) << R"(",)"
             << R"("directZeroRootChainOk":)"
             << (direct_zero_root_chain_ok ? "true" : "false") << ","
             << R"("directZeroRootTargetResult":)" << direct_zero_target_result << ","
             << R"("directZeroRootChainResult":)" << direct_zero_chain_result << ","
-            << R"("cacheContractOk":)" << (cache_contract_ok ? "true" : "false") << ","
+            << R"("smcCacheContractOk":)" << (cache_contract_ok ? "true" : "false") << ","
             << R"("directEdgeOwnershipOk":)"
             << (direct_edge_ownership_ok ? "true" : "false") << ","
-            << R"("cachePublicHashAbiOk":)"
+            << R"("persistentFingerprintAbiOk":)"
             << (cache_public_hash_abi_ok ? "true" : "false") << ","
             << R"("persistentIrDerivedRecomputeOk":)"
             << (persistent_ir_derived_recompute_ok ? "true" : "false") << ","
             << R"("cacheFirst":)" << smc_first << ","
-            << R"("cacheSecond":)" << smc_second << ","
-            << R"("cacheHashBefore":"0x)" << std::hex << hash_before << std::dec << R"(",)"
-            << R"("cacheHashAfter":"0x)" << std::hex << hash_after << std::dec << R"(",)"
-            << R"("cacheInvalidations":)" << (mismatch_after - mismatch_before) << ","
+            << R"("smcSecondResult":)" << smc_second << ","
+            << R"("smcFingerprintBefore":"0x)" << std::hex << hash_before << std::dec << R"(",)"
+            << R"("smcFingerprintAfter":"0x)" << std::hex << hash_after << std::dec << R"(",)"
+            << R"("smcMismatchDelta":)" << (mismatch_after - mismatch_before) << ","
             << R"("nativeEdgePrivateEdges":)"
             << (direct_edge_after_mutation != direct_edge_precompile ? "true" : "false")
             << ","
@@ -40426,7 +40426,7 @@ std::string ExerciseTranslationEngineJson() {
             << direct_mutation_result << std::dec << R"(",)"
             << R"("divideErrorDeliveryOk":)"
             << (divide_error_delivery_ok ? "true" : "false") << ","
-            << R"("fpuStateIsolationOk":)"
+            << R"("floatingStateIsolationOk":)"
             << (fpu_state_isolation_ok ? "true" : "false") << ","
             << R"("x87SqrtContractOk":)"
             << (x87_sqrt_contract_ok ? "true" : "false") << ","
@@ -40460,7 +40460,7 @@ std::string ExerciseTranslationEngineJson() {
             << interpreter_smoke_result << std::dec << R"(",)"
             << R"("interpreterCompilerRax":"0x)" << std::hex
             << ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rax) << std::dec << R"(",)"
-            << R"("partialPackedMoveNativeOk":)"
+            << R"("partialPackedTransferNativeOk":)"
             << (partial_packed_move_native_ok ? "true" : "false") << ","
             << R"("rgb565BlendNativeOk":)"
             << (rgb565_blend_native_ok ? "true" : "false") << ","
@@ -40508,7 +40508,7 @@ std::string ExerciseTranslationEngineJson() {
             << (hot_rsi_rdx_fallthrough_ok ? "true" : "false") << ","
             << R"("hotRsiRdxWrapOk":)"
             << (hot_rsi_rdx_wrap_ok ? "true" : "false") << ","
-            << R"("hotScalarNativeOk":)" << (hot_scalar_native_ok ? "true" : "false") << ","
+            << R"("hotScalarLoweringOk":)" << (hot_scalar_native_ok ? "true" : "false") << ","
             << R"("monoStringHashNativeOk":)"
             << (mono_string_hash_native_ok ? "true" : "false") << ","
             << R"("monoStringHashNonemptyOk":)"
@@ -40955,14 +40955,15 @@ std::string ExerciseTranslationEngineJson() {
             << (generic_cached_base_call_native_ok ? "true" : "false") << ","
             << R"("genericMemoryRmwNativeOk":)"
             << (generic_memory_rmw_native_ok ? "true" : "false") << ","
-            << R"("decoderCapContractOk":)"
+            << R"("decodeBudgetContractOk":)"
             << (decoder_cap_contract_ok ? "true" : "false") << ","
-            << R"("arenaBlocks":)" << arena.BlockCount()
+            << R"("codeArenaBlockCount":)" << arena.BlockCount()
             << "}";
     } catch (const std::exception& e) {
-        out << R"({"ok":false,"exception":")" << JsonEscape(e.what()) << R"("})";
+        out << R"({"schema":"lsx4.translation.selftest.v2","ok":false,"failure":")"
+            << JsonEscape(e.what()) << R"("})";
     } catch (...) {
-        out << R"({"ok":false,"exception":"unknown"})";
+        out << R"({"schema":"lsx4.translation.selftest.v2","ok":false,"failure":"unspecified"})";
     }
     return out.str();
 }
