@@ -3,6 +3,8 @@
 
 #include "executor/dynamic_translation/execution_context.h"
 
+#include "executor/dynamic_translation/live_state_port.h"
+
 namespace Lsx4::Translation {
 namespace {
 
@@ -14,12 +16,14 @@ thread_local bool completion_waiting = false;
 
 } // namespace
 
-ExecutionBinding::ExecutionBinding(CpuFrame& frame) noexcept : previous_{active_frame} {
+ExecutionBinding::ExecutionBinding(CpuFrame& frame) noexcept
+    : previous_{active_frame}, previous_storage_{ExchangeLiveStateStorage(&frame)} {
     active_frame = &frame;
 }
 
 ExecutionBinding::~ExecutionBinding() {
     active_frame = previous_;
+    (void)ExchangeLiveStateStorage(previous_storage_);
 }
 
 CpuFrame* CurrentExecutionFrame() noexcept {

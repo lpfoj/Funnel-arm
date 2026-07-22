@@ -20,6 +20,7 @@ public:
 
 private:
     CpuFrame* previous_{};
+    void* previous_storage_{};
 };
 
 [[nodiscard]] CpuFrame* CurrentExecutionFrame() noexcept;

@@ -9,6 +9,7 @@
 #include "executor/dynamic_translation/edge_portal.h"
 #include "executor/dynamic_translation/execution_context.h"
 #include "executor/dynamic_translation/execution_driver.h"
+#include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/machine_state.h"
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/native_encoder.h"
@@ -63,6 +64,7 @@ enum CheckBit : std::uint64_t {
     DriverNativeAccounting = 1ull << 26,
     DriverSemanticAccounting = 1ull << 27,
     DriverContextCleanup = 1ull << 28,
+    LiveStatePublication = 1ull << 29,
 };
 
 struct FetchContext {
@@ -725,6 +727,41 @@ bool CheckExecutionContext() {
            !TakeExecutionCompletion() && !TakeExecutionReplacement(replacement);
 }
 
+bool CheckLiveStatePort() {
+    alignas(CpuFrame) std::array<std::byte, sizeof(CpuFrame)> foreign{};
+    CpuFrame seed{};
+    seed.integer[RegisterIndex(IntegerRegister::A)] = 17;
+    seed.resume_address = 0x1234;
+    std::memcpy(foreign.data(), &seed, sizeof(seed));
+
+    void* const previous = ExchangeLiveStateStorage(foreign.data());
+    LiveStateView view = PublishedLiveState();
+    const bool initial = static_cast<bool>(view) &&
+                         view.Read(IntegerRegister::A) == 17 &&
+                         view.ResumeAddress() == 0x1234;
+    view.Write(IntegerRegister::R13, 0xa55a);
+    view.SetResumeAddress(0x5678);
+    CpuFrame observed{};
+    const bool copied = view.CopyTo(observed);
+
+    CpuFrame continuation{};
+    continuation.integer[RegisterIndex(IntegerRegister::Stack)] = 0x9abc;
+    const void* const old_continuation =
+        ExchangeContinuationStorage(&continuation);
+    CpuFrame continuation_copy{};
+    const bool continuation_copied =
+        SnapshotContinuationState(continuation_copy);
+    (void)ExchangeContinuationStorage(old_continuation);
+    (void)ExchangeLiveStateStorage(previous);
+
+    return previous == nullptr && initial && copied &&
+           observed.integer[RegisterIndex(IntegerRegister::R13)] == 0xa55a &&
+           observed.resume_address == 0x5678 && continuation_copied &&
+           continuation_copy.integer[RegisterIndex(IntegerRegister::Stack)] ==
+               0x9abc &&
+           !static_cast<bool>(PublishedLiveState());
+}
+
 struct DriverCheckResult {
     bool completed{};
     bool value{};
@@ -893,6 +930,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(X87Semantics, CheckX87Semantics());
     run(TranslationOrchestration, CheckTranslationOrchestration());
     run(ExecutionContext, CheckExecutionContext());
+    run(LiveStatePublication, CheckLiveStatePort());
     const DriverCheckResult driver = CheckExecutionDriver();
     run(DriverCompletion, driver.completed);
     run(DriverValue, driver.value);

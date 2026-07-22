@@ -1177,6 +1177,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/edge_portal.cpp
     src/executor/dynamic_translation/execution_context.cpp
     src/executor/dynamic_translation/execution_driver.cpp
+    src/executor/dynamic_translation/live_state_port.cpp
     src/executor/dynamic_translation/foundation_checks.cpp
     src/executor/dynamic_translation/integer_math.cpp
     src/executor/dynamic_translation/machine_state.cpp
