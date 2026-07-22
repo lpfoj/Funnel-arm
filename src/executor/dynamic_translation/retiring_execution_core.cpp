@@ -200,8 +200,6 @@ void ShiftPackedQuadwords(void* dst, const void* src, std::uint64_t count, bool 
                    std::size_t total_size);
 void SaturateDwordToUnsignedWord(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
 void SaturateWordToUnsignedByte(void* dst, const void* lhs, const void* rhs, std::size_t total_size);
-void AddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
-                   bool subtract, std::size_t total_size);
 void RoundScalarFloating(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
                   bool operate_double, std::uint32_t mxcsr);
 void SquareRootScalarFloating(void* dst, const void* old_dst, const void* src, bool operate_double);
@@ -24193,9 +24191,12 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
-        AddSubtractPackedIntegers(result.data(), lhs.data(), rhs.data(),
-                      PackedAddSubElementBytes(mnemonic),
-                      PackedAddSubSubtract(mnemonic), width);
+        if (!VectorSemantic::AddOrSubtractPacked(
+                result.data(), lhs.data(), rhs.data(),
+                PackedAddSubElementBytes(mnemonic), width,
+                PackedAddSubSubtract(mnemonic))) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -32227,16 +32228,6 @@ void StoreElement(std::uint8_t* ptr, std::uint64_t value, const std::size_t elem
     std::memcpy(ptr, &value, element_size);
 }
 } // namespace
-
-[[gnu::always_inline]] static inline void SemanticKernelAddSubtractPackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
-                   const bool subtract, const std::size_t total_size){
-    (void)VectorSemantic::AddOrSubtractPacked(
-        dst, lhs, rhs, element_size, total_size, subtract);
-}
-
-void AddSubtractPackedIntegers(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
-    SemanticKernelAddSubtractPackedIntegers(argument0, argument1, argument2, argument3, argument4, argument5);
-}
 
 namespace {
 void VPackSaturating(void* dst, const void* lhs, const void* rhs,
