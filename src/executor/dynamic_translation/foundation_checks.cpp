@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "executor/dynamic_translation/foundation_checks.h"
+#include "executor/dynamic_translation/independent_test_values.h"
 
 #include "common/x86_decoder.h"
 #include "executor/dynamic_translation/code_memory.h"
@@ -159,9 +160,11 @@ std::size_t FetchFixture(const std::uint64_t address,
 
 bool CheckMachineState() {
     CpuFrame frame{};
-    WriteInteger(frame, IntegerRegister::A, 0x1122334455667788ull, 64);
+    WriteInteger(frame, IntegerRegister::A, SelfTestValues::kWideCanary, 64);
     WriteInteger(frame, IntegerRegister::A, 0xaa, 8, true);
-    if (ReadInteger(frame, IntegerRegister::A, 64) != 0x112233445566aa88ull) {
+    constexpr std::uint64_t expected_high_byte_write =
+        (SelfTestValues::kWideCanary & ~0xff00ull) | 0xaa00ull;
+    if (ReadInteger(frame, IntegerRegister::A, 64) != expected_high_byte_write) {
         return false;
     }
     WriteInteger(frame, IntegerRegister::A, 0xfedcba98u, 32);
@@ -794,7 +797,7 @@ struct DriverCheckResult {
 
 DriverCheckResult CheckExecutionDriver() {
     constexpr std::uint64_t code_base = 0xfa00;
-    constexpr std::uint64_t sentinel = 0xfedcba9876543210ull;
+    constexpr std::uint64_t sentinel = SelfTestValues::kReverseCanary;
     constexpr std::array<std::uint8_t, 16> fixture{
         0xb8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x07,
         0xeb, 0x00, 0x83, 0xd0, 0x01, 0xeb, 0x00, 0xc3};
