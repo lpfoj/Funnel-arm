@@ -9,6 +9,7 @@
 #include "executor/dynamic_translation/guest_capability_profile.h"
 #include "executor/dynamic_translation/vector_lowering_policy.h"
 #include "executor/dynamic_translation/packed_lane_ops.h"
+#include "executor/dynamic_translation/partial_move_plan.h"
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
 #include "executor/dynamic_translation/integer_math.h"
@@ -17975,92 +17976,44 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             NativeAddress::SegmentPolicy::Apply);
     };
 
-    const bool partial_packed_move =
-        IsPartialPackedMoveMnemonic(mnemonic);
-    if (partial_packed_move) {
-        const bool vex_form = IsVexPartialPackedMove(mnemonic);
-        const bool high_qword = IsPartialPackedMoveHigh(mnemonic);
-        const bool store_form = ir.operand_count >= 1 &&
-                                ir.operands[0].type == X86_OPERAND_TYPE_MEMORY;
-        const auto xmm_state_offset = [&](const LsxOperandRecord& operand,
-                                          const std::uint32_t byte_offset,
-                                          std::uint32_t& state_offset) {
-            if (operand.type != X86_OPERAND_TYPE_REGISTER ||
-                operand.reg.value < X86_REGISTER_XMM0 ||
-                operand.reg.value > X86_REGISTER_XMM15) {
-                return false;
-            }
-            state_offset = kStateYmm0Offset +
-                static_cast<std::uint32_t>(operand.reg.value - X86_REGISTER_XMM0) * 32u +
-                byte_offset;
-            return true;
-        };
-
-        const LsxOperandRecord* memory_operand = nullptr;
-        std::uint32_t destination_offset = 0;
-        std::uint32_t source_offset = 0;
-        std::uint32_t merge_offset = 0;
-        bool operands_ok = false;
-        if (store_form) {
-            operands_ok = ir.operand_count == 2 && ir.operands[0].size == 64 &&
-                xmm_state_offset(ir.operands[1], high_qword ? 8u : 0u, source_offset);
-            memory_operand = &ir.operands[0];
-        } else if (vex_form) {
-            operands_ok = ir.operand_count == 3 &&
-                xmm_state_offset(ir.operands[0], high_qword ? 8u : 0u,
-                                 destination_offset) &&
-                xmm_state_offset(ir.operands[1], high_qword ? 0u : 8u,
-                                 merge_offset) &&
-                ir.operands[2].type == X86_OPERAND_TYPE_MEMORY &&
-                ir.operands[2].size == 64;
-            memory_operand = &ir.operands[2];
+    if (const auto move_plan = PlanPartialPackedMove(ir, kStateYmm0Offset)) {
+        auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
+        const auto& memory_operand = ir.operands[move_plan->memory_operand];
+        if (!emit_partial_move_address(*code, memory_operand, code->x11)) {
+            return nullptr;
+        }
+        if (move_plan->writes_memory) {
+            code->ldr(code->x10,
+                      Xbyak_aarch64::ptr(code->x0, move_plan->source_offset));
+            code->str(code->x10, Xbyak_aarch64::ptr(code->x11));
         } else {
-            operands_ok = ir.operand_count == 2 &&
-                xmm_state_offset(ir.operands[0], high_qword ? 8u : 0u,
-                                 destination_offset) &&
-                ir.operands[1].type == X86_OPERAND_TYPE_MEMORY &&
-                ir.operands[1].size == 64;
-            memory_operand = &ir.operands[1];
-        }
-
-        if (operands_ok && memory_operand != nullptr) {
-            auto code = std::make_unique<Xbyak_aarch64::CodeGenerator>(4096);
-            if (!emit_partial_move_address(*code, *memory_operand, code->x11)) {
-                return nullptr;
+            // Complete every faultable read before changing the architectural vector bank.
+            code->ldr(code->x10, Xbyak_aarch64::ptr(code->x11));
+            if (move_plan->has_merge_lane) {
+                code->ldr(code->x12,
+                          Xbyak_aarch64::ptr(code->x0, move_plan->merge_offset));
+                const std::uint32_t preserved_offset =
+                    move_plan->destination_lane_offset == 0
+                        ? move_plan->destination_offset + 8u
+                        : move_plan->destination_offset - 8u;
+                code->str(code->x12,
+                          Xbyak_aarch64::ptr(code->x0, preserved_offset));
             }
-            if (store_form) {
-                code->ldr(code->x10,
-                          Xbyak_aarch64::ptr(code->x0, source_offset));
-                code->str(code->x10, Xbyak_aarch64::ptr(code->x11));
-            } else {
-                // Read before modifying the destination. A fault therefore leaves every XMM/YMM
-                // byte untouched, matching both legacy and VEX architectural ordering.
-                code->ldr(code->x10, Xbyak_aarch64::ptr(code->x11));
-                if (vex_form) {
-                    code->ldr(code->x12,
-                              Xbyak_aarch64::ptr(code->x0, merge_offset));
-                    const std::uint32_t preserved_offset =
-                        high_qword ? destination_offset - 8u
-                                   : destination_offset + 8u;
-                    code->str(code->x12,
-                              Xbyak_aarch64::ptr(code->x0, preserved_offset));
-                }
-                code->str(code->x10,
-                          Xbyak_aarch64::ptr(code->x0, destination_offset));
-                if (vex_form) {
-                    const std::uint32_t destination_base =
-                        destination_offset - (high_qword ? 8u : 0u);
-                    code->eor(code->v31.b16, code->v31.b16, code->v31.b16);
-                    code->str(code->q31,
-                              Xbyak_aarch64::ptr(code->x0, destination_base + 16));
-                }
+            code->str(code->x10,
+                      Xbyak_aarch64::ptr(code->x0, move_plan->destination_offset));
+            if (move_plan->clears_upper_half) {
+                const std::uint32_t destination_base =
+                    move_plan->destination_offset - move_plan->destination_lane_offset;
+                code->eor(code->v31.b16, code->v31.b16, code->v31.b16);
+                code->str(code->q31,
+                          Xbyak_aarch64::ptr(code->x0, destination_base + 16));
             }
-            code->mov(code->x0, ir.guest_rip + ir.length);
-            code->ret();
-            code->ready();
-            auto* entry = CommitCode(std::move(code));
-            return finish_direct_native(entry);
         }
+        code->mov(code->x0, ir.guest_rip + ir.length);
+        code->ret();
+        code->ready();
+        auto* entry = CommitCode(std::move(code));
+        return finish_direct_native(entry);
     }
 
     if (mnemonic == X86_MNEMONIC_JMP) {

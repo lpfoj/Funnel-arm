@@ -1209,6 +1209,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/decode_bridge.cpp
     src/executor/dynamic_translation/vector_lowering_policy.cpp
     src/executor/dynamic_translation/packed_lane_ops.cpp
+    src/executor/dynamic_translation/partial_move_plan.cpp
     src/executor/runtime_death_catcher.cpp
 )
 
