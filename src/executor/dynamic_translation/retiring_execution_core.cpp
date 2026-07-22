@@ -23747,6 +23747,19 @@ bool CanExecuteVectorInstruction(const LsxDecodedOp& ir) {
     }
 }
 
+bool ReadBinaryVectorInputs(
+    LsxMachineImage& state, const LsxDecodedOp& instruction,
+    const bool three_operand_form,
+    std::array<std::uint8_t, kXmmRegisterBytes>& left,
+    std::array<std::uint8_t, kXmmRegisterBytes>& right) {
+    const std::size_t left_index = three_operand_form ? 1u : 0u;
+    const std::size_t right_index = left_index + 1u;
+    return ReadVector128(state, instruction.decoded,
+                         instruction.operands[left_index], left) &&
+           ReadVector128(state, instruction.decoded,
+                         instruction.operands[right_index], right);
+}
+
 bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
                               const bool classification_known) {
     if (!classification_known && !CanExecuteVectorInstruction(ir)) {
@@ -23916,13 +23929,10 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsVectorAlignRightMnemonic(mnemonic)) {
         const bool vex_form = IsVexVectorAlignRightMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
         const auto& imm_operand = vex_form ? ir.operands[3] : ir.operands[2];
         // Snapshot both sources before writing the destination: the FMOD frontier is
         // VPALIGNR xmm1,xmm8,xmm1,4, where dst aliases src2.
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         result.fill(0);
@@ -23984,10 +23994,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         const bool vex_form = IsVexVectorImmediateBlendMnemonic(mnemonic);
         const std::uint8_t imm =
             static_cast<std::uint8_t>(ir.operands[ir.operand_count - 1].imm.value.u);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
@@ -24005,11 +24012,8 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsVectorVariableBlendMnemonic(mnemonic)) {
         const bool vex_form = IsVexVectorVariableBlendMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
         std::array<std::uint8_t, kXmmRegisterBytes> mask{};
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         if (vex_form) {
@@ -24043,10 +24047,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedHorizontalFloatMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedHorizontalFloatMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24060,10 +24061,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedHorizontalAddDwordMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedHorizontalAddDwordMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
@@ -24112,10 +24110,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedSadByteMnemonic(mnemonic)) {
         const bool vex_form = mnemonic == X86_MNEMONIC_VPSADBW;
-        const auto& lhs_operand = ir.operands[vex_form ? 1 : 0];
-        const auto& rhs_operand = ir.operands[vex_form ? 2 : 1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24142,10 +24137,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedSaturatingAddSubMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedSaturatingAddSubMnemonic(mnemonic);
-        const auto& lhs_operand = ir.operands[vex_form ? 1 : 0];
-        const auto& rhs_operand = ir.operands[vex_form ? 2 : 1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24185,10 +24177,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedAddSubMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedAddSubMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
@@ -24203,10 +24192,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedMultiplyMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedMultiplyMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
@@ -24216,10 +24202,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedMinMaxMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedMinMaxMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
@@ -24292,12 +24275,9 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedSaturatingPackMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedSaturatingPackMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
         // Read both inputs before touching the destination. Besides being the architectural
         // ordering, this keeps every dst==src1/dst==src2 combination alias-safe.
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24310,12 +24290,9 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsDotProductPsMnemonic(mnemonic)) {
         const bool vex_form = IsVexDotProductPsMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
         const std::uint8_t imm =
             static_cast<std::uint8_t>(ir.operands[ir.operand_count - 1].imm.value.u);
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
@@ -24658,10 +24635,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedFloatArithMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedFloatArithMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24687,10 +24661,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedFloatAddSubMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedFloatAddSubMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
         result.fill(0);
@@ -24716,11 +24687,8 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedFloatCompareMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedFloatCompareMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
         const auto& predicate_operand = vex_form ? ir.operands[3] : ir.operands[2];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24748,10 +24716,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsPackedCompareMnemonic(mnemonic)) {
         const bool vex_form = IsVexPackedCompareMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24767,10 +24732,7 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
     if (IsVectorUnpackMnemonic(mnemonic)) {
         const bool vex_form = IsVexVectorUnpackMnemonic(mnemonic);
-        const auto& lhs_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& rhs_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, lhs_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, rhs_operand, rhs)) {
+        if (!ReadBinaryVectorInputs(state, ir, vex_form, lhs, rhs)) {
             return false;
         }
 
@@ -24784,16 +24746,9 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
-    if (IsVexVectorBitwiseMnemonic(mnemonic)) {
-        if (!ReadVector128(state, ir.decoded, ir.operands[1], lhs) ||
-            !ReadVector128(state, ir.decoded, ir.operands[2], rhs)) {
-            return false;
-        }
-    } else {
-        if (!ReadVector128(state, ir.decoded, ir.operands[0], lhs) ||
-            !ReadVector128(state, ir.decoded, ir.operands[1], rhs)) {
-            return false;
-        }
+    if (!ReadBinaryVectorInputs(state, ir, IsVexVectorBitwiseMnemonic(mnemonic),
+                                lhs, rhs)) {
+        return false;
     }
 
     const std::size_t width = VectorOperandBytes(ir.operands[0]);
