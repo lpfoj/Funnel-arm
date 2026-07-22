@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "executor/dynamic_translation/atomic_memory.h"
 #include "executor/dynamic_translation/instruction_model.h"
 #include "executor/dynamic_translation/machine_state.h"
 
@@ -21,6 +22,7 @@ struct GuestMemoryPort {
     GuestRead read{};
     GuestWrite write{};
     void* context{};
+    GuestCompareExchange compare_exchange{};
 };
 
 enum class SemanticStop : std::uint8_t {
@@ -28,6 +30,7 @@ enum class SemanticStop : std::uint8_t {
     Transfer,
     Return,
     MemoryFault,
+    Retry,
     Unsupported,
 };
 

@@ -41,6 +41,7 @@ enum CheckBit : std::uint64_t {
     NativeIrCompiler = 1ull << 10,
     ScalarSemantics = 1ull << 11,
     IntegerMath = 1ull << 12,
+    AtomicSemantics = 1ull << 13,
 };
 
 struct FetchContext {
@@ -81,6 +82,36 @@ bool WriteSemanticMemory(const std::uint64_t address,
     }
     std::memcpy(image.bytes.data() + offset, source.data(), source.size());
     return true;
+}
+
+bool CompareExchangeSemanticMemory(const std::uint64_t address,
+                                   const std::uint32_t width,
+                                   const std::uint64_t expected,
+                                   const std::uint64_t desired,
+                                   std::uint64_t& observed,
+                                   void* const opaque) noexcept {
+    const std::size_t size = width / 8;
+    if (size == 0 || size > sizeof(observed)) {
+        return false;
+    }
+    std::array<std::uint8_t, 8> bytes{};
+    if (!ReadSemanticMemory(address, std::span<std::uint8_t>{bytes.data(), size},
+                            opaque)) {
+        return false;
+    }
+    observed = 0;
+    for (std::size_t index = 0; index < size; ++index) {
+        observed |= static_cast<std::uint64_t>(bytes[index]) << (index * 8u);
+    }
+    if (observed != (expected & WidthMask(width))) {
+        return true;
+    }
+    for (std::size_t index = 0; index < size; ++index) {
+        bytes[index] = static_cast<std::uint8_t>(desired >> (index * 8u));
+    }
+    return WriteSemanticMemory(address,
+                               std::span<const std::uint8_t>{bytes.data(), size},
+                               opaque);
 }
 
 std::size_t FetchFixture(const std::uint64_t address,
@@ -288,6 +319,45 @@ bool CheckIntegerMath() {
            (arithmetic->flag_bits & SignFlag) != 0;
 }
 
+bool CheckAtomicSemantics() {
+    constexpr std::array<std::uint8_t, 14> fixture{
+        0xf0, 0x0f, 0xc1, 0x07, 0xf0, 0x0f, 0xb1,
+        0x0f, 0xf0, 0x0f, 0xb1, 0x0f, 0x87, 0x17};
+    constexpr std::uint64_t code_base = 0xe800;
+    SemanticMemoryImage image{.base = 0x130000};
+    const std::uint32_t initial = 10;
+    std::memcpy(image.bytes.data(), &initial, sizeof(initial));
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image,
+                           CompareExchangeSemanticMemory};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::A, 5, 32);
+    WriteInteger(frame, IntegerRegister::C, 21, 32);
+    WriteInteger(frame, IntegerRegister::D, 7, 32);
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 4; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+            DecodeOutcome::Complete) {
+            return false;
+        }
+        const SemanticResult result = ExecuteScalarInstruction(instruction, frame, memory);
+        if (result.stop != SemanticStop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    std::uint32_t final_memory = 0;
+    std::memcpy(&final_memory, image.bytes.data(), sizeof(final_memory));
+    return offset == fixture.size() && final_memory == 7 &&
+           ReadInteger(frame, IntegerRegister::A, 32) == 15 &&
+           ReadInteger(frame, IntegerRegister::C, 32) == 21 &&
+           ReadInteger(frame, IntegerRegister::D, 32) == 21 &&
+           (frame.condition_word & ZeroFlag) != 0;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -400,6 +470,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(NativeIrCompiler, CheckNativeIrCompiler());
     run(ScalarSemantics, CheckScalarSemantics());
     run(IntegerMath, CheckIntegerMath());
+    run(AtomicSemantics, CheckAtomicSemantics());
     return report;
 }
 

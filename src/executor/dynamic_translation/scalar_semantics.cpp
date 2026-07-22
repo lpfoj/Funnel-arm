@@ -296,6 +296,81 @@ void ApplyLogic(CpuFrame& frame, const std::uint64_t result,
     ApplyLogicalFlags(frame, result, width);
 }
 
+SemanticResult AtomicFailure(const Instruction& instruction,
+                             const std::uint64_t address,
+                             const AtomicCommit commit) noexcept {
+    if (commit == AtomicCommit::AccessFault) {
+        return Fault(instruction, address);
+    }
+    if (commit == AtomicCommit::RetryLimit) {
+        return {SemanticStop::Retry, instruction.address, 0};
+    }
+    return Unsupported(instruction);
+}
+
+std::optional<AtomicMutation> BinaryAtomicMutation(
+    const std::uint32_t mnemonic) noexcept {
+    switch (mnemonic) {
+    case X86_MNEMONIC_ADD:
+        return AtomicMutation::Add;
+    case X86_MNEMONIC_ADC:
+        return AtomicMutation::AddCarry;
+    case X86_MNEMONIC_SUB:
+        return AtomicMutation::Subtract;
+    case X86_MNEMONIC_SBB:
+        return AtomicMutation::SubtractBorrow;
+    case X86_MNEMONIC_AND:
+        return AtomicMutation::BitAnd;
+    case X86_MNEMONIC_OR:
+        return AtomicMutation::BitOr;
+    case X86_MNEMONIC_XOR:
+        return AtomicMutation::BitXor;
+    default:
+        return std::nullopt;
+    }
+}
+
+SemanticResult ExecuteLockedAlu(const Instruction& instruction, CpuFrame& frame,
+                                const GuestMemoryPort& memory) noexcept {
+    if (instruction.operand_count != 2 ||
+        instruction.operands[0].form != OperandForm::Memory ||
+        instruction.operands[1].form == OperandForm::Memory) {
+        return Unsupported(instruction);
+    }
+    const auto mutation = BinaryAtomicMutation(instruction.mnemonic);
+    const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+    const auto source = ReadOperand(instruction, instruction.operands[1], frame, memory);
+    const std::uint32_t width = instruction.operands[0].bit_width;
+    if (!mutation || !address || !source || source->width != width) {
+        return Unsupported(instruction);
+    }
+    const bool carry = (frame.condition_word & CarryFlag) != 0;
+    const AtomicMutationResult transaction = MutateGuestAtomically(
+        memory.compare_exchange, memory.context, *address, width, *mutation,
+        source->bits, carry);
+    if (transaction.commit != AtomicCommit::Stored) {
+        return AtomicFailure(instruction, *address, transaction.commit);
+    }
+    if (instruction.mnemonic == X86_MNEMONIC_ADD) {
+        ApplyAdditionFlags(frame, transaction.before, source->bits, width);
+    } else if (instruction.mnemonic == X86_MNEMONIC_SUB) {
+        ApplySubtractionFlags(frame, transaction.before, source->bits, width);
+    } else if (instruction.mnemonic == X86_MNEMONIC_ADC) {
+        const IntegerMathResult result =
+            AddWithCarry(transaction.before, source->bits, carry, width);
+        frame.condition_word = (frame.condition_word & ~result.flag_mask) |
+                               result.flag_bits;
+    } else if (instruction.mnemonic == X86_MNEMONIC_SBB) {
+        const IntegerMathResult result =
+            SubtractWithBorrow(transaction.before, source->bits, carry, width);
+        frame.condition_word = (frame.condition_word & ~result.flag_mask) |
+                               result.flag_bits;
+    } else {
+        ApplyLogic(frame, transaction.after, width);
+    }
+    return {SemanticStop::Continue, instruction.address + instruction.length, 0};
+}
+
 SemanticResult ExecuteMove(const Instruction& instruction, CpuFrame& frame,
                            const GuestMemoryPort& memory) noexcept {
     if (instruction.operand_count != 2) {
@@ -346,8 +421,10 @@ SemanticResult ExecuteLea(const Instruction& instruction, CpuFrame& frame) noexc
 
 SemanticResult ExecuteAlu(const Instruction& instruction, CpuFrame& frame,
                           const GuestMemoryPort& memory) noexcept {
-    if (instruction.operand_count != 2 ||
-        (instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0) {
+    if ((instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0) {
+        return ExecuteLockedAlu(instruction, frame, memory);
+    }
+    if (instruction.operand_count != 2) {
         return Unsupported(instruction);
     }
     const auto left = ReadOperand(instruction, instruction.operands[0], frame, memory);
@@ -457,9 +534,47 @@ SemanticResult ExecuteBitMovement(const Instruction& instruction, CpuFrame& fram
 
 SemanticResult ExecuteUnary(const Instruction& instruction, CpuFrame& frame,
                             const GuestMemoryPort& memory) noexcept {
-    if (instruction.operand_count != 1 ||
-        (instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0) {
+    if (instruction.operand_count != 1) {
         return Unsupported(instruction);
+    }
+    if ((instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0) {
+        if (instruction.operands[0].form != OperandForm::Memory) {
+            return Unsupported(instruction);
+        }
+        const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+        std::optional<AtomicMutation> mutation;
+        if (instruction.mnemonic == X86_MNEMONIC_INC) {
+            mutation = AtomicMutation::Increment;
+        } else if (instruction.mnemonic == X86_MNEMONIC_DEC) {
+            mutation = AtomicMutation::Decrement;
+        } else if (instruction.mnemonic == X86_MNEMONIC_NEG) {
+            mutation = AtomicMutation::Negate;
+        } else if (instruction.mnemonic == X86_MNEMONIC_NOT) {
+            mutation = AtomicMutation::Invert;
+        }
+        if (!address || !mutation) {
+            return Unsupported(instruction);
+        }
+        const AtomicMutationResult transaction = MutateGuestAtomically(
+            memory.compare_exchange, memory.context, *address,
+            instruction.operands[0].bit_width, *mutation);
+        if (transaction.commit != AtomicCommit::Stored) {
+            return AtomicFailure(instruction, *address, transaction.commit);
+        }
+        const std::uint64_t carry = frame.condition_word & CarryFlag;
+        if (instruction.mnemonic == X86_MNEMONIC_INC) {
+            ApplyAdditionFlags(frame, transaction.before, 1,
+                               instruction.operands[0].bit_width);
+            frame.condition_word = (frame.condition_word & ~CarryFlag) | carry;
+        } else if (instruction.mnemonic == X86_MNEMONIC_DEC) {
+            ApplySubtractionFlags(frame, transaction.before, 1,
+                                  instruction.operands[0].bit_width);
+            frame.condition_word = (frame.condition_word & ~CarryFlag) | carry;
+        } else if (instruction.mnemonic == X86_MNEMONIC_NEG) {
+            ApplySubtractionFlags(frame, 0, transaction.before,
+                                  instruction.operands[0].bit_width);
+        }
+        return {SemanticStop::Continue, instruction.address + instruction.length, 0};
     }
     const auto old = ReadOperand(instruction, instruction.operands[0], frame, memory);
     if (!old) {
@@ -495,6 +610,135 @@ SemanticResult ExecuteUnary(const Instruction& instruction, CpuFrame& frame,
             ApplySubtractionFlags(frame, old->bits, 1, old->width);
         }
         frame.condition_word = (frame.condition_word & ~CarryFlag) | carry;
+    }
+    return {SemanticStop::Continue, instruction.address + instruction.length, 0};
+}
+
+SemanticResult ExecuteExchangeAdd(const Instruction& instruction, CpuFrame& frame,
+                                  const GuestMemoryPort& memory) noexcept {
+    if (instruction.operand_count != 2 ||
+        instruction.operands[1].form != OperandForm::Register ||
+        instruction.operands[0].bit_width != instruction.operands[1].bit_width) {
+        return Unsupported(instruction);
+    }
+    const auto source = ReadOperand(instruction, instruction.operands[1], frame, memory);
+    if (!source) {
+        return Unsupported(instruction);
+    }
+    const bool memory_destination =
+        instruction.operands[0].form == OperandForm::Memory;
+    const bool requires_atomic =
+        instruction.mnemonic == X86_MNEMONIC_XCHG && memory_destination;
+    const bool requested_atomic =
+        (instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0;
+    if (requires_atomic || requested_atomic) {
+        if (!memory_destination) {
+            return Unsupported(instruction);
+        }
+        const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+        if (!address) {
+            return Unsupported(instruction);
+        }
+        const AtomicMutation mutation = instruction.mnemonic == X86_MNEMONIC_XADD
+                                            ? AtomicMutation::Add
+                                            : AtomicMutation::Exchange;
+        const AtomicMutationResult transaction = MutateGuestAtomically(
+            memory.compare_exchange, memory.context, *address, source->width, mutation,
+            source->bits);
+        if (transaction.commit != AtomicCommit::Stored) {
+            return AtomicFailure(instruction, *address, transaction.commit);
+        }
+        if (!WriteOperand(instruction.operands[1], 0, frame, memory,
+                          transaction.before)) {
+            return Unsupported(instruction);
+        }
+        if (instruction.mnemonic == X86_MNEMONIC_XADD) {
+            ApplyAdditionFlags(frame, transaction.before, source->bits, source->width);
+        }
+        return {SemanticStop::Continue, instruction.address + instruction.length, 0};
+    }
+
+    const auto destination = ReadOperand(instruction, instruction.operands[0], frame, memory);
+    if (!destination || destination->width != source->width) {
+        return Fault(instruction, instruction.address);
+    }
+    const std::uint64_t new_destination =
+        instruction.mnemonic == X86_MNEMONIC_XADD
+            ? (destination->bits + source->bits) & WidthMask(source->width)
+            : source->bits;
+    const std::optional<std::uint64_t> destination_address =
+        destination->from_memory ? std::optional{destination->memory_address}
+                                 : std::optional<std::uint64_t>{0};
+    if (destination->from_memory &&
+        !WriteOperand(instruction.operands[0], destination_address, frame, memory,
+                      new_destination)) {
+        return Fault(instruction, destination->memory_address);
+    }
+    if (!WriteOperand(instruction.operands[1], 0, frame, memory, destination->bits)) {
+        return Unsupported(instruction);
+    }
+    if (!destination->from_memory &&
+        !WriteOperand(instruction.operands[0], destination_address, frame, memory,
+                      new_destination)) {
+        return Unsupported(instruction);
+    }
+    if (instruction.mnemonic == X86_MNEMONIC_XADD) {
+        ApplyAdditionFlags(frame, destination->bits, source->bits, source->width);
+    }
+    return {SemanticStop::Continue, instruction.address + instruction.length, 0};
+}
+
+SemanticResult ExecuteCompareExchange(const Instruction& instruction, CpuFrame& frame,
+                                      const GuestMemoryPort& memory) noexcept {
+    if (instruction.operand_count != 2 ||
+        instruction.operands[1].form != OperandForm::Register ||
+        instruction.operands[0].bit_width != instruction.operands[1].bit_width) {
+        return Unsupported(instruction);
+    }
+    const std::uint32_t width = instruction.operands[0].bit_width;
+    const std::uint64_t expected = ReadInteger(frame, IntegerRegister::A, width);
+    const auto replacement = ReadOperand(instruction, instruction.operands[1], frame, memory);
+    if (!replacement) {
+        return Unsupported(instruction);
+    }
+    std::uint64_t observed = 0;
+    bool exchanged = false;
+    if ((instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0) {
+        if (instruction.operands[0].form != OperandForm::Memory) {
+            return Unsupported(instruction);
+        }
+        const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+        if (!address) {
+            return Unsupported(instruction);
+        }
+        const AtomicComparisonResult comparison = CompareGuestAtomically(
+            memory.compare_exchange, memory.context, *address, width, expected,
+            replacement->bits);
+        if (comparison.commit != AtomicCommit::Compared) {
+            return AtomicFailure(instruction, *address, comparison.commit);
+        }
+        observed = comparison.observed;
+        exchanged = comparison.exchanged;
+    } else {
+        const auto destination = ReadOperand(instruction, instruction.operands[0], frame, memory);
+        if (!destination) {
+            return Fault(instruction, instruction.address);
+        }
+        observed = destination->bits;
+        exchanged = observed == expected;
+        if (exchanged) {
+            const std::optional<std::uint64_t> address =
+                destination->from_memory ? std::optional{destination->memory_address}
+                                         : std::optional<std::uint64_t>{0};
+            if (!WriteOperand(instruction.operands[0], address, frame, memory,
+                              replacement->bits)) {
+                return Fault(instruction, destination->memory_address);
+            }
+        }
+    }
+    ApplySubtractionFlags(frame, expected, observed, width);
+    if (!exchanged) {
+        WriteInteger(frame, IntegerRegister::A, observed, width);
     }
     return {SemanticStop::Continue, instruction.address + instruction.length, 0};
 }
@@ -656,6 +900,11 @@ SemanticResult ExecuteScalarInstruction(const Instruction& instruction, CpuFrame
     case X86_MNEMONIC_NEG:
     case X86_MNEMONIC_NOT:
         return ExecuteUnary(instruction, frame, memory);
+    case X86_MNEMONIC_XADD:
+    case X86_MNEMONIC_XCHG:
+        return ExecuteExchangeAdd(instruction, frame, memory);
+    case X86_MNEMONIC_CMPXCHG:
+        return ExecuteCompareExchange(instruction, frame, memory);
     case X86_MNEMONIC_PUSH:
     case X86_MNEMONIC_POP:
         return ExecuteStack(instruction, frame, memory);
