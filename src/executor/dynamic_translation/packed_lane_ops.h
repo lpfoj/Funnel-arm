@@ -13,6 +13,12 @@ struct PackedBitTestResult {
     bool masked_complement_is_zero{};
 };
 
+enum class PackedShiftKind : std::uint8_t {
+    LogicalLeft,
+    LogicalRight,
+    ArithmeticRight,
+};
+
 // These kernels are pure, alias-safe transformations. They are shared by the
 // interpreter/semantic leaf while the native emitter uses the same operation
 // classification to produce direct NEON. Keeping state/flags outside this layer
@@ -32,6 +38,9 @@ bool ReplicateElement(void* destination, const void* element,
 bool SquareRootElements(void* destination, const void* source,
                         std::size_t element_width,
                         std::size_t total_width) noexcept;
+bool ShiftIntegerElements(void* destination, const void* source,
+                          std::uint64_t distance, std::size_t element_width,
+                          std::size_t total_width, PackedShiftKind kind) noexcept;
 bool CompareIntegerElements(void* destination, const void* left,
                             const void* right, std::size_t element_width,
                             std::size_t total_width,

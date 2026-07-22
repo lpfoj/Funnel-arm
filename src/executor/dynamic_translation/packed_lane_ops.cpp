@@ -63,7 +63,83 @@ bool SignedLaneGreater(const std::uint8_t* const left,
     }
 }
 
+std::uint64_t LoadUnsignedLane(const std::uint8_t* const source,
+                               const std::size_t width) noexcept {
+    switch (width) {
+    case 1: return LoadLane<std::uint8_t>(source);
+    case 2: return LoadLane<std::uint16_t>(source);
+    case 4: return LoadLane<std::uint32_t>(source);
+    case 8: return LoadLane<std::uint64_t>(source);
+    default: return 0;
+    }
+}
+
+std::int64_t LoadSignedLane(const std::uint8_t* const source,
+                           const std::size_t width) noexcept {
+    switch (width) {
+    case 1: return LoadLane<std::int8_t>(source);
+    case 2: return LoadLane<std::int16_t>(source);
+    case 4: return LoadLane<std::int32_t>(source);
+    case 8: return LoadLane<std::int64_t>(source);
+    default: return 0;
+    }
+}
+
+void StoreUnsignedLane(std::uint8_t* const destination, const std::uint64_t value,
+                       const std::size_t width) noexcept {
+    switch (width) {
+    case 1: StoreLane(destination, static_cast<std::uint8_t>(value)); break;
+    case 2: StoreLane(destination, static_cast<std::uint16_t>(value)); break;
+    case 4: StoreLane(destination, static_cast<std::uint32_t>(value)); break;
+    case 8: StoreLane(destination, value); break;
+    default: break;
+    }
+}
+
 } // namespace
+
+bool ShiftIntegerElements(void* const destination, const void* const source,
+                          const std::uint64_t distance,
+                          const std::size_t element_width,
+                          const std::size_t total_width,
+                          const PackedShiftKind kind) noexcept {
+    const bool valid_element = element_width == 1 || element_width == 2 ||
+                               element_width == 4 || element_width == 8;
+    if (destination == nullptr || source == nullptr || !valid_element ||
+        total_width > kMaximumVectorBytes || total_width % element_width != 0) {
+        return false;
+    }
+
+    std::array<std::uint8_t, kMaximumVectorBytes> input{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(input.data(), source, total_width);
+    const std::uint64_t lane_bits = element_width * 8u;
+    for (std::size_t offset = 0; offset < total_width; offset += element_width) {
+        const std::uint64_t unsigned_lane =
+            LoadUnsignedLane(input.data() + offset, element_width);
+        std::uint64_t shifted = 0;
+        if (distance < lane_bits) {
+            switch (kind) {
+            case PackedShiftKind::LogicalLeft:
+                shifted = unsigned_lane << distance;
+                break;
+            case PackedShiftKind::LogicalRight:
+                shifted = unsigned_lane >> distance;
+                break;
+            case PackedShiftKind::ArithmeticRight:
+                shifted = static_cast<std::uint64_t>(
+                    LoadSignedLane(input.data() + offset, element_width) >> distance);
+                break;
+            }
+        } else if (kind == PackedShiftKind::ArithmeticRight &&
+                   LoadSignedLane(input.data() + offset, element_width) < 0) {
+            shifted = UINT64_MAX;
+        }
+        StoreUnsignedLane(output.data() + offset, shifted, element_width);
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
 
 float CombineHorizontalSingle(const float left, const float right,
                               const bool subtract) noexcept {

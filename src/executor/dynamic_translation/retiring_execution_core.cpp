@@ -31578,43 +31578,13 @@ void SaturateDwordToUnsignedWord(void* argument0, const void* argument1, const v
     operation(argument0, argument1, argument2, argument3);
 }
 
-namespace {
-void VPackedElementShift(void* dst, const void* src, const std::uint64_t count,
-                         const std::size_t element_bytes, const bool left,
-                         const bool arithmetic_right, const std::size_t total_size) {
-    if (dst == nullptr || src == nullptr || element_bytes == 0 || element_bytes > 8 ||
-        total_size > 32) {
-        return;
-    }
-
-    std::array<std::uint8_t, 32> out{};
-    const auto* source = static_cast<const std::uint8_t*>(src);
-    const std::uint32_t element_bits = static_cast<std::uint32_t>(element_bytes * 8u);
-    for (std::size_t offset = 0; offset < total_size; offset += element_bytes) {
-        std::uint64_t value = 0;
-        if (count < element_bits) {
-            if (left) {
-                value = LoadElementUnsigned(source + offset, element_bytes) << count;
-            } else if (arithmetic_right) {
-                value = static_cast<std::uint64_t>(
-                    LoadElementSigned(source + offset, element_bytes) >> count);
-            } else {
-                value = LoadElementUnsigned(source + offset, element_bytes) >> count;
-            }
-        } else if (arithmetic_right) {
-            value = LoadElementSigned(source + offset, element_bytes) < 0 ? UINT64_MAX : 0;
-        }
-        StoreElement(out.data() + offset, value, element_bytes);
-    }
-    std::memcpy(dst, out.data(), out.size());
-}
-} // namespace
-
 [[gnu::always_inline]] static inline void SemanticKernelShiftPackedQuadwords(void* dst, const void* src, const std::uint64_t count, const bool left,
                    const std::size_t total_size){
     const std::size_t lane_width = sizeof(std::uint64_t);
-    VPackedElementShift(dst, src, count, lane_width, left,
-                        /*arithmetic_right=*/false, total_size);
+    const auto kind = left ? VectorSemantic::PackedShiftKind::LogicalLeft
+                           : VectorSemantic::PackedShiftKind::LogicalRight;
+    (void)VectorSemantic::ShiftIntegerElements(dst, src, count, lane_width,
+                                               total_size, kind);
 }
 
 void ShiftPackedQuadwords(void* argument0, const void* argument1, const std::uint64_t argument2, const bool argument3, const std::size_t argument4) {
@@ -31636,8 +31606,13 @@ void ShiftPackedQuadwords(void* argument0, const void* argument1, const std::uin
     };
     const ShiftDescription request{dst, src, count, element_bytes, total_size, left,
                                    arithmetic_right && !left};
-    VPackedElementShift(request.output, request.input, request.distance, request.lane_bytes,
-                        request.toward_high_bits, request.sign_filling, request.vector_bytes);
+    const auto kind = request.toward_high_bits
+        ? VectorSemantic::PackedShiftKind::LogicalLeft
+        : request.sign_filling ? VectorSemantic::PackedShiftKind::ArithmeticRight
+                               : VectorSemantic::PackedShiftKind::LogicalRight;
+    (void)VectorSemantic::ShiftIntegerElements(
+        request.output, request.input, request.distance, request.lane_bytes,
+        request.vector_bytes, kind);
 }
 
 void ShiftPackedWordGroups(void* argument0, const void* argument1, const std::uint64_t argument2, const std::size_t argument3, const bool argument4, const bool argument5, const std::size_t argument6) {
@@ -31684,8 +31659,12 @@ void ShiftWholeVectorBytes(void* argument0, const void* argument1, const std::si
     SemanticVectorImage output{};
     const bool signed_shift = element_bytes != sizeof(std::uint64_t) &&
                               arithmetic_right && !left;
-    VPackedElementShift(output.bytes.data(), src, count, element_bytes, left,
-                        signed_shift, total_size);
+    const auto kind = left ? VectorSemantic::PackedShiftKind::LogicalLeft
+                           : signed_shift
+                                 ? VectorSemantic::PackedShiftKind::ArithmeticRight
+                                 : VectorSemantic::PackedShiftKind::LogicalRight;
+    (void)VectorSemantic::ShiftIntegerElements(
+        output.bytes.data(), src, count, element_bytes, total_size, kind);
     std::copy_n(output.bytes.begin(), total_size, static_cast<std::uint8_t*>(dst));
 }
 
