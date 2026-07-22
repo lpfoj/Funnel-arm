@@ -4,6 +4,7 @@
 #pragma once
 
 #include "executor/dynamic_translation/operation_ir.h"
+#include "executor/dynamic_translation/register_access.h"
 #include "executor/dynamic_translation/region_plan.h"
 
 #include <cstdint>
@@ -19,12 +20,6 @@ enum class FlagFormula : std::uint8_t {
     Decrement,
 };
 
-struct IntegerAccess {
-    std::uint8_t slot{};
-    std::uint8_t width{};
-    bool upper_byte{};
-};
-
 struct TranslationProgram {
     explicit TranslationProgram(std::uint64_t first_address) : ir{first_address} {}
 
@@ -32,8 +27,6 @@ struct TranslationProgram {
     std::vector<Instruction> semantic_steps{};
 };
 
-[[nodiscard]] std::uint32_t PackIntegerAccess(IntegerAccess access) noexcept;
-[[nodiscard]] IntegerAccess UnpackIntegerAccess(std::uint32_t detail) noexcept;
 [[nodiscard]] TranslationProgram BuildScalarProgram(const RegionPlan& plan);
 
 } // namespace Lsx4::Translation

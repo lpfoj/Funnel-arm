@@ -11,32 +11,6 @@
 namespace Lsx4::Translation {
 namespace {
 
-std::optional<IntegerAccess> DecodeIntegerAccess(const Operand& operand) noexcept {
-    if (operand.form != OperandForm::Register || operand.bit_width == 0 ||
-        operand.bit_width > 64) {
-        return std::nullopt;
-    }
-    const std::uint32_t id = operand.register_id;
-    IntegerAccess result{.width = static_cast<std::uint8_t>(operand.bit_width)};
-    if (id >= X86_REGISTER_AL && id <= X86_REGISTER_BL) {
-        result.slot = static_cast<std::uint8_t>(id - X86_REGISTER_AL);
-    } else if (id >= X86_REGISTER_AH && id <= X86_REGISTER_BH) {
-        result.slot = static_cast<std::uint8_t>(id - X86_REGISTER_AH);
-        result.upper_byte = true;
-    } else if (id >= X86_REGISTER_SPL && id <= X86_REGISTER_R15L) {
-        result.slot = static_cast<std::uint8_t>(id - X86_REGISTER_SPL + 4);
-    } else if (id >= X86_REGISTER_AX && id <= X86_REGISTER_R15W) {
-        result.slot = static_cast<std::uint8_t>(id - X86_REGISTER_AX);
-    } else if (id >= X86_REGISTER_EAX && id <= X86_REGISTER_R15D) {
-        result.slot = static_cast<std::uint8_t>(id - X86_REGISTER_EAX);
-    } else if (id >= X86_REGISTER_RAX && id <= X86_REGISTER_R15) {
-        result.slot = static_cast<std::uint8_t>(id - X86_REGISTER_RAX);
-    } else {
-        return std::nullopt;
-    }
-    return result;
-}
-
 IrType IntegerType(const std::uint16_t width) noexcept {
     switch (width) {
     case 8:
@@ -62,7 +36,7 @@ IrValue ReadScalarOperand(TranslationProgram& program, const Operand& operand,
         return program.ir.AddValue(IrAction::Constant, type, {}, operand.immediate.bits,
                                    0, guest_address);
     }
-    const auto access = DecodeIntegerAccess(operand);
+    const auto access = DecodeIntegerRegister(operand);
     if (!access) {
         return {};
     }
@@ -72,7 +46,7 @@ IrValue ReadScalarOperand(TranslationProgram& program, const Operand& operand,
 
 bool WriteScalarOperand(TranslationProgram& program, const Operand& operand,
                         const IrValue value, const std::uint64_t guest_address) {
-    const auto access = DecodeIntegerAccess(operand);
+    const auto access = DecodeIntegerRegister(operand);
     if (!access || !value.Exists()) {
         return false;
     }
@@ -222,20 +196,6 @@ void EmitFallback(TranslationProgram& program, const Instruction& instruction) {
 }
 
 } // namespace
-
-std::uint32_t PackIntegerAccess(const IntegerAccess access) noexcept {
-    return static_cast<std::uint32_t>(access.slot) |
-           (static_cast<std::uint32_t>(access.width) << 8) |
-           (static_cast<std::uint32_t>(access.upper_byte) << 16);
-}
-
-IntegerAccess UnpackIntegerAccess(const std::uint32_t detail) noexcept {
-    return {
-        .slot = static_cast<std::uint8_t>(detail),
-        .width = static_cast<std::uint8_t>(detail >> 8),
-        .upper_byte = ((detail >> 16) & 1u) != 0,
-    };
-}
 
 TranslationProgram BuildScalarProgram(const RegionPlan& plan) {
     TranslationProgram program{plan.first_address};
