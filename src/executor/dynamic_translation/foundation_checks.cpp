@@ -3,10 +3,12 @@
 
 #include "executor/dynamic_translation/foundation_checks.h"
 
+#include "common/x86_decoder.h"
 #include "executor/dynamic_translation/code_memory.h"
 #include "executor/dynamic_translation/code_witness.h"
 #include "executor/dynamic_translation/edge_portal.h"
 #include "executor/dynamic_translation/machine_state.h"
+#include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/native_encoder.h"
 #include "executor/dynamic_translation/native_compiler.h"
 #include "executor/dynamic_translation/operation_ir.h"
@@ -38,6 +40,7 @@ enum CheckBit : std::uint64_t {
     ScalarIrBuilder = 1ull << 9,
     NativeIrCompiler = 1ull << 10,
     ScalarSemantics = 1ull << 11,
+    IntegerMath = 1ull << 12,
 };
 
 struct FetchContext {
@@ -272,6 +275,19 @@ bool CheckScalarSemantics() {
            (frame.condition_word & CarryFlag) == 0;
 }
 
+bool CheckIntegerMath() {
+    const IntegerMathResult adc = AddWithCarry(0xffffffffu, 0, true, 32);
+    const IntegerMathResult sbb = SubtractWithBorrow(0, 0, true, 16);
+    const auto rotate = EvaluateBitMovement(X86_MNEMONIC_ROL, 0x81, 1, 8);
+    const auto arithmetic = EvaluateBitMovement(X86_MNEMONIC_SAR, 0x8000, 4, 16);
+    return adc.value == 0 && (adc.flag_bits & (CarryFlag | ZeroFlag)) ==
+                                 (CarryFlag | ZeroFlag) &&
+           sbb.value == 0xffff && (sbb.flag_bits & CarryFlag) != 0 && rotate &&
+           rotate->value == 0x03 && (rotate->flag_bits & CarryFlag) != 0 &&
+           arithmetic && arithmetic->value == 0xf800 &&
+           (arithmetic->flag_bits & SignFlag) != 0;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -383,6 +399,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(ScalarIrBuilder, CheckScalarIrBuilder());
     run(NativeIrCompiler, CheckNativeIrCompiler());
     run(ScalarSemantics, CheckScalarSemantics());
+    run(IntegerMath, CheckIntegerMath());
     return report;
 }
 

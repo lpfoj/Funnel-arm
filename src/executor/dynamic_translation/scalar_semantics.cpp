@@ -4,6 +4,7 @@
 #include "executor/dynamic_translation/scalar_semantics.h"
 
 #include "common/x86_decoder.h"
+#include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/register_access.h"
 #include "executor/dynamic_translation/region_plan.h"
 
@@ -358,7 +359,8 @@ SemanticResult ExecuteAlu(const Instruction& instruction, CpuFrame& frame,
     const std::uint64_t mask = WidthMask(left->width);
     std::uint64_t result = 0;
     bool write = true;
-    enum class Flags : std::uint8_t { Add, Subtract, Logic } flags = Flags::Logic;
+    enum class Flags : std::uint8_t { Add, Subtract, Logic, Direct } flags = Flags::Logic;
+    IntegerMathResult direct{};
     switch (instruction.mnemonic) {
     case X86_MNEMONIC_ADD:
         result = (left->bits + right->bits) & mask;
@@ -367,6 +369,19 @@ SemanticResult ExecuteAlu(const Instruction& instruction, CpuFrame& frame,
     case X86_MNEMONIC_SUB:
         result = (left->bits - right->bits) & mask;
         flags = Flags::Subtract;
+        break;
+    case X86_MNEMONIC_ADC:
+        direct = AddWithCarry(left->bits, right->bits,
+                              (frame.condition_word & CarryFlag) != 0, left->width);
+        result = direct.value;
+        flags = Flags::Direct;
+        break;
+    case X86_MNEMONIC_SBB:
+        direct = SubtractWithBorrow(left->bits, right->bits,
+                                    (frame.condition_word & CarryFlag) != 0,
+                                    left->width);
+        result = direct.value;
+        flags = Flags::Direct;
         break;
     case X86_MNEMONIC_CMP:
         result = (left->bits - right->bits) & mask;
@@ -399,9 +414,44 @@ SemanticResult ExecuteAlu(const Instruction& instruction, CpuFrame& frame,
         ApplyAdditionFlags(frame, left->bits, right->bits, left->width);
     } else if (flags == Flags::Subtract) {
         ApplySubtractionFlags(frame, left->bits, right->bits, left->width);
+    } else if (flags == Flags::Direct) {
+        frame.condition_word = (frame.condition_word & ~direct.flag_mask) |
+                               direct.flag_bits;
     } else {
         ApplyLogic(frame, result, left->width);
     }
+    return {SemanticStop::Continue, instruction.address + instruction.length, 0};
+}
+
+SemanticResult ExecuteBitMovement(const Instruction& instruction, CpuFrame& frame,
+                                  const GuestMemoryPort& memory) noexcept {
+    if (instruction.operand_count != 2 ||
+        (instruction.prefix_attributes & X86_ATTRIB_HAS_LOCK) != 0) {
+        return Unsupported(instruction);
+    }
+    const auto value = ReadOperand(instruction, instruction.operands[0], frame, memory);
+    const auto count = ReadOperand(instruction, instruction.operands[1], frame, memory);
+    if (!value || !count) {
+        return Fault(instruction, value && value->from_memory ? value->memory_address
+                                                              : instruction.address);
+    }
+    const auto evaluated =
+        EvaluateBitMovement(instruction.mnemonic, value->bits, count->bits, value->width);
+    if (!evaluated) {
+        return Unsupported(instruction);
+    }
+    if (!evaluated->effective) {
+        return {SemanticStop::Continue, instruction.address + instruction.length, 0};
+    }
+    const std::optional<std::uint64_t> destination =
+        value->from_memory ? std::optional{value->memory_address}
+                           : std::optional<std::uint64_t>{0};
+    if (!WriteOperand(instruction.operands[0], destination, frame, memory,
+                      evaluated->value)) {
+        return Fault(instruction, value->memory_address);
+    }
+    frame.condition_word = (frame.condition_word & ~evaluated->flag_mask) |
+                           evaluated->flag_bits;
     return {SemanticStop::Continue, instruction.address + instruction.length, 0};
 }
 
@@ -586,13 +636,21 @@ SemanticResult ExecuteScalarInstruction(const Instruction& instruction, CpuFrame
     case X86_MNEMONIC_LEA:
         return ExecuteLea(instruction, frame);
     case X86_MNEMONIC_ADD:
+    case X86_MNEMONIC_ADC:
     case X86_MNEMONIC_SUB:
+    case X86_MNEMONIC_SBB:
     case X86_MNEMONIC_CMP:
     case X86_MNEMONIC_AND:
     case X86_MNEMONIC_OR:
     case X86_MNEMONIC_XOR:
     case X86_MNEMONIC_TEST:
         return ExecuteAlu(instruction, frame, memory);
+    case X86_MNEMONIC_SHL:
+    case X86_MNEMONIC_SHR:
+    case X86_MNEMONIC_SAR:
+    case X86_MNEMONIC_ROL:
+    case X86_MNEMONIC_ROR:
+        return ExecuteBitMovement(instruction, frame, memory);
     case X86_MNEMONIC_INC:
     case X86_MNEMONIC_DEC:
     case X86_MNEMONIC_NEG:
