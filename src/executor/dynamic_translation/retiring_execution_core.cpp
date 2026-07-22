@@ -1373,6 +1373,7 @@ void CompareStringUnit(LsxMachineImage& state, LsxMnemonicCode mnemonic, bool re
           bool repeat_not_equal);
 
 static bool JitOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi);
+static bool JitProtectedHostBand(std::uint64_t& lo, std::uint64_t& hi);
 
 namespace {
 constexpr std::uint32_t kJitMaxInstructionsPerBlock = 128;
@@ -16356,11 +16357,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     }
                                     std::uint64_t image_lo = 0;
                                     std::uint64_t image_hi = 0;
-                                    if (JitOwnHostImageRange(image_lo, image_hi)) {
+                                    if (JitProtectedHostBand(image_lo, image_hi)) {
                                         code->mov(code->x10, image_lo);
                                         code->cmp(code->x14, code->x10);
                                         code->blo(direct_exchange);
-                                        code->mov(code->x11, image_hi + 0x30000000ull);
+                                        code->mov(code->x11, image_hi);
                                         code->cmp(code->x14, code->x11);
                                         code->bhs(direct_exchange);
                                         code->b(slow_exchange);
@@ -18603,6 +18604,20 @@ static bool JitOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi) {
     return Lsx4::Translation::QueryProcessImageBounds(lo, hi);
 }
 
+static bool JitProtectedHostBand(std::uint64_t& lo, std::uint64_t& hi) {
+    if (!JitOwnHostImageRange(lo, hi)) {
+        return false;
+    }
+    constexpr std::uint64_t kMinimumGuardBytes = 64ull << 20u;
+    const std::uint64_t image_span = hi - lo;
+    const std::uint64_t scaled_span = image_span <= UINT64_MAX / 8u
+                                          ? image_span * 8u
+                                          : UINT64_MAX;
+    const std::uint64_t guard_bytes = std::max(kMinimumGuardBytes, scaled_span);
+    hi = guard_bytes <= UINT64_MAX - hi ? hi + guard_bytes : UINT64_MAX;
+    return true;
+}
+
 void CopyBytesToGuest(const std::uint64_t guest_va, const void* src, const std::uint32_t size_bytes) {
     if (src == nullptr || size_bytes == 0) {
         return;
@@ -18672,17 +18687,17 @@ LsxStackReservoir& LocalGuestStackReservoir() {
     return g_lsx_stack_reservoir;
 }
 
-std::uint8_t* AllocateGuestStyleBackendStack() {
+std::uint8_t* AllocateLowGuestStack() {
 #ifdef __ANDROID__
     static std::atomic<std::uint32_t> next_stack_slot{0};
-    constexpr std::array<std::uint64_t, 7> low_stack_bases = {
-        0x78000000ULL, 0x74000000ULL, 0x70000000ULL, 0x6c000000ULL,
-        0x68000000ULL, 0x64000000ULL, 0x60000000ULL,
-    };
+    constexpr std::uint32_t kLowStackSlotCount = 7;
+    constexpr std::uint64_t kFirstLowStackBase = 0x79000000ull;
+    constexpr std::uint64_t kLowStackStride = 0x03800000ull;
 
-    for (std::uint32_t probe = 0; probe < low_stack_bases.size(); ++probe) {
+    for (std::uint32_t probe = 0; probe < kLowStackSlotCount; ++probe) {
         const std::uint32_t slot = next_stack_slot.fetch_add(1, std::memory_order_relaxed);
-        const std::uint64_t base = low_stack_bases[slot % low_stack_bases.size()];
+        const std::uint64_t base =
+            kFirstLowStackBase - (slot % kLowStackSlotCount) * kLowStackStride;
         void* stack = mmap(reinterpret_cast<void*>(base), kGuestStackSize, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (stack == reinterpret_cast<void*>(base)) {
@@ -18734,7 +18749,7 @@ LsxStackLease BorrowGuestStackWindow(LsxMachineImage* state) {
             g_pending_stack_reservoir_base = 0;
             g_pending_stack_reservoir_size = 0;
         } else {
-            arena.allocation = AllocateGuestStyleBackendStack();
+            arena.allocation = AllocateLowGuestStack();
             arena.low = arena.allocation;
             arena.top = arena.low + kGuestStackSize;
         }
@@ -28502,11 +28517,10 @@ void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, const s
     {
         std::uint64_t img_lo = 0, img_hi = 0;
         const std::uint64_t taddr = reinterpret_cast<std::uint64_t>(target);
-        // Cover our .so image AND the adjacent host heap band above it (where guest PthreadMutex /
-        // AAudio / Vulkan objects are malloc'd). A guest atomic must never hit any of these; guest
-        // memory (direct 0x2xx, modules 0x8xx, stacks 0x7ef...) is far outside [img_lo, img_hi+768MB).
-        if (JitOwnHostImageRange(img_lo, img_hi) && taddr >= img_lo &&
-            taddr < img_hi + 0x30000000ull) {
+        // Cover the image and a guard band scaled from its mapped span, where nearby host runtime
+        // objects are commonly allocated. Guest atomics must never target that host-owned band.
+        if (JitProtectedHostBand(img_lo, img_hi) && taddr >= img_lo &&
+            taddr < img_hi) {
             static std::atomic<std::uint32_t> b{0};
             const std::uint32_t n = b.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
