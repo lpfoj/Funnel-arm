@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "jit_ir_cache.h"
+#include "executor/dynamic_translation/artifact_repository.h"
 #include "common/content_fingerprint.h"
 
 #include <algorithm>
@@ -67,7 +67,7 @@ constexpr std::uint8_t kKnownInstructionFlags =
     kInstructionFlagCanJitInitial | kInstructionFlagTerminatesBlock;
 
 // Stable limits of the LSX cache schema. Decoder values are normalized into these integer fields
-// by machine_code_lens.cpp; changing a bound requires an explicit schema review.
+// by decode_bridge.cpp; changing a bound requires an explicit schema review.
 constexpr std::uint8_t kOperandKindUnused = 0;
 constexpr std::uint8_t kOperandKindRegister = 1;
 constexpr std::uint8_t kOperandKindMemory = 2;

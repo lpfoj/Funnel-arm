@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "executor/jit/lsx_translation_engine.h"
-#include "executor/jit/jit_ir_cache.h"
-#include "executor/jit/machine_code_lens.h"
-#include "executor/jit/native_vector_plan.h"
-#include "executor/jit/vector_semantic_kernel.h"
+#include "executor/dynamic_translation/retiring_execution_core.h"
+#include "executor/dynamic_translation/artifact_repository.h"
+#include "executor/dynamic_translation/decode_bridge.h"
+#include "executor/dynamic_translation/vector_lowering_policy.h"
+#include "executor/dynamic_translation/packed_lane_ops.h"
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
-#include "jit_native_cache_abi.h"
+#include "native_artifact_layout.h"
 #include "common/content_fingerprint.h"
 #include "core/aerolib/stubs.h"
 #include "core/memory.h"

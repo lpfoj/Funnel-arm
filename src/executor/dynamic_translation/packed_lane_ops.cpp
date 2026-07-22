@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "executor/jit/vector_semantic_kernel.h"
+#include "executor/dynamic_translation/packed_lane_ops.h"
 
 #include <array>
 #include <cstring>

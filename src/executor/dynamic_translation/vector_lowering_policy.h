@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "executor/jit/lsx_translation_engine.h"
+#include "executor/dynamic_translation/retiring_execution_core.h"
 
 namespace Executor::Jit {
 

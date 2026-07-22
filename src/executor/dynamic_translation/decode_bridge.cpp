@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 PS4Run Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "executor/jit/machine_code_lens.h"
+#include "executor/dynamic_translation/decode_bridge.h"
 
 #include <algorithm>
 #include <cstring>
 
 #include "common/x86_decoder.h"
 
-#include "executor/jit/lsx_translation_engine.h"
+#include "executor/dynamic_translation/retiring_execution_core.h"
 
 namespace Executor::Jit {
 namespace {

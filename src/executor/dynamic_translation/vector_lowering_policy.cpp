@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "executor/jit/native_vector_plan.h"
+#include "executor/dynamic_translation/vector_lowering_policy.h"
 
 #include "common/x86_decoder.h"
 

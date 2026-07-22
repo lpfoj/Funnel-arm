@@ -211,7 +211,7 @@ enum class LsxOpClass : std::uint8_t {
 
 // Runtime execution retains only the scalar decode summary consumed by address calculation,
 // vector semantics, diagnostics and branch resolution. The complete vendor decode object remains
-// private to machine_code_lens.cpp instead of being retained by every published operation.
+// private to decode_bridge.cpp instead of being retained by every published operation.
 struct DecodeSummary {
     LsxInstructionAttributes attributes = 0;
     std::uint32_t mnemonic = 0;
@@ -262,7 +262,7 @@ struct LsxImmediateOperand {
 };
 
 // Stable JIT operand vocabulary. Decoder-specific layouts are translated once by
-// machine_code_lens.cpp; published regions and persistent-cache code retain only these fixed-width
+// decode_bridge.cpp; published regions and persistent-cache code retain only these fixed-width
 // architectural values.
 struct LsxOperandRecord {
     std::uint8_t id;

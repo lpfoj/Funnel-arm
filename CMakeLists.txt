@@ -1196,11 +1196,11 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/vector_semantics.cpp
     src/executor/dynamic_translation/x87_semantics.cpp
     src/executor/dynamic_translation/x87_state.cpp
-    src/executor/jit/lsx_translation_engine.cpp
-    src/executor/jit/jit_ir_cache.cpp
-    src/executor/jit/machine_code_lens.cpp
-    src/executor/jit/native_vector_plan.cpp
-    src/executor/jit/vector_semantic_kernel.cpp
+    src/executor/dynamic_translation/retiring_execution_core.cpp
+    src/executor/dynamic_translation/artifact_repository.cpp
+    src/executor/dynamic_translation/decode_bridge.cpp
+    src/executor/dynamic_translation/vector_lowering_policy.cpp
+    src/executor/dynamic_translation/packed_lane_ops.cpp
     src/executor/runtime_death_catcher.cpp
 )
 
@@ -1209,7 +1209,7 @@ add_library(lsx4_executor_android SHARED
 # into the object. Besides hardening indirect dispatch, this prevents generic two-instruction
 # capability getters from sharing an unguarded machine body with unrelated external runtimes.
 if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-    set_source_files_properties(src/executor/jit/lsx_translation_engine.cpp PROPERTIES
+    set_source_files_properties(src/executor/dynamic_translation/retiring_execution_core.cpp PROPERTIES
         COMPILE_OPTIONS "-mbranch-protection=bti")
 endif()
 
@@ -1219,8 +1219,8 @@ endif()
 # any input regenerate the header and rebuild only translation units which include it; unrelated
 # shader/HLE edits leave the key stable and can safely reuse native blocks.
 file(GLOB_RECURSE EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/jit/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/jit/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/externals/xbyak_aarch64/xbyak_aarch64/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_decoder.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_decoder.h"
@@ -1264,11 +1264,11 @@ string(SHA256 EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH
 string(SUBSTRING "${EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH}" 0 16
        EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64)
 set(EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/executor/jit")
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/executor/dynamic_translation")
 file(MAKE_DIRECTORY "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}")
 configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/jit/jit_native_cache_abi.h.in"
-    "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}/jit_native_cache_abi.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/native_artifact_layout.h.in"
+    "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}/native_artifact_layout.h"
     @ONLY
 )
 target_include_directories(lsx4_executor_android PRIVATE
