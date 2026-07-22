@@ -17,6 +17,7 @@
 #include "executor/dynamic_translation/scalar_ir_builder.h"
 #include "executor/dynamic_translation/scalar_semantics.h"
 #include "executor/dynamic_translation/value_residency.h"
+#include "executor/dynamic_translation/vector_semantics.h"
 
 #include <algorithm>
 #include <array>
@@ -42,6 +43,7 @@ enum CheckBit : std::uint64_t {
     ScalarSemantics = 1ull << 11,
     IntegerMath = 1ull << 12,
     AtomicSemantics = 1ull << 13,
+    VectorSemantics = 1ull << 14,
 };
 
 struct FetchContext {
@@ -358,6 +360,49 @@ bool CheckAtomicSemantics() {
            (frame.condition_word & ZeroFlag) != 0;
 }
 
+bool CheckVectorSemantics() {
+    constexpr std::array<std::uint8_t, 25> fixture{
+        0xf3, 0x0f, 0x6f, 0x07, 0xf3, 0x0f, 0x6f, 0x0e, 0x66,
+        0x0f, 0xfc, 0xc1, 0x66, 0x0f, 0x70, 0xd0, 0x1b, 0x66,
+        0x0f, 0xef, 0xd1, 0xf3, 0x0f, 0x7f, 0x12};
+    constexpr std::uint64_t code_base = 0xec00;
+    SemanticMemoryImage image{.base = 0x140000};
+    for (std::size_t index = 0; index < 16; ++index) {
+        image.bytes[index] = static_cast<std::uint8_t>(index);
+        image.bytes[32 + index] = 1;
+    }
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+    WriteInteger(frame, IntegerRegister::Source, image.base + 32, 64);
+    WriteInteger(frame, IntegerRegister::D, image.base + 64, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 6; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+            DecodeOutcome::Complete) {
+            return false;
+        }
+        const VectorSemanticResult result =
+            ExecuteVectorInstruction(instruction, frame, memory);
+        if (result.stop != VectorStop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    for (std::size_t output = 0; output < 16; ++output) {
+        const std::size_t source = 12 - (output / 4) * 4 + output % 4;
+        const std::uint8_t expected =
+            static_cast<std::uint8_t>(source + 1) ^ std::uint8_t{1};
+        if (image.bytes[64 + output] != expected) {
+            return false;
+        }
+    }
+    return offset == fixture.size();
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -471,6 +516,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(ScalarSemantics, CheckScalarSemantics());
     run(IntegerMath, CheckIntegerMath());
     run(AtomicSemantics, CheckAtomicSemantics());
+    run(VectorSemantics, CheckVectorSemantics());
     return report;
 }
 

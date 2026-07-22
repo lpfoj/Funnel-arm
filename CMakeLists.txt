@@ -1169,6 +1169,7 @@ set(LSX4_NATIVE_CORE_SOURCES
 add_library(lsx4_executor_android SHARED
     ${LSX4_NATIVE_CORE_SOURCES}
     src/executor/native_runtime_api.cpp
+    src/executor/dynamic_translation/address_resolver.cpp
     src/executor/dynamic_translation/atomic_memory.cpp
     src/executor/dynamic_translation/code_witness.cpp
     src/executor/dynamic_translation/code_memory.cpp
@@ -1186,6 +1187,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/scalar_ir_builder.cpp
     src/executor/dynamic_translation/scalar_semantics.cpp
     src/executor/dynamic_translation/value_residency.cpp
+    src/executor/dynamic_translation/vector_semantics.cpp
     src/executor/jit/lsx_translation_engine.cpp
     src/executor/jit/jit_ir_cache.cpp
     src/executor/jit/machine_code_lens.cpp

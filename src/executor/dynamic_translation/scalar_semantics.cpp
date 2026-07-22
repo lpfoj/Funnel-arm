@@ -4,6 +4,7 @@
 #include "executor/dynamic_translation/scalar_semantics.h"
 
 #include "common/x86_decoder.h"
+#include "executor/dynamic_translation/address_resolver.h"
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/register_access.h"
 #include "executor/dynamic_translation/region_plan.h"
@@ -163,59 +164,6 @@ bool TestPredicate(const Predicate predicate, const std::uint64_t flags) noexcep
     return false;
 }
 
-std::optional<std::uint64_t> ReadAddressRegister(const std::uint32_t register_id,
-                                                 const std::uint8_t address_width,
-                                                 const CpuFrame& frame) noexcept {
-    Operand synthetic{};
-    synthetic.form = OperandForm::Register;
-    synthetic.register_id = register_id;
-    synthetic.bit_width = address_width;
-    const auto access = DecodeIntegerRegister(synthetic);
-    if (!access) {
-        return std::nullopt;
-    }
-    return ReadInteger(frame, static_cast<IntegerRegister>(access->slot), access->width,
-                       access->upper_byte);
-}
-
-std::optional<std::uint64_t> EffectiveAddress(const Instruction& instruction,
-                                              const Operand& operand,
-                                              const CpuFrame& frame) noexcept {
-    if (operand.form != OperandForm::Memory) {
-        return std::nullopt;
-    }
-    std::uint64_t address = 0;
-    if (operand.address.base == X86_REGISTER_RIP ||
-        operand.address.base == X86_REGISTER_EIP) {
-        address = instruction.address + instruction.length;
-    } else if (operand.address.base != X86_REGISTER_NONE) {
-        const auto base = ReadAddressRegister(operand.address.base,
-                                              instruction.address_width, frame);
-        if (!base) {
-            return std::nullopt;
-        }
-        address = *base;
-    }
-    if (operand.address.index != X86_REGISTER_NONE) {
-        const auto index = ReadAddressRegister(operand.address.index,
-                                               instruction.address_width, frame);
-        if (!index) {
-            return std::nullopt;
-        }
-        address += *index * operand.address.scale;
-    }
-    address += static_cast<std::uint64_t>(operand.address.displacement);
-    if (operand.address.segment == X86_REGISTER_FS) {
-        address += frame.fs_origin;
-    } else if (operand.address.segment == X86_REGISTER_GS) {
-        address += frame.gs_origin;
-    }
-    if (instruction.address_width == 32) {
-        address = static_cast<std::uint32_t>(address);
-    }
-    return address;
-}
-
 bool ReadMemoryScalar(const GuestMemoryPort& memory, const std::uint64_t address,
                       const std::uint32_t width, std::uint64_t& value) noexcept {
     const std::size_t size = width / 8;
@@ -263,7 +211,7 @@ std::optional<ScalarValue> ReadOperand(const Instruction& instruction,
                                        access->width, access->upper_byte),
                            0, access->width, false};
     }
-    const auto address = EffectiveAddress(instruction, operand, frame);
+    const auto address = ResolveGuestAddress(instruction, operand, frame);
     std::uint64_t value = 0;
     if (!address || !ReadMemoryScalar(memory, *address, operand.bit_width, value)) {
         return std::nullopt;
@@ -275,7 +223,7 @@ std::optional<std::uint64_t> DestinationAddress(const Instruction& instruction,
                                                 const Operand& operand,
                                                 const CpuFrame& frame) noexcept {
     return operand.form == OperandForm::Memory
-               ? EffectiveAddress(instruction, operand, frame)
+               ? ResolveGuestAddress(instruction, operand, frame)
                : std::optional<std::uint64_t>{0};
 }
 
@@ -338,7 +286,8 @@ SemanticResult ExecuteLockedAlu(const Instruction& instruction, CpuFrame& frame,
         return Unsupported(instruction);
     }
     const auto mutation = BinaryAtomicMutation(instruction.mnemonic);
-    const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+    const auto address =
+        ResolveGuestAddress(instruction, instruction.operands[0], frame);
     const auto source = ReadOperand(instruction, instruction.operands[1], frame, memory);
     const std::uint32_t width = instruction.operands[0].bit_width;
     if (!mutation || !address || !source || source->width != width) {
@@ -410,7 +359,8 @@ SemanticResult ExecuteLea(const Instruction& instruction, CpuFrame& frame) noexc
     if (instruction.operand_count != 2) {
         return Unsupported(instruction);
     }
-    const auto address = EffectiveAddress(instruction, instruction.operands[1], frame);
+    const auto address =
+        ResolveGuestAddress(instruction, instruction.operands[1], frame);
     const auto destination = DestinationAddress(instruction, instruction.operands[0], frame);
     if (!address || !destination ||
         !WriteOperand(instruction.operands[0], destination, frame, {}, *address)) {
@@ -541,7 +491,8 @@ SemanticResult ExecuteUnary(const Instruction& instruction, CpuFrame& frame,
         if (instruction.operands[0].form != OperandForm::Memory) {
             return Unsupported(instruction);
         }
-        const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+        const auto address =
+            ResolveGuestAddress(instruction, instruction.operands[0], frame);
         std::optional<AtomicMutation> mutation;
         if (instruction.mnemonic == X86_MNEMONIC_INC) {
             mutation = AtomicMutation::Increment;
@@ -635,7 +586,8 @@ SemanticResult ExecuteExchangeAdd(const Instruction& instruction, CpuFrame& fram
         if (!memory_destination) {
             return Unsupported(instruction);
         }
-        const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+        const auto address =
+            ResolveGuestAddress(instruction, instruction.operands[0], frame);
         if (!address) {
             return Unsupported(instruction);
         }
@@ -707,7 +659,8 @@ SemanticResult ExecuteCompareExchange(const Instruction& instruction, CpuFrame& 
         if (instruction.operands[0].form != OperandForm::Memory) {
             return Unsupported(instruction);
         }
-        const auto address = EffectiveAddress(instruction, instruction.operands[0], frame);
+        const auto address =
+            ResolveGuestAddress(instruction, instruction.operands[0], frame);
         if (!address) {
             return Unsupported(instruction);
         }
