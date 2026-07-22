@@ -41,5 +41,9 @@ bool ReplicateElement(void* destination, const void* element,
 bool SquareRootElements(void* destination, const void* source,
                         std::size_t element_width,
                         std::size_t total_width) noexcept;
+bool CompareIntegerElements(void* destination, const void* left,
+                            const void* right, std::size_t element_width,
+                            std::size_t total_width,
+                            bool signed_greater_than) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic

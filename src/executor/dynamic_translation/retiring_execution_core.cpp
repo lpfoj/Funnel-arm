@@ -182,8 +182,6 @@ void SquareRootPackedFloating(void* dst, const void* src, bool operate_double, s
                  bool zero_upper_ymm);
 void ComputePackedFloating(void* dst, const void* lhs, const void* rhs, ScalarArithOp op,
                        bool operate_double, std::size_t total_size);
-void ComparePackedIntegers(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
-                    bool signed_greater_than, std::size_t total_size);
 void SelectPackedIntegerExtrema(void* dst, const void* lhs, const void* rhs, std::size_t element_size,
                    bool compare_signed, bool select_max, std::size_t total_size);
 void MultiplyPackedIntegers(void* dst, const void* lhs, const void* rhs, std::uint32_t mode,
@@ -24844,9 +24842,12 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
 
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
-        ComparePackedIntegers(result.data(), lhs.data(), rhs.data(),
-                       PackedCompareElementBytes(mnemonic),
-                       PackedCompareSignedGreaterThan(mnemonic), width);
+        if (!VectorSemantic::CompareIntegerElements(
+                result.data(), lhs.data(), rhs.data(),
+                PackedCompareElementBytes(mnemonic), width,
+                PackedCompareSignedGreaterThan(mnemonic))) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -32751,36 +32752,6 @@ void MultiplyPackedIntegers(void* argument0, const void* argument1, const void* 
 
 void SelectPackedIntegerExtrema(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const bool argument5, const std::size_t argument6) {
     SemanticKernelSelectPackedIntegerExtrema(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelComparePackedIntegers(void* dst, const void* lhs, const void* rhs, const std::size_t element_size,
-                    const bool signed_greater_than, const std::size_t total_size){
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_size == 0 ||
-        element_size > 8 || total_size > 32) {
-        return;
-    }
-    const auto left = SemanticVectorImage::Capture(lhs, total_size);
-    const auto right = SemanticVectorImage::Capture(rhs, total_size);
-    SemanticVectorImage result{};
-    for (std::size_t lane = 0; lane != total_size / element_size; ++lane) {
-        const std::size_t offset = lane * element_size;
-        bool match = false;
-        if (signed_greater_than) {
-            match = LoadElementSigned(left.bytes.data() + offset, element_size) >
-                    LoadElementSigned(right.bytes.data() + offset, element_size);
-        } else {
-            match = std::equal(left.bytes.begin() + offset,
-                               left.bytes.begin() + offset + element_size,
-                               right.bytes.begin() + offset);
-        }
-        std::fill_n(result.bytes.begin() + offset, element_size,
-                    match ? std::uint8_t{0xff} : std::uint8_t{0});
-    }
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void ComparePackedIntegers(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
-    SemanticKernelComparePackedIntegers(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 namespace {

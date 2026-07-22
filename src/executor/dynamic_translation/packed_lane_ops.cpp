@@ -45,6 +45,23 @@ void ComputeSquareRoots(std::array<std::uint8_t, kMaximumVectorBytes>& output,
     }
 }
 
+bool SignedLaneGreater(const std::uint8_t* const left,
+                       const std::uint8_t* const right,
+                       const std::size_t width) noexcept {
+    switch (width) {
+    case 1:
+        return LoadLane<std::int8_t>(left) > LoadLane<std::int8_t>(right);
+    case 2:
+        return LoadLane<std::int16_t>(left) > LoadLane<std::int16_t>(right);
+    case 4:
+        return LoadLane<std::int32_t>(left) > LoadLane<std::int32_t>(right);
+    case 8:
+        return LoadLane<std::int64_t>(left) > LoadLane<std::int64_t>(right);
+    default:
+        return false;
+    }
+}
+
 std::uint64_t ApplyBooleanWord(const std::uint64_t left,
                                const std::uint64_t right,
                                const BooleanOperation operation) noexcept {
@@ -337,6 +354,36 @@ bool SquareRootElements(void* const destination, const void* const source,
         ComputeSquareRoots<double>(output, input, total_width);
     } else {
         ComputeSquareRoots<float>(output, input, total_width);
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
+bool CompareIntegerElements(void* const destination, const void* const left,
+                            const void* const right,
+                            const std::size_t element_width,
+                            const std::size_t total_width,
+                            const bool signed_greater_than) noexcept {
+    const bool valid_element = element_width == 1 || element_width == 2 ||
+                               element_width == 4 || element_width == 8;
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        !valid_element || (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+
+    std::array<std::uint8_t, kMaximumVectorBytes> lhs{};
+    std::array<std::uint8_t, kMaximumVectorBytes> rhs{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(lhs.data(), left, total_width);
+    std::memcpy(rhs.data(), right, total_width);
+    for (std::size_t cursor = 0; cursor < total_width; cursor += element_width) {
+        const bool selected = signed_greater_than
+            ? SignedLaneGreater(lhs.data() + cursor, rhs.data() + cursor,
+                                element_width)
+            : std::memcmp(lhs.data() + cursor, rhs.data() + cursor,
+                          element_width) == 0;
+        std::memset(output.data() + cursor, selected ? 0xff : 0x00,
+                    element_width);
     }
     std::memcpy(destination, output.data(), output.size());
     return true;
