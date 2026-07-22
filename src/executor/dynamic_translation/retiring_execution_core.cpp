@@ -19169,8 +19169,7 @@ void CopyBytesToGuest(const std::uint64_t guest_va, const void* src, const std::
         static std::atomic<std::uint32_t> s_bad_write_budget{0};
         const std::uint32_t n = s_bad_write_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 128) {
-            JitLog("[EXECUTOR_JIT_BAD_WRITE_SKIP] n=%u rip=0x%llx address=0x%llx size=%u "
-                        "activeRip=0x%llx",
+            JitLog("[LSX4_UNMAPPED_STORE] sample=%u instruction_pc=0x%llx target=0x%llx bytes=%u active_pc=0x%llx",
                         n,
                         static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
                                                             ? CurrentPublishedFaultIr()->guest_rip
@@ -34495,25 +34494,23 @@ std::string ExerciseTranslationEngineJson() {
             const bool case_ok = decoded_ok && interpreter_capable && emitted_ok && result_ok &&
                                  differential_state_ok && expected_state_ok && memory_ok;
             if (!case_ok) {
-                JitLog("[EXECUTOR_JIT_PARTIAL_MOVE_SELFTEST_FAIL] "
-                            "bytes=%s vex=%d high=%d store=%d decoded=%d insns=%zu "
-                            "canRef=%d entry=%d direct=%d refResult=0x%llx nativeResult=0x%llx "
-                            "end=0x%llx diffState=%d expectedState=%d memory=%d "
-                            "refStored=0x%llx nativeStored=0x%llx expectedStored=0x%llx",
-                            HexBytesAt(reinterpret_cast<std::uint64_t>(bytes.data()),
-                                       bytes.size()).c_str(),
-                            vex_form ? 1 : 0, high_qword ? 1 : 0, store_form ? 1 : 0,
-                            decoded_ok ? 1 : 0, decoded.instructions.size(),
-                            interpreter_capable ? 1 : 0, native_entry != nullptr ? 1 : 0,
-                            native_direct != nullptr ? 1 : 0,
-                            static_cast<unsigned long long>(interpreter_result),
-                            static_cast<unsigned long long>(native_result),
-                            static_cast<unsigned long long>(decoded.end_rip),
-                            differential_state_ok ? 1 : 0, expected_state_ok ? 1 : 0,
-                            memory_ok ? 1 : 0,
-                            static_cast<unsigned long long>(interpreter_stored),
-                            static_cast<unsigned long long>(native_stored),
-                            static_cast<unsigned long long>(expected_stored));
+                JitLog("[LSX4_TEST_PARTIAL_MOVE] image=%s encoding=%s lane=%s direction=%s decoded=%d operations=%zu semantic=%d entry=%d direct=%d",
+                       HexBytesAt(reinterpret_cast<std::uint64_t>(bytes.data()),
+                                  bytes.size()).c_str(),
+                       vex_form ? "vex" : "legacy", high_qword ? "high" : "low",
+                       store_form ? "store" : "load", decoded_ok ? 1 : 0,
+                       decoded.instructions.size(), interpreter_capable ? 1 : 0,
+                       native_entry != nullptr ? 1 : 0, native_direct != nullptr ? 1 : 0);
+                JitLog("[LSX4_TEST_PARTIAL_MOVE_OUTCOME] semantic=0x%llx native=0x%llx expected_pc=0x%llx state_equal=%d expected_state=%d memory_equal=%d",
+                       static_cast<unsigned long long>(interpreter_result),
+                       static_cast<unsigned long long>(native_result),
+                       static_cast<unsigned long long>(decoded.end_rip),
+                       differential_state_ok ? 1 : 0, expected_state_ok ? 1 : 0,
+                       memory_ok ? 1 : 0);
+                JitLog("[LSX4_TEST_PARTIAL_MOVE_MEMORY] semantic=0x%llx native=0x%llx expected=0x%llx",
+                       static_cast<unsigned long long>(interpreter_stored),
+                       static_cast<unsigned long long>(native_stored),
+                       static_cast<unsigned long long>(expected_stored));
             }
             return case_ok;
         };
@@ -34613,22 +34610,20 @@ std::string ExerciseTranslationEngineJson() {
             const bool case_ok = base_ok &&
                 validate(native_state, memory, native_result, decoded);
             if (!case_ok) {
-                JitLog("[EXECUTOR_JIT_PACKED_NATIVE_SELFTEST_FAIL] "
-                            "case=%s size=%zu insns=%zu decoded=%d canRef=%d "
-                            "entry=%d direct=%d ref=0x%llx native=0x%llx "
-                            "state=%d memory=%d validate=%d",
-                            label, bytes.size(), decoded.instructions.size(),
-                            decoded.HasDecodeFailure() ? 0 : 1,
-                            CanInterpretRegion(decoded) ? 1 : 0,
-                            native_entry != nullptr ? 1 : 0,
-                            native_direct != nullptr ? 1 : 0,
-                            static_cast<unsigned long long>(interpreter_result),
-                            static_cast<unsigned long long>(native_result),
-                            std::memcmp(&canonical_interpreter, &canonical_native,
-                                        sizeof(LsxMachineImage)) == 0 ? 1 : 0,
-                            interpreter_memory == memory ? 1 : 0,
-                            base_ok && validate(native_state, memory, native_result, decoded)
-                                ? 1 : 0);
+                JitLog("[LSX4_TEST_PACKED] fixture=%s bytes=%zu operations=%zu decoded=%d semantic=%d entry=%d direct=%d",
+                       label, bytes.size(), decoded.instructions.size(),
+                       decoded.HasDecodeFailure() ? 0 : 1,
+                       CanInterpretRegion(decoded) ? 1 : 0,
+                       native_entry != nullptr ? 1 : 0,
+                       native_direct != nullptr ? 1 : 0);
+                JitLog("[LSX4_TEST_PACKED_OUTCOME] semantic=0x%llx native=0x%llx state_equal=%d memory_equal=%d validator=%d",
+                       static_cast<unsigned long long>(interpreter_result),
+                       static_cast<unsigned long long>(native_result),
+                       std::memcmp(&canonical_interpreter, &canonical_native,
+                                   sizeof(LsxMachineImage)) == 0 ? 1 : 0,
+                       interpreter_memory == memory ? 1 : 0,
+                       base_ok && validate(native_state, memory, native_result, decoded)
+                           ? 1 : 0);
             }
             return case_ok;
         };
@@ -34786,26 +34781,24 @@ std::string ExerciseTranslationEngineJson() {
                     (0x1122334400000000ull | initial_r8d) &&
                 native_state.rflags == expected_flags.rflags;
             if (!case_ok) {
-                JitLog("[EXECUTOR_JIT_RGB565_BLEND_NATIVE_SELFTEST_FAIL] "
-                            "case=%s size=%zu insns=%zu decoded=%d canRef=%d "
-                            "entry=%d direct=%d ref=0x%llx native=0x%llx "
-                            "expected=0x%llx state=%d memory=%d word=0x%x expectedWord=0x%x "
-                            "flags=0x%llx expectedFlags=0x%llx",
-                            label, rgb565_blend.size(), decoded.instructions.size(),
-                            decoded.HasDecodeFailure() ? 0 : 1,
-                            CanInterpretRegion(decoded) ? 1 : 0,
-                            native_entry != nullptr ? 1 : 0,
-                            native_direct != nullptr ? 1 : 0,
-                            static_cast<unsigned long long>(interpreter_result),
-                            static_cast<unsigned long long>(native_result),
-                            static_cast<unsigned long long>(expected_result),
-                            std::memcmp(&canonical_interpreter, &canonical_native,
-                                        sizeof(LsxMachineImage)) == 0 ? 1 : 0,
-                            interpreter_memory == memory ? 1 : 0,
-                            static_cast<unsigned>(native_word),
-                            static_cast<unsigned>(expected_word),
-                            static_cast<unsigned long long>(native_state.rflags),
-                            static_cast<unsigned long long>(expected_flags.rflags));
+                JitLog("[LSX4_TEST_RGB565] fixture=%s bytes=%zu operations=%zu decoded=%d semantic=%d entry=%d direct=%d",
+                       label, rgb565_blend.size(), decoded.instructions.size(),
+                       decoded.HasDecodeFailure() ? 0 : 1,
+                       CanInterpretRegion(decoded) ? 1 : 0,
+                       native_entry != nullptr ? 1 : 0,
+                       native_direct != nullptr ? 1 : 0);
+                JitLog("[LSX4_TEST_RGB565_OUTCOME] semantic=0x%llx native=0x%llx expected=0x%llx state_equal=%d memory_equal=%d",
+                       static_cast<unsigned long long>(interpreter_result),
+                       static_cast<unsigned long long>(native_result),
+                       static_cast<unsigned long long>(expected_result),
+                       std::memcmp(&canonical_interpreter, &canonical_native,
+                                   sizeof(LsxMachineImage)) == 0 ? 1 : 0,
+                       interpreter_memory == memory ? 1 : 0);
+                JitLog("[LSX4_TEST_RGB565_STATE] word=0x%x expected_word=0x%x flags=0x%llx expected_flags=0x%llx",
+                       static_cast<unsigned>(native_word),
+                       static_cast<unsigned>(expected_word),
+                       static_cast<unsigned long long>(native_state.rflags),
+                       static_cast<unsigned long long>(expected_flags.rflags));
             }
             return case_ok;
         };
@@ -34958,27 +34951,25 @@ std::string ExerciseTranslationEngineJson() {
                 ReadGuestGpr64(native_state, LsxGpr::Rsi) ==
                     (0x9999999900000000ull | esi);
             if (!case_ok) {
-                JitLog("[EXECUTOR_JIT_RGB565_TABLE_NATIVE_SELFTEST_FAIL] "
-                            "case=%s size=%zu insns=%zu decoded=%d canRef=%d "
-                            "entry=%d direct=%d ref=0x%llx native=0x%llx "
-                            "expected=0x%llx state=%d memory=%d slot=%d "
-                            "word=0x%x eax=0x%llx lookup=0x%x",
-                            label, rgb565_table_blend.size(),
-                            decoded.instructions.size(), decoded.HasDecodeFailure() ? 0 : 1,
-                            CanInterpretRegion(decoded) ? 1 : 0,
-                            native_entry != nullptr ? 1 : 0,
-                            native_direct != nullptr ? 1 : 0,
-                            static_cast<unsigned long long>(interpreter_result),
-                            static_cast<unsigned long long>(native_result),
-                            static_cast<unsigned long long>(expected_result),
-                            std::memcmp(&canonical_interpreter, &canonical_native,
-                                        sizeof(LsxMachineImage)) == 0 ? 1 : 0,
-                            interpreter_memory == memory ? 1 : 0,
-                            fault_slot_retired ? 1 : 0,
-                            static_cast<unsigned>(stored_word),
-                            static_cast<unsigned long long>(
-                                ReadGuestGpr64(native_state, LsxGpr::Rax)),
-                            static_cast<unsigned>(effective_lookup));
+                JitLog("[LSX4_TEST_RGB565_TABLE] fixture=%s bytes=%zu operations=%zu decoded=%d semantic=%d entry=%d direct=%d",
+                       label, rgb565_table_blend.size(), decoded.instructions.size(),
+                       decoded.HasDecodeFailure() ? 0 : 1,
+                       CanInterpretRegion(decoded) ? 1 : 0,
+                       native_entry != nullptr ? 1 : 0,
+                       native_direct != nullptr ? 1 : 0);
+                JitLog("[LSX4_TEST_RGB565_TABLE_OUTCOME] semantic=0x%llx native=0x%llx expected=0x%llx state_equal=%d memory_equal=%d slot_retired=%d",
+                       static_cast<unsigned long long>(interpreter_result),
+                       static_cast<unsigned long long>(native_result),
+                       static_cast<unsigned long long>(expected_result),
+                       std::memcmp(&canonical_interpreter, &canonical_native,
+                                   sizeof(LsxMachineImage)) == 0 ? 1 : 0,
+                       interpreter_memory == memory ? 1 : 0,
+                       fault_slot_retired ? 1 : 0);
+                JitLog("[LSX4_TEST_RGB565_TABLE_STATE] word=0x%x accumulator=0x%llx lookup=0x%x",
+                       static_cast<unsigned>(stored_word),
+                       static_cast<unsigned long long>(
+                           ReadGuestGpr64(native_state, LsxGpr::Rax)),
+                       static_cast<unsigned>(effective_lookup));
             }
             return case_ok;
         };
