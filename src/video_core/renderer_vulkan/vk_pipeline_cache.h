@@ -321,12 +321,11 @@ private:
     };
     static constexpr size_t MaxShaderIdentityEntriesPerSubmit = 4096;
     static constexpr size_t ShaderIdentityInvalidationHistorySize = 4096;
-    // Android precise readback can protect a shader page after the GPU aliases it. Re-running
-    // SearchBinaryInfo for every draw then faults, downloads and waits even though the same program
-    // was already identified earlier in this guest submit. This cache stores metadata only; every
-    // lookup still receives the current register user_data and must prove the complete code span is
-    // GPU-clean with an unchanged readback generation. CPU invalidation and submit boundaries
-    // invalidate entries under this mutex.
+    // SearchBinaryInfo scans as much as 64 KiB. Cache the identity of the CPU-visible backing bytes;
+    // GPU-dirty ownership is not itself a backing mutation. CPU writes/unmaps and exact GPU->CPU
+    // publications erase overlapping entries, while every lookup still receives current register
+    // user_data. This avoids repeatedly scanning an unchanged shader merely because a conservative
+    // writable descriptor overlaps its allocation.
     bool shader_identity_cache_enabled{};
     // Aggressive opt-in for titles which keep shader binaries immutable after their first
     // successful scan. CPU writes still erase overlapping entries. Conservative GPU writable

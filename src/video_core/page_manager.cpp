@@ -76,14 +76,17 @@ constexpr size_t PAGE_BITS = 12;
 
 struct PageManager::Impl {
     struct PageState {
-        // Keep PageState at one byte. Buffer-cache ranges still do not overlap, but Android's
-        // deferred EOP path may temporarily add one independent CPU-read watcher to the same page.
-        u8 num_write_watchers : 6;
+        // Keep PageState at one byte: this table has one entry for every 4-KB page in the 40-bit
+        // guest address space. Buffer-cache ranges do not overlap, so five ordinary write-watcher
+        // bits leave ample headroom while reserving one bit for the idempotent WAIT_REG_MEM event.
+        u8 num_write_watchers : 5;
         u8 num_read_watchers : 2;
+        u8 memory_wait_write_watcher : 1;
 
         Core::MemoryPermission WritePerm() const noexcept {
-            return num_write_watchers == 0 ? Core::MemoryPermission::Write
-                                           : Core::MemoryPermission::None;
+            return num_write_watchers == 0 && memory_wait_write_watcher == 0
+                       ? Core::MemoryPermission::Write
+                       : Core::MemoryPermission::None;
         }
 
         Core::MemoryPermission ReadPerm() const noexcept {
@@ -108,6 +111,7 @@ struct PageManager::Impl {
                 }
             } else {
                 if constexpr (delta == 1) {
+                    ASSERT_MSG(num_write_watchers < 31, "Too many write watchers");
                     return ++num_write_watchers;
                 } else if (delta == -1) {
                     ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
@@ -118,6 +122,8 @@ struct PageManager::Impl {
             }
         }
     };
+    static_assert(sizeof(PageState) == 1,
+                  "The 40-bit page-state table must remain byte-packed");
 
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PAGE_BITS);
@@ -209,7 +215,10 @@ struct PageManager::Impl {
 
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
-            rasterizer->InvalidateMemory(addr, 1);
+            const bool wait_event = rasterizer->ConsumeMemoryWaitWriteFault(addr);
+            const bool invalidated = rasterizer->InvalidateMemory(addr, 1);
+            ASSERT_MSG(wait_event || invalidated,
+                       "Unhandled userfaultfd write protection at {:#x}", addr);
         }
     }
 
@@ -272,8 +281,10 @@ struct PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const bool is_write = Common::IsWriteError(context);
-        const bool handled = is_write ? rasterizer->InvalidateMemory(addr, 8)
-                                      : rasterizer->ReadMemory(addr, 8);
+        const bool wait_event = is_write && rasterizer->ConsumeMemoryWaitWriteFault(addr);
+        const bool cache_event = is_write ? rasterizer->InvalidateMemory(addr, 8)
+                                          : rasterizer->ReadMemory(addr, 8);
+        const bool handled = wait_event || cache_event;
 #ifdef __ANDROID__
         if (ExecutorReadbackContractTraceEnabled()) {
             const u64 ordinal =
@@ -442,6 +453,52 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    template <bool track>
+    void UpdateMemoryWaitWriteWatchers(VAddr addr, u64 size) {
+        if (size == 0 || addr >= (u64{1} << ADDRESS_BITS) ||
+            size > (u64{1} << ADDRESS_BITS) - addr) {
+            return;
+        }
+        size_t page = addr >> PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PAGE_SIZE);
+        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
+        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard lk(lock_start, lock_end);
+
+        for (; page != page_end; ++page) {
+            PageState& state = cached_pages[page];
+            const auto old_perms = state.Perms();
+            const u8 desired = track ? 1u : 0u;
+            if (state.memory_wait_write_watcher == desired) {
+                continue;
+            }
+            state.memory_wait_write_watcher = desired;
+            const auto new_perms = state.Perms();
+            if (new_perms != old_perms) {
+                Protect(static_cast<VAddr>(page) << PAGE_BITS, PAGE_SIZE, new_perms);
+            }
+        }
+    }
+
+    bool ConsumeMemoryWaitWriteFault(VAddr addr) {
+        if (addr >= (u64{1} << ADDRESS_BITS)) {
+            return false;
+        }
+        const size_t page = addr >> PAGE_BITS;
+        std::scoped_lock lk{locks[page / PAGES_PER_LOCK]};
+        PageState& state = cached_pages[page];
+        if (state.memory_wait_write_watcher == 0) {
+            return false;
+        }
+        const auto old_perms = state.Perms();
+        state.memory_wait_write_watcher = 0;
+        const auto new_perms = state.Perms();
+        if (new_perms != old_perms) {
+            Protect(static_cast<VAddr>(page) << PAGE_BITS, PAGE_SIZE, new_perms);
+        }
+        return true;
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef __ANDROID__
     // Match the desktop adaptive-mutex behavior on bionic. The previous Android-only SpinLock
@@ -475,6 +532,18 @@ void PageManager::TrackPendingCompletionRead(VAddr addr, u64 size) const {
 
 void PageManager::UntrackPendingCompletionRead(VAddr addr, u64 size) const {
     impl->UpdatePageWatchers<false, true>(addr, size);
+}
+
+void PageManager::TrackMemoryWaitWrite(VAddr addr, u64 size) const {
+    impl->UpdateMemoryWaitWriteWatchers<true>(addr, size);
+}
+
+void PageManager::UntrackMemoryWaitWrite(VAddr addr, u64 size) const {
+    impl->UpdateMemoryWaitWriteWatchers<false>(addr, size);
+}
+
+bool PageManager::ConsumeMemoryWaitWriteFault(VAddr addr) const {
+    return impl->ConsumeMemoryWaitWriteFault(addr);
 }
 
 template <bool track>

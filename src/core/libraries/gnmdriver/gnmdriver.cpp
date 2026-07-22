@@ -4218,7 +4218,12 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     // Guest-RIP pulse for the Unity/Game/mono threads: SubmitDone is the one reliable heartbeat
     // through the whole boot (Thread3 calls it every few seconds even while everything else is
     // stalled), so this exposes the poll sites of a mutual polling standoff with no contention.
-    if (executor_live_dump_unity_thread_rips && submit_done_call >= 12 &&
+    // Stack/RIP inspection is diagnostic-only.  In particular, mincore() cannot distinguish a
+    // readable guest-stack page from a mapped PROT_NONE guard page, so enabling this sampler in an
+    // ordinary run can fault while scanning a live guest stack.  Never run it merely because the
+    // title reached its twelfth SubmitDone; require the explicit trace switch.
+    if (std::getenv("EXECUTOR_TRACE_LIVE_THREAD_RIPS") != nullptr &&
+        submit_done_call >= 12 &&
         submit_done_call <= 24 && (submit_done_call % 4) == 0 &&
         g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0) {
         executor_live_dump_unity_thread_rips("submitdone", static_cast<int>(submit_done_call));

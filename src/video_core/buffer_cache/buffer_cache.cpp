@@ -273,6 +273,36 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
         return;
     }
 
+    // Low-rate production telemetry: deciding whether to widen the wave or move publication to
+    // an asynchronous ticket requires the actual dirty-byte density. Logging every fault would
+    // itself perturb the signal-heavy path, so aggregate one report per 256 completed plans.
+    static u64 wave_plan_samples{};
+    static u64 wave_plan_bytes{};
+    static u64 wave_plan_copies{};
+    static u64 wave_plan_max_bytes{};
+    static u64 wave_plan_max_copies{};
+    ++wave_plan_samples;
+    wave_plan_bytes += total_size_bytes;
+    wave_plan_copies += copies.size();
+    wave_plan_max_bytes = std::max(wave_plan_max_bytes, total_size_bytes);
+    wave_plan_max_copies = std::max<u64>(wave_plan_max_copies, copies.size());
+    if ((wave_plan_samples & 255u) == 0u) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_READBACK_WAVE_PLAN] samples=256 totalMiB=%.3f avgKiB=%.3f "
+            "maxMiB=%.3f copies=%llu avgCopies=%.3f maxCopies=%llu",
+            static_cast<double>(wave_plan_bytes) / static_cast<double>(1_MB),
+            static_cast<double>(wave_plan_bytes) / (256.0 * 1024.0),
+            static_cast<double>(wave_plan_max_bytes) / static_cast<double>(1_MB),
+            static_cast<unsigned long long>(wave_plan_copies),
+            static_cast<double>(wave_plan_copies) / 256.0,
+            static_cast<unsigned long long>(wave_plan_max_copies));
+        wave_plan_bytes = 0;
+        wave_plan_copies = 0;
+        wave_plan_max_bytes = 0;
+        wave_plan_max_copies = 0;
+    }
+
     const auto [download, base_offset] = download_buffer.Map(total_size_bytes);
     if (download == nullptr) {
         // Stream-buffer exhaustion is exceptional; preserve correctness with the proven exact

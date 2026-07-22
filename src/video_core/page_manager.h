@@ -41,6 +41,13 @@ public:
     void TrackPendingCompletionRead(VAddr addr, u64 size) const;
     void UntrackPendingCompletionRead(VAddr addr, u64 size) const;
 
+    /// Arm an idempotent, one-shot CPU-write event for a WAIT_REG_MEM page. The write-fault
+    /// handler consumes the event before retrying the guest instruction, so direct JIT stores can
+    /// wake the GPU command processor without periodic polling or a helper on every guest store.
+    void TrackMemoryWaitWrite(VAddr addr, u64 size) const;
+    void UntrackMemoryWaitWrite(VAddr addr, u64 size) const;
+    [[nodiscard]] bool ConsumeMemoryWaitWriteFault(VAddr addr) const;
+
     /// Updates watches in the pages touching the specified region using a mask.
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;

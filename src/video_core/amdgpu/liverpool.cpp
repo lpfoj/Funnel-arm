@@ -159,14 +159,11 @@ bool ExecutorBoundedRasterizerPipeline() {
 }
 
 bool ExecutorEopWaitBatchingV2() {
-    static const bool enabled = ExecutorEnvFlag("EXECUTOR_EOP_WAIT_BATCHING_V2");
-    return enabled;
-}
-
-bool ExecutorGpuWaitEventDriven() {
-    // Enabled by default because the fallback remains a bounded predicate recheck, not a semantic
-    // shortcut. The opt-out restores the former yield/poll loop for compatibility bisection.
-    static const bool enabled = !ExecutorEnvFlag("EXECUTOR_DISABLE_GPU_WAIT_EVENT_DRIVEN");
+    // Completion batching is the production contract. Requiring a positive launcher marker left
+    // Android silently running the legacy empty-queue flush path and produced more host submits
+    // than guest submits. Retain only an explicit compatibility opt-out.
+    static const bool enabled =
+        !ExecutorEnvFlag("EXECUTOR_DISABLE_EOP_WAIT_BATCHING_V2");
     return enabled;
 }
 
@@ -1244,8 +1241,10 @@ u64 Liverpool::ConsumeCompletionWaitForExecutor(const Pm4SubmissionStatePtr& sta
     return dependency_tick;
 }
 
-bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(const PM4CmdWaitRegMem& wait,
-                                                           u32& value) {
+bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(
+    const PM4CmdWaitRegMem& wait, u32& value, const bool may_defer_gpu_publication,
+    bool& gpu_publication_deferred) {
+    gpu_publication_deferred = false;
     if (rasterizer == nullptr || IsRendererTerminal() ||
         wait.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
         return false;
@@ -1261,10 +1260,18 @@ bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(const PM4CmdWaitRegMem
     // it on the same guest queue.
     //
     const bool gpu_modified = rasterizer->IsMemoryGpuModified(address, sizeof(value));
-    // Logical EOP->WAIT pairs have already returned from ConsumeCompletionWaitForExecutor above, so
-    // this is the correctness boundary for the remaining genuine dependencies. Publish the work
-    // before parking the guest queue. The queue is woken only after its exact memory predicate passes.
-    FlushGpuCompletionBatchForExecutor(true, true);
+    // A GPU-dirty target needs an immediate readback. For an ordinary CPU-backed semaphore, defer
+    // publication until every runnable queue front is parked. That lets other guest queues produce
+    // the value first and collapses N independent WAIT boundaries into one Vulkan submission. The
+    // deferred mask is consumed before the executor sleeps, so an incompletely tracked GPU producer
+    // is still published and the exact predicate remains the only condition which wakes the queue.
+    if (gpu_modified || !may_defer_gpu_publication) {
+        FlushGpuCompletionBatchForExecutor(true, true);
+    } else {
+        auto& scheduler = rasterizer->GetScheduler();
+        gpu_publication_deferred =
+            executor_completion_flush_pending || scheduler.HasPendingWork();
+    }
     if (gpu_modified) {
         rasterizer->ReadMemory(address, sizeof(value));
     }
@@ -1561,6 +1568,9 @@ Liverpool::~Liverpool() {
     process_thread.request_stop();
     submit_cv.notify_all();
     process_thread.join();
+#ifdef __ANDROID__
+    ClearParkedMemoryWaitsForExecutor();
+#endif
 }
 
 bool Liverpool::IsRendererTerminal() const noexcept {
@@ -1596,6 +1606,16 @@ void Liverpool::FlushGpuCompletionBatchForExecutor(bool force, bool synchronizat
     }
     if (synchronization_wait && executor_completion_flush_pending) {
         ++executor_metrics_wait_flushes;
+    }
+    auto& scheduler = rasterizer->GetScheduler();
+    if (synchronization_wait && scheduler.HasPendingWork()) {
+        // A generic shader/DMA producer may not own an EOP callback. Attach one event to the
+        // timeline value about to be submitted so a parked WAIT is reconsidered at retirement;
+        // no timer is required even for incompletely classified producers.
+        const u64 publication_tick = scheduler.CurrentTick();
+        scheduler.DeferPriorityOperationAt(
+            publication_tick,
+            [this] { NotifyMemoryPublicationForExecutor(0, 1); });
     }
     rasterizer->Flush();
     executor_completion_flush_pending = false;
@@ -1707,23 +1727,66 @@ bool Liverpool::PublishSubmit(u32 qid, Task::Handle handle, u32* published_submi
 
 #ifdef __ANDROID__
 void Liverpool::ParkMemoryWaitForExecutor(const u32 queue_id,
-                                          const PM4CmdWaitRegMem& wait) {
+                                          const PM4CmdWaitRegMem& wait,
+                                          const bool gpu_publication_deferred) {
     ASSERT(queue_id < NumTotalQueues);
     auto& parked = executor_parked_memory_waits[queue_id];
+    const VAddr address = reinterpret_cast<VAddr>(wait.Address<const u32*>());
+    if (parked.active && parked.address != address) {
+        ReleaseParkedMemoryWaitForExecutor(queue_id);
+    }
     if (!parked.active) {
         ++executor_parked_wait_count;
     }
-    parked.address = reinterpret_cast<VAddr>(wait.Address<const u32*>());
+    // Arm protection before publishing the parked state. A direct CPU/JIT store either faults and
+    // emits an event, or happened before protection and is observed by the mandatory recheck
+    // requested below. This closes both sides of the lost-wake window.
+    if (rasterizer != nullptr) {
+        rasterizer->TrackMemoryWaitWrite(address, sizeof(u32));
+    }
+    parked.address = address;
     parked.function = static_cast<u32>(wait.function.Value());
     parked.reference = wait.ref;
     parked.mask = wait.mask;
     parked.active = true;
     const u64 queue_bit = u64{1} << queue_id;
     executor_parked_memory_wait_mask |= queue_bit;
+    if (gpu_publication_deferred) {
+        executor_deferred_wait_flush_mask |= queue_bit;
+    }
     // A producer may append another submit while the current front task is parked. It can set this
     // bit again, but Process always intersects the published mask with the consumer-owned blocked
     // mask, so strict in-queue ordering is retained until this exact predicate becomes true.
     submit_ready_mask.fetch_and(~queue_bit, std::memory_order_acq_rel);
+    NotifyMemoryPublicationForExecutor(address, sizeof(u32));
+}
+
+void Liverpool::ReleaseParkedMemoryWaitForExecutor(const u32 queue_id) {
+    ASSERT(queue_id < NumTotalQueues);
+    auto& parked = executor_parked_memory_waits[queue_id];
+    const VAddr released_page = Common::AlignDown(parked.address, 4_KB);
+    parked.active = false;
+    const u64 queue_bit = u64{1} << queue_id;
+    executor_parked_memory_wait_mask &= ~queue_bit;
+    executor_deferred_wait_flush_mask &= ~queue_bit;
+
+    const bool page_still_waited = std::ranges::any_of(
+        executor_parked_memory_waits, [released_page](const ExecutorParkedMemoryWait& other) {
+            return other.active && Common::AlignDown(other.address, 4_KB) == released_page;
+        });
+    if (!page_still_waited && rasterizer != nullptr && released_page != 0) {
+        rasterizer->UntrackMemoryWaitWrite(released_page, 4_KB);
+    }
+}
+
+void Liverpool::ClearParkedMemoryWaitsForExecutor() {
+    for (u32 queue_id = 0; queue_id < NumTotalQueues; ++queue_id) {
+        if (executor_parked_memory_waits[queue_id].active) {
+            ReleaseParkedMemoryWaitForExecutor(queue_id);
+        }
+    }
+    executor_parked_memory_wait_mask = 0;
+    executor_deferred_wait_flush_mask = 0;
 }
 
 void Liverpool::RefreshParkedMemoryWaitsForExecutor() {
@@ -1739,7 +1802,14 @@ void Liverpool::RefreshParkedMemoryWaitsForExecutor() {
         auto& parked = executor_parked_memory_waits[queue_id];
         if (!parked.active) {
             executor_parked_memory_wait_mask &= ~queue_bit;
+            executor_deferred_wait_flush_mask &= ~queue_bit;
             continue;
+        }
+        // The previous CPU write consumed this page's one-shot protection. Rearm it before reading
+        // the predicate: a writer can no longer change the value between this read and the sleep
+        // without producing another generation event.
+        if (rasterizer != nullptr) {
+            rasterizer->TrackMemoryWaitWrite(parked.address, sizeof(u32));
         }
         const u32 value = ExecutorReadMappedWaitValueFast(
             reinterpret_cast<const u64*>(parked.address));
@@ -1768,8 +1838,7 @@ void Liverpool::RefreshParkedMemoryWaitsForExecutor() {
         if (!satisfied) {
             continue;
         }
-        parked.active = false;
-        executor_parked_memory_wait_mask &= ~queue_bit;
+        ReleaseParkedMemoryWaitForExecutor(queue_id);
         submit_ready_mask.fetch_or(queue_bit, std::memory_order_release);
         ++executor_parked_wait_wake_count;
     }
@@ -1826,6 +1895,8 @@ void Liverpool::Process(std::stop_token stoken) {
     // only the hot inner round-robin loop is amortized. At most 63 queue steps are discarded after
     // another thread publishes a terminal device, which is far below one guest submission.
     u32 terminal_poll_counter = 0;
+    u64 processed_wait_generation =
+        executor_wait_event_generation.load(std::memory_order_acquire);
 #endif
 
     while (!stoken.stop_requested()) {
@@ -1892,8 +1963,11 @@ void Liverpool::Process(std::stop_token stoken) {
                 break;
             }
 #ifdef __ANDROID__
+            const u64 current_wait_generation =
+                executor_wait_event_generation.load(std::memory_order_acquire);
             if (executor_parked_memory_wait_mask != 0 &&
-                ((executor_parked_wait_poll_counter++ & 7u) == 0u)) {
+                current_wait_generation != processed_wait_generation) {
+                processed_wait_generation = current_wait_generation;
                 RefreshParkedMemoryWaitsForExecutor();
             }
 #endif
@@ -1927,10 +2001,7 @@ void Liverpool::Process(std::stop_token stoken) {
                     submit_ready_mask.store(0, std::memory_order_release);
 #ifdef __ANDROID__
                     executor_completion_flush_pending = false;
-                    executor_parked_memory_wait_mask = 0;
-                    for (auto& parked : executor_parked_memory_waits) {
-                        parked.active = false;
-                    }
+                    ClearParkedMemoryWaitsForExecutor();
 #endif
                     submit_done = false;
                     submit_cv.notify_all();
@@ -1952,44 +2023,39 @@ void Liverpool::Process(std::stop_token stoken) {
                 if (executor_parked_memory_wait_mask != 0) {
                     const u64 observed_wait_generation =
                         executor_wait_event_generation.load(std::memory_order_acquire);
+                    if (executor_deferred_wait_flush_mask != 0) {
+                        // No queue can currently advance. Publish every untracked dependency which
+                        // accumulated during this scheduling pass with one host submission.
+                        executor_deferred_wait_flush_mask = 0;
+                        FlushGpuCompletionBatchForExecutor(true, true);
+                    }
                     RefreshParkedMemoryWaitsForExecutor();
                     ready_mask = submit_ready_mask.load(std::memory_order_acquire) &
                                  valid_queue_mask & ~executor_parked_memory_wait_mask;
                     if (ready_mask == 0) {
-                        if (ExecutorGpuWaitEventDriven()) {
-                            // Every runnable queue front is blocked on a memory predicate. Sleep
-                            // until a known publisher advances the generation, while retaining a
-                            // short timeout for ordinary guest CPU stores that bypass GPU tracking.
-                            // Capturing the generation before the predicate scan closes the lost-
-                            // wake window: publication either changes the sampled value or is seen
-                            // by RefreshParkedMemoryWaitsForExecutor above.
-                            constexpr auto RecheckBound = std::chrono::microseconds{250};
-                            const auto sleep_begin = std::chrono::steady_clock::now();
-                            std::unique_lock wait_lock{submit_mutex};
-                            const bool event_wake = submit_cv.wait_for(
-                                wait_lock, RecheckBound, [this, observed_wait_generation] {
-                                    return executor_wait_event_generation.load(
-                                               std::memory_order_acquire) !=
-                                               observed_wait_generation ||
-                                           num_commands.load(std::memory_order_acquire) != 0 ||
-                                           (submit_ready_mask.load(std::memory_order_acquire) &
-                                            ~executor_parked_memory_wait_mask) != 0 ||
-                                           IsRendererTerminal();
-                                });
-                            const u64 sleep_ns = static_cast<u64>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - sleep_begin)
-                                    .count());
-                            ++executor_parked_event_sleep_count;
-                            executor_parked_event_sleep_ns += sleep_ns;
-                            if (event_wake) {
-                                ++executor_parked_event_wake_count;
-                            } else {
-                                ++executor_parked_event_timeout_count;
-                            }
-                        } else {
-                            std::this_thread::yield();
-                        }
+                        // Every runnable queue front is blocked. CPU/JIT writes are now observed by
+                        // one-shot page protection, GPU completion by retirement callbacks, and
+                        // queue/command publication by this same condition variable. There is no
+                        // periodic fallback: wake only for a real state transition.
+                        const auto sleep_begin = std::chrono::steady_clock::now();
+                        std::unique_lock wait_lock{submit_mutex};
+                        submit_cv.wait(wait_lock, [this, observed_wait_generation, &stoken] {
+                            return stoken.stop_requested() ||
+                                   executor_wait_event_generation.load(
+                                       std::memory_order_acquire) !=
+                                       observed_wait_generation ||
+                                   num_commands.load(std::memory_order_acquire) != 0 ||
+                                   (submit_ready_mask.load(std::memory_order_acquire) &
+                                    ~executor_parked_memory_wait_mask) != 0 ||
+                                   IsRendererTerminal();
+                        });
+                        const u64 sleep_ns = static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - sleep_begin)
+                                .count());
+                        ++executor_parked_event_sleep_count;
+                        executor_parked_event_sleep_ns += sleep_ns;
+                        ++executor_parked_event_wake_count;
                         continue;
                     }
                 }
@@ -2088,8 +2154,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
                 active_tasks[curr_qid] = {};
 #ifdef __ANDROID__
-                executor_parked_memory_waits[curr_qid].active = false;
-                executor_parked_memory_wait_mask &= ~(u64{1} << curr_qid);
+                ReleaseParkedMemoryWaitForExecutor(curr_qid);
 #endif
                 task.destroy();
 #ifdef __ANDROID__
@@ -3899,6 +3964,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const bool untracked_wait_pending =
                     !TestWaitRegMemValue(*wait_reg_mem, wait_value);
+                bool untracked_gpu_publication_deferred = false;
+                const bool untracked_gpu_publication_managed =
+                    untracked_wait_pending &&
+                    std::strcmp(wait_source, "memory_backing") == 0;
                 const auto untracked_wait_start =
                     untracked_wait_pending ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
@@ -3915,11 +3984,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                 };
                 if (untracked_wait_pending &&
-                    SynchronizeUntrackedMemoryWaitForExecutor(*wait_reg_mem, wait_value)) {
+                    SynchronizeUntrackedMemoryWaitForExecutor(
+                        *wait_reg_mem, wait_value,
+                        std::strcmp(wait_source, "memory_backing") == 0,
+                        untracked_gpu_publication_deferred)) {
                     ++executor_logical_wait_count;
                     break;
                 }
                 const bool completion_wait_stall =
+                    !untracked_gpu_publication_managed &&
                     executor_completion_flush_pending &&
                     !TestWaitRegMemValue(*wait_reg_mem, wait_value);
                 const auto completion_wait_start =
@@ -3940,7 +4013,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     executor_completion_wait_stall_max_ns =
                         std::max(executor_completion_wait_stall_max_ns, elapsed_ns);
                 };
-                if (executor_completion_flush_pending &&
+                if (!untracked_gpu_publication_managed &&
+                    executor_completion_flush_pending &&
                     !TestWaitRegMemValue(*wait_reg_mem, wait_value)) {
                     FlushGpuCompletionBatchForExecutor(false, true);
                 }
@@ -4005,7 +4079,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
 #endif
 #ifdef __ANDROID__
-                        ParkMemoryWaitForExecutor(GfxQueueId, *wait_reg_mem);
+                        ParkMemoryWaitForExecutor(GfxQueueId, *wait_reg_mem,
+                                                  untracked_gpu_publication_deferred);
 #endif
                         YIELD_GFX();
                         wait_value = ExecutorReadMappedWaitValueFast(wait_addr);
@@ -4726,6 +4801,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                 }
                 const bool untracked_wait_pending =
                     !TestWaitRegMemValue(*wait_reg_mem, current_value);
+                bool untracked_gpu_publication_deferred = false;
                 const auto untracked_wait_start =
                     untracked_wait_pending ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
@@ -4742,12 +4818,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                     }
                 };
                 if (untracked_wait_pending &&
-                    SynchronizeUntrackedMemoryWaitForExecutor(*wait_reg_mem, current_value)) {
+                    SynchronizeUntrackedMemoryWaitForExecutor(
+                        *wait_reg_mem, current_value,
+                        wait_reg_mem->mem_space.Value() ==
+                            PM4CmdWaitRegMem::MemSpace::Memory,
+                        untracked_gpu_publication_deferred)) {
                     ++executor_logical_wait_count;
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array) && !state->abort) {
-                    ParkMemoryWaitForExecutor(vqid + 1, *wait_reg_mem);
+                    ParkMemoryWaitForExecutor(vqid + 1, *wait_reg_mem,
+                                              untracked_gpu_publication_deferred);
                     YIELD_ASC(vqid);
                 }
                 break;

@@ -65,6 +65,9 @@ public:
     bool ReadMemory(VAddr addr, u64 size);
     void TrackPendingCompletionRead(VAddr addr, u64 size);
     void UntrackPendingCompletionRead(VAddr addr, u64 size);
+    void TrackMemoryWaitWrite(VAddr addr, u64 size);
+    void UntrackMemoryWaitWrite(VAddr addr, u64 size);
+    [[nodiscard]] bool ConsumeMemoryWaitWriteFault(VAddr addr);
     bool IsMemoryGpuModified(VAddr addr, u64 size);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);

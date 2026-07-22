@@ -5,9 +5,10 @@
         android:icon="@drawable/lsx4_launcher_icon"
         android:roundIcon="@drawable/lsx4_launcher_icon"
         android:localeConfig="@xml/locales_config"
+        android:appCategory="game"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
-        android:gwpAsanMode="always"
+        android:gwpAsanMode="never"
         android:resizeableActivity="false">
         <activity
             android:name="app.lsx4.android.MainActivity"

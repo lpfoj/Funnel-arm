@@ -172,11 +172,22 @@ struct Info : InfoPersistent {
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
-        T data;
+        T data{};
         const u32* base = user_data.data();
         if (ptr_index != IR::NumScalarRegs) {
+            constexpr u32 PointerDwords = sizeof(std::uintptr_t) / sizeof(u32);
+            if (ptr_index > user_data.size() ||
+                PointerDwords > user_data.size() - ptr_index) {
+                return data;
+            }
             std::memcpy(&base, &user_data[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+            // An unbound descriptor-table pointer is a valid transient GPU state while command
+            // buffers rewrite shader user data.  Callers already treat an all-zero sharp as
+            // absent; avoid dereferencing page zero before that check can run.
+            if (base == nullptr) {
+                return data;
+            }
             // PC-writer capture: the descriptor table this pointer references lives in guest memory
             // that no resource hook records. Capture the bytes actually read so replay can rebase the
             // user_data pointer AND patch the V#/T# bases inside the copied table. usage=6 (ud-table).
@@ -184,6 +195,12 @@ struct Info : InfoPersistent {
                 const u64 tbl_base = reinterpret_cast<u64>(base);
                 const u64 read_size = static_cast<u64>(dword_offset) * 4u + sizeof(T);
                 Libraries::GnmDriver::ExecutorGnmCaptureRecordResource(6u, tbl_base, read_size);
+            }
+        } else {
+            constexpr u32 DataDwords = (sizeof(T) + sizeof(u32) - 1) / sizeof(u32);
+            if (dword_offset > user_data.size() ||
+                DataDwords > user_data.size() - dword_offset) {
+                return data;
             }
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));

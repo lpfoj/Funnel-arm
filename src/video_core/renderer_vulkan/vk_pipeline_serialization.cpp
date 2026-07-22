@@ -424,7 +424,15 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().FinishPreload();
 #ifdef __ANDROID__
     if (!deferred_pipeline_blobs.empty()) {
-        StartBackgroundWarmUp(std::move(deferred_pipeline_blobs));
+        // LoadDiskResources runs on the title's launch path. Starting the deferred worker here
+        // makes it wake during gameplay after its grace period, where vkCreate*Pipelines consumes
+        // a full CPU core and contends with foreground submissions inside the Adreno driver.
+        // Pipelines remain available through the normal on-demand path and are persisted for the
+        // next launch; only speculative compilation while a title is running is suppressed.
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_PIPELINE_WARMUP_DEFERRED] skipped=%zu reason=live_title_android",
+            deferred_pipeline_blobs.size());
     }
 #endif
 }

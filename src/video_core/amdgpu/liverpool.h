@@ -360,8 +360,12 @@ private:
         const Pm4SubmissionStatePtr& state, Pm4Engine engine,
         const PM4CmdWaitRegMem& wait);
     [[nodiscard]] bool SynchronizeUntrackedMemoryWaitForExecutor(
-        const PM4CmdWaitRegMem& wait, u32& value);
-    void ParkMemoryWaitForExecutor(u32 queue_id, const PM4CmdWaitRegMem& wait);
+        const PM4CmdWaitRegMem& wait, u32& value, bool may_defer_gpu_publication,
+        bool& gpu_publication_deferred);
+    void ParkMemoryWaitForExecutor(u32 queue_id, const PM4CmdWaitRegMem& wait,
+                                  bool gpu_publication_deferred);
+    void ReleaseParkedMemoryWaitForExecutor(u32 queue_id);
+    void ClearParkedMemoryWaitsForExecutor();
     void RefreshParkedMemoryWaitsForExecutor();
 #endif
     void SnapshotCpuIndirectGraph(Pm4Engine engine, std::span<const u32> stream,
@@ -493,6 +497,10 @@ private:
     // Owned exclusively by the Liverpool consumer thread. Producers continue to publish queue
     // nodes through submit_ready_mask; a parked front task keeps its queue out of that ready set.
     u64 executor_parked_memory_wait_mask{};
+    // A bit means that the queue reached an ordinary memory WAIT while Vulkan work was still
+    // recording. The consumer publishes all such dependencies once, when no runnable queue can
+    // make further progress, instead of submitting once for every queue encountered in the pass.
+    u64 executor_deferred_wait_flush_mask{};
     u32 executor_parked_wait_poll_counter{};
 #endif
 

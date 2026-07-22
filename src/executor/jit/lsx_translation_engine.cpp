@@ -4089,6 +4089,7 @@ public:
     std::uint64_t RunGuest(const std::uint64_t guest_rip, const LsxEntryPacket& ctx) {
 #ifdef __ANDROID__
         bool start_persistent_native_prewarm = false;
+        bool wait_for_persistent_native_prewarm = false;
         {
             // Cache configuration precedes guest-VA mapping, so byte-validated native prewarm is
             // deferred to the first RunGuest entry. At this point the module is mapped but no
@@ -4096,13 +4097,23 @@ public:
             std::lock_guard lock{block_cache_mutex_};
             if (persistent_native_prewarm_pending_) {
                 persistent_native_prewarm_pending_ = false;
+                persistent_native_prewarm_active_.store(true, std::memory_order_release);
                 start_persistent_native_prewarm = true;
+            } else {
+                wait_for_persistent_native_prewarm =
+                    persistent_native_prewarm_active_.load(std::memory_order_acquire);
             }
         }
-        // The hot prefix is restored synchronously below and publishes under block_cache_mutex_.
-        // Start only after releasing the state-transition lock above.
+        // Exactly one mapped entry restores the complete native working set. Other guest threads
+        // wait on a dedicated startup event instead of racing the publisher through the global
+        // cache-miss lock and redundantly compiling records already present on disk.
         if (start_persistent_native_prewarm) {
             StartPersistentNativePrewarm();
+        } else if (wait_for_persistent_native_prewarm) {
+            std::unique_lock warm_lock{persistent_native_prewarm_mutex_};
+            persistent_native_prewarm_cv_.wait(warm_lock, [this] {
+                return !persistent_native_prewarm_active_.load(std::memory_order_acquire);
+            });
         }
 #endif
         LsxMachineImage state{};
@@ -4621,6 +4632,7 @@ public:
         persistent_ir_cache_.Configure(root_dir, title_id, executable_fingerprint, enabled);
 #ifdef __ANDROID__
         persistent_native_prewarm_pending_ = enabled;
+        persistent_native_prewarm_active_.store(false, std::memory_order_release);
 #endif
     }
 
@@ -4630,6 +4642,19 @@ public:
             persistent_native_prewarm_thread_.request_stop();
             persistent_native_prewarm_thread_.join();
         }
+        if (persistent_native_prewarm_active_.load(std::memory_order_acquire)) {
+            std::unique_lock warm_lock{persistent_native_prewarm_mutex_};
+            persistent_native_prewarm_cv_.wait(warm_lock, [this] {
+                return !persistent_native_prewarm_active_.load(std::memory_order_acquire);
+            });
+        }
+#endif
+    }
+
+    void FinishPersistentNativePrewarm() noexcept {
+#ifdef __ANDROID__
+        persistent_native_prewarm_active_.store(false, std::memory_order_release);
+        persistent_native_prewarm_cv_.notify_all();
 #endif
     }
 
@@ -4644,127 +4669,55 @@ public:
         if (!production_native_mode) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
                         "reason=diagnostic_or_interpreter_mode");
+            FinishPersistentNativePrewarm();
             return;
         }
 
-        // A 64k cap left medium Unity titles restoring another ~100k already-valid native records
-        // serially on Game:Main.  That is observable as a multi-minute animated title/loading
-        // screen even though persistent-cache hit rate is above 97%.  The publisher below is now
-        // parallel, low-priority and bounded in 16k batches, so cover a complete medium working
-        // set while retaining a finite ceiling for mature 300k+ titles.  Records beyond the
-        // ceiling remain indexed and restore lazily on first guest use.
-        constexpr std::size_t kNativeWarmRecordLimit = 192u * 1024u;
         const auto started = std::chrono::steady_clock::now();
-        // Loaded records were already structurally validated in parallel. Do not serially hash
-        // 300k+ tiny guest spans before the first instruction: the background publisher checks
-        // the live bytes again immediately before making each restored entry reachable. This
-        // keeps relocation/SMC safety while moving code-copy and link construction off the first
-        // RunGuest critical path.
-        std::vector<StableDecodedBlock> warm_set =
-            persistent_ir_cache_.TakeNativeWarmSet(kNativeWarmRecordLimit, false);
+        // Take every structurally valid native record. The former 196,608-record ceiling left
+        // roughly 148k Bloodborne blocks to be restored lazily by gameplay threads under
+        // block_cache_mutex_. A finite trust-boundary limit was already enforced while loading the
+        // cache, so imposing a second runtime subset here only reintroduces compilation stalls.
+        std::vector<StableDecodedBlock> warm_set;
+        try {
+            warm_set = persistent_ir_cache_.TakeNativeWarmSet(
+                std::numeric_limits<std::size_t>::max(), false);
+        } catch (const std::exception& exception) {
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
+                        "reason=complete_extract_failed error=%s",
+                        exception.what());
+            FinishPersistentNativePrewarm();
+            return;
+        } catch (...) {
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
+                        "reason=complete_extract_failed error=unknown");
+            FinishPersistentNativePrewarm();
+            return;
+        }
         if (warm_set.empty()) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 records=0");
+            FinishPersistentNativePrewarm();
             return;
         }
 
         const auto extracted_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_START] requested=%zu "
-                    "extractMs=%lld mode=background-live-validated",
+                    "extractMs=%lld mode=synchronous-complete-live-validated",
                     warm_set.size(), static_cast<long long>(extracted_ms));
-
-        // First-touch order is retained by the cache loader. Restore enough of that prefix before
-        // entering the guest so boot cannot race the background publisher and redundantly compile
-        // the same 5-7k blocks. The bound is deliberately small: it trades roughly one short
-        // parallel copy/relocation burst for eliminating thousands of serialized JIT misses on the
-        // guest's main thread. A one-time identity migration remains all-background because its
-        // completion marker describes one coherent migrated generation.
-        constexpr std::size_t kSynchronousHotRecords = 16u * 1024u;
-        const bool needs_identity_migration = std::ranges::any_of(
-            warm_set, [](const StableDecodedBlock& stable) {
-                return stable.needs_identity_migration;
-            });
-        std::vector<StableDecodedBlock> background_set;
-        if (!needs_identity_migration && warm_set.size() > kSynchronousHotRecords) {
-            const auto split = warm_set.begin() +
-                               static_cast<std::ptrdiff_t>(kSynchronousHotRecords);
-            std::vector<StableDecodedBlock> hot_set{
-                std::make_move_iterator(warm_set.begin()),
-                std::make_move_iterator(split)};
-            background_set.assign(std::make_move_iterator(split),
-                                  std::make_move_iterator(warm_set.end()));
-            std::vector<StableDecodedBlock>{}.swap(warm_set);
-            const auto hot_started = std::chrono::steady_clock::now();
-            PrewarmPersistentNativeCache(std::move(hot_set), started,
-                                         std::stop_token{}, false);
-            const auto hot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - hot_started).count();
-            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_HOT] requested=%zu "
-                        "elapsedMs=%lld remaining=%zu",
-                        kSynchronousHotRecords, static_cast<long long>(hot_ms),
-                        background_set.size());
-        } else {
-            background_set = std::move(warm_set);
-        }
-
-        if (background_set.empty()) {
-            return;
-        }
         try {
-            persistent_native_prewarm_thread_ = std::jthread(
-                [this, warm_set = std::move(background_set), started,
-                 batch_publication = !needs_identity_migration](
-                    const std::stop_token stop_token) mutable {
-                    // Cache construction is opportunistic. Leave scheduler priority to guest,
-                    // render and audio threads; worker pthreads inherit this per-thread nice
-                    // value and consume otherwise-idle cores without delaying the first frame.
-                    (void)::setpriority(PRIO_PROCESS, 0, 8);
-                    if (!batch_publication) {
-                        PrewarmPersistentNativeCache(std::move(warm_set), started,
-                                                     stop_token, true);
-                        persistent_ir_cache_.FlushNativeWarmProfile();
-                        return;
-                    }
-
-                    // Publish restored code continuously instead of after copying the complete
-                    // 300k-block image. The guest therefore sees the next first-touch window every
-                    // ~100 ms and cannot run thousands of redundant serialized compilations while
-                    // the low-priority cache thread is still working.
-                    constexpr std::size_t kPublicationBatchRecords = 16u * 1024u;
-                    const std::size_t total_records = warm_set.size();
-                    const auto background_started = std::chrono::steady_clock::now();
-                    for (std::size_t offset = 0; offset < total_records;
-                         offset += kPublicationBatchRecords) {
-                        if (stop_token.stop_requested()) {
-                            break;
-                        }
-                        const std::size_t count = std::min(
-                            kPublicationBatchRecords, total_records - offset);
-                        std::vector<StableDecodedBlock> batch;
-                        batch.reserve(count);
-                        auto begin = warm_set.begin() + static_cast<std::ptrdiff_t>(offset);
-                        auto end = begin + static_cast<std::ptrdiff_t>(count);
-                        batch.assign(std::make_move_iterator(begin),
-                                     std::make_move_iterator(end));
-                        PrewarmPersistentNativeCache(
-                            std::move(batch), std::chrono::steady_clock::now(),
-                            stop_token, true);
-                    }
-                    persistent_ir_cache_.FlushNativeWarmProfile();
-                    const auto elapsed_ms =
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - background_started).count();
-                    JitLog(
-                        "[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_BATCHED_DONE] "
-                        "requested=%zu elapsedMs=%lld stopped=%u",
-                        total_records, static_cast<long long>(elapsed_ms),
-                        stop_token.stop_requested() ? 1u : 0u);
-                });
+            PrewarmPersistentNativeCache(std::move(warm_set), started,
+                                         std::stop_token{}, false);
+            persistent_ir_cache_.FlushNativeWarmProfile();
         } catch (const std::exception& exception) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
-                        "reason=background_start_failed error=%s",
+                        "reason=complete_restore_failed error=%s",
                         exception.what());
+        } catch (...) {
+            JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
+                        "reason=complete_restore_failed error=unknown");
         }
+        FinishPersistentNativePrewarm();
 #endif
     }
 
@@ -5081,7 +5034,7 @@ public:
         // guest thread at a seemingly random global decoded-block count. Publish bounded batches,
         // preserving the same block-cache -> chain-patch lock order and rechecking duplicates each
         // time the lock is reacquired.
-        constexpr std::size_t kPublicationBatchSize = 128;
+        constexpr std::size_t kPublicationBatchSize = 4096;
         for (std::size_t batch_begin = 0; batch_begin < warm_set.size();
              batch_begin += kPublicationBatchSize) {
             const std::size_t batch_end =
@@ -5976,6 +5929,9 @@ private:
     GuestRegionDirectory block_results_;
 #ifdef __ANDROID__
     bool persistent_native_prewarm_pending_ = false;
+    std::atomic<bool> persistent_native_prewarm_active_{false};
+    std::mutex persistent_native_prewarm_mutex_{};
+    std::condition_variable persistent_native_prewarm_cv_{};
     std::jthread persistent_native_prewarm_thread_{};
 #endif
 };
@@ -8120,6 +8076,19 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         return (IsXmmOperand(source) || source.type == X86_OPERAND_TYPE_MEMORY) &&
                source.size == ir.operands[0].size;
     };
+    const auto is_native_cvttps2dq = [](const LsxDecodedOp& ir) {
+        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+        if (!ir.can_execute_vector ||
+            (mnemonic != X86_MNEMONIC_CVTTPS2DQ &&
+             mnemonic != X86_MNEMONIC_VCVTTPS2DQ) ||
+            ir.operand_count != 2 || !IsXmmOperand(ir.operands[0]) ||
+            (ir.operands[0].size != 128 && ir.operands[0].size != 256)) {
+            return false;
+        }
+        const auto& source = ir.operands[1];
+        return (IsXmmOperand(source) || source.type == X86_OPERAND_TYPE_MEMORY) &&
+               source.size == ir.operands[0].size;
+    };
     const auto is_native_immediate_blend = [](const LsxDecodedOp& ir) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
         if (!ir.can_execute_vector || !IsVectorImmediateBlendMnemonic(mnemonic)) {
@@ -8365,6 +8334,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                  is_native_vector_extract_f128(ir) ||
                  is_native_pshufb(ir) ||
                  is_native_cvtdq2ps(ir) ||
+                 is_native_cvttps2dq(ir) ||
                  is_native_immediate_blend(ir) ||
                  is_native_theora_idct_simd(ir));
     };
@@ -18484,6 +18454,47 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         emitted = emit_vector_store_pair(ir, ir.operands[0], code->q0,
                                                          code->q1, source_width);
+                        emitted_simd_fast += emitted ? 1u : 0u;
+                        continue;
+                    }
+                    if (is_native_cvttps2dq(ir)) {
+                        std::uint32_t source_width = 0;
+                        emitted = emit_vector_load_pair(ir, ir.operands[1], code->q0,
+                                                        code->q1, source_width);
+                        if (!emitted) {
+                            continue;
+                        }
+
+                        // FCVTZS performs the required truncation, but AArch64 saturates
+                        // out-of-range values whereas x86 writes the integer-indefinite value
+                        // INT32_MIN for NaN and either overflow direction. Build the exact x86
+                        // validity mask before converting, then select INT32_MIN for every
+                        // invalid lane. The comparisons are also false for NaN.
+                        code->mov(code->w10, 0xcf000000u); // -2^31 as float
+                        code->dup(code->v2.s4, code->w10);
+                        code->mov(code->w10, 0x4f000000u); // +2^31 as float (exclusive)
+                        code->dup(code->v3.s4, code->w10);
+                        code->mov(code->w10, 0x80000000u);
+                        code->dup(code->v6.s4, code->w10);
+
+                        const auto emit_trunc_lane = [&](const VReg4S& source,
+                                                         const VReg4S& output,
+                                                         const VReg4S& temporary) {
+                            code->fcmge(output, source, code->v2.s4);
+                            code->fcmgt(temporary, code->v3.s4, source);
+                            code->and_(VReg16B{output.getIdx()},
+                                       VReg16B{output.getIdx()},
+                                       VReg16B{temporary.getIdx()});
+                            code->fcvtzs(temporary, source);
+                            code->bsl(VReg16B{output.getIdx()},
+                                      VReg16B{temporary.getIdx()}, code->v6.b16);
+                        };
+                        emit_trunc_lane(code->v0.s4, code->v4.s4, code->v7.s4);
+                        if (source_width == 32) {
+                            emit_trunc_lane(code->v1.s4, code->v5.s4, code->v7.s4);
+                        }
+                        emitted = emit_vector_store_pair(ir, ir.operands[0], code->q4,
+                                                         code->q5, source_width);
                         emitted_simd_fast += emitted ? 1u : 0u;
                         continue;
                     }
@@ -43739,6 +43750,76 @@ std::string ExerciseTranslationEngineJson() {
         const bool generic_post_load_v7_ok =
             generic_post_load_v7_result_ok && generic_post_load_v7_counter_ok;
 
+        // CVTTPS2DQ_DIRECT_DIFFERENTIAL_GATE: Bloodborne's steady gameplay executes this leaf
+        // roughly 1.6 million times per 2^22 semantic calls. Cover both AVX widths, VEX upper
+        // clearing, legacy upper preservation, fractional truncation, both overflow directions,
+        // infinity and NaN. The counter gate proves neither conversion silently fell back to C++.
+        const std::uint64_t cvttps2dq_fast_before =
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
+        const std::uint64_t cvttps2dq_semantic_before =
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
+        const std::array<std::uint8_t, 14> generic_cvttps2dq = {
+            0xc5, 0xfe, 0x5b, 0xf3, // vcvttps2dq ymm6,ymm3
+            0xf3, 0x0f, 0x5b, 0xfc, // cvttps2dq xmm7,xmm4
+            0xc5, 0xfe, 0x7f, 0x33, // vmovdqu [rbx],ymm6
+            0xeb, 0x00,
+        };
+        const bool generic_cvttps2dq_result_ok = run_generic_simd_case(
+            generic_cvttps2dq, 4, 2,
+            [](LsxMachineImage& state, std::array<std::uint8_t, 128>& memory) {
+                state.rflags = 0xad7u;
+                state.mxcsr = 0x1f80u;
+                WriteGuestGpr64(state, LsxGpr::Rbx,
+                         reinterpret_cast<std::uint64_t>(memory.data()));
+                constexpr std::array<std::uint32_t, 8> ymm_source = {
+                    0x00000000u, // +0
+                    0x3ff33333u, // +1.9 -> +1
+                    0xbff33333u, // -1.9 -> -1
+                    0x4f000000u, // +2^31 -> integer indefinite
+                    0xcf000000u, // -2^31 -> INT32_MIN (valid edge)
+                    0xcf000001u, // below -2^31 -> integer indefinite
+                    0x7fc12345u, // qNaN -> integer indefinite
+                    0x7f800000u, // +infinity -> integer indefinite
+                };
+                constexpr std::array<std::uint32_t, 4> xmm_source = {
+                    0x80000000u, // -0 -> 0
+                    0x4effffffu, // largest float below +2^31
+                    0xceffffffu, // finite negative in range
+                    0xff800000u, // -infinity -> integer indefinite
+                };
+                std::memcpy(state.ymm[3].data(), ymm_source.data(), sizeof(ymm_source));
+                std::memcpy(state.ymm[4].data(), xmm_source.data(), sizeof(xmm_source));
+                for (std::size_t byte = 0; byte < 32; ++byte) {
+                    state.ymm[6][byte] = static_cast<std::uint8_t>(0x90u + byte);
+                    state.ymm[7][byte] = static_cast<std::uint8_t>(0xc0u + byte);
+                }
+            },
+            [](const LsxMachineImage& state,
+               const std::array<std::uint8_t, 128>& memory) {
+                constexpr std::array<std::int32_t, 8> expected_ymm = {
+                    0, 1, -1, INT32_MIN, INT32_MIN, INT32_MIN, INT32_MIN, INT32_MIN,
+                };
+                constexpr std::array<std::int32_t, 4> expected_xmm = {
+                    0, 2147483520, -2147483520, INT32_MIN,
+                };
+                return std::memcmp(state.ymm[6].data(), expected_ymm.data(),
+                                   sizeof(expected_ymm)) == 0 &&
+                       std::memcmp(state.ymm[7].data(), expected_xmm.data(),
+                                   sizeof(expected_xmm)) == 0 &&
+                       std::memcmp(memory.data(), expected_ymm.data(),
+                                   sizeof(expected_ymm)) == 0;
+            });
+        const std::uint64_t cvttps2dq_fast_delta =
+            g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) -
+            cvttps2dq_fast_before;
+        const std::uint64_t cvttps2dq_semantic_delta =
+            g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) -
+            cvttps2dq_semantic_before;
+        const bool generic_cvttps2dq_counter_ok =
+            cvttps2dq_fast_delta == 3u && cvttps2dq_semantic_delta == 0u;
+        const bool generic_cvttps2dq_native_ok =
+            generic_cvttps2dq_result_ok && generic_cvttps2dq_counter_ok;
+
         // SCALAR_FP_MOVE_DIRECT_DIFFERENTIAL_GATE: these used to decode correctly yet always
         // enter the scalar semantic thunk because the direct classifier only admitted
         // can_execute_vector.  Snapshot both counters so byte equality cannot hide that
@@ -44504,6 +44585,7 @@ std::string ExerciseTranslationEngineJson() {
             generic_wide_hot_v5_simd_ok &&
             generic_post_load_v6_ok &&
             generic_post_load_v7_ok &&
+            generic_cvttps2dq_native_ok &&
             generic_simd_scalar_move_native_ok &&
             generic_movd_transfer_native_ok &&
             generic_vmovlpd_cusa07010_native_ok &&
@@ -46291,6 +46373,14 @@ std::string ExerciseTranslationEngineJson() {
             << (generic_post_load_v7_counter_ok ? "true" : "false") << ","
             << R"("genericPostLoadV7FastDelta":)" << post_load_v7_fast_delta << ","
             << R"("genericPostLoadV7SemanticDelta":)" << post_load_v7_semantic_delta << ","
+            << R"("genericCvttps2dqNativeOk":)"
+            << (generic_cvttps2dq_native_ok ? "true" : "false") << ","
+            << R"("genericCvttps2dqResultOk":)"
+            << (generic_cvttps2dq_result_ok ? "true" : "false") << ","
+            << R"("genericCvttps2dqCounterOk":)"
+            << (generic_cvttps2dq_counter_ok ? "true" : "false") << ","
+            << R"("genericCvttps2dqFastDelta":)" << cvttps2dq_fast_delta << ","
+            << R"("genericCvttps2dqSemanticDelta":)" << cvttps2dq_semantic_delta << ","
             << R"("genericSimdScalarMoveNativeOk":)"
             << (generic_simd_scalar_move_native_ok ? "true" : "false") << ","
             << R"("genericSimdScalarMoveResultOk":)"

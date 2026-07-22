@@ -265,8 +265,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #ifdef __ANDROID__
     const char* const shader_identity_cache_flag =
         std::getenv("EXECUTOR_SHADER_IDENTITY_CACHE");
+    // The strict cache validates every hit against BufferCache's exact GPU-dirty interval set and
+    // remains correct for GPU-generated shaders. Keep it enabled on Android unless explicitly
+    // disabled: repeatedly rescanning an unchanged shader through a protected guest mapping turns
+    // a four-byte metadata load into a synchronous 256-KiB GPU readback wave.
     shader_identity_cache_enabled =
-        shader_identity_cache_flag != nullptr && shader_identity_cache_flag[0] != '\0' &&
+        shader_identity_cache_flag == nullptr || shader_identity_cache_flag[0] == '\0' ||
         shader_identity_cache_flag[0] != '0';
     const char* const immutable_shader_identity_cache_flag =
         std::getenv("EXECUTOR_IMMUTABLE_SHADER_IDENTITY_CACHE");
@@ -284,8 +288,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_SHADER_IDENTITY_CACHE] enabled=1 scope=%s maxEntries=%zu",
-            immutable_shader_identity_cache_enabled ? "immutable_cpu_invalidation"
-                                                    : "precise_invalidation",
+            immutable_shader_identity_cache_enabled ? "backing_invalidation+fetch_epoch"
+                                                    : "backing_invalidation",
             MaxShaderIdentityEntriesPerSubmit);
     }
     if (immutable_srt_snapshot_cache_enabled) {
@@ -602,108 +606,35 @@ Shader::ShaderParams PipelineCache::GetShaderParams(const u32* user_data, const 
 
     const VAddr address = reinterpret_cast<VAddr>(code);
     u64 scan_generation{};
-    ShaderIdentityMetadata cached_metadata{};
-    bool has_cached_metadata = false;
     {
         std::scoped_lock lock{shader_identity_cache_mutex};
         ++shader_identity_lookups;
         scan_generation = shader_identity_generation;
         if (auto it = shader_identity_cache.find(address); it != shader_identity_cache.end()) {
-            cached_metadata = it->second;
-            has_cached_metadata = true;
-            if (immutable_shader_identity_cache_enabled) {
-                // CPU writes and unmaps erase every overlapping entry while holding this same
-                // mutex. The immutable title contract excludes GPU-authored shader binaries, so
-                // finding the entry here is already the complete point-in-time validation. Avoid
-                // dropping and reacquiring the lock only to find the same entry and walk an
-                // invalidation journal which cannot have changed in between.
-                ++shader_identity_hits;
-                ++shader_identity_gpu_alias_hits;
-                return {
-                    .user_data = fresh_user_data,
-                    .code = std::span{code, cached_metadata.length_bytes / sizeof(u32)},
-                    .hash = cached_metadata.hash,
-                };
-            }
-        }
-    }
-
-    if (has_cached_metadata) {
-        bool gpu_modified = true;
-        if (immutable_shader_identity_cache_enabled) {
-            // The entry was published only after an authoritative scan and overlapping CPU writes
-            // erase it synchronously through InvalidateShaderIdentityRange. A storage/UAV
-            // descriptor, however, marks its entire declared range GPU-dirty even when the shader
-            // bytes inside that allocation were never touched. Re-reading code in that case faults
-            // on the precise-readback page and forces Scheduler::Finish several times per frame.
-            //
-            // This mode is deliberately separate and opt-in: games which genuinely generate or
-            // rewrite shader binaries on the GPU retain the strict exact-range validation path.
-            gpu_modified = false;
-        } else if (cached_metadata.length_bytes != 0) {
-            // Do not nest a RegionManager lock under shader_identity_cache_mutex. CPU
-            // invalidation increments shader_identity_generation, and the recheck below rejects
-            // metadata which changed while this lock-free dirty query was in progress.
-            // Shader identity is a byte-range contract, not a page ownership contract. The normal
-            // precise-readback tracker is intentionally 4-KB granular for mprotect; using it here
-            // made an unrelated storage write elsewhere on the shader page evict the cached hash,
-            // fault while rescanning code, and synchronously Finish the queue. The exact interval
-            // set is updated by every real GPU buffer write and therefore preserves support for
-            // genuinely GPU-generated shaders without the false page alias.
-            gpu_modified = buffer_cache->IsRegionGpuModifiedExact(
-                cached_metadata.address, cached_metadata.length_bytes);
-        }
-        {
-            std::scoped_lock lock{shader_identity_cache_mutex};
-            const auto it = shader_identity_cache.find(address);
-            const bool same_metadata =
-                it != shader_identity_cache.end() &&
-                it->second.address == cached_metadata.address &&
-                it->second.length_bytes == cached_metadata.length_bytes &&
-                it->second.hash == cached_metadata.hash;
-            const bool invalidation_stable =
-                same_metadata &&
-                !WasCpuRangeInvalidatedSinceLocked(cached_metadata.address,
-                                                   cached_metadata.length_bytes, scan_generation);
-            if (same_metadata && invalidation_stable && !gpu_modified) {
-                ++shader_identity_hits;
-                shader_identity_gpu_alias_hits += immutable_shader_identity_cache_enabled;
-                return {
-                    .user_data = fresh_user_data,
-                    .code = std::span{code, cached_metadata.length_bytes / sizeof(u32)},
-                    .hash = cached_metadata.hash,
-                };
-            }
-            if (same_metadata) {
-                shader_identity_cache.erase(it);
-            }
-            if (!invalidation_stable || !same_metadata) {
-                ++shader_identity_invalidation_misses;
-            } else {
-                ++shader_identity_gpu_dirty_misses;
-            }
-            // The validation above may have overlapped an invalidation. Start the scan from the
-            // now-current epochs so a stable scan can still be published.
-            scan_generation = shader_identity_generation;
+            const ShaderIdentityMetadata& cached_metadata = it->second;
+            // Shader identity describes the bytes SearchBinaryInfo actually observed in guest
+            // backing memory. A GPU-dirty interval only says that a newer device-local copy may
+            // exist; rescanning the unchanged backing cannot reveal that copy. CPU writes/unmaps
+            // erase overlapping entries through InvalidateShaderIdentityRange, and the exact
+            // GPU->CPU publication path erases them through
+            // InvalidateShaderIdentityReadbackRange. Consequently an entry found while holding
+            // this mutex is the current identity of the backing bytes even when a conservative
+            // writable descriptor keeps the same interval GPU-dirty for thousands of draws.
+            ++shader_identity_hits;
+            ++shader_identity_gpu_alias_hits;
+            return {
+                .user_data = fresh_user_data,
+                .code = std::span{code, cached_metadata.length_bytes / sizeof(u32)},
+                .hash = cached_metadata.hash,
+            };
         }
     }
 
     const Shader::ShaderParams params = scan_metadata();
     const size_t length_bytes = params.code.size_bytes();
-    bool gpu_modified_after_scan = true;
     const bool valid_length =
         length_bytes != 0 && length_bytes <= std::numeric_limits<u32>::max() &&
         address <= std::numeric_limits<VAddr>::max() - length_bytes;
-    if (valid_length && !immutable_shader_identity_cache_enabled) {
-        // As above, avoid shader-cache -> RegionManager lock nesting.
-        gpu_modified_after_scan =
-            buffer_cache->IsRegionGpuModifiedExact(address, length_bytes);
-    } else if (valid_length) {
-        // SearchBinaryInfo has just completed an authoritative synchronous read of this code. In
-        // the immutable title profile, conservative GPU-writable aliases are not an invalidation
-        // source; only an overlapping CPU write or unmap may retire the published metadata.
-        gpu_modified_after_scan = false;
-    }
     {
         std::scoped_lock lock{shader_identity_cache_mutex};
         ++shader_identity_scans;
@@ -712,10 +643,6 @@ Shader::ShaderParams PipelineCache::GetShaderParams(const u32* user_data, const 
         // same point-in-time semantics as the uncached path and the next lookup scans again.
         if (!valid_length ||
             WasCpuRangeInvalidatedSinceLocked(address, length_bytes, scan_generation)) {
-            return params;
-        }
-        if (gpu_modified_after_scan) {
-            ++shader_identity_dirty_after_scan;
             return params;
         }
         if (!shader_identity_cache.contains(address) &&
@@ -773,14 +700,11 @@ void PipelineCache::InvalidateShaderIdentityRange(const VAddr address, const u64
 }
 
 void PipelineCache::InvalidateShaderIdentityReadbackRange(const VAddr address, const u64 size) {
-    if (immutable_shader_identity_cache_enabled) {
-        // A cache-miss SearchBinaryInfo can fault on its own protected code page. The resulting
-        // synchronous readback runs before the scan resumes, so treating that readback as a CPU
-        // mutation advances shader_identity_generation during the scan and prevents publication
-        // forever. This opt-in mode explicitly excludes GPU-generated shaders; real CPU writes and
-        // unmaps still use InvalidateShaderIdentityRange and remain authoritative invalidators.
-        return;
-    }
+    // A device-to-backing publication changes the same bytes whose identity is cached. Record it in
+    // the exact invalidation journal as well as erasing main-shader entries, so fetch-shader
+    // snapshots can use an O(1) address+epoch hit without assuming that GPU-authored code is
+    // immutable. Rasterizer::ReadMemory calls this at both ends of the synchronous publication;
+    // the closing event rejects a scan or memcmp that raced the transfer.
     InvalidateShaderIdentityRange(address, size);
 }
 
@@ -802,7 +726,7 @@ void PipelineCache::AdvanceShaderIdentitySubmit() {
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_SHADER_IDENTITY_CACHE] submits=%llu lookups=%llu hits=%llu hitPct=%.1f "
-            "scans=%llu gpuDirtyMiss=%llu gpuAliasHit=%llu invalidationMiss=%llu dirtyAfterScan=%llu "
+            "scans=%llu gpuDirtyMiss=%llu backingHits=%llu invalidationMiss=%llu dirtyAfterScan=%llu "
             "cpuErases=%llu capacityErases=%llu capacityMiss=%llu entries=%zu",
             static_cast<unsigned long long>(shader_identity_submits),
             static_cast<unsigned long long>(shader_identity_lookups),
@@ -848,53 +772,54 @@ const std::optional<Shader::Gcn::FetchShaderData>& PipelineCache::ResolveFetchSh
     if (snapshot.initialized && snapshot.parsed &&
         snapshot.code.size() == snapshot.parsed->size) {
         const size_t size_bytes = snapshot.code.size() * sizeof(u32);
-        if (immutable_shader_identity_cache_enabled) {
-            // The fetch program is generated by the guest CPU. Once the exact bytes have been
-            // parsed, a stable pointer plus the exact CPU-write journal is authoritative and needs
-            // no guest-VA read at all. This removes the former per-draw memcmp which faulted on a
-            // conservative GPU-dirty page and synchronously drained the Vulkan queue.
-            {
-                std::scoped_lock lock{shader_identity_cache_mutex};
-                if (snapshot.address == address &&
-                    !WasCpuRangeInvalidatedSinceLocked(address, size_bytes,
-                                                       snapshot.invalidation_sequence)) {
-                    ++fetch_shader_epoch_hits;
-                    return snapshot.parsed;
-                }
+        // A stable address plus the exact backing-mutation journal is sufficient for every title,
+        // including GPU-generated fetch shaders: GPU-only dirty ownership does not alter backing,
+        // and the readback which publishes new bytes advances this journal at both transfer edges.
+        {
+            std::scoped_lock lock{shader_identity_cache_mutex};
+            if (snapshot.address == address &&
+                !WasCpuRangeInvalidatedSinceLocked(address, size_bytes,
+                                                   snapshot.invalidation_sequence)) {
+                ++fetch_shader_epoch_hits;
+                return snapshot.parsed;
             }
+        }
 
+        const u64 validation_sequence = CaptureCpuInvalidationSequence();
+        bool bytes_match = false;
+        if (immutable_shader_identity_cache_enabled) {
             // Command buffers can relocate an otherwise identical fetch program. Compare through
             // the always-readable physical alias, then publish only if no overlapping CPU write
             // raced the copy. An identical relocation retains the parsed semantic description.
-            const u64 validation_sequence = CaptureCpuInvalidationSequence();
             fetch_shader_backing_validation_scratch.resize(snapshot.code.size());
             const bool copied =
                 size_bytes == 0 ||
                 Core::Memory::Instance()->TryCopyBackingMemory(
                     address, fetch_shader_backing_validation_scratch.data(), size_bytes);
-            u64 publish_sequence{};
-            bool stable = false;
-            {
-                std::scoped_lock lock{shader_identity_cache_mutex};
-                stable = copied &&
-                         !WasCpuRangeInvalidatedSinceLocked(address, size_bytes,
-                                                           validation_sequence);
-                publish_sequence = shader_identity_generation;
-            }
-            if (stable &&
-                std::ranges::equal(fetch_shader_backing_validation_scratch, snapshot.code)) {
-                snapshot.address = address;
-                snapshot.invalidation_sequence = publish_sequence;
-                ++fetch_shader_backing_hits;
-                return snapshot.parsed;
-            }
+            bytes_match = copied &&
+                          std::ranges::equal(fetch_shader_backing_validation_scratch,
+                                             snapshot.code);
         } else {
-            // Strict default: fetch programs may be GPU-generated, so preserve byte validation
-            // through the synchronized guest mapping.
-            if (size_bytes == 0 ||
-                std::memcmp(snapshot.code.data(), code, size_bytes) == 0) {
-                return snapshot.parsed;
-            }
+            // A relocation has no reusable address epoch. Validate it once through the normal
+            // synchronized guest mapping, then publish the new address so subsequent draws take
+            // the journal-only path above.
+            bytes_match = size_bytes == 0 ||
+                          std::memcmp(snapshot.code.data(), code, size_bytes) == 0;
+        }
+        u64 publish_sequence{};
+        bool stable = false;
+        {
+            std::scoped_lock lock{shader_identity_cache_mutex};
+            stable = bytes_match &&
+                     !WasCpuRangeInvalidatedSinceLocked(address, size_bytes,
+                                                       validation_sequence);
+            publish_sequence = shader_identity_generation;
+        }
+        if (stable) {
+            snapshot.address = address;
+            snapshot.invalidation_sequence = publish_sequence;
+            ++fetch_shader_backing_hits;
+            return snapshot.parsed;
         }
     }
 
@@ -921,8 +846,8 @@ const std::optional<Shader::Gcn::FetchShaderData>& PipelineCache::ResolveFetchSh
     }
 
     u64 publish_sequence{};
-    bool stable_publication = true;
-    if (immutable_shader_identity_cache_enabled && parsed) {
+    bool stable_publication = parsed.has_value();
+    if (parsed) {
         std::scoped_lock lock{shader_identity_cache_mutex};
         stable_publication = !WasCpuRangeInvalidatedSinceLocked(
             address, parsed_code.size() * sizeof(u32), parse_sequence);

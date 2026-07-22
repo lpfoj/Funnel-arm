@@ -386,7 +386,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     memory->SetRasterizer(this);
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    // Liverpool outlives Presenter/Rasterizer in the normal GNM shutdown order. Do not leave its
+    // event-wait cleanup path pointing at a destroyed page manager.
+    if (liverpool != nullptr) {
+        liverpool->BindRasterizer(nullptr);
+    }
+}
 
 #ifdef __ANDROID__
 void Rasterizer::ExecutorGpuLatePassTransition(u64 next_attachment_signature, u64 next_sequence,
@@ -3455,6 +3461,10 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     // ever reusing a hash after GPU-written code bytes have been published to guest memory.
     pipeline_cache.InvalidateShaderIdentityReadbackRange(addr, size);
     buffer_cache.ReadMemory(addr, size);
+    // Close the publication interval after backing bytes and GPU-dirty ownership have both been
+    // updated. A shader/fetch scan which overlapped the synchronous transfer is thereby prevented
+    // from publishing a stale snapshot after the opening invalidation.
+    pipeline_cache.InvalidateShaderIdentityReadbackRange(addr, size);
     return true;
 }
 
@@ -3464,6 +3474,22 @@ void Rasterizer::TrackPendingCompletionRead(VAddr addr, u64 size) {
 
 void Rasterizer::UntrackPendingCompletionRead(VAddr addr, u64 size) {
     page_manager.UntrackPendingCompletionRead(addr, size);
+}
+
+void Rasterizer::TrackMemoryWaitWrite(VAddr addr, u64 size) {
+    page_manager.TrackMemoryWaitWrite(addr, size);
+}
+
+void Rasterizer::UntrackMemoryWaitWrite(VAddr addr, u64 size) {
+    page_manager.UntrackMemoryWaitWrite(addr, size);
+}
+
+bool Rasterizer::ConsumeMemoryWaitWriteFault(VAddr addr) {
+    if (!page_manager.ConsumeMemoryWaitWriteFault(addr)) {
+        return false;
+    }
+    liverpool->NotifyMemoryPublicationForExecutor(addr, 1);
+    return true;
 }
 
 bool Rasterizer::IsMemoryGpuModified(VAddr addr, u64 size) {

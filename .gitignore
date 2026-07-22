@@ -22,6 +22,7 @@ compile_commands.json
 *.bak
 out/
 .cache/
+.codex-tmp/
 
 # Rust
 target/
