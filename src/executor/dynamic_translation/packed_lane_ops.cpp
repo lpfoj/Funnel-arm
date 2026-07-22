@@ -411,4 +411,75 @@ bool SelectElementsBySign(void* const destination, const void* const left,
     return true;
 }
 
+bool Replace128BitHalf(void* const destination, const void* const original,
+                       const void* const replacement,
+                       const std::uint32_t half_index) noexcept {
+    if (destination == nullptr || original == nullptr || replacement == nullptr) {
+        return false;
+    }
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::array<std::uint8_t, 16> incoming{};
+    std::memcpy(output.data(), original, output.size());
+    std::memcpy(incoming.data(), replacement, incoming.size());
+    std::memcpy(output.data() + (half_index & 1u) * incoming.size(),
+                incoming.data(), incoming.size());
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
+bool Permute128BitHalves(void* const destination, const void* const left,
+                         const void* const right,
+                         const std::uint32_t selection) noexcept {
+    if (destination == nullptr || left == nullptr || right == nullptr) {
+        return false;
+    }
+    constexpr std::size_t half_width = 16;
+    std::array<std::uint8_t, kMaximumVectorBytes> inputs[2]{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(inputs[0].data(), left, inputs[0].size());
+    std::memcpy(inputs[1].data(), right, inputs[1].size());
+    for (std::size_t destination_half = 0; destination_half < 2;
+         ++destination_half) {
+        const std::uint32_t command =
+            (selection >> (destination_half * 4)) & 0xfu;
+        if ((command & 8u) != 0) {
+            continue;
+        }
+        const std::size_t input_image = (command >> 1) & 1u;
+        const std::size_t input_half = command & 1u;
+        std::memcpy(output.data() + destination_half * half_width,
+                    inputs[input_image].data() + input_half * half_width,
+                    half_width);
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
+bool InsertSinglePrecisionElement(void* const destination,
+                                  const void* const original,
+                                  const void* const source,
+                                  const std::uint32_t control,
+                                  const bool source_is_memory) noexcept {
+    if (destination == nullptr || original == nullptr || source == nullptr) {
+        return false;
+    }
+    constexpr std::size_t element_width = sizeof(float);
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::array<std::uint8_t, 16> incoming{};
+    std::memcpy(output.data(), original, 16);
+    std::memcpy(incoming.data(), source, incoming.size());
+    const std::size_t source_index =
+        source_is_memory ? 0 : ((control >> 6) & 3u);
+    const std::size_t destination_index = (control >> 4) & 3u;
+    std::memcpy(output.data() + destination_index * element_width,
+                incoming.data() + source_index * element_width, element_width);
+    for (std::size_t index = 0; index < 4; ++index) {
+        if ((control & (1u << index)) != 0) {
+            std::memset(output.data() + index * element_width, 0, element_width);
+        }
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
 } // namespace Executor::Jit::VectorSemantic

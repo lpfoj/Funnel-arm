@@ -49,5 +49,14 @@ bool SelectElementsBySign(void* destination, const void* left,
                           const void* right, const void* selectors,
                           std::size_t element_width,
                           std::size_t total_width) noexcept;
+bool Replace128BitHalf(void* destination, const void* original,
+                       const void* replacement,
+                       std::uint32_t half_index) noexcept;
+bool Permute128BitHalves(void* destination, const void* left,
+                         const void* right,
+                         std::uint32_t selection) noexcept;
+bool InsertSinglePrecisionElement(void* destination, const void* original,
+                                  const void* source, std::uint32_t control,
+                                  bool source_is_memory) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic

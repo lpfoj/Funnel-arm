@@ -224,13 +224,8 @@ void PermuteDwordsFromImmediate(void* dst, const void* src, std::uint8_t imm);
 void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
                      std::size_t scalar_size);
 void PermuteBytesFromMask(void* dst, const void* src, const void* mask, std::size_t total_size);
-void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, std::uint32_t imm);
-void ExtractVectorHalf(void* dst, const void* src, std::uint32_t half_index, bool zero_upper_ymm);
-void InsertVectorHalf(void* dst, const void* old_dst, const void* src, std::uint32_t half_index);
 void InsertVectorIntegerLane(void* dst, const void* old_dst, std::uint64_t value, std::uint32_t index,
             std::size_t element_size);
-void InsertPackedSingleLane(void* dst, const void* old_dst, const void* src, std::uint32_t imm,
-               bool src_is_memory);
 void ExtractVectorLane(void* dst, const void* src, std::uint32_t index, bool store_qword,
                      std::size_t element_size);
 void ExtractVectorDword(void* dst, const void* src, std::uint32_t index, bool store_qword);
@@ -24556,7 +24551,10 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
         const std::uint32_t half_index =
             static_cast<std::uint32_t>(ir.operands[3].imm.value.u);
-        InsertVectorHalf(result.data(), lhs.data(), rhs.data(), half_index);
+        if (!VectorSemantic::Replace128BitHalf(
+                result.data(), lhs.data(), rhs.data(), half_index)) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -24604,7 +24602,10 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
         const std::uint8_t imm =
             static_cast<std::uint8_t>(ir.operands[3].imm.value.u);
-        PermuteVectorHalves(result.data(), lhs.data(), rhs.data(), imm);
+        if (!VectorSemantic::Permute128BitHalves(
+                result.data(), lhs.data(), rhs.data(), imm)) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -24615,8 +24616,11 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
         const std::uint8_t imm =
             static_cast<std::uint8_t>(ir.operands[3].imm.value.u);
-        InsertPackedSingleLane(result.data(), lhs.data(), rhs.data(), imm,
-                  ir.operands[2].type == X86_OPERAND_TYPE_MEMORY);
+        if (!VectorSemantic::InsertSinglePrecisionElement(
+                result.data(), lhs.data(), rhs.data(), imm,
+                ir.operands[2].type == X86_OPERAND_TYPE_MEMORY)) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -31649,29 +31653,6 @@ void ExtractVectorLane(void* argument0, const void* argument1, const std::uint32
     SemanticKernelExtractVectorLane(argument0, argument1, argument2, argument3, argument4);
 }
 
-[[gnu::always_inline]] static inline void SemanticKernelInsertPackedSingleLane(void* dst, const void* old_dst, const void* src, const std::uint32_t imm,
-               const bool src_is_memory){
-    if (dst == nullptr || old_dst == nullptr || src == nullptr) {
-        return;
-    }
-
-    auto result = SemanticVectorImage::Capture(old_dst, 16);
-    const auto incoming = SemanticVectorImage::Capture(src, 16);
-    const std::size_t source_lane = src_is_memory ? 0u : ((imm >> 6u) & 3u);
-    const std::size_t dest_lane = (imm >> 4u) & 3u;
-    CopyVectorSlice(result, dest_lane * 4u, incoming, source_lane * 4u, 4);
-    for (std::size_t lane = 0; lane < 4; ++lane) {
-        if ((imm & (1u << lane)) != 0) {
-            std::fill_n(result.bytes.begin() + lane * 4u, 4u, std::uint8_t{0});
-        }
-    }
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void InsertPackedSingleLane(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const bool argument4) {
-    SemanticKernelInsertPackedSingleLane(argument0, argument1, argument2, argument3, argument4);
-}
-
 [[gnu::always_inline]] static inline void SemanticKernelInsertVectorIntegerLane(void* dst, const void* old_dst, const std::uint64_t value,
             const std::uint32_t index, const std::size_t element_size){
     if (dst == nullptr || old_dst == nullptr || element_size == 0 || element_size > 8) {
@@ -31685,57 +31666,6 @@ void InsertPackedSingleLane(void* argument0, const void* argument1, const void* 
 
 void InsertVectorIntegerLane(void* argument0, const void* argument1, const std::uint64_t argument2, const std::uint32_t argument3, const std::size_t argument4) {
     SemanticKernelInsertVectorIntegerLane(argument0, argument1, argument2, argument3, argument4);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelInsertVectorHalf(void* dst, const void* old_dst, const void* src, const std::uint32_t half_index){
-    if (dst == nullptr || old_dst == nullptr || src == nullptr) {
-        return;
-    }
-    auto result = SemanticVectorImage::Capture(old_dst, kSemanticVectorBytes);
-    const auto incoming = SemanticVectorImage::Capture(src, 16);
-    CopyVectorSlice(result, (half_index % 2u) * 16u, incoming, 0, 16);
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void InsertVectorHalf(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3) {
-    SemanticKernelInsertVectorHalf(argument0, argument1, argument2, argument3);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelExtractVectorHalf(void* dst, const void* src, const std::uint32_t half_index,
-                  const bool zero_upper_ymm){
-    if (dst == nullptr || src == nullptr) {
-        return;
-    }
-    const auto source = SemanticVectorImage::Capture(src, kSemanticVectorBytes);
-    SemanticVectorImage result{};
-    CopyVectorSlice(result, 0, source, (half_index % 2u) * 16u, 16);
-    result.Publish(dst, zero_upper_ymm ? kSemanticVectorBytes : 16u);
-}
-
-void ExtractVectorHalf(void* argument0, const void* argument1, const std::uint32_t argument2, const bool argument3) {
-    SemanticKernelExtractVectorHalf(argument0, argument1, argument2, argument3);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelPermuteVectorHalves(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm){
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr) {
-        return;
-    }
-
-    const auto left = SemanticVectorImage::Capture(lhs, kSemanticVectorBytes);
-    const auto right = SemanticVectorImage::Capture(rhs, kSemanticVectorBytes);
-    SemanticVectorImage result{};
-    for (std::size_t half = 0; half != 2; ++half) {
-        const std::uint32_t nibble = (imm >> (half * 4u)) & 0xfu;
-        if ((nibble & 8u) == 0) {
-            CopyVectorSlice(result, half * 16u, (nibble & 2u) ? right : left,
-                            (nibble & 1u) * 16u, 16u);
-        }
-    }
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void PermuteVectorHalves(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3) {
-    SemanticKernelPermuteVectorHalves(argument0, argument1, argument2, argument3);
 }
 
 [[gnu::always_inline]] static inline void SemanticKernelPermuteBytesFromMask(void* dst, const void* src, const void* mask, const std::size_t total_size){
