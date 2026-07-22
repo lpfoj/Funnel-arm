@@ -5478,25 +5478,23 @@ public:
                     const LsxOperandRecord* op =
                         first.operand_count > 0 ? &first.operands[0] : nullptr;
                     const char* mnemonic_name = X86MnemonicGetString(first_mnemonic);
-                    JitLog("[EXECUTOR_JIT_CONTROL_INITIAL_SKIP] n=%u rip=0x%llx "
-                                "mnemonic=%s blockCanJit=%d firstCanJit=%d category=%u "
-                                "insnCount=%zu decodeFailed=%d operandCount=%u decodedVisible=%u "
-                                "decodedTotal=%u opType=%u opSize=%u bytes=%s diagnostic=%s",
-                                n,
-                                static_cast<unsigned long long>(decoded->start_rip),
-                                mnemonic_name != nullptr ? mnemonic_name : "<unknown>",
-                                decoded->SupportsInitialNativeTier() ? 1 : 0,
-                                first.eligible_for_initial_native ? 1 : 0,
-                                static_cast<unsigned>(first.category),
-                                decoded->instructions.size(),
-                                decoded->HasDecodeFailure() ? 1 : 0,
-                                static_cast<unsigned>(first.operand_count),
-                                static_cast<unsigned>(first.decoded.operand_count_visible),
-                                static_cast<unsigned>(first.decoded.operand_count),
-                                op != nullptr ? static_cast<unsigned>(op->type) : 0u,
-                                op != nullptr ? static_cast<unsigned>(op->size) : 0u,
-                                HexBytesAt(first.guest_rip, first.length).c_str(),
-                                decoded->diagnostic.c_str());
+                    JitLog("[LSX4_TRANSLATION_SKIP] sample=%u pc=0x%llx op=%s region_native=%d first_native=%d decode_error=%d detail=%s",
+                           n, static_cast<unsigned long long>(decoded->start_rip),
+                           mnemonic_name != nullptr ? mnemonic_name : "unresolved",
+                           decoded->SupportsInitialNativeTier() ? 1 : 0,
+                           first.eligible_for_initial_native ? 1 : 0,
+                           decoded->HasDecodeFailure() ? 1 : 0,
+                           decoded->diagnostic.c_str());
+                    JitLog("[LSX4_TRANSLATION_SKIP_DECODE] sample=%u family=%u region_ops=%zu declared_operands=%u public_operands=%u raw_operands=%u image=%s",
+                           n, static_cast<unsigned>(first.category),
+                           decoded->instructions.size(),
+                           static_cast<unsigned>(first.operand_count),
+                           static_cast<unsigned>(first.decoded.operand_count_visible),
+                           static_cast<unsigned>(first.decoded.operand_count),
+                           HexBytesAt(first.guest_rip, first.length).c_str());
+                    JitLog("[LSX4_TRANSLATION_SKIP_OPERAND] sample=%u kind=%u width=%u",
+                           n, op != nullptr ? static_cast<unsigned>(op->type) : 0u,
+                           op != nullptr ? static_cast<unsigned>(op->size) : 0u);
                 }
             }
         }
@@ -5542,33 +5540,29 @@ public:
                             const LsxOperandRecord* op =
                                 first.operand_count > 0 ? &first.operands[0] : nullptr;
                             const char* mnemonic_name = X86MnemonicGetString(first_mnemonic);
-                            JitLog("[EXECUTOR_JIT_CONTROL_HELPER_PUBLISH] n=%u "
-                                        "rip=0x%llx mnemonic=%s blockCanJit=%d firstCanJit=%d "
-                                        "canRef=%d category=%u insnCount=%zu operandCount=%u "
-                                        "decodedVisible=%u decodedTotal=%u opType=%u opSize=%u "
-                                        "base=%u index=%u scale=%u dispSize=%u disp=0x%llx "
-                                        "bytes=%s",
-                                        n,
-                                        static_cast<unsigned long long>(decoded->start_rip),
-                                        mnemonic_name != nullptr ? mnemonic_name : "<unknown>",
-                                        decoded->SupportsInitialNativeTier() ? 1 : 0,
-                                        first.eligible_for_initial_native ? 1 : 0,
-                                        CanInterpretRegion(*decoded) ? 1 : 0,
-                                        static_cast<unsigned>(first.category),
-                                        decoded->instructions.size(),
-                                        static_cast<unsigned>(first.operand_count),
-                                        static_cast<unsigned>(first.decoded.operand_count_visible),
-                                        static_cast<unsigned>(first.decoded.operand_count),
-                                        op != nullptr ? static_cast<unsigned>(op->type) : 0u,
-                                        op != nullptr ? static_cast<unsigned>(op->size) : 0u,
-                                        op != nullptr ? static_cast<unsigned>(op->mem.base) : 0u,
-                                        op != nullptr ? static_cast<unsigned>(op->mem.index) : 0u,
-                                        op != nullptr ? static_cast<unsigned>(op->mem.scale) : 0u,
-                                        op != nullptr ? static_cast<unsigned>(op->mem.disp.size) : 0u,
-                                        op != nullptr
-                                            ? static_cast<unsigned long long>(op->mem.disp.value)
-                                            : 0ull,
-                                        HexBytesAt(first.guest_rip, first.length).c_str());
+                            JitLog("[LSX4_TRANSLATION_BRIDGE] sample=%u pc=0x%llx op=%s region_native=%d first_native=%d semantic=%d family=%u image=%s",
+                                   n, static_cast<unsigned long long>(decoded->start_rip),
+                                   mnemonic_name != nullptr ? mnemonic_name : "unresolved",
+                                   decoded->SupportsInitialNativeTier() ? 1 : 0,
+                                   first.eligible_for_initial_native ? 1 : 0,
+                                   CanInterpretRegion(*decoded) ? 1 : 0,
+                                   static_cast<unsigned>(first.category),
+                                   HexBytesAt(first.guest_rip, first.length).c_str());
+                            JitLog("[LSX4_TRANSLATION_BRIDGE_DECODE] sample=%u region_ops=%zu declared_operands=%u public_operands=%u raw_operands=%u",
+                                   n, decoded->instructions.size(),
+                                   static_cast<unsigned>(first.operand_count),
+                                   static_cast<unsigned>(first.decoded.operand_count_visible),
+                                   static_cast<unsigned>(first.decoded.operand_count));
+                            JitLog("[LSX4_TRANSLATION_BRIDGE_ADDRESS] sample=%u kind=%u width=%u base_reg=%u index_reg=%u multiplier=%u displacement_width=%u displacement=0x%llx",
+                                   n, op != nullptr ? static_cast<unsigned>(op->type) : 0u,
+                                   op != nullptr ? static_cast<unsigned>(op->size) : 0u,
+                                   op != nullptr ? static_cast<unsigned>(op->mem.base) : 0u,
+                                   op != nullptr ? static_cast<unsigned>(op->mem.index) : 0u,
+                                   op != nullptr ? static_cast<unsigned>(op->mem.scale) : 0u,
+                                   op != nullptr ? static_cast<unsigned>(op->mem.disp.size) : 0u,
+                                   op != nullptr
+                                       ? static_cast<unsigned long long>(op->mem.disp.value)
+                                       : 0ull);
                         }
                     }
                 }
@@ -5576,21 +5570,18 @@ public:
             }
         }
         if ((decoded_count & 0x3ffull) == 0) {
-            JitLog("[EXECUTOR_JIT_JIT_COVERAGE] decoded=%llu native=%llu helper=%llu "
-                        "unsupported=%llu arenaBlocks=%zu lastRip=0x%llx lastNative=%d "
-                        "lastCanRef=%d lastInsn=%zu",
-                        static_cast<unsigned long long>(decoded_count),
-                        static_cast<unsigned long long>(
-                            g_jit_blocks_native.load(std::memory_order_relaxed)),
-                        static_cast<unsigned long long>(
-                            g_jit_blocks_helper.load(std::memory_order_relaxed)),
-                        static_cast<unsigned long long>(
-                            g_jit_blocks_unsupported.load(std::memory_order_relaxed)),
-                        native_depot_.BlockCount(),
-                        static_cast<unsigned long long>(guest_rip),
-                        compiled_native ? 1 : 0,
-                        CanInterpretRegion(*decoded) ? 1 : 0,
-                        decoded->instructions.size());
+            JitLog("[LSX4_TRANSLATION_COVERAGE] decoded=%llu native=%llu bridges=%llu rejected=%llu artifacts=%zu",
+                   static_cast<unsigned long long>(decoded_count),
+                   static_cast<unsigned long long>(
+                       g_jit_blocks_native.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(
+                       g_jit_blocks_helper.load(std::memory_order_relaxed)),
+                   static_cast<unsigned long long>(
+                       g_jit_blocks_unsupported.load(std::memory_order_relaxed)),
+                   native_depot_.BlockCount());
+            JitLog("[LSX4_TRANSLATION_LATEST] pc=0x%llx native=%d semantic=%d operations=%zu",
+                   static_cast<unsigned long long>(guest_rip), compiled_native ? 1 : 0,
+                   CanInterpretRegion(*decoded) ? 1 : 0, decoded->instructions.size());
         }
 
         TranslationRecord result{};
