@@ -7,6 +7,7 @@
 #include "executor/dynamic_translation/code_memory.h"
 #include "executor/dynamic_translation/code_witness.h"
 #include "executor/dynamic_translation/edge_portal.h"
+#include "executor/dynamic_translation/execution_context.h"
 #include "executor/dynamic_translation/machine_state.h"
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/native_encoder.h"
@@ -54,6 +55,7 @@ enum CheckBit : std::uint64_t {
     X87State = 1ull << 19,
     X87Semantics = 1ull << 20,
     TranslationOrchestration = 1ull << 21,
+    ExecutionContext = 1ull << 22,
 };
 
 struct FetchContext {
@@ -680,6 +682,42 @@ bool CheckTranslationOrchestration() {
            service.NativeBytes() != 0;
 }
 
+bool CheckExecutionContext() {
+    ClearExecutionMessages();
+    CpuFrame outer{};
+    CpuFrame inner{};
+    outer.integer[0] = 11;
+    inner.integer[0] = 22;
+    {
+        ExecutionBinding outer_binding{outer};
+        if (CurrentExecutionFrame() != &outer) {
+            return false;
+        }
+        CpuFrame snapshot{};
+        if (!SnapshotExecutionFrame(snapshot) || snapshot.integer[0] != 11) {
+            return false;
+        }
+        {
+            ExecutionBinding inner_binding{inner};
+            if (CurrentExecutionFrame() != &inner) {
+                return false;
+            }
+            inner.integer[1] = 33;
+            PostExecutionReplacement(inner);
+            PostExecutionCompletion(44);
+        }
+        if (CurrentExecutionFrame() != &outer) {
+            return false;
+        }
+    }
+    CpuFrame replacement{};
+    const auto completion = TakeExecutionCompletion();
+    return CurrentExecutionFrame() == nullptr &&
+           TakeExecutionReplacement(replacement) && replacement.integer[0] == 22 &&
+           replacement.integer[1] == 33 && completion && *completion == 44 &&
+           !TakeExecutionCompletion() && !TakeExecutionReplacement(replacement);
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -801,6 +839,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(X87State, CheckX87State());
     run(X87Semantics, CheckX87Semantics());
     run(TranslationOrchestration, CheckTranslationOrchestration());
+    run(ExecutionContext, CheckExecutionContext());
     return report;
 }
 

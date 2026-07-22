@@ -152,10 +152,17 @@ void TranslationService::NotifyMutation(const std::uint64_t guest_address,
     mutations_.MarkChanged(guest_address, byte_count);
     runtime_epoch_.fetch_add(1, std::memory_order_acq_rel);
     edges_.RevokeAll();
-    const std::uint64_t end = guest_address + byte_count;
+    const std::uint64_t end =
+        byte_count > std::numeric_limits<std::uint64_t>::max() - guest_address
+            ? std::numeric_limits<std::uint64_t>::max()
+            : guest_address + byte_count;
     for (const auto& region : regions_.Snapshot()) {
         const CodeWitness& witness = region->Payload().source_identity;
-        const std::uint64_t witness_end = witness.guest_address + witness.byte_count;
+        const std::uint64_t witness_end =
+            witness.byte_count >
+                    std::numeric_limits<std::uint64_t>::max() - witness.guest_address
+                ? std::numeric_limits<std::uint64_t>::max()
+                : witness.guest_address + witness.byte_count;
         if (guest_address < witness_end && witness.guest_address < end) {
             Retire(regions_.Remove(region->GuestAddress()));
             invalidated_regions_.fetch_add(1, std::memory_order_relaxed);
