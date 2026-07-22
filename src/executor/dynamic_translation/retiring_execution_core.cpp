@@ -18075,13 +18075,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 const std::uint32_t n = budget.fetch_add(1, std::memory_order_relaxed);
                 if (n < 96) {
                     const char* mnemonic_name = X86MnemonicGetString(first_mnemonic);
-                    JitLog("[EXECUTOR_JIT_CONTROL_NATIVE_MISS] n=%u rip=0x%llx "
-                                "mnemonic=%s reason=block_size insnCount=%zu bytes=%s",
-                                n,
-                                static_cast<unsigned long long>(block.start_rip),
-                                mnemonic_name != nullptr ? mnemonic_name : "<unknown>",
-                                block.instructions.size(),
-                                HexBytesAt(block.start_rip, block.end_rip - block.start_rip).c_str());
+                    JitLog("[LSX4_CONTROL_REJECT] ticket=%u pc=0x%llx op=%s cause=multi-op-region count=%zu image=%s",
+                           n, static_cast<unsigned long long>(block.start_rip),
+                           mnemonic_name != nullptr ? mnemonic_name : "unresolved",
+                           block.instructions.size(),
+                           HexBytesAt(block.start_rip,
+                                      block.end_rip - block.start_rip).c_str());
                 }
             }
         }
@@ -18106,25 +18105,26 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         }
         const char* mnemonic_name = X86MnemonicGetString(mnemonic);
         const LsxOperandRecord* op = ir.operand_count > 0 ? &ir.operands[0] : nullptr;
-        JitLog("[EXECUTOR_JIT_CONTROL_NATIVE_MISS] n=%u rip=0x%llx "
-                    "mnemonic=%s reason=%s operandCount=%u decodedVisible=%u decodedTotal=%u "
-                    "opType=%u opSize=%u base=%u index=%u scale=%u dispSize=%u disp=0x%llx "
-                    "bytes=%s",
-                    n,
-                    static_cast<unsigned long long>(ir.guest_rip),
-                    mnemonic_name != nullptr ? mnemonic_name : "<unknown>",
-                    reason != nullptr ? reason : "<unknown>",
-                    static_cast<unsigned>(ir.operand_count),
-                    static_cast<unsigned>(ir.decoded.operand_count_visible),
-                    static_cast<unsigned>(ir.decoded.operand_count),
-                    op != nullptr ? static_cast<unsigned>(op->type) : 0u,
-                    op != nullptr ? static_cast<unsigned>(op->size) : 0u,
-                    op != nullptr ? static_cast<unsigned>(op->mem.base) : 0u,
-                    op != nullptr ? static_cast<unsigned>(op->mem.index) : 0u,
-                    op != nullptr ? static_cast<unsigned>(op->mem.scale) : 0u,
-                    op != nullptr ? static_cast<unsigned>(op->mem.disp.size) : 0u,
-                    op != nullptr ? static_cast<unsigned long long>(op->mem.disp.value) : 0ull,
-                    HexBytesAt(ir.guest_rip, ir.length).c_str());
+        const auto operand_or_zero = [op](const auto member) -> unsigned {
+            return op != nullptr ? static_cast<unsigned>(member(*op)) : 0u;
+        };
+        JitLog("[LSX4_CONTROL_REJECT] ticket=%u pc=0x%llx op=%s cause=%s image=%s",
+               n, static_cast<unsigned long long>(ir.guest_rip),
+               mnemonic_name != nullptr ? mnemonic_name : "unresolved",
+               reason != nullptr ? reason : "unspecified",
+               HexBytesAt(ir.guest_rip, ir.length).c_str());
+        JitLog("[LSX4_CONTROL_DECODE] ticket=%u operands=%u public_operands=%u raw_operands=%u",
+               n, static_cast<unsigned>(ir.operand_count),
+               static_cast<unsigned>(ir.decoded.operand_count_visible),
+               static_cast<unsigned>(ir.decoded.operand_count));
+        JitLog("[LSX4_CONTROL_OPERAND] ticket=%u kind=%u width=%u base_reg=%u index_reg=%u multiplier=%u displacement_width=%u displacement=0x%llx",
+               n, operand_or_zero([](const LsxOperandRecord& value) { return value.type; }),
+               operand_or_zero([](const LsxOperandRecord& value) { return value.size; }),
+               operand_or_zero([](const LsxOperandRecord& value) { return value.mem.base; }),
+               operand_or_zero([](const LsxOperandRecord& value) { return value.mem.index; }),
+               operand_or_zero([](const LsxOperandRecord& value) { return value.mem.scale; }),
+               operand_or_zero([](const LsxOperandRecord& value) { return value.mem.disp.size; }),
+               op != nullptr ? static_cast<unsigned long long>(op->mem.disp.value) : 0ull);
     };
 
     if (IsConditionalBranchMnemonic(mnemonic) && mnemonic != X86_MNEMONIC_JCXZ &&
