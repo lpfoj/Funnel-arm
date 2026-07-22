@@ -199,6 +199,26 @@ std::uint32_t NormalizeMnemonic(const std::uint32_t mnemonic) noexcept {
         return X86_MNEMONIC_PSHUFB;
     case X86_MNEMONIC_VPSHUFD:
         return X86_MNEMONIC_PSHUFD;
+    case X86_MNEMONIC_VPSLLW:
+        return X86_MNEMONIC_PSLLW;
+    case X86_MNEMONIC_VPSLLD:
+        return X86_MNEMONIC_PSLLD;
+    case X86_MNEMONIC_VPSLLQ:
+        return X86_MNEMONIC_PSLLQ;
+    case X86_MNEMONIC_VPSRLW:
+        return X86_MNEMONIC_PSRLW;
+    case X86_MNEMONIC_VPSRLD:
+        return X86_MNEMONIC_PSRLD;
+    case X86_MNEMONIC_VPSRLQ:
+        return X86_MNEMONIC_PSRLQ;
+    case X86_MNEMONIC_VPSRAW:
+        return X86_MNEMONIC_PSRAW;
+    case X86_MNEMONIC_VPSRAD:
+        return X86_MNEMONIC_PSRAD;
+    case X86_MNEMONIC_VPSLLDQ:
+        return X86_MNEMONIC_PSLLDQ;
+    case X86_MNEMONIC_VPSRLDQ:
+        return X86_MNEMONIC_PSRLDQ;
     case X86_MNEMONIC_VSHUFPS:
         return X86_MNEMONIC_SHUFPS;
     case X86_MNEMONIC_VUNPCKLPS:
@@ -439,6 +459,73 @@ VectorValue PackNarrow(const std::uint32_t mnemonic, const VectorValue& left,
     return result;
 }
 
+std::uint8_t ShiftLaneBytes(const std::uint32_t mnemonic) noexcept {
+    switch (mnemonic) {
+    case X86_MNEMONIC_PSLLW:
+    case X86_MNEMONIC_PSRLW:
+    case X86_MNEMONIC_PSRAW:
+        return 2;
+    case X86_MNEMONIC_PSLLD:
+    case X86_MNEMONIC_PSRLD:
+    case X86_MNEMONIC_PSRAD:
+        return 4;
+    case X86_MNEMONIC_PSLLQ:
+    case X86_MNEMONIC_PSRLQ:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+VectorValue ShiftPacked(const std::uint32_t mnemonic, const VectorValue& source,
+                        const std::uint64_t count) noexcept {
+    VectorValue result{};
+    result.active_bytes = source.active_bytes;
+    const std::uint8_t bytes = ShiftLaneBytes(mnemonic);
+    const std::uint32_t bits = bytes * 8u;
+    const bool left = mnemonic == X86_MNEMONIC_PSLLW ||
+                      mnemonic == X86_MNEMONIC_PSLLD ||
+                      mnemonic == X86_MNEMONIC_PSLLQ;
+    const bool arithmetic = mnemonic == X86_MNEMONIC_PSRAW ||
+                            mnemonic == X86_MNEMONIC_PSRAD;
+    for (std::size_t offset = 0; offset < result.active_bytes; offset += bytes) {
+        const std::uint64_t raw = LoadLane(source.bytes.data() + offset, bytes);
+        std::uint64_t value = 0;
+        if (count < bits) {
+            if (left) {
+                value = raw << count;
+            } else if (arithmetic) {
+                value = static_cast<std::uint64_t>(SignedLane(raw, bytes) >> count);
+            } else {
+                value = raw >> count;
+            }
+        } else if (arithmetic && SignedLane(raw, bytes) < 0) {
+            value = ~std::uint64_t{};
+        }
+        StoreLane(result.bytes.data() + offset, bytes, value);
+    }
+    return result;
+}
+
+VectorValue ShiftBytes(const std::uint32_t mnemonic, const VectorValue& source,
+                       const std::uint64_t count) noexcept {
+    VectorValue result{};
+    result.active_bytes = source.active_bytes;
+    const std::size_t distance = std::min<std::uint64_t>(count, 16);
+    for (std::size_t lane = 0; lane < result.active_bytes; lane += 16) {
+        for (std::size_t index = distance; index < 16; ++index) {
+            const std::size_t destination = mnemonic == X86_MNEMONIC_PSLLDQ
+                                                ? index
+                                                : index - distance;
+            const std::size_t input = mnemonic == X86_MNEMONIC_PSLLDQ
+                                          ? index - distance
+                                          : index;
+            result.bytes[lane + destination] = source.bytes[lane + input];
+        }
+    }
+    return result;
+}
+
 VectorValue ShuffleBytes(const VectorValue& source,
                          const VectorValue& control) noexcept {
     VectorValue result{};
@@ -545,6 +632,41 @@ VectorSemanticResult ExecuteVectorInstruction(
         }
         const VectorValue result =
             ShuffleDwords(*source, instruction.operands[2].immediate.bits);
+        if (!WriteVectorOperand(instruction, instruction.operands[0], result, frame,
+                                memory)) {
+            return Unsupported(instruction);
+        }
+        return {VectorStop::Continue, instruction.address + instruction.length, 0};
+    }
+
+    if (ShiftLaneBytes(mnemonic) != 0 || mnemonic == X86_MNEMONIC_PSLLDQ ||
+        mnemonic == X86_MNEMONIC_PSRLDQ) {
+        const bool vex_shift =
+            instruction.encoding_family != X86_INSTRUCTION_ENCODING_LEGACY;
+        const std::size_t source_index = vex_shift ? 1 : 0;
+        const std::size_t count_index = vex_shift ? 2 : 1;
+        if (instruction.operand_count <= count_index) {
+            return Unsupported(instruction);
+        }
+        const auto source = ReadVectorOperand(
+            instruction, instruction.operands[source_index], frame, memory);
+        if (!source) {
+            return Fault(instruction, instruction.address);
+        }
+        std::uint64_t count = 0;
+        if (instruction.operands[count_index].form == OperandForm::Immediate) {
+            count = instruction.operands[count_index].immediate.bits;
+        } else {
+            const auto count_vector = ReadVectorOperand(
+                instruction, instruction.operands[count_index], frame, memory);
+            if (!count_vector) {
+                return Fault(instruction, instruction.address);
+            }
+            count = LoadLane(count_vector->bytes.data(), 8);
+        }
+        const VectorValue result =
+            ShiftLaneBytes(mnemonic) != 0 ? ShiftPacked(mnemonic, *source, count)
+                                          : ShiftBytes(mnemonic, *source, count);
         if (!WriteVectorOperand(instruction, instruction.operands[0], result, frame,
                                 memory)) {
             return Unsupported(instruction);

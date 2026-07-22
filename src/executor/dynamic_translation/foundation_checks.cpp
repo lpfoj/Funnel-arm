@@ -45,6 +45,7 @@ enum CheckBit : std::uint64_t {
     AtomicSemantics = 1ull << 13,
     VectorSemantics = 1ull << 14,
     VectorPacking = 1ull << 15,
+    VectorShifts = 1ull << 16,
 };
 
 struct FetchContext {
@@ -449,6 +450,38 @@ bool CheckVectorPacking() {
     return offset == fixture.size();
 }
 
+bool CheckVectorShifts() {
+    constexpr std::array<std::uint8_t, 18> fixture{
+        0xf3, 0x0f, 0x6f, 0x07, 0x66, 0x0f, 0x71, 0xe0, 0x04,
+        0x66, 0x0f, 0x71, 0xf0, 0x01, 0xf3, 0x0f, 0x7f, 0x06};
+    constexpr std::array<std::uint16_t, 8> source{
+        0x8001, 0xffff, 0x7fff, 0x0010, 0xfff0, 0x1234, 0xedcc, 0x0000};
+    constexpr std::array<std::uint16_t, 8> expected{
+        0xf000, 0xfffe, 0x0ffe, 0x0002, 0xfffe, 0x0246, 0xfdb8, 0x0000};
+    constexpr std::uint64_t code_base = 0xef00;
+    SemanticMemoryImage image{.base = 0x160000};
+    std::memcpy(image.bytes.data(), source.data(), sizeof(source));
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+    WriteInteger(frame, IntegerRegister::Source, image.base + 32, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 4; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+            DecodeOutcome::Complete ||
+            ExecuteVectorInstruction(instruction, frame, memory).stop !=
+                VectorStop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    return offset == fixture.size() &&
+           std::memcmp(image.bytes.data() + 32, expected.data(), sizeof(expected)) == 0;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -564,6 +597,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(AtomicSemantics, CheckAtomicSemantics());
     run(VectorSemantics, CheckVectorSemantics());
     run(VectorPacking, CheckVectorPacking());
+    run(VectorShifts, CheckVectorShifts());
     return report;
 }
 
