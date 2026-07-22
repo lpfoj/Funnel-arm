@@ -430,4 +430,62 @@ bool InterleaveElementHalves(void* const destination, const void* const left,
     return true;
 }
 
+bool SelectElementsByImmediate(void* const destination, const void* const left,
+                               const void* const right,
+                               const std::uint32_t selection_bits,
+                               const std::size_t element_width,
+                               const std::size_t total_width,
+                               const bool restart_bits_per_half) noexcept {
+    const bool valid_element = element_width == 1 || element_width == 2 ||
+                               element_width == 4 || element_width == 8;
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        !valid_element || (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    std::array<std::uint8_t, kMaximumVectorBytes> inputs[2]{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(inputs[0].data(), left, total_width);
+    std::memcpy(inputs[1].data(), right, total_width);
+    for (std::size_t offset = 0; offset < total_width;
+         offset += element_width) {
+        const std::size_t selector_index = restart_bits_per_half
+            ? (offset % 16) / element_width
+            : offset / element_width;
+        const std::size_t input_index =
+            (selection_bits >> selector_index) & 1u;
+        std::memcpy(output.data() + offset, inputs[input_index].data() + offset,
+                    element_width);
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
+bool SelectElementsBySign(void* const destination, const void* const left,
+                          const void* const right, const void* const selectors,
+                          const std::size_t element_width,
+                          const std::size_t total_width) noexcept {
+    const bool valid_element = element_width == 1 || element_width == 2 ||
+                               element_width == 4 || element_width == 8;
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        selectors == nullptr || !valid_element ||
+        (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    std::array<std::uint8_t, kMaximumVectorBytes> inputs[2]{};
+    std::array<std::uint8_t, kMaximumVectorBytes> mask{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(inputs[0].data(), left, total_width);
+    std::memcpy(inputs[1].data(), right, total_width);
+    std::memcpy(mask.data(), selectors, total_width);
+    for (std::size_t offset = 0; offset < total_width;
+         offset += element_width) {
+        const std::size_t sign_position = offset + element_width - 1;
+        const std::size_t input_index = (mask[sign_position] >> 7) & 1u;
+        std::memcpy(output.data() + offset, inputs[input_index].data() + offset,
+                    element_width);
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
 } // namespace Executor::Jit::VectorSemantic

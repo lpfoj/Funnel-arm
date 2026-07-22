@@ -49,5 +49,14 @@ bool InterleaveElementHalves(void* destination, const void* left,
                              const void* right, std::size_t element_width,
                              std::size_t total_width,
                              bool select_upper_half) noexcept;
+bool SelectElementsByImmediate(void* destination, const void* left,
+                               const void* right, std::uint32_t selection_bits,
+                               std::size_t element_width,
+                               std::size_t total_width,
+                               bool restart_bits_per_half) noexcept;
+bool SelectElementsBySign(void* destination, const void* left,
+                          const void* right, const void* selectors,
+                          std::size_t element_width,
+                          std::size_t total_width) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic

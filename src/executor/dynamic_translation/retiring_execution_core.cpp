@@ -226,15 +226,6 @@ void PermuteDwordsFromImmediate(void* dst, const void* src, std::uint8_t imm);
 void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
                      std::size_t scalar_size);
 void PermuteBytesFromMask(void* dst, const void* src, const void* mask, std::size_t total_size);
-void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
-              std::size_t total_size);
-void BlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               std::size_t total_size);
-void BlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               std::size_t lane_bytes, std::size_t total_size);
-void BlendVectorImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
-               std::size_t lane_bytes, std::size_t total_size,
-               bool repeat_mask_per_128 = false);
 void PermuteVectorHalves(void* dst, const void* lhs, const void* rhs, std::uint32_t imm);
 void ExtractVectorHalf(void* dst, const void* src, std::uint32_t half_index, bool zero_upper_ymm);
 void InsertVectorHalf(void* dst, const void* old_dst, const void* src, std::uint32_t half_index);
@@ -24005,8 +23996,11 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         const bool repeat_mask_per_128 =
             mnemonic == X86_MNEMONIC_PBLENDW ||
             mnemonic == X86_MNEMONIC_VPBLENDW;
-        BlendVectorImmediate(result.data(), lhs.data(), rhs.data(), imm, lane_bytes, width,
-                  repeat_mask_per_128);
+        if (!VectorSemantic::SelectElementsByImmediate(
+                result.data(), lhs.data(), rhs.data(), imm, lane_bytes, width,
+                repeat_mask_per_128)) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -24036,8 +24030,11 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         if (lane_bytes == 0 || lane_bytes > width) {
             return false;
         }
-        result.fill(0);
-        BlendVectorByMask(result.data(), lhs.data(), rhs.data(), mask.data(), lane_bytes, width);
+        if (!VectorSemantic::SelectElementsBySign(
+                result.data(), lhs.data(), rhs.data(), mask.data(), lane_bytes,
+                width)) {
+            return false;
+        }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
@@ -31790,91 +31787,6 @@ void ExtractVectorHalf(void* argument0, const void* argument1, const std::uint32
 
 void PermuteVectorHalves(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3) {
     SemanticKernelPermuteVectorHalves(argument0, argument1, argument2, argument3);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelBlendVectorImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
-               const std::size_t lane_bytes, const std::size_t total_size,
-               const bool repeat_mask_per_128){
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || lane_bytes == 0 ||
-        total_size > 32) {
-        return;
-    }
-
-    const auto left = SemanticVectorImage::Capture(lhs, total_size);
-    const auto right = SemanticVectorImage::Capture(rhs, total_size);
-    const auto result = SelectVectorElements(
-        left, right, total_size, lane_bytes,
-        [&](const std::size_t lane, const std::size_t) {
-            const std::size_t bit = repeat_mask_per_128
-                                        ? lane % (16u / lane_bytes)
-                                        : lane;
-            return std::pair{((imm >> bit) & 1u) != 0, lane};
-        });
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void BlendVectorImmediate(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const std::size_t argument4, const std::size_t argument5, const bool argument6) {
-    SemanticKernelBlendVectorImmediate(argument0, argument1, argument2, argument3, argument4, argument5, argument6);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelBlendVectorByMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               const std::size_t lane_bytes, const std::size_t total_size){
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || mask == nullptr ||
-        lane_bytes == 0 || total_size > 32) {
-        return;
-    }
-
-    const auto left = SemanticVectorImage::Capture(lhs, total_size);
-    const auto right = SemanticVectorImage::Capture(rhs, total_size);
-    const auto selectors = SemanticVectorImage::Capture(mask, total_size);
-    const auto result = SelectVectorElements(
-        left, right, total_size, lane_bytes,
-        [&](const std::size_t lane, const std::size_t) {
-            const auto sign = std::bit_cast<std::int8_t>(
-                selectors.bytes[(lane + 1u) * lane_bytes - 1u]);
-            return std::pair{sign < 0, lane};
-        });
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void BlendVectorByMask(void* argument0, const void* argument1, const void* argument2, const void* argument3, const std::size_t argument4, const std::size_t argument5) {
-    SemanticKernelBlendVectorByMask(argument0, argument1, argument2, argument3, argument4, argument5);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelBlendVectorBytesByRegisterMask(void* dst, const void* lhs, const void* rhs, const void* mask,
-               const std::size_t total_size){
-    constexpr auto byte_granularity = sizeof(std::uint8_t);
-    const std::array<const void*, 3> inputs{lhs, rhs, mask};
-    if (total_size > kSemanticVectorBytes ||
-        std::ranges::any_of(inputs, [](const void* input) { return input == nullptr; })) {
-        return;
-    }
-    BlendVectorByMask(dst, inputs[0], inputs[1], inputs[2], byte_granularity,
-                      total_size);
-}
-
-void BlendVectorBytesByRegisterMask(void* argument0, const void* argument1, const void* argument2, const void* argument3, const std::size_t argument4) {
-    auto operation = std::bind_front(&SemanticKernelBlendVectorBytesByRegisterMask);
-    operation(argument0, argument1, argument2, argument3, argument4);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelBlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, const std::uint32_t imm,
-              const std::size_t total_size){
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || total_size > 32) {
-        return;
-    }
-    const auto left = SemanticVectorImage::Capture(lhs, total_size);
-    const auto right = SemanticVectorImage::Capture(rhs, total_size);
-    const auto result = SelectVectorElements(
-        left, right, total_size, sizeof(std::uint16_t),
-        [&](const std::size_t lane, const std::size_t) {
-            return std::pair{((imm >> (lane % 8u)) & 1u) != 0, lane};
-        });
-    result.Publish(dst, kSemanticVectorBytes);
-}
-
-void BlendVectorWordsImmediate(void* argument0, const void* argument1, const void* argument2, const std::uint32_t argument3, const std::size_t argument4) {
-    SemanticKernelBlendVectorWordsImmediate(argument0, argument1, argument2, argument3, argument4);
 }
 
 [[gnu::always_inline]] static inline void SemanticKernelPermuteBytesFromMask(void* dst, const void* src, const void* mask, const std::size_t total_size){
