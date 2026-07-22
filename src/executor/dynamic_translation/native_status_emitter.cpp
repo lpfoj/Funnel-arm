@@ -12,9 +12,7 @@ namespace {
 // accumulated x86 status word; W16 is temporary. The nibble lookup avoids
 // reproducing the reference XOR-fold implementation.
 void EmitEvenParity(Xbyak_aarch64::CodeGenerator& code, const WReg& source) {
-    code.mov(code.w15, source);
-    code.lsr(code.w16, code.w15, 4);
-    code.eor(code.w15, code.w15, code.w16);
+    code.eor(code.w15, source, source, Xbyak_aarch64::LSR, 4);
     code.and_(code.w15, code.w15, 0xf);
     code.mov(code.w16, 0x9669);
     code.lsrv(code.w15, code.w16, code.w15);
@@ -26,8 +24,8 @@ void PublishStatus(Xbyak_aarch64::CodeGenerator& code,
     code.mov(code.x15, mask);
     code.ldr(code.x16, Xbyak_aarch64::ptr(code.x0, layout.state_offset));
     code.bic(code.x16, code.x16, code.x15);
-    code.orr(code.x16, code.x16, code.x14);
-    code.str(code.x16, Xbyak_aarch64::ptr(code.x0, layout.state_offset));
+    code.orr(code.x14, code.x14, code.x16);
+    code.str(code.x14, Xbyak_aarch64::ptr(code.x0, layout.state_offset));
 }
 
 void AppendNzv(Xbyak_aarch64::CodeGenerator& code,
@@ -168,18 +166,15 @@ void EmitSubtract8(Xbyak_aarch64::CodeGenerator& code, const WReg& left,
     code.cset(code.x14, Xbyak_aarch64::CC);
     code.cmp(result, 0);
     code.cset(code.x15, Xbyak_aarch64::EQ);
-    code.lsl(code.x15, code.x15, layout.zero_bit);
-    code.orr(code.x14, code.x14, code.x15);
-    code.lsr(code.w15, result, 7);
-    code.lsl(code.x15, code.x15, layout.sign_bit);
-    code.orr(code.x14, code.x14, code.x15);
-    code.eor(code.w15, left, right);
-    code.eor(code.w16, left, result);
-    code.and_(code.w15, code.w15, code.w16);
-    code.lsr(code.w15, code.w15, 7);
-    code.and_(code.w15, code.w15, 1);
-    code.lsl(code.x15, code.x15, layout.overflow_bit);
-    code.orr(code.x14, code.x14, code.x15);
+    code.bfi(code.x14, code.x15, layout.zero_bit, 1);
+    code.ubfx(code.w15, result, 7, 1);
+    code.bfi(code.x14, code.x15, layout.sign_bit, 1);
+    code.eor(code.w16, left, right);
+    code.eor(code.w15, left, result);
+    code.and_(code.w16, code.w16, code.w15);
+    code.tst(code.w16, 0x80);
+    code.cset(code.x15, Xbyak_aarch64::NE);
+    code.bfi(code.x14, code.x15, layout.overflow_bit, 1);
     AppendAdjust32(code, left, right, result, layout);
     AppendParity(code, result, layout);
     PublishStatus(code, layout, layout.arithmetic_mask);
