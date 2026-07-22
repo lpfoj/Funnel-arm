@@ -39843,506 +39843,274 @@ std::string ExerciseTranslationEngineJson() {
             << R"("interpreterCompilerResult":"0x)" << std::hex
             << interpreter_smoke_result << std::dec << R"(",)"
             << R"("interpreterCompilerRax":"0x)" << std::hex
-            << ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rax) << std::dec << R"(",)"
-            << R"("partialPackedTransferNativeOk":)"
-            << (partial_packed_move_native_ok ? "true" : "false") << ","
-            << R"("rgb565BlendNativeOk":)"
-            << (rgb565_blend_native_ok ? "true" : "false") << ","
-            << R"("rgb565BlendTakenOk":)"
-            << (rgb565_blend_taken_ok ? "true" : "false") << ","
-            << R"("rgb565BlendFallthroughOk":)"
-            << (rgb565_blend_fallthrough_ok ? "true" : "false") << ","
-            << R"("rgb565BlendAliasOk":)"
-            << (rgb565_blend_alias_ok ? "true" : "false") << ","
-            << R"("rgb565TableNativeOk":)"
-            << (rgb565_table_native_ok ? "true" : "false") << ","
-            << R"("rgb565TableTakenOk":)"
-            << (rgb565_table_taken_ok ? "true" : "false") << ","
-            << R"("rgb565TableFallthroughOk":)"
-            << (rgb565_table_fallthrough_ok ? "true" : "false") << ","
-            << R"("rgb565TableAliasOk":)"
-            << (rgb565_table_alias_ok ? "true" : "false") << ","
-            << R"("hotIterationBatchNativeOk":)"
-            << (hot_iteration_batch_native_ok ? "true" : "false") << ","
-            << R"("hotR13RecordNativeOk":)"
-            << (hot_r13_record_native_ok ? "true" : "false") << ","
-            << R"("hotR13RecordTakenOk":)"
-            << (hot_r13_record_taken_ok ? "true" : "false") << ","
-            << R"("hotR13RecordFallthroughOk":)"
-            << (hot_r13_record_fallthrough_ok ? "true" : "false") << ","
-            << R"("hotR13RecordWrapOk":)"
-            << (hot_r13_record_wrap_ok ? "true" : "false") << ","
-            << R"("hotEcxRecordNativeOk":)"
-            << (hot_ecx_record_native_ok ? "true" : "false") << ","
-            << R"("hotEcxRecordTakenOk":)"
-            << (hot_ecx_record_taken_ok ? "true" : "false") << ","
-            << R"("hotEcxRecordFallthroughOk":)"
-            << (hot_ecx_record_fallthrough_ok ? "true" : "false") << ","
-            << R"("hotEcxRecordWrapOk":)"
-            << (hot_ecx_record_wrap_ok ? "true" : "false") << ","
-            << R"("hotEcxRecordAliasR15Ok":)"
-            << (hot_ecx_record_alias_r15_ok ? "true" : "false") << ","
-            << R"("hotEcxRecordAliasR15Plus26Ok":)"
-            << (hot_ecx_record_alias_r15_plus26_ok ? "true" : "false") << ","
-            << R"("hotRsiRdxNativeOk":)"
-            << (hot_rsi_rdx_native_ok ? "true" : "false") << ","
-            << R"("hotRsiRdxTakenOk":)"
-            << (hot_rsi_rdx_taken_ok ? "true" : "false") << ","
-            << R"("hotRsiRdxFallthroughOk":)"
-            << (hot_rsi_rdx_fallthrough_ok ? "true" : "false") << ","
-            << R"("hotRsiRdxWrapOk":)"
-            << (hot_rsi_rdx_wrap_ok ? "true" : "false") << ","
-            << R"("hotScalarLoweringOk":)" << (hot_scalar_native_ok ? "true" : "false") << ","
-            << R"("monoStringHashNativeOk":)"
-            << (mono_string_hash_native_ok ? "true" : "false") << ","
-            << R"("monoStringHashNonemptyOk":)"
-            << (mono_string_hash_nonempty_ok ? "true" : "false") << ","
-            << R"("monoStringHashEmptyOk":)"
-            << (mono_string_hash_empty_ok ? "true" : "false") << ","
-            << R"("monoStrlenNativeOk":)"
-            << (mono_strlen_native_ok ? "true" : "false") << ","
-            << R"("monoStrlenEmptyOk":)"
-            << (mono_strlen_empty_ok ? "true" : "false") << ","
-            << R"("monoStrlenNonemptyOk":)"
-            << (mono_strlen_nonempty_ok ? "true" : "false") << ","
-            << R"("monoStringEqualNativeOk":)"
-            << (mono_string_equal_native_ok ? "true" : "false") << ","
-            << R"("monoStringEqualEmptyOk":)"
-            << (mono_string_equal_empty_ok ? "true" : "false") << ","
-            << R"("monoStringEqualMatchOk":)"
-            << (mono_string_equal_match_ok ? "true" : "false") << ","
-            << R"("monoStringEqualMismatchOk":)"
-            << (mono_string_equal_mismatch_ok ? "true" : "false") << ","
-            << R"("fastGuestStrcmpNativeOk":)"
-            << (fast_guest_strcmp_native_ok ? "true" : "false") << ","
-            << R"("fastGuestStrcmpMatchOk":)"
-            << (fast_guest_strcmp_match_ok ? "true" : "false") << ","
-            << R"("fastGuestStrcmpHighbitOk":)"
-            << (fast_guest_strcmp_highbit_ok ? "true" : "false") << ","
-            << R"("fastGuestStrncmpNativeOk":)"
-            << (fast_guest_strncmp_native_ok ? "true" : "false") << ","
-            << R"("fastGuestStrncmpCountOk":)"
-            << (fast_guest_strncmp_count_ok ? "true" : "false") << ","
-            << R"("fastGuestStrncmpZeroOk":)"
-            << (fast_guest_strncmp_zero_ok ? "true" : "false") << ","
-            << R"("fastGuestStrncmpMismatchOk":)"
-            << (fast_guest_strncmp_mismatch_ok ? "true" : "false") << ","
-            << R"("fastGuestMemcmpNativeOk":)"
-            << (fast_guest_memcmp_native_ok ? "true" : "false") << ","
-            << R"("fastGuestMemcmpEqualOk":)"
-            << (fast_guest_memcmp_equal_ok ? "true" : "false") << ","
-            << R"("fastGuestMemcmpAfterZeroOk":)"
-            << (fast_guest_memcmp_after_zero_ok ? "true" : "false") << ","
-            << R"("monoScriptCacheTreeNativeOk":)"
-            << (mono_script_cache_tree_native_ok ? "true" : "false") << ","
-            << R"("monoScriptCacheTreeEntryNativeOk":)"
-            << (mono_script_cache_tree_entry_native_ok ? "true" : "false") << ","
-            << R"("monoScriptCacheTreeLoopNativeOk":)"
-            << (mono_script_cache_tree_loop_native_ok ? "true" : "false") << ","
-            << R"("monoScriptCacheTreeThunkIdentityOk":)"
-            << (mono_script_cache_thunk_identity_ok ? "true" : "false") << ","
-            << R"("monoScriptCacheTreeEntryFailure":)"
-            << mono_script_cache_tree_entry_failure << ","
-            << R"("monoScriptCacheTreeLoopFailure":)"
-            << mono_script_cache_tree_loop_failure << ","
-            << R"("monoAotCompareNativeOk":)"
-            << (mono_aot_compare_native_ok ? "true" : "false") << ","
-            << R"("monoAotCompareEmptyOk":)"
-            << (mono_aot_compare_empty_ok ? "true" : "false") << ","
-            << R"("monoAotCompareMatchOk":)"
-            << (mono_aot_compare_match_ok ? "true" : "false") << ","
-            << R"("monoAotCompareMismatchOk":)"
-            << (mono_aot_compare_mismatch_ok ? "true" : "false") << ","
-            << R"("monoGHashLookupNativeOk":)"
-            << (mono_ghash_lookup_native_ok ? "true" : "false") << ","
-            << R"("monoGHashLookupHitOk":)"
-            << (mono_ghash_lookup_hit_ok ? "true" : "false") << ","
-            << R"("monoGHashLookupEmptyOk":)"
-            << (mono_ghash_lookup_empty_ok ? "true" : "false") << ","
-            << R"("monoGHashLookupZeroDivisorOk":)"
-            << (mono_ghash_lookup_zero_divisor_ok ? "true" : "false") << ","
-            << R"("monoMetadataHashNativeOk":)"
-            << (mono_metadata_hash_native_ok ? "true" : "false") << ","
-            << R"("monoMetadataHashEmptyOk":)"
-            << (mono_metadata_hash_empty_ok ? "true" : "false") << ","
-            << R"("monoMetadataHashAsciiOk":)"
-            << (mono_metadata_hash_ascii_ok ? "true" : "false") << ","
-            << R"("monoMetadataHashHighbitOk":)"
-            << (mono_metadata_hash_highbit_ok ? "true" : "false") << ","
-            << R"("monoMetadataHashBackedgeOk":)"
-            << (mono_metadata_hash_backedge_ok ? "true" : "false") << ","
-            << R"("monoMetadataStringHeapNativeOk":)"
-            << (mono_metadata_string_heap_native_ok ? "true" : "false") << ","
-            << R"("monoMetadataStringHeapValidOk":)"
-            << (mono_metadata_string_heap_valid_ok ? "true" : "false") << ","
-            << R"("monoMetadataStringHeapInvalidOk":)"
-            << (mono_metadata_string_heap_invalid_ok ? "true" : "false") << ","
-            << R"("monoMetadataRowDecodeNativeOk":)"
-            << (mono_metadata_row_decode_native_ok ? "true" : "false") << ","
-            << R"("monoInterfaceCopyNativeOk":)"
-            << (mono_interface_copy_native_ok ? "true" : "false") << ","
-            << R"("monoInterfaceCopy60Ok":)"
-            << (mono_interface_copy_60_ok ? "true" : "false") << ","
-            << R"("monoInterfaceCopy78Ok":)"
-            << (mono_interface_copy_78_ok ? "true" : "false") << ","
-            << R"("genericScalarNativeOk":)"
-            << (generic_scalar_native_ok ? "true" : "false") << ","
-            << R"("serializedHeaderMovbeNativeOk":)"
-            << (serialized_header_movbe_native_ok ? "true" : "false") << ","
-            << R"("serializedMetadataDivNativeOk":)"
-            << (serialized_metadata_div_native_ok ? "true" : "false") << ","
-            << R"("genericSimdNativeOk":)"
-            << (generic_simd_native_ok ? "true" : "false") << ","
-            << R"("genericFaultableSimdWritebackOk":)"
-            << (generic_faultable_simd_writeback_ok ? "true" : "false") << ","
-            << R"("genericSimdYmmNativeOk":)"
-            << (generic_simd_ymm_native_ok ? "true" : "false") << ","
-            << R"("genericVectorKernelNativeOk":)"
-            << (generic_vector_kernel_native_ok ? "true" : "false") << ","
-            << R"("genericScalarPredicateNativeOk":)"
-            << (generic_scalar_predicate_native_ok ? "true" : "false") << ","
-            << R"("genericVectorKernelResultOk":)"
-            << (generic_vector_kernel_result_ok ? "true" : "false") << ","
-            << R"("genericVectorKernelCounterOk":)"
-            << (generic_vector_kernel_counter_ok ? "true" : "false") << ","
-            << R"("genericVectorKernelSemanticNs":)"
-            << vector_kernel_semantic_ns << ","
-            << R"("genericVectorKernelNativeNs":)"
-            << vector_kernel_native_ns << ","
-            << R"("genericVectorKernelSpeedupMilli":)"
-            << vector_kernel_speedup_milli << ","
-            << R"("genericLddquVlddquNativeOk":)"
-            << (generic_lddqu_vlddqu_native_ok ? "true" : "false") << ","
-            << R"("genericLddquVlddquResultOk":)"
-            << (generic_lddqu_vlddqu_result_ok ? "true" : "false") << ","
-            << R"("genericLddquVlddquCounterOk":)"
-            << (generic_lddqu_vlddqu_counter_ok ? "true" : "false") << ","
-            << R"("genericMaskmovdquNativeOk":)"
-            << (generic_maskmovdqu_native_ok ? "true" : "false") << ","
-            << R"("genericMaskmovdquResultOk":)"
-            << (generic_maskmovdqu_result_ok ? "true" : "false") << ","
-            << R"("genericMaskmovdquCounterOk":)"
-            << (generic_maskmovdqu_counter_ok ? "true" : "false") << ","
-            << R"("genericPsadbwVpsadbwNativeOk":)"
-            << (generic_psadbw_vpsadbw_native_ok ? "true" : "false") << ","
-            << R"("genericPsadbwVpsadbwResultOk":)"
-            << (generic_psadbw_vpsadbw_result_ok ? "true" : "false") << ","
-            << R"("genericPsadbwVpsadbwCounterOk":)"
-            << (generic_psadbw_vpsadbw_counter_ok ? "true" : "false") << ","
-            << R"("genericSaturatingPackedNativeOk":)"
-            << (generic_saturating_packed_native_ok ? "true" : "false") << ","
-            << R"("genericSaturatingPackedResultOk":)"
-            << (generic_saturating_packed_result_ok ? "true" : "false") << ","
-            << R"("genericSaturatingPackedCounterOk":)"
-            << (generic_saturating_packed_counter_ok ? "true" : "false") << ","
-            << R"("genericSaturatingPackedMmxRejectOk":)"
-            << (generic_saturating_packed_mmx_reject_ok ? "true" : "false") << ","
-            << R"("genericSimdXmmFpNativeOk":)"
-            << (generic_simd_xmm_fp_native_ok ? "true" : "false") << ","
-            << R"("genericWideHotV5SimdOk":)"
-            << (generic_wide_hot_v5_simd_ok ? "true" : "false") << ","
-            << R"("genericWideHotV5SimdResultOk":)"
-            << (generic_wide_hot_v5_simd_result_ok ? "true" : "false") << ","
-            << R"("genericWideHotV5SimdCounterOk":)"
-            << (generic_wide_hot_v5_simd_counter_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV6Ok":)"
-            << (generic_post_load_v6_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV6PackedResultOk":)"
-            << (generic_post_load_v6_packed_result_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV6ConvertResultOk":)"
-            << (generic_post_load_v6_convert_result_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV6CounterOk":)"
-            << (generic_post_load_v6_counter_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV6FastDelta":)" << post_load_v6_fast_delta << ","
-            << R"("genericPostLoadV6SemanticDelta":)" << post_load_v6_semantic_delta << ","
-            << R"("genericPostLoadV7Ok":)"
-            << (generic_post_load_v7_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV7ResultOk":)"
-            << (generic_post_load_v7_result_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV7CounterOk":)"
-            << (generic_post_load_v7_counter_ok ? "true" : "false") << ","
-            << R"("genericPostLoadV7FastDelta":)" << post_load_v7_fast_delta << ","
-            << R"("genericPostLoadV7SemanticDelta":)" << post_load_v7_semantic_delta << ","
-            << R"("genericCvttps2dqNativeOk":)"
-            << (generic_cvttps2dq_native_ok ? "true" : "false") << ","
-            << R"("genericCvttps2dqResultOk":)"
-            << (generic_cvttps2dq_result_ok ? "true" : "false") << ","
-            << R"("genericCvttps2dqCounterOk":)"
-            << (generic_cvttps2dq_counter_ok ? "true" : "false") << ","
-            << R"("genericCvttps2dqFastDelta":)" << cvttps2dq_fast_delta << ","
-            << R"("genericCvttps2dqSemanticDelta":)" << cvttps2dq_semantic_delta << ","
-            << R"("genericSimdScalarMoveNativeOk":)"
-            << (generic_simd_scalar_move_native_ok ? "true" : "false") << ","
-            << R"("genericSimdScalarMoveResultOk":)"
-            << (generic_simd_scalar_move_result_ok ? "true" : "false") << ","
-            << R"("genericSimdScalarMoveCounterOk":)"
-            << (generic_simd_scalar_move_counter_ok ? "true" : "false") << ","
-            << R"("codecSimdDirectNativeOk":)"
-            << (codec_simd_direct_native_ok ? "true" : "false") << ","
-            << R"("codecSimdDirectCounterOk":)"
-            << (codec_simd_direct_counter_ok ? "true" : "false") << ","
-            << R"("genericTheoraIdctSimdNativeOk":)"
-            << (generic_theora_idct_simd_native_ok ? "true" : "false") << ","
-            << R"("genericTheoraIdctSimdResultOk":)"
-            << (generic_theora_idct_simd_result_ok ? "true" : "false") << ","
-            << R"("genericTheoraIdctSimdCounterOk":)"
-            << (generic_theora_idct_simd_counter_ok ? "true" : "false") << ","
-            << R"("genericVpshufdYmmNativeOk":)"
-            << (generic_vpshufd_ymm_native_ok ? "true" : "false") << ","
-            << R"("genericPshufdMemoryNativeOk":)"
-            << (generic_pshufd_memory_native_ok ? "true" : "false") << ","
-            << R"("genericPackedQShiftNativeOk":)"
-            << (generic_packed_q_shift_native_ok ? "true" : "false") << ","
-            << R"("genericMovqTransferNativeOk":)"
-            << (generic_movq_transfer_native_ok ? "true" : "false") << ","
-            << R"("genericMovdTransferNativeOk":)"
-            << (generic_movd_transfer_native_ok ? "true" : "false") << ","
-            << R"("genericMovdTransferResultOk":)"
-            << (generic_movd_transfer_result_ok ? "true" : "false") << ","
-            << R"("genericMovdTransferCounterOk":)"
-            << (generic_movd_transfer_counter_ok ? "true" : "false") << ","
-            << R"("genericVmovlpdCusa07010NativeOk":)"
-            << (generic_vmovlpd_cusa07010_native_ok ? "true" : "false") << ","
-            << R"("genericVmovlpdCusa07010ResultOk":)"
-            << (generic_vmovlpd_cusa07010_result_ok ? "true" : "false") << ","
-            << R"("genericVpalignrFmodDecodeOk":)"
-            << (generic_vpalignr_fmod_decode_ok ? "true" : "false") << ","
-            << R"("genericVpalignrFmodNativeOk":)"
-            << (generic_vpalignr_fmod_native_ok ? "true" : "false") << ","
-            << R"("genericPalignrLegacyNativeOk":)"
-            << (generic_palignr_legacy_native_ok ? "true" : "false") << ","
-            << R"("genericAlignRightFastCounterOk":)"
-            << (generic_align_right_fast_counter_ok ? "true" : "false") << ","
-            << R"("genericAlignRightNativeOk":)"
-            << (generic_align_right_native_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpdFmodDecodeOk":)"
-            << (generic_vunpcklpd_fmod_decode_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpdFmodNativeOk":)"
-            << (generic_vunpcklpd_fmod_native_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsNativeOk":)"
-            << (generic_vunpcklps_native_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsXmmSrc1AliasOk":)"
-            << (generic_vunpcklps_xmm_src1_alias_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsXmmSrc2AliasOk":)"
-            << (generic_vunpcklps_xmm_src2_alias_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsXmmMemoryOk":)"
-            << (generic_vunpcklps_xmm_memory_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsYmmLaneLocalOk":)"
-            << (generic_vunpcklps_ymm_lane_local_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsYmmSrc2AliasOk":)"
-            << (generic_vunpcklps_ymm_src2_alias_ok ? "true" : "false") << ","
-            << R"("genericVunpcklpsYmmMemoryOk":)"
-            << (generic_vunpcklps_ymm_memory_ok ? "true" : "false") << ","
-            << R"("genericSimdCounterGateOk":)"
-            << (generic_simd_counter_gate_ok ? "true" : "false") << ","
-            << R"("genericExtensionNativeOk":)"
-            << (generic_extension_native_ok ? "true" : "false") << ","
-            << R"("genericWideHotV5CountsOk":)"
-            << (generic_wide_hot_v5_counts_ok ? "true" : "false") << ","
-            << R"("genericIncDecNativeOk":)"
-            << (generic_incdec_native_ok ? "true" : "false") << ","
-            << R"("genericLiveFlagsNativeOk":)"
-            << (generic_live_flags_native_ok ? "true" : "false") << ","
-            << R"("genericLiveFlagsWidthSemanticOk":)"
-            << (generic_live_flags_width_semantic_ok ? "true" : "false") << ","
-            << R"("genericLiveFlagsOpcodeSemanticOk":)"
-            << (generic_live_flags_opcode_semantic_ok ? "true" : "false") << ","
-            << R"("genericLiveFlagsStructuralOk":)"
-            << (generic_live_flags_structural_ok ? "true" : "false") << ","
-            << R"("genericLiveFlagsMemorySemanticOk":)"
-            << (generic_live_flags_memory_semantic_ok ? "true" : "false") << ","
-            << R"("genericLiveFlagsMemoryFaultOrderingOk":)"
-            << (generic_live_flags_memory_fault_ordering_ok ? "true" : "false") << ","
-            << R"("genericShiftNativeOk":)"
-            << (generic_shift_native_ok ? "true" : "false") << ","
-            << R"("genericScalarShiftInlineOk":)"
-            << (generic_shift_inline_ok ? "true" : "false") << ","
-            << R"("genericCodecDeadFlagsNativeOk":)"
-            << (generic_codec_dead_flags_native_ok ? "true" : "false") << ","
-            << R"("genericCodecDeadFlagsSemanticOk":)"
-            << (generic_codec_dead_flags_semantic_ok ? "true" : "false") << ","
-            << R"("genericCodecDeadFlagsStructuralOk":)"
-            << (generic_codec_dead_flags_structural_ok ? "true" : "false") << ","
-            << R"("genericAddSubDeadFlagsNativeOk":)"
-            << (generic_addsub_dead_flags_native_ok ? "true" : "false") << ","
-            << R"("genericAddSubDeadFlagsSemanticOk":)"
-            << (generic_addsub_dead_flags_semantic_ok ? "true" : "false") << ","
-            << R"("genericAddSubDeadFlagsStructuralOk":)"
-            << (generic_addsub_dead_flags_structural_ok ? "true" : "false") << ","
-            << R"("genericAddSubFaultBarrierSemanticOk":)"
-            << (generic_addsub_fault_barrier_semantic_ok ? "true" : "false") << ","
-            << R"("genericAddSubFaultBarrierStructuralOk":)"
-            << (generic_addsub_fault_barrier_structural_ok ? "true" : "false") << ","
-            << R"("genericLogicDeadFlagsNativeOk":)"
-            << (generic_logic_dead_flags_native_ok ? "true" : "false") << ","
-            << R"("genericLogicDeadFlagsSemanticOk":)"
-            << (generic_logic_dead_flags_semantic_ok ? "true" : "false") << ","
-            << R"("genericLogicDeadFlagsStructuralOk":)"
-            << (generic_logic_dead_flags_structural_ok ? "true" : "false") << ","
-            << R"("genericLogicLiveJccSemanticOk":)"
-            << (generic_logic_live_jcc_semantic_ok ? "true" : "false") << ","
-            << R"("genericLogicLiveJccStructuralOk":)"
-            << (generic_logic_live_jcc_structural_ok ? "true" : "false") << ","
-            << R"("genericLogicFaultBarrierSemanticOk":)"
-            << (generic_logic_fault_barrier_semantic_ok ? "true" : "false") << ","
-            << R"("genericLogicFaultBarrierStructuralOk":)"
-            << (generic_logic_fault_barrier_structural_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftDeadFlagsNativeOk":)"
-            << (generic_variable_shift_dead_flags_native_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftDeadFlagsSemanticOk":)"
-            << (generic_variable_shift_dead_flags_semantic_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftDeadFlagsStructuralOk":)"
-            << (generic_variable_shift_dead_flags_structural_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftDeadCountZeroOk":)"
-            << (generic_variable_shift_dead_count_zero_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftLiveJccSemanticOk":)"
-            << (generic_variable_shift_live_jcc_semantic_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftLiveJccStructuralOk":)"
-            << (generic_variable_shift_live_jcc_structural_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftFaultBarrierSemanticOk":)"
-            << (generic_variable_shift_fault_barrier_semantic_ok ? "true" : "false") << ","
-            << R"("genericVariableShiftFaultBarrierStructuralOk":)"
-            << (generic_variable_shift_fault_barrier_structural_ok ? "true" : "false") << ","
-            << R"("genericStaticJmpNativeOk":)"
-            << (generic_static_jmp_native_ok ? "true" : "false") << ","
-            << R"("genericFallthroughNativeOk":)"
-            << (generic_fallthrough_native_ok ? "true" : "false") << ","
-            << R"("genericSetccCmovNegNativeOk":)"
-            << (generic_setcc_cmov_neg_native_ok ? "true" : "false") << ","
-            << R"("genericScalarControlNativeOk":)"
-            << (generic_scalar_control_native_ok ? "true" : "false") << ","
-            << R"("genericScalarExtendedNativeOk":)"
-            << (generic_scalar_extended_native_ok ? "true" : "false") << ","
-            << R"("genericScalarImulInlineOk":)"
-            << (generic_imul_inline_ok ? "true" : "false") << ","
-            << R"("genericScalarSemanticNativeOk":)"
-            << (generic_scalar_semantic_native_ok ? "true" : "false") << ","
-            << R"("genericScalarSemanticCounterOk":)"
-            << (generic_scalar_semantic_counter_ok ? "true" : "false") << ","
-            << R"("genericLahfSahfContractOk":)"
-            << (generic_lahf_sahf_contract_ok ? "true" : "false") << ","
-            << R"("genericLahfNativeOk":)"
-            << (generic_lahf_native_ok ? "true" : "false") << ","
-            << R"("genericLahfFixedBitsOk":)"
-            << (generic_lahf_fixed_bits_ok ? "true" : "false") << ","
-            << R"("genericLahfRaxPreservedOk":)"
-            << (generic_lahf_rax_preserved_ok ? "true" : "false") << ","
-            << R"("genericLahfRflagsPreservedOk":)"
-            << (generic_lahf_rflags_preserved_ok ? "true" : "false") << ","
-            << R"("genericSahfNativeOk":)"
-            << (generic_sahf_native_ok ? "true" : "false") << ","
-            << R"("genericSahfStatusOnlyOk":)"
-            << (generic_sahf_status_only_ok ? "true" : "false") << ","
-            << R"("genericSahfIgnoredBitsOk":)"
-            << (generic_sahf_ignored_bits_ok ? "true" : "false") << ","
-            << R"("genericSahfRaxPreservedOk":)"
-            << (generic_sahf_rax_preserved_ok ? "true" : "false") << ","
-            << R"("genericHigh8SemanticNativeOk":)"
-            << (generic_high8_semantic_native_ok ? "true" : "false") << ","
-            << R"("genericCountedControlNativeOk":)"
-            << (generic_counted_control_native_ok ? "true" : "false") << ","
-            << R"("genericStackControlNativeOk":)"
-            << (generic_stack_control_native_ok ? "true" : "false") << ","
-            << R"("genericIndirectControlSemanticCounterOk":)"
-            << (generic_indirect_control_semantic_counter_ok ? "true" : "false") << ","
-            << R"("genericIndirectCallNativeOk":)"
-            << (generic_indirect_call_native_ok ? "true" : "false") << ","
-            << R"("genericIndirectGuestFastPathOk":)"
-            << (generic_indirect_guest_fast_path_ok ? "true" : "false") << ","
-            << R"("genericIndirectMemoryJmpNativeOk":)"
-            << (generic_indirect_memory_jmp_native_ok ? "true" : "false") << ","
-            << R"("genericIndirectMemoryCallNativeOk":)"
-            << (generic_indirect_memory_call_native_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicOk":)"
-            << (generic_indirect_pic_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicMonoPolyOk":)"
-            << (generic_indirect_pic_mono_poly_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicMissPublishHitOk":)"
-            << (generic_indirect_pic_miss_publish_hit_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicRetStackZeroOk":)"
-            << (generic_indirect_pic_ret_stack_zero_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicRetNineWayWarmOk":)"
-            << (generic_indirect_pic_ret_nine_way_warm_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicSafepointSmcOk":)"
-            << (generic_indirect_pic_safepoint_smc_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicDenyRetireOk":)"
-            << (generic_indirect_pic_deny_retire_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicPersistenceRoundtripOk":)"
-            << (generic_indirect_pic_persistence_roundtrip_ok ? "true" : "false") << ","
-            << R"("genericIndirectPicBindCalls":)"
-            << g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed) << ","
-            << R"("genericIndirectPicNativeBlocks":)"
-            << g_jit_indirect_pic_native_blocks.load(std::memory_order_relaxed) << ","
-            << R"("genericIndirectHleSlowGateOk":)"
-            << (generic_indirect_hle_slow_gate_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleFailureMask":)"
-            << generic_indirect_hle_failure_mask << ","
-            << R"("genericIndirectHleIdentityOk":)"
-            << (generic_indirect_hle_identity_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleInStubSlabOk":)"
-            << (generic_indirect_hle_in_slab_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleSemanticCountOk":)"
-            << (generic_indirect_hle_semantic_count_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleResultOk":)"
-            << (generic_indirect_hle_result_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleRspOk":)"
-            << (generic_indirect_hle_rsp_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleStackOk":)"
-            << (generic_indirect_hle_stack_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleStateOk":)"
-            << (generic_indirect_hle_state_ok ? "true" : "false") << ","
-            << R"("genericIndirectHleThunk":"0x)" << std::hex
-            << generic_indirect_hle_thunk << std::dec << R"(",)"
-            << R"("genericIndirectHleSlabBase":"0x)" << std::hex
-            << generic_indirect_hle_slab_base << std::dec << R"(",)"
-            << R"("genericIndirectHleInterpreterResult":"0x)" << std::hex
-            << generic_indirect_hle_interpreter_result << std::dec << R"(",)"
-            << R"("genericIndirectHleNativeResult":"0x)" << std::hex
-            << generic_indirect_hle_native_result << std::dec << R"(",)"
-            << R"("genericHleMarkerNativeOk":)"
-            << (generic_hle_marker_native_ok ? "true" : "false") << ","
-            << R"("genericHleMarkerStableHashOk":)"
-            << (generic_hle_marker_stable_hash_ok ? "true" : "false") << ","
-            << R"("genericSetccAllConditionsNativeOk":)"
-            << (generic_setcc_all_conditions_native_ok ? "true" : "false") << ","
-            << R"("genericConditionFamilyClassificationOk":)"
-            << (generic_condition_family_classification_ok ? "true" : "false") << ","
-            << R"("genericCmovNativeOk":)"
-            << (generic_cmov_native_ok ? "true" : "false") << ","
-            << R"("genericCmovMixedNativeOk":)"
-            << (generic_cmov_mixed_native_ok ? "true" : "false") << ","
-            << R"("genericCmovFalseNoReadNativeOk":)"
-            << (generic_cmov_false_no_read_native_ok ? "true" : "false") << ","
-            << R"("genericNegNativeOk":)"
-            << (generic_neg_native_ok ? "true" : "false") << ","
-            << R"("genericNeg8NativeOk":)"
-            << (generic_neg8_native_ok ? "true" : "false") << ","
-            << R"("genericNeg16NativeOk":)"
-            << (generic_neg16_native_ok ? "true" : "false") << ","
-            << R"("genericNeg32NativeOk":)"
-            << (generic_neg32_native_ok ? "true" : "false") << ","
-            << R"("genericNeg64NativeOk":)"
-            << (generic_neg64_native_ok ? "true" : "false") << ","
-            << R"("genericMemoryReadDirectNativeOk":)"
-            << (generic_memory_read_direct_native_ok ? "true" : "false") << ","
-            << R"("genericMemoryByteCmpJnzNativeOk":)"
-            << (generic_memory_byte_cmp_jnz_native_ok ? "true" : "false") << ","
-            << R"("genericMemoryWriteNativeOk":)"
-            << (generic_memory_write_native_ok ? "true" : "false") << ","
-            << R"("genericMemoryWriteWidthsOk":)"
-            << (generic_memory_write_widths_ok ? "true" : "false") << ","
-            << R"("genericMemoryWriteNoDoubleOk":)"
-            << (generic_memory_write_no_double_ok ? "true" : "false") << ","
-            << R"("genericMemoryFaultRipOk":)"
-            << (generic_memory_fault_rip_ok ? "true" : "false") << ","
-            << R"("genericCachedBaseCallNativeOk":)"
-            << (generic_cached_base_call_native_ok ? "true" : "false") << ","
-            << R"("genericMemoryRmwNativeOk":)"
-            << (generic_memory_rmw_native_ok ? "true" : "false") << ","
-            << R"("decodeBudgetContractOk":)"
-            << (decoder_cap_contract_ok ? "true" : "false") << ","
-            << R"("codeArenaBlockCount":)" << arena.BlockCount()
-            << "}";
+            << ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rax) << std::dec << R"(",)";
+
+        const auto emit_flag = [&out](const std::string_view name, const bool value) {
+            out << '"' << name << "\":" << (value ? "true" : "false") << ',';
+        };
+        const auto emit_number = [&out](const std::string_view name, const auto value) {
+            out << '"' << name << "\":" << value << ',';
+        };
+        const auto emit_hex = [&out](const std::string_view name, const auto value) {
+            out << '"' << name << "\":\"0x" << std::hex << value << std::dec << "\",";
+        };
+
+        emit_flag("partialPackedTransferNativeOk", partial_packed_move_native_ok);
+        emit_flag("rgb565BlendNativeOk", rgb565_blend_native_ok);
+        emit_flag("rgb565BlendTakenOk", rgb565_blend_taken_ok);
+        emit_flag("rgb565BlendFallthroughOk", rgb565_blend_fallthrough_ok);
+        emit_flag("rgb565BlendAliasOk", rgb565_blend_alias_ok);
+        emit_flag("rgb565TableNativeOk", rgb565_table_native_ok);
+        emit_flag("rgb565TableTakenOk", rgb565_table_taken_ok);
+        emit_flag("rgb565TableFallthroughOk", rgb565_table_fallthrough_ok);
+        emit_flag("rgb565TableAliasOk", rgb565_table_alias_ok);
+        emit_flag("hotIterationBatchNativeOk", hot_iteration_batch_native_ok);
+        emit_flag("hotR13RecordNativeOk", hot_r13_record_native_ok);
+        emit_flag("hotR13RecordTakenOk", hot_r13_record_taken_ok);
+        emit_flag("hotR13RecordFallthroughOk", hot_r13_record_fallthrough_ok);
+        emit_flag("hotR13RecordWrapOk", hot_r13_record_wrap_ok);
+        emit_flag("hotEcxRecordNativeOk", hot_ecx_record_native_ok);
+        emit_flag("hotEcxRecordTakenOk", hot_ecx_record_taken_ok);
+        emit_flag("hotEcxRecordFallthroughOk", hot_ecx_record_fallthrough_ok);
+        emit_flag("hotEcxRecordWrapOk", hot_ecx_record_wrap_ok);
+        emit_flag("hotEcxRecordAliasR15Ok", hot_ecx_record_alias_r15_ok);
+        emit_flag("hotEcxRecordAliasR15Plus26Ok", hot_ecx_record_alias_r15_plus26_ok);
+        emit_flag("hotRsiRdxNativeOk", hot_rsi_rdx_native_ok);
+        emit_flag("hotRsiRdxTakenOk", hot_rsi_rdx_taken_ok);
+        emit_flag("hotRsiRdxFallthroughOk", hot_rsi_rdx_fallthrough_ok);
+        emit_flag("hotRsiRdxWrapOk", hot_rsi_rdx_wrap_ok);
+        emit_flag("hotScalarLoweringOk", hot_scalar_native_ok);
+        emit_flag("monoStringHashNativeOk", mono_string_hash_native_ok);
+        emit_flag("monoStringHashNonemptyOk", mono_string_hash_nonempty_ok);
+        emit_flag("monoStringHashEmptyOk", mono_string_hash_empty_ok);
+        emit_flag("monoStrlenNativeOk", mono_strlen_native_ok);
+        emit_flag("monoStrlenEmptyOk", mono_strlen_empty_ok);
+        emit_flag("monoStrlenNonemptyOk", mono_strlen_nonempty_ok);
+        emit_flag("monoStringEqualNativeOk", mono_string_equal_native_ok);
+        emit_flag("monoStringEqualEmptyOk", mono_string_equal_empty_ok);
+        emit_flag("monoStringEqualMatchOk", mono_string_equal_match_ok);
+        emit_flag("monoStringEqualMismatchOk", mono_string_equal_mismatch_ok);
+        emit_flag("fastGuestStrcmpNativeOk", fast_guest_strcmp_native_ok);
+        emit_flag("fastGuestStrcmpMatchOk", fast_guest_strcmp_match_ok);
+        emit_flag("fastGuestStrcmpHighbitOk", fast_guest_strcmp_highbit_ok);
+        emit_flag("fastGuestStrncmpNativeOk", fast_guest_strncmp_native_ok);
+        emit_flag("fastGuestStrncmpCountOk", fast_guest_strncmp_count_ok);
+        emit_flag("fastGuestStrncmpZeroOk", fast_guest_strncmp_zero_ok);
+        emit_flag("fastGuestStrncmpMismatchOk", fast_guest_strncmp_mismatch_ok);
+        emit_flag("fastGuestMemcmpNativeOk", fast_guest_memcmp_native_ok);
+        emit_flag("fastGuestMemcmpEqualOk", fast_guest_memcmp_equal_ok);
+        emit_flag("fastGuestMemcmpAfterZeroOk", fast_guest_memcmp_after_zero_ok);
+        emit_flag("monoScriptCacheTreeNativeOk", mono_script_cache_tree_native_ok);
+        emit_flag("monoScriptCacheTreeEntryNativeOk", mono_script_cache_tree_entry_native_ok);
+        emit_flag("monoScriptCacheTreeLoopNativeOk", mono_script_cache_tree_loop_native_ok);
+        emit_flag("monoScriptCacheTreeThunkIdentityOk", mono_script_cache_thunk_identity_ok);
+        emit_number("monoScriptCacheTreeEntryFailure", mono_script_cache_tree_entry_failure);
+        emit_number("monoScriptCacheTreeLoopFailure", mono_script_cache_tree_loop_failure);
+        emit_flag("monoAotCompareNativeOk", mono_aot_compare_native_ok);
+        emit_flag("monoAotCompareEmptyOk", mono_aot_compare_empty_ok);
+        emit_flag("monoAotCompareMatchOk", mono_aot_compare_match_ok);
+        emit_flag("monoAotCompareMismatchOk", mono_aot_compare_mismatch_ok);
+        emit_flag("monoGHashLookupNativeOk", mono_ghash_lookup_native_ok);
+        emit_flag("monoGHashLookupHitOk", mono_ghash_lookup_hit_ok);
+        emit_flag("monoGHashLookupEmptyOk", mono_ghash_lookup_empty_ok);
+        emit_flag("monoGHashLookupZeroDivisorOk", mono_ghash_lookup_zero_divisor_ok);
+        emit_flag("monoMetadataHashNativeOk", mono_metadata_hash_native_ok);
+        emit_flag("monoMetadataHashEmptyOk", mono_metadata_hash_empty_ok);
+        emit_flag("monoMetadataHashAsciiOk", mono_metadata_hash_ascii_ok);
+        emit_flag("monoMetadataHashHighbitOk", mono_metadata_hash_highbit_ok);
+        emit_flag("monoMetadataHashBackedgeOk", mono_metadata_hash_backedge_ok);
+        emit_flag("monoMetadataStringHeapNativeOk", mono_metadata_string_heap_native_ok);
+        emit_flag("monoMetadataStringHeapValidOk", mono_metadata_string_heap_valid_ok);
+        emit_flag("monoMetadataStringHeapInvalidOk", mono_metadata_string_heap_invalid_ok);
+        emit_flag("monoMetadataRowDecodeNativeOk", mono_metadata_row_decode_native_ok);
+        emit_flag("monoInterfaceCopyNativeOk", mono_interface_copy_native_ok);
+        emit_flag("monoInterfaceCopy60Ok", mono_interface_copy_60_ok);
+        emit_flag("monoInterfaceCopy78Ok", mono_interface_copy_78_ok);
+        emit_flag("genericScalarNativeOk", generic_scalar_native_ok);
+        emit_flag("serializedHeaderMovbeNativeOk", serialized_header_movbe_native_ok);
+        emit_flag("serializedMetadataDivNativeOk", serialized_metadata_div_native_ok);
+        emit_flag("genericSimdNativeOk", generic_simd_native_ok);
+        emit_flag("genericFaultableSimdWritebackOk", generic_faultable_simd_writeback_ok);
+        emit_flag("genericSimdYmmNativeOk", generic_simd_ymm_native_ok);
+        emit_flag("genericVectorKernelNativeOk", generic_vector_kernel_native_ok);
+        emit_flag("genericScalarPredicateNativeOk", generic_scalar_predicate_native_ok);
+        emit_flag("genericVectorKernelResultOk", generic_vector_kernel_result_ok);
+        emit_flag("genericVectorKernelCounterOk", generic_vector_kernel_counter_ok);
+        emit_number("genericVectorKernelSemanticNs", vector_kernel_semantic_ns);
+        emit_number("genericVectorKernelNativeNs", vector_kernel_native_ns);
+        emit_number("genericVectorKernelSpeedupMilli", vector_kernel_speedup_milli);
+        emit_flag("genericLddquVlddquNativeOk", generic_lddqu_vlddqu_native_ok);
+        emit_flag("genericLddquVlddquResultOk", generic_lddqu_vlddqu_result_ok);
+        emit_flag("genericLddquVlddquCounterOk", generic_lddqu_vlddqu_counter_ok);
+        emit_flag("genericMaskmovdquNativeOk", generic_maskmovdqu_native_ok);
+        emit_flag("genericMaskmovdquResultOk", generic_maskmovdqu_result_ok);
+        emit_flag("genericMaskmovdquCounterOk", generic_maskmovdqu_counter_ok);
+        emit_flag("genericPsadbwVpsadbwNativeOk", generic_psadbw_vpsadbw_native_ok);
+        emit_flag("genericPsadbwVpsadbwResultOk", generic_psadbw_vpsadbw_result_ok);
+        emit_flag("genericPsadbwVpsadbwCounterOk", generic_psadbw_vpsadbw_counter_ok);
+        emit_flag("genericSaturatingPackedNativeOk", generic_saturating_packed_native_ok);
+        emit_flag("genericSaturatingPackedResultOk", generic_saturating_packed_result_ok);
+        emit_flag("genericSaturatingPackedCounterOk", generic_saturating_packed_counter_ok);
+        emit_flag("genericSaturatingPackedMmxRejectOk", generic_saturating_packed_mmx_reject_ok);
+        emit_flag("genericSimdXmmFpNativeOk", generic_simd_xmm_fp_native_ok);
+        emit_flag("genericWideHotV5SimdOk", generic_wide_hot_v5_simd_ok);
+        emit_flag("genericWideHotV5SimdResultOk", generic_wide_hot_v5_simd_result_ok);
+        emit_flag("genericWideHotV5SimdCounterOk", generic_wide_hot_v5_simd_counter_ok);
+        emit_flag("genericPostLoadV6Ok", generic_post_load_v6_ok);
+        emit_flag("genericPostLoadV6PackedResultOk", generic_post_load_v6_packed_result_ok);
+        emit_flag("genericPostLoadV6ConvertResultOk", generic_post_load_v6_convert_result_ok);
+        emit_flag("genericPostLoadV6CounterOk", generic_post_load_v6_counter_ok);
+        emit_number("genericPostLoadV6FastDelta", post_load_v6_fast_delta);
+        emit_number("genericPostLoadV6SemanticDelta", post_load_v6_semantic_delta);
+        emit_flag("genericPostLoadV7Ok", generic_post_load_v7_ok);
+        emit_flag("genericPostLoadV7ResultOk", generic_post_load_v7_result_ok);
+        emit_flag("genericPostLoadV7CounterOk", generic_post_load_v7_counter_ok);
+        emit_number("genericPostLoadV7FastDelta", post_load_v7_fast_delta);
+        emit_number("genericPostLoadV7SemanticDelta", post_load_v7_semantic_delta);
+        emit_flag("genericCvttps2dqNativeOk", generic_cvttps2dq_native_ok);
+        emit_flag("genericCvttps2dqResultOk", generic_cvttps2dq_result_ok);
+        emit_flag("genericCvttps2dqCounterOk", generic_cvttps2dq_counter_ok);
+        emit_number("genericCvttps2dqFastDelta", cvttps2dq_fast_delta);
+        emit_number("genericCvttps2dqSemanticDelta", cvttps2dq_semantic_delta);
+        emit_flag("genericSimdScalarMoveNativeOk", generic_simd_scalar_move_native_ok);
+        emit_flag("genericSimdScalarMoveResultOk", generic_simd_scalar_move_result_ok);
+        emit_flag("genericSimdScalarMoveCounterOk", generic_simd_scalar_move_counter_ok);
+        emit_flag("codecSimdDirectNativeOk", codec_simd_direct_native_ok);
+        emit_flag("codecSimdDirectCounterOk", codec_simd_direct_counter_ok);
+        emit_flag("genericTheoraIdctSimdNativeOk", generic_theora_idct_simd_native_ok);
+        emit_flag("genericTheoraIdctSimdResultOk", generic_theora_idct_simd_result_ok);
+        emit_flag("genericTheoraIdctSimdCounterOk", generic_theora_idct_simd_counter_ok);
+        emit_flag("genericVpshufdYmmNativeOk", generic_vpshufd_ymm_native_ok);
+        emit_flag("genericPshufdMemoryNativeOk", generic_pshufd_memory_native_ok);
+        emit_flag("genericPackedQShiftNativeOk", generic_packed_q_shift_native_ok);
+        emit_flag("genericMovqTransferNativeOk", generic_movq_transfer_native_ok);
+        emit_flag("genericMovdTransferNativeOk", generic_movd_transfer_native_ok);
+        emit_flag("genericMovdTransferResultOk", generic_movd_transfer_result_ok);
+        emit_flag("genericMovdTransferCounterOk", generic_movd_transfer_counter_ok);
+        emit_flag("genericVmovlpdCusa07010NativeOk", generic_vmovlpd_cusa07010_native_ok);
+        emit_flag("genericVmovlpdCusa07010ResultOk", generic_vmovlpd_cusa07010_result_ok);
+        emit_flag("genericVpalignrFmodDecodeOk", generic_vpalignr_fmod_decode_ok);
+        emit_flag("genericVpalignrFmodNativeOk", generic_vpalignr_fmod_native_ok);
+        emit_flag("genericPalignrLegacyNativeOk", generic_palignr_legacy_native_ok);
+        emit_flag("genericAlignRightFastCounterOk", generic_align_right_fast_counter_ok);
+        emit_flag("genericAlignRightNativeOk", generic_align_right_native_ok);
+        emit_flag("genericVunpcklpdFmodDecodeOk", generic_vunpcklpd_fmod_decode_ok);
+        emit_flag("genericVunpcklpdFmodNativeOk", generic_vunpcklpd_fmod_native_ok);
+        emit_flag("genericVunpcklpsNativeOk", generic_vunpcklps_native_ok);
+        emit_flag("genericVunpcklpsXmmSrc1AliasOk", generic_vunpcklps_xmm_src1_alias_ok);
+        emit_flag("genericVunpcklpsXmmSrc2AliasOk", generic_vunpcklps_xmm_src2_alias_ok);
+        emit_flag("genericVunpcklpsXmmMemoryOk", generic_vunpcklps_xmm_memory_ok);
+        emit_flag("genericVunpcklpsYmmLaneLocalOk", generic_vunpcklps_ymm_lane_local_ok);
+        emit_flag("genericVunpcklpsYmmSrc2AliasOk", generic_vunpcklps_ymm_src2_alias_ok);
+        emit_flag("genericVunpcklpsYmmMemoryOk", generic_vunpcklps_ymm_memory_ok);
+        emit_flag("genericSimdCounterGateOk", generic_simd_counter_gate_ok);
+        emit_flag("genericExtensionNativeOk", generic_extension_native_ok);
+        emit_flag("genericWideHotV5CountsOk", generic_wide_hot_v5_counts_ok);
+        emit_flag("genericIncDecNativeOk", generic_incdec_native_ok);
+        emit_flag("genericLiveFlagsNativeOk", generic_live_flags_native_ok);
+        emit_flag("genericLiveFlagsWidthSemanticOk", generic_live_flags_width_semantic_ok);
+        emit_flag("genericLiveFlagsOpcodeSemanticOk", generic_live_flags_opcode_semantic_ok);
+        emit_flag("genericLiveFlagsStructuralOk", generic_live_flags_structural_ok);
+        emit_flag("genericLiveFlagsMemorySemanticOk", generic_live_flags_memory_semantic_ok);
+        emit_flag("genericLiveFlagsMemoryFaultOrderingOk", generic_live_flags_memory_fault_ordering_ok);
+        emit_flag("genericShiftNativeOk", generic_shift_native_ok);
+        emit_flag("genericScalarShiftInlineOk", generic_shift_inline_ok);
+        emit_flag("genericCodecDeadFlagsNativeOk", generic_codec_dead_flags_native_ok);
+        emit_flag("genericCodecDeadFlagsSemanticOk", generic_codec_dead_flags_semantic_ok);
+        emit_flag("genericCodecDeadFlagsStructuralOk", generic_codec_dead_flags_structural_ok);
+        emit_flag("genericAddSubDeadFlagsNativeOk", generic_addsub_dead_flags_native_ok);
+        emit_flag("genericAddSubDeadFlagsSemanticOk", generic_addsub_dead_flags_semantic_ok);
+        emit_flag("genericAddSubDeadFlagsStructuralOk", generic_addsub_dead_flags_structural_ok);
+        emit_flag("genericAddSubFaultBarrierSemanticOk", generic_addsub_fault_barrier_semantic_ok);
+        emit_flag("genericAddSubFaultBarrierStructuralOk", generic_addsub_fault_barrier_structural_ok);
+        emit_flag("genericLogicDeadFlagsNativeOk", generic_logic_dead_flags_native_ok);
+        emit_flag("genericLogicDeadFlagsSemanticOk", generic_logic_dead_flags_semantic_ok);
+        emit_flag("genericLogicDeadFlagsStructuralOk", generic_logic_dead_flags_structural_ok);
+        emit_flag("genericLogicLiveJccSemanticOk", generic_logic_live_jcc_semantic_ok);
+        emit_flag("genericLogicLiveJccStructuralOk", generic_logic_live_jcc_structural_ok);
+        emit_flag("genericLogicFaultBarrierSemanticOk", generic_logic_fault_barrier_semantic_ok);
+        emit_flag("genericLogicFaultBarrierStructuralOk", generic_logic_fault_barrier_structural_ok);
+        emit_flag("genericVariableShiftDeadFlagsNativeOk", generic_variable_shift_dead_flags_native_ok);
+        emit_flag("genericVariableShiftDeadFlagsSemanticOk", generic_variable_shift_dead_flags_semantic_ok);
+        emit_flag("genericVariableShiftDeadFlagsStructuralOk", generic_variable_shift_dead_flags_structural_ok);
+        emit_flag("genericVariableShiftDeadCountZeroOk", generic_variable_shift_dead_count_zero_ok);
+        emit_flag("genericVariableShiftLiveJccSemanticOk", generic_variable_shift_live_jcc_semantic_ok);
+        emit_flag("genericVariableShiftLiveJccStructuralOk", generic_variable_shift_live_jcc_structural_ok);
+        emit_flag("genericVariableShiftFaultBarrierSemanticOk", generic_variable_shift_fault_barrier_semantic_ok);
+        emit_flag("genericVariableShiftFaultBarrierStructuralOk", generic_variable_shift_fault_barrier_structural_ok);
+        emit_flag("genericStaticJmpNativeOk", generic_static_jmp_native_ok);
+        emit_flag("genericFallthroughNativeOk", generic_fallthrough_native_ok);
+        emit_flag("genericSetccCmovNegNativeOk", generic_setcc_cmov_neg_native_ok);
+        emit_flag("genericScalarControlNativeOk", generic_scalar_control_native_ok);
+        emit_flag("genericScalarExtendedNativeOk", generic_scalar_extended_native_ok);
+        emit_flag("genericScalarImulInlineOk", generic_imul_inline_ok);
+        emit_flag("genericScalarSemanticNativeOk", generic_scalar_semantic_native_ok);
+        emit_flag("genericScalarSemanticCounterOk", generic_scalar_semantic_counter_ok);
+        emit_flag("genericLahfSahfContractOk", generic_lahf_sahf_contract_ok);
+        emit_flag("genericLahfNativeOk", generic_lahf_native_ok);
+        emit_flag("genericLahfFixedBitsOk", generic_lahf_fixed_bits_ok);
+        emit_flag("genericLahfRaxPreservedOk", generic_lahf_rax_preserved_ok);
+        emit_flag("genericLahfRflagsPreservedOk", generic_lahf_rflags_preserved_ok);
+        emit_flag("genericSahfNativeOk", generic_sahf_native_ok);
+        emit_flag("genericSahfStatusOnlyOk", generic_sahf_status_only_ok);
+        emit_flag("genericSahfIgnoredBitsOk", generic_sahf_ignored_bits_ok);
+        emit_flag("genericSahfRaxPreservedOk", generic_sahf_rax_preserved_ok);
+        emit_flag("genericHigh8SemanticNativeOk", generic_high8_semantic_native_ok);
+        emit_flag("genericCountedControlNativeOk", generic_counted_control_native_ok);
+        emit_flag("genericStackControlNativeOk", generic_stack_control_native_ok);
+        emit_flag("genericIndirectControlSemanticCounterOk", generic_indirect_control_semantic_counter_ok);
+        emit_flag("genericIndirectCallNativeOk", generic_indirect_call_native_ok);
+        emit_flag("genericIndirectGuestFastPathOk", generic_indirect_guest_fast_path_ok);
+        emit_flag("genericIndirectMemoryJmpNativeOk", generic_indirect_memory_jmp_native_ok);
+        emit_flag("genericIndirectMemoryCallNativeOk", generic_indirect_memory_call_native_ok);
+        emit_flag("genericIndirectPicOk", generic_indirect_pic_ok);
+        emit_flag("genericIndirectPicMonoPolyOk", generic_indirect_pic_mono_poly_ok);
+        emit_flag("genericIndirectPicMissPublishHitOk", generic_indirect_pic_miss_publish_hit_ok);
+        emit_flag("genericIndirectPicRetStackZeroOk", generic_indirect_pic_ret_stack_zero_ok);
+        emit_flag("genericIndirectPicRetNineWayWarmOk", generic_indirect_pic_ret_nine_way_warm_ok);
+        emit_flag("genericIndirectPicSafepointSmcOk", generic_indirect_pic_safepoint_smc_ok);
+        emit_flag("genericIndirectPicDenyRetireOk", generic_indirect_pic_deny_retire_ok);
+        emit_flag("genericIndirectPicPersistenceRoundtripOk", generic_indirect_pic_persistence_roundtrip_ok);
+
+        emit_number("genericIndirectPicBindCalls",
+                    g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed));
+        emit_number("genericIndirectPicNativeBlocks",
+                    g_jit_indirect_pic_native_blocks.load(std::memory_order_relaxed));
+        emit_flag("genericIndirectHleSlowGateOk", generic_indirect_hle_slow_gate_ok);
+        emit_number("genericIndirectHleFailureMask", generic_indirect_hle_failure_mask);
+        emit_flag("genericIndirectHleIdentityOk", generic_indirect_hle_identity_ok);
+        emit_flag("genericIndirectHleInStubSlabOk", generic_indirect_hle_in_slab_ok);
+        emit_flag("genericIndirectHleSemanticCountOk", generic_indirect_hle_semantic_count_ok);
+        emit_flag("genericIndirectHleResultOk", generic_indirect_hle_result_ok);
+        emit_flag("genericIndirectHleRspOk", generic_indirect_hle_rsp_ok);
+        emit_flag("genericIndirectHleStackOk", generic_indirect_hle_stack_ok);
+        emit_flag("genericIndirectHleStateOk", generic_indirect_hle_state_ok);
+        emit_hex("genericIndirectHleThunk", generic_indirect_hle_thunk);
+        emit_hex("genericIndirectHleSlabBase", generic_indirect_hle_slab_base);
+        emit_hex("genericIndirectHleInterpreterResult", generic_indirect_hle_interpreter_result);
+        emit_hex("genericIndirectHleNativeResult", generic_indirect_hle_native_result);
+        emit_flag("genericHleMarkerNativeOk", generic_hle_marker_native_ok);
+        emit_flag("genericHleMarkerStableHashOk", generic_hle_marker_stable_hash_ok);
+        emit_flag("genericSetccAllConditionsNativeOk", generic_setcc_all_conditions_native_ok);
+        emit_flag("genericConditionFamilyClassificationOk", generic_condition_family_classification_ok);
+        emit_flag("genericCmovNativeOk", generic_cmov_native_ok);
+        emit_flag("genericCmovMixedNativeOk", generic_cmov_mixed_native_ok);
+        emit_flag("genericCmovFalseNoReadNativeOk", generic_cmov_false_no_read_native_ok);
+        emit_flag("genericNegNativeOk", generic_neg_native_ok);
+        emit_flag("genericNeg8NativeOk", generic_neg8_native_ok);
+        emit_flag("genericNeg16NativeOk", generic_neg16_native_ok);
+        emit_flag("genericNeg32NativeOk", generic_neg32_native_ok);
+        emit_flag("genericNeg64NativeOk", generic_neg64_native_ok);
+        emit_flag("genericMemoryReadDirectNativeOk", generic_memory_read_direct_native_ok);
+        emit_flag("genericMemoryByteCmpJnzNativeOk", generic_memory_byte_cmp_jnz_native_ok);
+        emit_flag("genericMemoryWriteNativeOk", generic_memory_write_native_ok);
+        emit_flag("genericMemoryWriteWidthsOk", generic_memory_write_widths_ok);
+        emit_flag("genericMemoryWriteNoDoubleOk", generic_memory_write_no_double_ok);
+        emit_flag("genericMemoryFaultRipOk", generic_memory_fault_rip_ok);
+        emit_flag("genericCachedBaseCallNativeOk", generic_cached_base_call_native_ok);
+        emit_flag("genericMemoryRmwNativeOk", generic_memory_rmw_native_ok);
+        emit_flag("decodeBudgetContractOk", decoder_cap_contract_ok);
+        out << R"("codeArenaBlockCount":)" << arena.BlockCount() << '}';
     } catch (const std::exception& e) {
         out << R"({"schema":"lsx4.translation.selftest.v2","ok":false,"failure":")"
             << JsonEscape(e.what()) << R"("})";
