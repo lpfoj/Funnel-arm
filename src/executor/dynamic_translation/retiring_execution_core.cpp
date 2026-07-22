@@ -224,10 +224,6 @@ void PermutePackedWords(void* dst, const void* src, std::uint8_t imm, std::size_
 void PermuteDwordsFromImmediate(void* dst, const void* src, std::uint8_t imm);
 void MergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,
                      std::size_t scalar_size);
-void InterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
-             bool high_half, std::size_t total_size);
-void InterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs, std::size_t element_bytes,
-            bool high_half, std::size_t total_size);
 void PermuteBytesFromMask(void* dst, const void* src, const void* mask, std::size_t total_size);
 void BlendVectorWordsImmediate(void* dst, const void* lhs, const void* rhs, std::uint32_t imm,
               std::size_t total_size);
@@ -24862,12 +24858,10 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
 
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
         const std::size_t element_bytes = VectorUnpackElementBytes(mnemonic);
-        if (vex_form) {
-            InterleavePackedVectorLanes(result.data(), lhs.data(), rhs.data(), element_bytes,
-                    VectorUnpackHighHalf(mnemonic), width);
-        } else {
-            InterleavePackedLegacyLanes(result.data(), lhs.data(), rhs.data(), element_bytes,
-                   VectorUnpackHighHalf(mnemonic), width);
+        if (!VectorSemantic::InterleaveElementHalves(
+                result.data(), lhs.data(), rhs.data(), element_bytes, width,
+                VectorUnpackHighHalf(mnemonic))) {
+            return false;
         }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
@@ -31993,55 +31987,6 @@ void BlendVectorWordsImmediate(void* argument0, const void* argument1, const voi
 
 void PermuteBytesFromMask(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3) {
     SemanticKernelPermuteBytesFromMask(argument0, argument1, argument2, argument3);
-}
-
-namespace {
-void InterleavePackedLanes(void* dst, const void* lhs, const void* rhs,
-                           const std::size_t element_bytes, const bool high_half,
-                           const std::size_t total_size, const bool clear_upper) {
-    if (dst == nullptr || lhs == nullptr || rhs == nullptr || element_bytes == 0 ||
-        total_size > kSemanticVectorBytes) {
-        return;
-    }
-    const std::array images{SemanticVectorImage::Capture(lhs, total_size),
-                            SemanticVectorImage::Capture(rhs, total_size)};
-    auto output = clear_upper ? SemanticVectorImage{}
-                              : SemanticVectorImage::Capture(dst, kSemanticVectorBytes);
-    constexpr std::size_t group_bytes = 16;
-    for (std::size_t group = 0; group != total_size; group += group_bytes) {
-        const auto active_bytes = std::min(group_bytes, total_size - group);
-        const auto first_input = group + (high_half ? active_bytes / 2u : 0u);
-        const auto output_elements = active_bytes / element_bytes;
-        for (std::size_t element = 0; element != output_elements; ++element) {
-            const auto source_number = element & 1u;
-            const auto source_element = element >> 1u;
-            CopyVectorSlice(output, group + element * element_bytes,
-                            images[source_number], first_input + source_element * element_bytes,
-                            element_bytes);
-        }
-    }
-    output.Publish(dst, clear_upper ? kSemanticVectorBytes : total_size);
-}
-} // namespace
-
-[[gnu::always_inline]] static inline void SemanticKernelInterleavePackedLegacyLanes(void* dst, const void* lhs, const void* rhs,
-                                 const std::size_t element_bytes, const bool high_half,
-                                 const std::size_t total_size){
-    InterleavePackedLanes(dst, lhs, rhs, element_bytes, high_half, total_size, false);
-}
-
-void InterleavePackedLegacyLanes(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
-    SemanticKernelInterleavePackedLegacyLanes(argument0, argument1, argument2, argument3, argument4, argument5);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelInterleavePackedVectorLanes(void* dst, const void* lhs, const void* rhs,
-                                 const std::size_t element_bytes, const bool high_half,
-                                 const std::size_t total_size){
-    InterleavePackedLanes(dst, lhs, rhs, element_bytes, high_half, total_size, true);
-}
-
-void InterleavePackedVectorLanes(void* argument0, const void* argument1, const void* argument2, const std::size_t argument3, const bool argument4, const std::size_t argument5) {
-    SemanticKernelInterleavePackedVectorLanes(argument0, argument1, argument2, argument3, argument4, argument5);
 }
 
 [[gnu::always_inline]] static inline void SemanticKernelMergeScalarVectorLane(void* dst, const void* old_dst, const void* scalar_src,

@@ -45,5 +45,9 @@ bool CompareIntegerElements(void* destination, const void* left,
                             const void* right, std::size_t element_width,
                             std::size_t total_width,
                             bool signed_greater_than) noexcept;
+bool InterleaveElementHalves(void* destination, const void* left,
+                             const void* right, std::size_t element_width,
+                             std::size_t total_width,
+                             bool select_upper_half) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic

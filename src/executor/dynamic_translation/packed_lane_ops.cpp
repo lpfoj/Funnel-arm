@@ -389,4 +389,45 @@ bool CompareIntegerElements(void* const destination, const void* const left,
     return true;
 }
 
+bool InterleaveElementHalves(void* const destination, const void* const left,
+                             const void* const right,
+                             const std::size_t element_width,
+                             const std::size_t total_width,
+                             const bool select_upper_half) noexcept {
+    const bool valid_element = element_width == 1 || element_width == 2 ||
+                               element_width == 4 || element_width == 8;
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        !valid_element || (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+
+    std::array<std::uint8_t, kMaximumVectorBytes> sources[2]{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(sources[0].data(), left, total_width);
+    std::memcpy(sources[1].data(), right, total_width);
+    constexpr std::size_t vector_half_width = 16;
+    constexpr std::size_t selected_span = vector_half_width / 2;
+    const std::size_t source_bias = select_upper_half ? selected_span : 0;
+    const std::size_t elements_per_source = selected_span / element_width;
+    for (std::size_t vector_base = 0; vector_base < total_width;
+         vector_base += vector_half_width) {
+        for (std::size_t source_element = 0;
+             source_element < elements_per_source; ++source_element) {
+            for (std::size_t source_index = 0; source_index < 2;
+                 ++source_index) {
+                const std::size_t destination_element =
+                    source_element * 2 + source_index;
+                std::memcpy(
+                    output.data() + vector_base +
+                        destination_element * element_width,
+                    sources[source_index].data() + vector_base + source_bias +
+                        source_element * element_width,
+                    element_width);
+            }
+        }
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
 } // namespace Executor::Jit::VectorSemantic
