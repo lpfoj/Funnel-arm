@@ -38,5 +38,8 @@ bool AddOrSubtractPacked(void* destination, const void* left, const void* right,
 bool ReplicateElement(void* destination, const void* element,
                       std::size_t element_width,
                       std::size_t total_width) noexcept;
+bool SquareRootElements(void* destination, const void* source,
+                        std::size_t element_width,
+                        std::size_t total_width) noexcept;
 
 } // namespace Executor::Jit::VectorSemantic

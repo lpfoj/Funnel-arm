@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 
 #if defined(__aarch64__)
@@ -30,6 +31,18 @@ T LoadLane(const std::uint8_t* source) noexcept {
 template <typename T>
 void StoreLane(std::uint8_t* destination, const T value) noexcept {
     std::memcpy(destination, &value, sizeof(value));
+}
+
+template <typename Float>
+void ComputeSquareRoots(std::array<std::uint8_t, kMaximumVectorBytes>& output,
+                        const std::array<std::uint8_t, kMaximumVectorBytes>& input,
+                        const std::size_t total_width) noexcept {
+    const std::size_t lane_count = total_width / sizeof(Float);
+    for (std::size_t lane = 0; lane < lane_count; ++lane) {
+        const std::size_t byte_index = lane * sizeof(Float);
+        StoreLane(output.data() + byte_index,
+                  std::sqrt(LoadLane<Float>(input.data() + byte_index)));
+    }
 }
 
 std::uint64_t ApplyBooleanWord(const std::uint64_t left,
@@ -303,6 +316,27 @@ bool ReplicateElement(void* const destination, const void* const element,
             std::min(initialized, total_width - initialized);
         std::memcpy(output.data() + initialized, output.data(), copy_count);
         initialized += copy_count;
+    }
+    std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
+bool SquareRootElements(void* const destination, const void* const source,
+                        const std::size_t element_width,
+                        const std::size_t total_width) noexcept {
+    if (destination == nullptr || source == nullptr ||
+        (element_width != sizeof(float) && element_width != sizeof(double)) ||
+        (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+
+    std::array<std::uint8_t, kMaximumVectorBytes> input{};
+    std::array<std::uint8_t, kMaximumVectorBytes> output{};
+    std::memcpy(input.data(), source, total_width);
+    if (element_width == sizeof(double)) {
+        ComputeSquareRoots<double>(output, input, total_width);
+    } else {
+        ComputeSquareRoots<float>(output, input, total_width);
     }
     std::memcpy(destination, output.data(), output.size());
     return true;

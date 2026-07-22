@@ -24825,19 +24825,11 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
             return false;
         }
         const std::size_t width = VectorOperandBytes(ir.operands[0]);
-        const bool double_lane = PackedSqrtDoubleLane(mnemonic);
-        const std::size_t lane_bytes = double_lane ? sizeof(double) : sizeof(float);
-        result.fill(0);
-        for (std::size_t offset = 0; offset < width; offset += lane_bytes) {
-            if (double_lane) {
-                StoreUnaligned<double>(
-                    result.data() + offset,
-                    std::sqrt(LoadUnaligned<double>(lhs.data() + offset)));
-            } else {
-                StoreUnaligned<float>(
-                    result.data() + offset,
-                    std::sqrt(LoadUnaligned<float>(lhs.data() + offset)));
-            }
+        const std::size_t element_width =
+            PackedSqrtDoubleLane(mnemonic) ? sizeof(double) : sizeof(float);
+        if (!VectorSemantic::SquareRootElements(result.data(), lhs.data(),
+                                                element_width, width)) {
+            return false;
         }
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
