@@ -8,6 +8,7 @@
 #include "executor/dynamic_translation/code_witness.h"
 #include "executor/dynamic_translation/edge_portal.h"
 #include "executor/dynamic_translation/execution_context.h"
+#include "executor/dynamic_translation/execution_driver.h"
 #include "executor/dynamic_translation/machine_state.h"
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/native_encoder.h"
@@ -56,6 +57,12 @@ enum CheckBit : std::uint64_t {
     X87Semantics = 1ull << 20,
     TranslationOrchestration = 1ull << 21,
     ExecutionContext = 1ull << 22,
+    DriverCompletion = 1ull << 23,
+    DriverValue = 1ull << 24,
+    DriverInstructionAccounting = 1ull << 25,
+    DriverNativeAccounting = 1ull << 26,
+    DriverSemanticAccounting = 1ull << 27,
+    DriverContextCleanup = 1ull << 28,
 };
 
 struct FetchContext {
@@ -718,6 +725,52 @@ bool CheckExecutionContext() {
            !TakeExecutionCompletion() && !TakeExecutionReplacement(replacement);
 }
 
+struct DriverCheckResult {
+    bool completed{};
+    bool value{};
+    bool instructions{};
+    bool native_regions{};
+    bool semantic_regions{};
+    bool context_cleanup{};
+};
+
+DriverCheckResult CheckExecutionDriver() {
+    constexpr std::uint64_t code_base = 0xfa00;
+    constexpr std::uint64_t sentinel = 0xfedcba9876543210ull;
+    constexpr std::array<std::uint8_t, 16> fixture{
+        0xb8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x07,
+        0xeb, 0x00, 0x83, 0xd0, 0x01, 0xeb, 0x00, 0xc3};
+    FetchContext fetch_context{code_base, fixture};
+    const ReadGuestBytes reader = [&fixture](const std::uint64_t address,
+                                              const std::span<std::uint8_t> output) {
+        if (address < code_base || address - code_base > fixture.size()) {
+            return false;
+        }
+        const std::size_t offset = static_cast<std::size_t>(address - code_base);
+        if (output.size() > fixture.size() - offset) {
+            return false;
+        }
+        std::memcpy(output.data(), fixture.data() + offset, output.size());
+        return true;
+    };
+    SemanticMemoryImage stack{.base = 0x1a0000};
+    std::memcpy(stack.bytes.data() + 64, &sentinel, sizeof(sentinel));
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &stack};
+    ExecutionPorts ports{FetchFixture, &fetch_context, reader, memory};
+    ExecutionLimits limits{sentinel, 32, 8};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Stack, stack.base + 64, 64);
+    ExecutionDriver driver{64 * 1024};
+    const DriverResult result = driver.Run(code_base, frame, ports, limits);
+    const TranslationServiceCounters counters = driver.Service().Counters();
+    return {result.stop == DriverStop::Complete,
+            result.result == 13 && frame.integer[0] == 13,
+            result.instructions == 6,
+            counters.compiled_regions == 1,
+            counters.semantic_regions == 2,
+            CurrentExecutionFrame() == nullptr};
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -840,6 +893,13 @@ FoundationCheckReport RunFoundationChecks() {
     run(X87Semantics, CheckX87Semantics());
     run(TranslationOrchestration, CheckTranslationOrchestration());
     run(ExecutionContext, CheckExecutionContext());
+    const DriverCheckResult driver = CheckExecutionDriver();
+    run(DriverCompletion, driver.completed);
+    run(DriverValue, driver.value);
+    run(DriverInstructionAccounting, driver.instructions);
+    run(DriverNativeAccounting, driver.native_regions);
+    run(DriverSemanticAccounting, driver.semantic_regions);
+    run(DriverContextCleanup, driver.context_cleanup);
     return report;
 }
 

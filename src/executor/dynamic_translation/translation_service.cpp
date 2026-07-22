@@ -117,6 +117,12 @@ AcquireResult TranslationService::Acquire(const std::uint64_t guest_address,
     }
     NativeArtifact artifact = CompileScalarIr(program, arena_);
     if (!artifact.Succeeded()) {
+        if (artifact.failure == NativeCompileFailure::UnsupportedAction ||
+            artifact.failure == NativeCompileFailure::RegisterPressure ||
+            artifact.failure == NativeCompileFailure::FrameTooLarge) {
+            semantic_regions_.fetch_add(1, std::memory_order_relaxed);
+            return {AcquireStatus::NeedsSemanticFallback, {}, std::move(plan)};
+        }
         compile_failures_.fetch_add(1, std::memory_order_relaxed);
         return {AcquireStatus::NativeCompileFailure, {}, std::move(plan)};
     }
