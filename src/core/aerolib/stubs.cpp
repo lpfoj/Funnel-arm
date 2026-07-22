@@ -10,10 +10,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libc_internal/libc_internal_io.h"
 #include "core/memory.h"
-#ifdef __ANDROID__
-#include "executor/jit/lsx_translation_engine.h"
-#endif
-
+#include "executor/dynamic_translation/hle_thunk_identity.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -148,18 +145,6 @@ static constexpr std::size_t AndroidX64HleSafePoolSize = 256 * 1024 * 1024;
 static constexpr u32 AndroidX64HleSafeSlotSize = 0x1000;
 static constexpr u32 AndroidX64HleSafeSlotRsp = 0x800;
 static constexpr u32 AndroidX64HleStackScratchSize = 0x1000;
-static constexpr std::array<u8, 32> ExecutorFexHleThunkHash = {
-    0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
-    0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
-    0x3a, 0x66, 0x65, 0x78, 0x63, 0x6f, 0x72, 0x65,
-    0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x30, 0x31,
-};
-static constexpr std::array<u8, 32> ExecutorJitHleThunkHash = {
-    0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
-    0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
-    0x3a, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64,
-    0x62, 0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x31,
-};
 static constexpr u32 ExecutorBox64HleBridgeSyscall = 0x5ad00001u;
 static std::mutex g_android_x64_hle_names_mutex;
 static std::unordered_map<u64, std::string> g_android_x64_hle_names_by_native;
@@ -668,8 +653,9 @@ u64 GetAndroidX64HleStub(u32 slot, u64 native_function) {
     code[cursor++] = 0x0f;
     code[cursor++] = 0x3f;
     const auto& hle_hash =
-        ExecutorJitActiveForStubGeneration() ? ExecutorJitHleThunkHash
-                                                  : ExecutorFexHleThunkHash;
+        ExecutorJitActiveForStubGeneration()
+            ? Lsx4::Translation::TranslationThunkIdentity
+            : Lsx4::Translation::FexThunkIdentity;
     std::memcpy(code + cursor, hle_hash.data(), hle_hash.size());
     cursor += hle_hash.size();
     while (cursor < AndroidX64StubSize) {
@@ -4554,46 +4540,52 @@ public:
             page_size - static_cast<std::size_t>(host_ptr & page_mask);
         std::size_t candidate = static_cast<std::size_t>(
             std::min<u64>(requested, static_cast<u64>(page_remaining)));
-        auto* memory = Core::Memory::Instance();
-        bool guest_managed = false;
-        bool guest_readable =
-            memory != nullptr && memory->IsReadableMapping(ptr, candidate, &guest_managed);
-        if (!guest_managed) {
-            // JIT's synthetic pthread stacks and other explicitly published guest ranges
-            // are identity-mapped host memory, but intentionally do not belong to MemoryManager's
-            // VMA tree.  Prove the complete span against JIT's authoritative range registry
-            // before applying the low-40-bit guest-hole rejection below.  When a registered range
-            // ends inside this host page, preserve exactly its readable prefix just like the VMA
-            // path does below; never infer readability from the first/last byte alone.
-            if (ExecutorJitIsReadableGuestRange != nullptr) {
-                if (ExecutorJitIsReadableGuestRange(host_ptr, candidate)) {
-                    out = {
-                        .data = reinterpret_cast<const unsigned char*>(host_ptr),
-                        .size = candidate,
-                        .direct = true,
-                    };
-                    return true;
-                }
-                if (candidate > 1 &&
-                    ExecutorJitIsReadableGuestRange(host_ptr, 1)) {
-                    std::size_t low = 1;
-                    std::size_t high = candidate;
-                    while (low < high) {
-                        const std::size_t mid = low + (high - low + 1) / 2;
-                        if (ExecutorJitIsReadableGuestRange(host_ptr, mid)) {
-                            low = mid;
-                        } else {
-                            high = mid - 1;
-                        }
-                    }
-                    out = {
-                        .data = reinterpret_cast<const unsigned char*>(host_ptr),
-                        .size = low,
-                        .direct = true,
-                    };
-                    return true;
-                }
+        constexpr u64 GuestAddressLimit = 0x10000000000ull;
+        // Android can place a native pthread stack below the 40-bit guest
+        // ceiling.  Exact registered ranges therefore take precedence over
+        // numerical address classification.
+        if (ExecutorJitIsReadableGuestRange != nullptr) {
+            const bool complete_registered_span =
+                ExecutorJitIsReadableGuestRange(host_ptr, candidate);
+            if (complete_registered_span) {
+                out = {
+                    .data = reinterpret_cast<const unsigned char*>(host_ptr),
+                    .size = candidate,
+                    .direct = true,
+                };
+                return true;
             }
+            if (candidate > 1 &&
+                ExecutorJitIsReadableGuestRange(host_ptr, 1)) {
+                std::size_t low = 1;
+                std::size_t high = candidate;
+                while (low < high) {
+                    const std::size_t mid = low + (high - low + 1) / 2;
+                    if (ExecutorJitIsReadableGuestRange(host_ptr, mid)) {
+                        low = mid;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                out = {
+                    .data = reinterpret_cast<const unsigned char*>(host_ptr),
+                    .size = low,
+                    .direct = true,
+                };
+                return true;
+            }
+        }
+        decltype(Core::Memory::Instance()) memory = nullptr;
+        bool guest_managed = false;
+        bool guest_readable = false;
+        if (host_ptr < GuestAddressLimit) {
+            memory = Core::Memory::Instance();
+            if (memory != nullptr) {
+                guest_readable =
+                    memory->IsReadableMapping(ptr, candidate, &guest_managed);
+            }
+        }
+        if (!guest_managed) {
             // Bootstrap helpers may run before the lazy guest libc mspace is available. Their
             // fallback allocations remain directly addressable by translated guest code, but can
             // sit inside the low 40-bit window and therefore look like guest-map holes. Accept only
@@ -4612,7 +4604,6 @@ public:
             // hole, not an invitation to adopt an unrelated fixed host mmap merely because Linux
             // marks it readable. Native HLE stack/heap/rodata pointers live above the guest window
             // after top-byte canonicalization and retain the checked host-range path below.
-            constexpr u64 GuestAddressLimit = 0x10000000000ull;
             if (host_ptr < GuestAddressLimit) {
                 return false;
             }
@@ -4885,7 +4876,6 @@ static int ExecutorSafeStrcmp(const char* func, u64 lhs, u64 rhs, u64 limit, boo
             ExecutorLogInvalidLibcPtr(func, rhs_address);
             return -1;
         }
-
         const std::size_t common = std::min(lhs_span.size, rhs_span.size);
         const auto* lhs_nul = static_cast<const unsigned char*>(
             std::memchr(lhs_span.data, 0, common));

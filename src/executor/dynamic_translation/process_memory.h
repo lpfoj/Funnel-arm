@@ -8,6 +8,8 @@
 
 namespace Lsx4::Translation {
 
+[[nodiscard]] bool IsProcessImageMemory(std::uint64_t address,
+                                        std::size_t byte_count) noexcept;
 [[nodiscard]] bool ReadProcessGuestMemory(std::uint64_t address, void* destination,
                                           std::size_t byte_count) noexcept;
 [[nodiscard]] bool WriteProcessGuestMemory(std::uint64_t address, const void* source,

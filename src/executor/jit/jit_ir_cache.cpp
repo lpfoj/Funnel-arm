@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Executor Project
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "jit_ir_cache.h"

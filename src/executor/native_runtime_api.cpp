@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Executor Project
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/config.h"
@@ -30,7 +30,10 @@
 #include "core/memory.h"
 #include "core/tls.h"
 #include "executor/dynamic_translation/foundation_checks.h"
-#include "executor/jit/lsx_translation_engine.h"
+#include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "executor/dynamic_translation/live_state_port.h"
+#include "executor/dynamic_translation/process_memory.h"
+#include "executor/dynamic_translation/runtime_gateway.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -108,6 +111,12 @@ bool InitializeAndroidTitleInfo(const std::filesystem::path& app0_path,
 
 namespace {
 
+using HleMachineWord = std::uint64_t;
+
+constexpr unsigned long long HleLogWord(const HleMachineWord value) noexcept {
+    return static_cast<unsigned long long>(value);
+}
+
 constexpr std::uint32_t ExecutorBox64MappedEntryAbiVersion = 4;
 constexpr std::uint32_t ExecutorBox64MappedEntryMaxSegments = 64;
 // The mapped-entry primary thread executes on a separate guest stack instead of the native host
@@ -131,18 +140,6 @@ constexpr std::uint32_t ExecutorBox64HleSafeSlotRsp = 0x800;  // leave room both
 constexpr std::uint32_t ExecutorBox64HleStackScratchSize = 0x1000;
 constexpr std::size_t ExecutorBox64HleSidebandSlotSize = 96;
 constexpr std::size_t ExecutorBox64HleSidebandSlabSize = 64 * 1024;
-constexpr std::array<std::uint8_t, 32> ExecutorFexHleThunkHash = {
-    0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
-    0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
-    0x3a, 0x66, 0x65, 0x78, 0x63, 0x6f, 0x72, 0x65,
-    0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x30, 0x31,
-};
-constexpr std::array<std::uint8_t, 32> ExecutorJitHleThunkHash = {
-    0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
-    0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
-    0x3a, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64,
-    0x62, 0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x31,
-};
 constexpr std::array<const char*, 14> ExecutorSupportedFirmwareModules = {
     "libSceCesCs.sprx",      "libSceFont.sprx",         "libSceFontFt.sprx",
     "libSceFreeTypeOt.sprx", "libSceJpegDec.sprx",      "libSceJpegEnc.sprx",
@@ -294,89 +291,57 @@ std::uint64_t RunJitMappedFunction(const std::uint64_t guest_rip,
                                         const std::uint64_t segment_base = 0,
                                         const std::uint64_t stack_base = 0,
                                         const std::uint64_t stack_size = 0) {
-    Executor::Jit::LsxEntryPacket ctx{};
-    ctx.arg_count = static_cast<std::uint32_t>(
-        std::min<std::size_t>(args.size(), ctx.args.size()));
-    ctx.stack_args_enabled = args.size() > 6 ? 1 : 0;
+    Lsx4::Translation::EntryRequest request{};
+    request.argument_count = static_cast<std::uint32_t>(
+        std::min<std::size_t>(args.size(), request.arguments.size()));
+    request.stack_argument_mode = args.size() > 6 ? 1 : 0;
     std::size_t index = 0;
     for (const std::uint64_t arg : args) {
-        if (index >= ctx.args.size()) {
+        if (index >= request.arguments.size()) {
             break;
         }
-        ctx.args[index++] = arg;
+        request.arguments[index++] = arg;
     }
-    ctx.segment_base = segment_base;
-    ctx.stack_base = stack_base;
-    ctx.stack_size = stack_size;
-    ctx.allow_guest_return_sentinel = 1;
-    return Executor::Jit::DispatchGuestOnArm64(guest_rip, ctx);
+    request.thread_segment_origin = segment_base;
+    request.supplied_stack_base = stack_base;
+    request.supplied_stack_bytes = stack_size;
+    request.permit_return_sentinel = true;
+    return Lsx4::Translation::ExecuteGuest(guest_rip, request);
 }
 
-constexpr std::size_t JitFsBaseStateOffset =
-    offsetof(Executor::Jit::LsxMachineImage, fs_base);
-constexpr std::size_t JitGsBaseStateOffset =
-    offsetof(Executor::Jit::LsxMachineImage, gs_base);
-static_assert(JitGsBaseStateOffset + sizeof(std::uint64_t) <=
-              sizeof(Executor::Jit::LsxMachineImage));
-
-std::uint64_t ReadJitStateQword(const Executor::Jit::LsxMachineImage& state,
-                                     const std::size_t offset) {
-    std::uint64_t value = 0;
-    std::memcpy(&value, reinterpret_cast<const std::uint8_t*>(&state) + offset, sizeof(value));
-    return value;
+std::uint64_t TranslationRegister(const Lsx4::Translation::CpuFrame& state,
+                                  const Lsx4::Translation::IntegerRegister reg) {
+    return Lsx4::Translation::ReadInteger(state, reg, 64);
 }
 
-std::uint64_t JitGpr(const Executor::Jit::LsxMachineImage& state,
-                          const Executor::Jit::LsxGpr reg) {
-    return Executor::Jit::ReadGuestGpr64(state, reg);
-}
-
-void FillBox64RegsFromJitState(const Executor::Jit::LsxMachineImage& state,
-                                    ExecutorBox64GuestRegsSnapshot& out) {
+void FillBox64RegsFromJitState(const Lsx4::Translation::CpuFrame& state,
+                               ExecutorBox64GuestRegsSnapshot& out) {
+    using Lsx4::Translation::IntegerRegister;
     out = {};
-    out.regs[0] = JitGpr(state, Executor::Jit::LsxGpr::Rax);
-    out.regs[1] = JitGpr(state, Executor::Jit::LsxGpr::Rcx);
-    out.regs[2] = JitGpr(state, Executor::Jit::LsxGpr::Rdx);
-    out.regs[3] = JitGpr(state, Executor::Jit::LsxGpr::Rbx);
-    out.regs[4] = JitGpr(state, Executor::Jit::LsxGpr::Rsp);
-    out.regs[5] = JitGpr(state, Executor::Jit::LsxGpr::Rbp);
-    out.regs[6] = JitGpr(state, Executor::Jit::LsxGpr::Rsi);
-    out.regs[7] = JitGpr(state, Executor::Jit::LsxGpr::Rdi);
-    out.regs[8] = JitGpr(state, Executor::Jit::LsxGpr::R8);
-    out.regs[9] = JitGpr(state, Executor::Jit::LsxGpr::R9);
-    out.regs[10] = JitGpr(state, Executor::Jit::LsxGpr::R10);
-    out.regs[11] = JitGpr(state, Executor::Jit::LsxGpr::R11);
-    out.regs[12] = JitGpr(state, Executor::Jit::LsxGpr::R12);
-    out.regs[13] = JitGpr(state, Executor::Jit::LsxGpr::R13);
-    out.regs[14] = JitGpr(state, Executor::Jit::LsxGpr::R14);
-    out.regs[15] = JitGpr(state, Executor::Jit::LsxGpr::R15);
-    out.rip = state.rip_or_exit;
-    out.old_ip = state.rip_or_exit;
-    out.fsbase = ReadJitStateQword(state, JitFsBaseStateOffset);
-    out.gsbase = ReadJitStateQword(state, JitGsBaseStateOffset);
+    constexpr std::array<IntegerRegister, 16> order{
+        IntegerRegister::A, IntegerRegister::C, IntegerRegister::D,
+        IntegerRegister::B, IntegerRegister::Stack, IntegerRegister::Frame,
+        IntegerRegister::Source, IntegerRegister::Destination,
+        IntegerRegister::R8, IntegerRegister::R9, IntegerRegister::R10,
+        IntegerRegister::R11, IntegerRegister::R12, IntegerRegister::R13,
+        IntegerRegister::R14, IntegerRegister::R15};
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        out.regs[index] = TranslationRegister(state, order[index]);
+    }
+    out.rip = state.resume_address;
+    out.old_ip = state.resume_address;
+    out.fsbase = state.fs_origin;
+    out.gsbase = state.gs_origin;
 }
 
-void RestoreJitStateFromBox64Regs(Executor::Jit::LsxMachineImage& state,
-                                       const ExecutorBox64GuestRegsSnapshot& in) {
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rax, in.regs[0]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rcx, in.regs[1]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rdx, in.regs[2]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rbx, in.regs[3]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rsp, in.regs[4]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rbp, in.regs[5]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rsi, in.regs[6]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::Rdi, in.regs[7]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R8, in.regs[8]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R9, in.regs[9]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R10, in.regs[10]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R11, in.regs[11]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R12, in.regs[12]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R13, in.regs[13]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R14, in.regs[14]);
-    Executor::Jit::WriteGuestGpr64(state, Executor::Jit::LsxGpr::R15, in.regs[15]);
-    state.rip_or_exit = in.rip;
-    state.fs_base = in.fsbase;
-    state.gs_base = in.gsbase;
+void RestoreJitStateFromBox64Regs(Lsx4::Translation::CpuFrame& state,
+                                  const ExecutorBox64GuestRegsSnapshot& in) {
+    for (std::size_t index = 0; index < state.integer.size(); ++index) {
+        state.integer[index] = in.regs[index];
+    }
+    state.resume_address = in.rip;
+    state.fs_origin = in.fsbase;
+    state.gs_origin = in.gsbase;
 }
 
 std::uint64_t JitTcbBaseForGuestThread(void* guest_thread) {
@@ -534,18 +499,10 @@ using box64_dump_guest_threads_fn = int (*)(const char* reason);
 using box64_arm_sgen_hw_watchpoints_fn = int (*)();
 using box64_arm_addr_software_watch_fn = int (*)(std::uint64_t addr);
 using box64_sw_watch_rearm_fn = void (*)();
-using box64_hle_bridge_callback_fn = std::uint64_t (*)(std::uint64_t native_function,
-                                                       std::uint64_t arg0,
-                                                       std::uint64_t arg1,
-                                                       std::uint64_t arg2,
-                                                       std::uint64_t arg3,
-                                                       std::uint64_t arg4,
-                                                       std::uint64_t arg5,
-                                                       std::uint64_t guest_rsp,
-                                                       std::uint64_t xmm0,
-                                                       std::uint64_t xmm1,
-                                                       std::uint64_t xmm2,
-                                                       std::uint64_t xmm3);
+using box64_hle_bridge_callback_fn = HleMachineWord (*)(
+    HleMachineWord, HleMachineWord, HleMachineWord, HleMachineWord,
+    HleMachineWord, HleMachineWord, HleMachineWord, HleMachineWord,
+    HleMachineWord, HleMachineWord, HleMachineWord, HleMachineWord);
 box64_cstr_fn g_box64_embed_abi = nullptr;
 box64_cstr_fn g_box64_embed_version = nullptr;
 box64_cstr_fn g_box64_mapped_entry_abi = nullptr;
@@ -591,12 +548,12 @@ std::atomic_bool g_load_exec_process_worker_active{false};
 
 int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
     if (RuntimeGuestJitActive()) {
-        auto* state = Executor::Jit::FindActiveMachineImage();
-        if (state == nullptr) {
+        Lsx4::Translation::CpuFrame state{};
+        if (!Lsx4::Translation::PublishedLiveState().CopyTo(state)) {
             out = {};
             return -1;
         }
-        FillBox64RegsFromJitState(*state, out);
+        FillBox64RegsFromJitState(state, out);
         return 0;
     }
     if (g_box64_get_current_guest_regs == nullptr) {
@@ -1310,31 +1267,24 @@ extern "C" void executor_lsx4_android_note_auto_allocated_pthread_key(int key) {
 }
 
 std::string JsonEscape(const std::string& value) {
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (const char ch : value) {
-        switch (ch) {
-        case '\\':
-            out += "\\\\";
-            break;
-        case '"':
-            out += "\\\"";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            out += ch;
-            break;
+    std::string escaped;
+    escaped.reserve(value.size() + value.size() / 8);
+    constexpr char hex[] = "0123456789abcdef";
+    for (const unsigned char byte : value) {
+        if (byte >= 0x20 && byte != '"' && byte != '\\') {
+            escaped.push_back(static_cast<char>(byte));
+            continue;
         }
+        if (byte == '"' || byte == '\\') {
+            escaped.push_back('\\');
+            escaped.push_back(static_cast<char>(byte));
+            continue;
+        }
+        escaped.append("\\u00");
+        escaped.push_back(hex[byte >> 4]);
+        escaped.push_back(hex[byte & 0x0f]);
     }
-    return out;
+    return escaped;
 }
 
 std::filesystem::path FirmwareModulesRoot() {
@@ -2112,6 +2062,9 @@ bool IsJitOrdinaryGuestRange(const std::uint64_t address, const std::size_t size
         static_cast<std::uint64_t>(size) > GuestAddressLimit - address) {
         return false;
     }
+    if (Lsx4::Translation::IsProcessImageMemory(address, size)) {
+        return false;
+    }
     auto* memory = Core::Memory::Instance();
     if (memory == nullptr) {
         return false;
@@ -2173,9 +2126,8 @@ bool IsJitCurrentThreadStackRange(const std::uint64_t address, const std::size_t
 }
 
 bool IsJitGuestRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
-    return IsJitRegisteredPageCached(address, size) ||
-           IsJitOrdinaryGuestRange(address, size) ||
-           IsJitRegisteredGuestRange(address, size);
+    return IsJitRegisteredGuestRange(address, size) ||
+           IsJitOrdinaryGuestRange(address, size);
 }
 
 bool IsJitSourceRangeWithoutProcMaps(const std::uint64_t address, const std::size_t size) {
@@ -2207,38 +2159,11 @@ extern "C" bool ExecutorJitReadGuestBytes(const std::uint64_t address, void* dst
     if (size == 0) {
         return true;
     }
-    if (address == 0 || dst == nullptr || address > (~std::uint64_t{0} - (size - 1))) {
-        return false;
-    }
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
-    const std::uint64_t host_dst =
+    const std::uint64_t host_destination =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
-    if (host_address == 0 || host_dst == 0 ||
-        host_address > (~std::uint64_t{0} - (size - 1))) {
-        return false;
-    }
-    // Ordinary guest mappings and registered guest stacks are already authoritative. Avoid the
-    // process-global /proc/self/maps cache mutex on every interpreted/JIT memory operand.
-    if (IsJitGuestRangeWithoutProcMaps(host_address, size)) {
-        std::memcpy(reinterpret_cast<void*>(host_dst),
-                    reinterpret_cast<const void*>(host_address), size);
-        return true;
-    }
-    // JIT also decodes high host self-test buffers before the guest Linker/MemoryManager is
-    // initialized. Keep the guarded host fallback for those buffers only.
-    if (IsHostAddressReadableByProcMaps(host_address) &&
-        IsHostAddressReadableByProcMaps(host_address + size - 1)) {
-        std::memcpy(reinterpret_cast<void*>(host_dst),
-                    reinterpret_cast<const void*>(host_address), size);
-        return true;
-    }
-    auto* out = static_cast<std::uint8_t*>(dst);
-    for (std::size_t i = 0; i < size; ++i) {
-        if (!GuestReadByteCheckedLocked(address + i, out[i])) {
-            return false;
-        }
-    }
-    return true;
+    return Lsx4::Translation::ReadProcessGuestMemory(
+        host_address, reinterpret_cast<void*>(host_destination), size);
 }
 
 extern "C" bool ExecutorJitReadGuestBytesStable(const std::uint64_t address, void* dst,
@@ -2246,110 +2171,12 @@ extern "C" bool ExecutorJitReadGuestBytesStable(const std::uint64_t address, voi
     if (size == 0) {
         return true;
     }
-    if (address == 0 || dst == nullptr || address > (~std::uint64_t{0} - (size - 1))) {
-        return false;
-    }
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
-    if (host_address == 0 ||
-        host_address > (~std::uint64_t{0} - (size - 1)) ||
-        !IsJitGuestRangeWithoutProcMaps(host_address, size)) {
-        return false;
-    }
-#if (defined(__ANDROID__) || defined(__linux__)) && defined(SYS_process_vm_readv)
-    iovec local{
-        .iov_base = dst,
-        .iov_len = size,
-    };
-    iovec remote{
-        .iov_base = reinterpret_cast<void*>(host_address),
-        .iov_len = size,
-    };
-    // Unlike a validate-then-memcpy sequence, process_vm_readv performs the copy while the kernel
-    // owns the remote-mm lookup. If another guest thread unmaps a module concurrently, the read
-    // fails with a short result/EFAULT instead of taking SIGBUS between validation and memcpy.
-    const long copied =
-        syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1, 0);
-    return copied == static_cast<long>(size);
-#else
-    return ExecutorJitReadGuestBytes(address, dst, size);
-#endif
-}
-
-// Range [lo,hi) of our own loaded host image (liblsx4_executor_android.so). A guest store must
-// never land inside a loaded HOST shared object — that only happens when a native JIT block
-// computes a store base from a garbage/host pointer (observed: the RSDK audio worker Thread2 stores
-// into our .so BSS, corrupting a std::mutex / unordered_map and later FORTIFY-aborting or SIGSEGVing
-// a different thread with a shape-shifting victim address). Computed once from /proc/self/maps.
-static bool ExecutorOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi) {
-#if defined(__ANDROID__) || defined(__linux__)
-    static std::uint64_t s_lo = 0;
-    static std::uint64_t s_hi = 0;
-    static std::once_flag s_once;
-    std::call_once(s_once, [] {
-        // Robust: find the /proc/self/maps entry that CONTAINS the address of this very function
-        // (guaranteed inside our loaded image), take its pathname, then union every mapping with that
-        // same pathname. Avoids relying on dladdr's dli_fname string matching the maps pathname.
-        const std::uint64_t self_addr =
-            reinterpret_cast<std::uint64_t>(&ExecutorOwnHostImageRange);
-        std::ifstream maps("/proc/self/maps");
-        std::string line;
-        std::string self_path;
-        while (std::getline(maps, line)) {
-            unsigned long long begin = 0;
-            unsigned long long end = 0;
-            char perms[8] = {};
-            int path_off = 0;
-            if (std::sscanf(line.c_str(), "%llx-%llx %7s %*x %*x:%*x %*u %n", &begin, &end, perms,
-                            &path_off) < 3) {
-                continue;
-            }
-            if (self_addr >= begin && self_addr < end && path_off > 0 &&
-                static_cast<std::size_t>(path_off) < line.size()) {
-                self_path = line.substr(static_cast<std::size_t>(path_off));
-                while (!self_path.empty() && (self_path.back() == '\n' || self_path.back() == ' ')) {
-                    self_path.pop_back();
-                }
-                break;
-            }
-        }
-        if (self_path.empty()) {
-            NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_OWN_HOST_IMAGE_RANGE] FAILED to find self mapping for addr=0x%llx",
-                      static_cast<unsigned long long>(self_addr));
-            return;
-        }
-        std::ifstream maps2("/proc/self/maps");
-        std::uint64_t min_begin = ~std::uint64_t{0};
-        std::uint64_t max_end = 0;
-        while (std::getline(maps2, line)) {
-            if (line.find(self_path) == std::string::npos) {
-                continue;
-            }
-            unsigned long long begin = 0;
-            unsigned long long end = 0;
-            if (std::sscanf(line.c_str(), "%llx-%llx", &begin, &end) != 2) {
-                continue;
-            }
-            min_begin = std::min<std::uint64_t>(min_begin, begin);
-            max_end = std::max<std::uint64_t>(max_end, end);
-        }
-        if (max_end > min_begin) {
-            s_lo = min_begin;
-            s_hi = max_end;
-        }
-        NativeLog(ANDROID_LOG_ERROR,
-                  "[EXECUTOR_OWN_HOST_IMAGE_RANGE] path=%s lo=0x%llx hi=0x%llx",
-                  self_path.c_str(), static_cast<unsigned long long>(s_lo),
-                  static_cast<unsigned long long>(s_hi));
-    });
-    lo = s_lo;
-    hi = s_hi;
-    return s_hi > s_lo;
-#else
-    (void)lo;
-    (void)hi;
-    return false;
-#endif
+    const std::uint64_t host_destination =
+        JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
+    return IsJitGuestRangeWithoutProcMaps(host_address, size) &&
+           Lsx4::Translation::ReadProcessGuestMemory(
+               host_address, reinterpret_cast<void*>(host_destination), size);
 }
 
 extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const void* src,
@@ -2357,69 +2184,11 @@ extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const vo
     if (size == 0) {
         return true;
     }
-    if (address == 0 || src == nullptr || address > (~std::uint64_t{0} - (size - 1))) {
-        return false;
-    }
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
-    const std::uint64_t host_src =
+    const std::uint64_t host_source =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(src));
-    if (host_address == 0 || host_src == 0 ||
-        host_address > (~std::uint64_t{0} - (size - 1)) ||
-        host_src > (~std::uint64_t{0} - (size - 1))) {
-        return false;
-    }
-    if (std::uint64_t img_lo = 0, img_hi = 0; ExecutorOwnHostImageRange(img_lo, img_hi) &&
-                                              host_address < img_hi &&
-                                              (host_address + size) > img_lo) {
-        static std::atomic<std::uint32_t> s_budget{0};
-        const std::uint32_t n = s_budget.fetch_add(1, std::memory_order_relaxed);
-        if (n < 64) {
-            NativeLog(ANDROID_LOG_ERROR,
-                      "[EXECUTOR_GUEST_STORE_INTO_HOST_IMAGE] n=%u dst=0x%llx size=%zu "
-                      "image=[0x%llx,0x%llx) (rejected; JIT garbage store base)",
-                      n, static_cast<unsigned long long>(address), size,
-                      static_cast<unsigned long long>(img_lo),
-                      static_cast<unsigned long long>(img_hi));
-            std::FILE* cf = std::fopen(
-                "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a");
-            if (cf != nullptr) {
-                std::fprintf(cf, "GUEST_STORE_INTO_HOST_IMAGE dst=0x%llx size=%zu\n",
-                             static_cast<unsigned long long>(address), size);
-                std::fclose(cf);
-            }
-        }
-        return false;
-    }
-    // The memcpy below READS `src` — for a guest string/block store (rep movs) `src` is itself a
-    // guest address, and the RSDK audio worker (Thread2) reaches here with a near-null source
-    // (0x4b0 etc) that is unmapped, so the memcpy SIGSEGVs reading src and takes the whole process
-    // down. Validate the SOURCE range too (not just the writable destination) and skip the copy on
-    // a bad read, exactly as a real guest fault would (the offending guest thread continues instead
-    // of crashing every other thread). Guards the null-page and any unmapped source page.
-    if (host_src < 0x10000ull) {
-        return false;
-    }
-    const bool destination_is_guest =
-        IsJitGuestRangeWithoutProcMaps(host_address, size);
-    if (!destination_is_guest) {
-        const bool destination_writable =
-            IsHostAddressWritableByProcMaps(host_address) &&
-            IsHostAddressWritableByProcMaps(host_address + size - 1);
-        const bool destination_readable =
-            IsHostAddressReadableByProcMaps(host_address) &&
-            IsHostAddressReadableByProcMaps(host_address + size - 1);
-        if (!destination_writable && !destination_readable) {
-            return false;
-        }
-    }
-    if (!IsJitSourceRangeWithoutProcMaps(host_src, size) &&
-        (!IsHostAddressReadableByProcMaps(host_src) ||
-         !IsHostAddressReadableByProcMaps(host_src + size - 1))) {
-        return false;
-    }
-    std::memcpy(reinterpret_cast<void*>(host_address), reinterpret_cast<const void*>(host_src),
-                size);
-    return true;
+    return Lsx4::Translation::WriteProcessGuestMemory(
+        host_address, reinterpret_cast<const void*>(host_source), size);
 }
 
 bool GuestReadQwordDirectMspaceLocked(const std::uint64_t address, std::uint64_t& out) {
@@ -3588,12 +3357,9 @@ void RecordMappedEntryHleResult(const char* name, const char* symbol_name,
                                      recent.return_class.c_str(),
                                      static_cast<unsigned long long>(recent.module_offset),
                                      recent.module_path.empty() ? "<unknown>" : recent.module_path.c_str(),
-                                     static_cast<unsigned long long>(arg0),
-                                     static_cast<unsigned long long>(arg1),
-                                     static_cast<unsigned long long>(arg2),
-                                     static_cast<unsigned long long>(arg3),
-                                     static_cast<unsigned long long>(arg4),
-                                     static_cast<unsigned long long>(arg5));
+                                     HleLogWord(arg0), HleLogWord(arg1),
+                                     HleLogWord(arg2), HleLogWord(arg3),
+                                     HleLogWord(arg4), HleLogWord(arg5));
                         std::fflush(err_file);
                     }
                 }
@@ -5046,10 +4812,12 @@ void RecordLibcCompareBadPtr(const char* name, const char* symbol_name,
               ret_context.empty() ? "<unreadable>" : ret_context.c_str());
 }
 
-void RecordLiveHleCallsite(const char* name, const char* symbol_name, std::uint64_t native_function,
-                           std::uint64_t arg0, std::uint64_t arg1, std::uint64_t arg2,
-                            std::uint64_t arg3, std::uint64_t arg4, std::uint64_t arg5,
-                            std::uint64_t guest_rsp, const bool is_live_trace_target) {
+void RecordLiveHleCallsite(const char* name, const char* symbol_name,
+                           HleMachineWord native_function, HleMachineWord arg0,
+                           HleMachineWord arg1, HleMachineWord arg2,
+                           HleMachineWord arg3, HleMachineWord arg4,
+                           HleMachineWord arg5, HleMachineWord guest_rsp,
+                           const bool is_live_trace_target) {
     static const bool enabled = ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_WIDE") ||
                                 ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_HLE");
     if (!enabled) {
@@ -5559,10 +5327,8 @@ extern "C" void executor_live_log_fiber_transition(
             static_cast<unsigned long long>(guest_return));
         if (result != 0) {
             std::uint64_t guest_rbp = 0;
-            if (const auto* machine = Executor::Jit::FindActiveMachineImage();
-                machine != nullptr) {
-                guest_rbp = Executor::Jit::ReadGuestGpr64(
-                    *machine, Executor::Jit::LsxGpr::Rbp);
+            if (const auto machine = Lsx4::Translation::PublishedLiveState(); machine) {
+                guest_rbp = machine.Read(Lsx4::Translation::IntegerRegister::Frame);
             }
             std::fprintf(trace, "  failureStack rbp=0x%llx",
                          static_cast<unsigned long long>(guest_rbp));
@@ -7013,14 +6779,9 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                       "[EXECUTOR_HLE_STACK_ARGS] glTexImage2D target=0x%llx level=%llu "
                       "internal=0x%llx size=%llux%llu border=%llu format=0x%llx type=0x%llx "
                       "pixels=%p guest_rsp=%p",
-                      static_cast<unsigned long long>(arg0),
-                      static_cast<unsigned long long>(arg1),
-                      static_cast<unsigned long long>(arg2),
-                      static_cast<unsigned long long>(arg3),
-                      static_cast<unsigned long long>(arg4),
-                      static_cast<unsigned long long>(arg5),
-                      static_cast<unsigned long long>(format),
-                      static_cast<unsigned long long>(type), reinterpret_cast<void*>(pixels),
+                      HleLogWord(arg0), HleLogWord(arg1), HleLogWord(arg2),
+                      HleLogWord(arg3), HleLogWord(arg4), HleLogWord(arg5),
+                      HleLogWord(format), HleLogWord(type), reinterpret_cast<void*>(pixels),
                       reinterpret_cast<void*>(guest_rsp));
         }
         reinterpret_cast<Fn>(native_function)(
@@ -7045,14 +6806,9 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                       "[EXECUTOR_HLE_STACK_ARGS] glTexSubImage2D target=0x%llx level=%llu "
                       "offset=%llu,%llu size=%llux%llu format=0x%llx type=0x%llx pixels=%p "
                       "guest_rsp=%p",
-                      static_cast<unsigned long long>(arg0),
-                      static_cast<unsigned long long>(arg1),
-                      static_cast<unsigned long long>(arg2),
-                      static_cast<unsigned long long>(arg3),
-                      static_cast<unsigned long long>(arg4),
-                      static_cast<unsigned long long>(arg5),
-                      static_cast<unsigned long long>(format),
-                      static_cast<unsigned long long>(type), reinterpret_cast<void*>(pixels),
+                      HleLogWord(arg0), HleLogWord(arg1), HleLogWord(arg2),
+                      HleLogWord(arg3), HleLogWord(arg4), HleLogWord(arg5),
+                      HleLogWord(format), HleLogWord(type), reinterpret_cast<void*>(pixels),
                       reinterpret_cast<void*>(guest_rsp));
         }
         reinterpret_cast<Fn>(native_function)(
@@ -7085,10 +6841,9 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_HLE_STACK_ARGS] sceVideoOutSetBufferAttribute attr=%p fmt=0x%llx "
                       "tiling=%llu aspect=%llu size=%llux%llu pitch=%llu guest_rsp=%p",
-                      reinterpret_cast<void*>(arg0), static_cast<unsigned long long>(arg1),
-                      static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3),
-                      static_cast<unsigned long long>(arg4), static_cast<unsigned long long>(arg5),
-                      static_cast<unsigned long long>(pitch), reinterpret_cast<void*>(guest_rsp));
+                      reinterpret_cast<void*>(arg0), HleLogWord(arg1), HleLogWord(arg2),
+                      HleLogWord(arg3), HleLogWord(arg4), HleLogWord(arg5),
+                      HleLogWord(pitch), reinterpret_cast<void*>(guest_rsp));
         }
         reinterpret_cast<Fn>(native_function)(
             reinterpret_cast<void*>(arg0), static_cast<std::uint32_t>(arg1),
@@ -7507,8 +7262,8 @@ extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
             std::uint64_t calls{};
         };
         static thread_local std::array<HotLeafHleEdge, 16> hot_edges{};
-        const auto* const guest_state = Executor::Jit::FindActiveMachineImage();
-        const std::uint64_t guest_rip = guest_state != nullptr ? guest_state->rip_or_exit : 0;
+        const auto guest_state = Lsx4::Translation::PublishedLiveState();
+        const std::uint64_t guest_rip = guest_state.ResumeAddress();
         const std::size_t hot_index =
             static_cast<std::size_t>(((native_function >> 4) ^ (guest_rip >> 4)) &
                                      (hot_edges.size() - 1));
@@ -7569,7 +7324,7 @@ extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
     return 0;
 }
 
-extern "C" Executor::Jit::JitLeafHleCallResult
+extern "C" Lsx4::Translation::HleLeafOutcome
 ExecutorJitTryLeafHleThunkCallback(
     const std::uint64_t thunk, const std::uint64_t arg0,
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
@@ -7581,9 +7336,9 @@ ExecutorJitTryLeafHleThunkCallback(
         return {};
     }
     return {
-        .result = ExecutorJitResolvedLeafHleCallback(
+        .value = ExecutorJitResolvedLeafHleCallback(
             native_function, arg0, arg1, arg2, arg3, arg4, arg5, guest_rsp),
-        .executed = 1,
+        .accepted = 1,
     };
 }
 
@@ -8301,7 +8056,8 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x0f;
         code[cursor++] = 0x3f;
         const auto& hle_hash =
-            RuntimeGuestJitActive() ? ExecutorJitHleThunkHash : ExecutorFexHleThunkHash;
+            RuntimeGuestJitActive() ? Lsx4::Translation::TranslationThunkIdentity
+                                    : Lsx4::Translation::FexThunkIdentity;
         std::memcpy(code + cursor, hle_hash.data(), hle_hash.size());
         cursor += hle_hash.size();
     }
@@ -8893,7 +8649,7 @@ static int ExecutorInstallManagedSpawnProbe(void* seg_host, const std::size_t se
     __builtin___clear_cache(reinterpret_cast<char*>(bytes + kCompileEntryOff),
                             reinterpret_cast<char*>(bytes + kCompileEntryOff + patch.size()));
     NativeLog(ANDROID_LOG_INFO,
-              "[EXECUTOR_MANAGED_COACH_PROBE_INSTALL] result=patched backend=B base=0x%llx "
+              "[EXECUTOR_MANAGED_COACH_PROBE_INSTALL] result=patched route=managed base=0x%llx "
               "compilerEntry=0x%llx trampoline=0x%llx tokens="
               "0x%08x,0x%08x,0x%08x,0x%08x",
               (unsigned long long)reinterpret_cast<std::uint64_t>(bytes),
@@ -9733,7 +9489,7 @@ static int ExecutorInstallMonoAotClassNameChainGuard(void* seg_host, std::size_t
 
     NativeLog(ANDROID_LOG_WARN,
               "[EXECUTOR_MONO_AOT_CHAIN_GUARD] installed init=0x%llx step=0x%llx "
-              "capture=0x%llx bound=TypeDef.rows overflow-safe violation=unlock+FALSE backend=B",
+              "capture=0x%llx bound=TypeDef.rows overflow-safe violation=unlock+FALSE route=managed",
               (unsigned long long)reinterpret_cast<std::uint64_t>(init_helper),
               (unsigned long long)reinterpret_cast<std::uint64_t>(step_helper),
               (unsigned long long)g_mono_aot_chain_guard_buf);
@@ -20015,7 +19771,7 @@ void ConfigureJitPersistentCacheForLaunch(
     const bool jit_launch, const std::filesystem::path& app0_path,
     const std::filesystem::path& executable_path) {
     if (!jit_launch) {
-        Executor::Jit::ConfigureTranslationStore({}, {}, 0, false);
+        Lsx4::Translation::ConfigureArtifactStore({}, {}, 0, false);
         return;
     }
 
@@ -20040,7 +19796,7 @@ void ConfigureJitPersistentCacheForLaunch(
         : 0;
     const std::string cache_title =
         JitCacheTitleId(app0_path, executable_path, executable_fingerprint);
-    Executor::Jit::ConfigureTranslationStore(
+    Lsx4::Translation::ConfigureArtifactStore(
         g_root, cache_title, executable_fingerprint,
         cache_enabled && executable_fingerprint != 0);
     const auto fingerprint_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -22815,14 +22571,15 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
         if (regs == nullptr || regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
             return -2;
         }
-        auto* state = Executor::Jit::FindActiveMachineImage();
-        if (state == nullptr) {
+        const auto live = Lsx4::Translation::PublishedLiveState();
+        Lsx4::Translation::CpuFrame state{};
+        if (!live.CopyTo(state)) {
             return -1;
         }
         ExecutorBox64GuestRegsSnapshot snapshot{};
         std::memcpy(&snapshot, regs, sizeof(snapshot));
-        RestoreJitStateFromBox64Regs(*state, snapshot);
-        return 0;
+        RestoreJitStateFromBox64Regs(state, snapshot);
+        return live.ReplaceWith(state) ? 0 : -1;
     }
     if (!g_box64_set_current_guest_regs) {
         return -1;
@@ -24593,7 +24350,7 @@ extern "C" const char* executor_lsx4_runtime_status() {
 
 extern "C" const char* executor_lsx4_runtime_jit_status() {
     static std::string status;
-    status = Executor::Jit::DescribeTranslationEngineJson();
+    status = Lsx4::Translation::DescribeTranslationRuntime();
     return status.c_str();
 }
 
@@ -24639,32 +24396,32 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
         return -1;
     }
 
-    const auto cpu = Executor::Jit::SnapshotTranslationTelemetry();
+    const auto cpu = Lsx4::Translation::ReadTranslationCounters();
     const auto gpu = Libraries::GnmDriver::ExecutorGetGnmHudStats();
-    values[0] = cpu.decoded_blocks;
-    values[1] = cpu.native_blocks;
-    values[2] = cpu.helper_blocks;
-    values[3] = cpu.unsupported_blocks;
-    values[4] = cpu.native_cache_hits;
+    values[0] = cpu.decoded_regions;
+    values[1] = cpu.native_regions;
+    values[2] = cpu.semantic_regions;
+    values[3] = cpu.unsupported_regions;
+    values[4] = cpu.memory_cache_hits;
     values[5] = gpu.builder_total;
     values[6] = gpu.actual_draw;
     values[7] = gpu.builder_shader;
     values[8] = gpu.submit_calls;
     values[9] = gpu.submit_done_calls;
     values[10] = Vulkan::ExecutorGetLivePresentCount();
-    values[11] = cpu.persistent_ir_enabled;
-    values[12] = cpu.persistent_ir_records_loaded;
-    values[13] = cpu.persistent_ir_hits;
-    values[14] = cpu.persistent_native_hits;
-    values[15] = cpu.persistent_native_records_captured;
-    values[16] = cpu.persistent_ir_records_written;
-    values[17] = cpu.persistent_native_records_written;
+    values[11] = cpu.stored_ir_enabled;
+    values[12] = cpu.stored_ir_loaded;
+    values[13] = cpu.stored_ir_hits;
+    values[14] = cpu.stored_native_hits;
+    values[15] = cpu.stored_native_captured;
+    values[16] = cpu.stored_ir_written;
+    values[17] = cpu.stored_native_written;
     return static_cast<int>(kValueCount);
 }
 
 extern "C" const char* executor_lsx4_runtime_jit_selftest() {
     static std::string status;
-    status = Executor::Jit::ExerciseTranslationEngineJson();
+    status = Lsx4::Translation::ExerciseTranslationRuntime();
     const bool guest_range_ok = executor_jit_guest_range_selftest() != 0;
     const auto foundation = Lsx4::Translation::RunFoundationChecks();
     if (!status.empty() && status.back() == '}') {
@@ -25690,28 +25447,28 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                                       primary_guest_thread->native_thr.GetHandle()),
                                   static_cast<void*>(primary_guest_thread->tcb), signal_mask_rc);
                     }
-                    Executor::Jit::LsxEntryPacket ctx{};
-                    ctx.args[0] = request.entry_params;
-                    ctx.args[1] = request.exit_func;
-                    ctx.arg_count = 2;
+                    Lsx4::Translation::EntryRequest entry_request{};
+                    entry_request.arguments[0] = request.entry_params;
+                    entry_request.arguments[1] = request.exit_func;
+                    entry_request.argument_count = 2;
                     // Main-entry is not a normal ExecuteGuest call. Upstream shadPS4 reaches
                     // eboot through RunMainEntry: RDI=params, RSI=ProgramExitFunc, and the first
                     // two EntryParams qwords are copied to the initial guest stack before a jump
                     // into the eboot entry. JIT must reconstruct that process-entry frame;
-                    // ordinary HLE/guest calls still use the LsxEntryPacket stack-argument
+                    // ordinary HLE/guest calls still use the standard entry-request stack-argument
                     // contract.
-                    ctx.stack_args_enabled = 2;
-                    ctx.segment_base = request.tcb_base;
-                    ctx.stack_base = request.stack_base;
-                    ctx.stack_size = request.stack_size;
+                    entry_request.stack_argument_mode = 2;
+                    entry_request.thread_segment_origin = request.tcb_base;
+                    entry_request.supplied_stack_base = request.stack_base;
+                    entry_request.supplied_stack_bytes = request.stack_size;
                     // A real process entry should leave via ProgramExitFunc or the eboot exit
                     // chain, not by a managed helper tail-returning into JIT's sentinel.
                     // Keep the sentinel enabled for explicit JIT helper exits, but the
                     // main-entry stack above prevents ordinary tail-call icalls from becoming a
                     // false mapped-entry completion.
-                    ctx.allow_guest_return_sentinel = 1;
+                    entry_request.permit_return_sentinel = true;
                     const std::uint64_t guest_result =
-                        Executor::Jit::DispatchGuestOnArm64(request.entry, ctx);
+                        Lsx4::Translation::ExecuteGuest(request.entry, entry_request);
                     result = static_cast<int>(guest_result);
                 } catch (const std::exception& e) {
                     exception_text = e.what();

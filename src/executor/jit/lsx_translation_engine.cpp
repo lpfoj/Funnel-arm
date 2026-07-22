@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Executor Project
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "executor/jit/lsx_translation_engine.h"
@@ -7,6 +7,8 @@
 #include "executor/jit/native_vector_plan.h"
 #include "executor/jit/vector_semantic_kernel.h"
 #include "executor/dynamic_translation/live_state_port.h"
+#include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "executor/dynamic_translation/runtime_gateway.h"
 #include "jit_native_cache_abi.h"
 #include "common/content_fingerprint.h"
 #include "core/aerolib/stubs.h"
@@ -97,7 +99,7 @@ extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
     std::uint64_t native_function, std::uint64_t arg0, std::uint64_t arg1,
     std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4,
     std::uint64_t arg5, std::uint64_t guest_rsp);
-extern "C" Executor::Jit::JitLeafHleCallResult
+extern "C" Lsx4::Translation::HleLeafOutcome
 ExecutorJitTryLeafHleThunkCallback(
     std::uint64_t thunk, std::uint64_t arg0, std::uint64_t arg1,
     std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4,
@@ -3696,12 +3698,8 @@ bool TryResolveJitLeafHlePlt(const std::uint64_t plt_rip,
     return true;
 }
 
-constexpr std::array<std::uint8_t, 32> kJitHleThunkHash = {
-    0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x6f, 0x72,
-    0x3a, 0x70, 0x73, 0x34, 0x3a, 0x68, 0x6c, 0x65,
-    0x3a, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64,
-    0x62, 0x3a, 0x74, 0x68, 0x75, 0x6e, 0x6b, 0x31,
-};
+constexpr const auto& kJitHleThunkHash =
+    Lsx4::Translation::TranslationThunkIdentity;
 constexpr std::uint8_t kJitHleMarkerLength =
     static_cast<std::uint8_t>(2 + kJitHleThunkHash.size());
 
@@ -46702,3 +46700,57 @@ ExecutorProbeNativeOwnership(const std::uint64_t host_pc, std::uint64_t* range_b
 }
 
 } // namespace Executor::Jit
+
+namespace Lsx4::Translation {
+
+std::uint64_t ExecuteGuest(const std::uint64_t address,
+                           const EntryRequest& request) {
+    Executor::Jit::LsxEntryPacket packet{};
+    packet.args = request.arguments;
+    packet.arg_count = request.argument_count;
+    packet.stack_args_enabled = request.stack_argument_mode;
+    packet.allow_guest_return_sentinel = request.permit_return_sentinel ? 1 : 0;
+    packet.segment_base = request.thread_segment_origin;
+    packet.stack_base = request.supplied_stack_base;
+    packet.stack_size = request.supplied_stack_bytes;
+    return Executor::Jit::DispatchGuestOnArm64(address, packet);
+}
+
+void ConfigureArtifactStore(const std::string& directory,
+                            const std::string& title,
+                            const std::uint64_t executable_identity,
+                            const bool enabled) {
+    Executor::Jit::ConfigureTranslationStore(directory, title,
+                                             executable_identity, enabled);
+}
+
+TranslationCounters ReadTranslationCounters() noexcept {
+    const Executor::Jit::RuntimeStatsSnapshot source =
+        Executor::Jit::SnapshotTranslationTelemetry();
+    return {source.decoded_blocks,
+            source.native_blocks,
+            source.helper_blocks,
+            source.unsupported_blocks,
+            source.native_cache_hits,
+            source.persistent_ir_enabled,
+            source.persistent_ir_hits,
+            source.persistent_ir_misses,
+            source.persistent_ir_records_loaded,
+            source.persistent_ir_records_written,
+            source.persistent_native_hits,
+            source.persistent_native_segments_restored,
+            source.persistent_native_records_captured,
+            source.persistent_native_records_written,
+            source.persistent_native_restore_fallbacks,
+            source.persistent_native_capture_rejected};
+}
+
+std::string DescribeTranslationRuntime() {
+    return Executor::Jit::DescribeTranslationEngineJson();
+}
+
+std::string ExerciseTranslationRuntime() {
+    return Executor::Jit::ExerciseTranslationEngineJson();
+}
+
+} // namespace Lsx4::Translation

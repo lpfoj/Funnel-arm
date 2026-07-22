@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Executor Project
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -135,14 +135,6 @@ struct alignas(32) LsxMachineImage {
     // derive guest RIP from the IR and removes both the TLS store and the separate rip_or_exit
     // store from the hot memory path. Specialized/semantic paths may continue using fault_ir_slot.
     std::uint64_t native_fault_ir = 0;
-};
-
-// AAPCS64 returns this two-qword aggregate in x0/x1.  The leaf-HLE fast bridge uses the second
-// word as a fail-closed predicate so generated code can take the original guest CALL/PLT path if
-// a GOT slot is ever rebound to a non-leaf target.
-struct JitLeafHleCallResult {
-    std::uint64_t result = 0;
-    std::uint64_t executed = 0;
 };
 
 static_assert(std::is_standard_layout_v<LsxMachineImage>);
