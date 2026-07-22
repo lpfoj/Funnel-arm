@@ -6,6 +6,7 @@
 #include "common/x86_decoder.h"
 #include "executor/dynamic_translation/address_resolver.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <optional>
@@ -146,6 +147,14 @@ std::uint32_t NormalizeMnemonic(const std::uint32_t mnemonic) noexcept {
         return X86_MNEMONIC_PADDD;
     case X86_MNEMONIC_VPADDQ:
         return X86_MNEMONIC_PADDQ;
+    case X86_MNEMONIC_VPADDSB:
+        return X86_MNEMONIC_PADDSB;
+    case X86_MNEMONIC_VPADDSW:
+        return X86_MNEMONIC_PADDSW;
+    case X86_MNEMONIC_VPADDUSB:
+        return X86_MNEMONIC_PADDUSB;
+    case X86_MNEMONIC_VPADDUSW:
+        return X86_MNEMONIC_PADDUSW;
     case X86_MNEMONIC_VPSUBB:
         return X86_MNEMONIC_PSUBB;
     case X86_MNEMONIC_VPSUBW:
@@ -154,6 +163,38 @@ std::uint32_t NormalizeMnemonic(const std::uint32_t mnemonic) noexcept {
         return X86_MNEMONIC_PSUBD;
     case X86_MNEMONIC_VPSUBQ:
         return X86_MNEMONIC_PSUBQ;
+    case X86_MNEMONIC_VPSUBSB:
+        return X86_MNEMONIC_PSUBSB;
+    case X86_MNEMONIC_VPSUBSW:
+        return X86_MNEMONIC_PSUBSW;
+    case X86_MNEMONIC_VPSUBUSB:
+        return X86_MNEMONIC_PSUBUSB;
+    case X86_MNEMONIC_VPSUBUSW:
+        return X86_MNEMONIC_PSUBUSW;
+    case X86_MNEMONIC_VPACKSSWB:
+        return X86_MNEMONIC_PACKSSWB;
+    case X86_MNEMONIC_VPACKSSDW:
+        return X86_MNEMONIC_PACKSSDW;
+    case X86_MNEMONIC_VPACKUSWB:
+        return X86_MNEMONIC_PACKUSWB;
+    case X86_MNEMONIC_VPACKUSDW:
+        return X86_MNEMONIC_PACKUSDW;
+    case X86_MNEMONIC_VPCMPEQB:
+        return X86_MNEMONIC_PCMPEQB;
+    case X86_MNEMONIC_VPCMPEQW:
+        return X86_MNEMONIC_PCMPEQW;
+    case X86_MNEMONIC_VPCMPEQD:
+        return X86_MNEMONIC_PCMPEQD;
+    case X86_MNEMONIC_VPCMPEQQ:
+        return X86_MNEMONIC_PCMPEQQ;
+    case X86_MNEMONIC_VPCMPGTB:
+        return X86_MNEMONIC_PCMPGTB;
+    case X86_MNEMONIC_VPCMPGTW:
+        return X86_MNEMONIC_PCMPGTW;
+    case X86_MNEMONIC_VPCMPGTD:
+        return X86_MNEMONIC_PCMPGTD;
+    case X86_MNEMONIC_VPCMPGTQ:
+        return X86_MNEMONIC_PCMPGTQ;
     case X86_MNEMONIC_VPSHUFB:
         return X86_MNEMONIC_PSHUFB;
     case X86_MNEMONIC_VPSHUFD:
@@ -248,6 +289,151 @@ VectorValue LogicalBinary(const std::uint32_t mnemonic, const VectorValue& left,
                                   right.bytes[index];
         } else {
             result.bytes[index] = left.bytes[index] | right.bytes[index];
+        }
+    }
+    return result;
+}
+
+std::uint8_t SaturatingLaneBytes(const std::uint32_t mnemonic) noexcept {
+    switch (mnemonic) {
+    case X86_MNEMONIC_PADDSB:
+    case X86_MNEMONIC_PADDUSB:
+    case X86_MNEMONIC_PSUBSB:
+    case X86_MNEMONIC_PSUBUSB:
+        return 1;
+    case X86_MNEMONIC_PADDSW:
+    case X86_MNEMONIC_PADDUSW:
+    case X86_MNEMONIC_PSUBSW:
+    case X86_MNEMONIC_PSUBUSW:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+bool IsUnsignedSaturation(const std::uint32_t mnemonic) noexcept {
+    return mnemonic == X86_MNEMONIC_PADDUSB || mnemonic == X86_MNEMONIC_PADDUSW ||
+           mnemonic == X86_MNEMONIC_PSUBUSB || mnemonic == X86_MNEMONIC_PSUBUSW;
+}
+
+bool IsSaturatingAddition(const std::uint32_t mnemonic) noexcept {
+    return mnemonic == X86_MNEMONIC_PADDSB || mnemonic == X86_MNEMONIC_PADDSW ||
+           mnemonic == X86_MNEMONIC_PADDUSB || mnemonic == X86_MNEMONIC_PADDUSW;
+}
+
+std::int64_t SignedLane(const std::uint64_t value,
+                        const std::uint8_t bytes) noexcept {
+    if (bytes == 8) {
+        return static_cast<std::int64_t>(value);
+    }
+    const std::uint32_t bits = bytes * 8u;
+    const std::uint64_t sign = std::uint64_t{1} << (bits - 1);
+    return (value & sign) == 0
+               ? static_cast<std::int64_t>(value)
+               : static_cast<std::int64_t>(value | (~std::uint64_t{} << bits));
+}
+
+VectorValue SaturatingBinary(const std::uint32_t mnemonic, const VectorValue& left,
+                             const VectorValue& right) noexcept {
+    VectorValue result{};
+    result.active_bytes = left.active_bytes;
+    const std::uint8_t bytes = SaturatingLaneBytes(mnemonic);
+    const bool addition = IsSaturatingAddition(mnemonic);
+    const bool unsigned_values = IsUnsignedSaturation(mnemonic);
+    const std::uint32_t bits = bytes * 8u;
+    for (std::size_t offset = 0; offset < result.active_bytes; offset += bytes) {
+        const std::uint64_t first = LoadLane(left.bytes.data() + offset, bytes);
+        const std::uint64_t second = LoadLane(right.bytes.data() + offset, bytes);
+        std::uint64_t value = 0;
+        if (unsigned_values) {
+            const std::uint64_t maximum = (std::uint64_t{1} << bits) - 1;
+            value = addition ? std::min(maximum, first + second)
+                             : (first < second ? 0 : first - second);
+        } else {
+            const std::int64_t minimum = -(std::int64_t{1} << (bits - 1));
+            const std::int64_t maximum = (std::int64_t{1} << (bits - 1)) - 1;
+            const std::int64_t wide = addition
+                                          ? SignedLane(first, bytes) +
+                                                SignedLane(second, bytes)
+                                          : SignedLane(first, bytes) -
+                                                SignedLane(second, bytes);
+            value = static_cast<std::uint64_t>(std::clamp(wide, minimum, maximum));
+        }
+        StoreLane(result.bytes.data() + offset, bytes, value);
+    }
+    return result;
+}
+
+std::uint8_t ComparisonLaneBytes(const std::uint32_t mnemonic) noexcept {
+    switch (mnemonic) {
+    case X86_MNEMONIC_PCMPEQB:
+    case X86_MNEMONIC_PCMPGTB:
+        return 1;
+    case X86_MNEMONIC_PCMPEQW:
+    case X86_MNEMONIC_PCMPGTW:
+        return 2;
+    case X86_MNEMONIC_PCMPEQD:
+    case X86_MNEMONIC_PCMPGTD:
+        return 4;
+    case X86_MNEMONIC_PCMPEQQ:
+    case X86_MNEMONIC_PCMPGTQ:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+VectorValue ComparePacked(const std::uint32_t mnemonic, const VectorValue& left,
+                          const VectorValue& right) noexcept {
+    VectorValue result{};
+    result.active_bytes = left.active_bytes;
+    const std::uint8_t bytes = ComparisonLaneBytes(mnemonic);
+    const bool greater = mnemonic == X86_MNEMONIC_PCMPGTB ||
+                         mnemonic == X86_MNEMONIC_PCMPGTW ||
+                         mnemonic == X86_MNEMONIC_PCMPGTD ||
+                         mnemonic == X86_MNEMONIC_PCMPGTQ;
+    for (std::size_t offset = 0; offset < result.active_bytes; offset += bytes) {
+        const std::uint64_t first = LoadLane(left.bytes.data() + offset, bytes);
+        const std::uint64_t second = LoadLane(right.bytes.data() + offset, bytes);
+        const bool selected = greater ? SignedLane(first, bytes) > SignedLane(second, bytes)
+                                      : first == second;
+        StoreLane(result.bytes.data() + offset, bytes,
+                  selected ? ~std::uint64_t{} : 0);
+    }
+    return result;
+}
+
+VectorValue PackNarrow(const std::uint32_t mnemonic, const VectorValue& left,
+                       const VectorValue& right) noexcept {
+    VectorValue result{};
+    result.active_bytes = left.active_bytes;
+    const bool dwords = mnemonic == X86_MNEMONIC_PACKSSDW ||
+                        mnemonic == X86_MNEMONIC_PACKUSDW;
+    const bool unsigned_output = mnemonic == X86_MNEMONIC_PACKUSWB ||
+                                 mnemonic == X86_MNEMONIC_PACKUSDW;
+    const std::uint8_t input_bytes = dwords ? 4 : 2;
+    const std::uint8_t output_bytes = dwords ? 2 : 1;
+    const std::int64_t minimum = unsigned_output
+                                     ? 0
+                                     : -(std::int64_t{1} << (output_bytes * 8u - 1));
+    const std::int64_t maximum = unsigned_output
+                                     ? (std::int64_t{1} << (output_bytes * 8u)) - 1
+                                     : (std::int64_t{1} << (output_bytes * 8u - 1)) - 1;
+    const std::size_t values_per_source = 16 / input_bytes;
+    for (std::size_t lane = 0; lane < result.active_bytes; lane += 16) {
+        for (std::size_t source_index = 0; source_index < 2; ++source_index) {
+            const VectorValue& source = source_index == 0 ? left : right;
+            for (std::size_t index = 0; index < values_per_source; ++index) {
+                const std::uint64_t raw =
+                    LoadLane(source.bytes.data() + lane + index * input_bytes,
+                             input_bytes);
+                const std::int64_t narrowed =
+                    std::clamp(SignedLane(raw, input_bytes), minimum, maximum);
+                const std::size_t output =
+                    lane + (source_index * values_per_source + index) * output_bytes;
+                StoreLane(result.bytes.data() + output, output_bytes,
+                          static_cast<std::uint64_t>(narrowed));
+            }
         }
     }
     return result;
@@ -387,6 +573,15 @@ VectorSemanticResult ExecuteVectorInstruction(
         result = LogicalBinary(mnemonic, *left, *right);
     } else if (PackedLaneBytes(mnemonic) != 0) {
         result = PackedBinary(mnemonic, *left, *right);
+    } else if (SaturatingLaneBytes(mnemonic) != 0) {
+        result = SaturatingBinary(mnemonic, *left, *right);
+    } else if (ComparisonLaneBytes(mnemonic) != 0) {
+        result = ComparePacked(mnemonic, *left, *right);
+    } else if (mnemonic == X86_MNEMONIC_PACKSSWB ||
+               mnemonic == X86_MNEMONIC_PACKSSDW ||
+               mnemonic == X86_MNEMONIC_PACKUSWB ||
+               mnemonic == X86_MNEMONIC_PACKUSDW) {
+        result = PackNarrow(mnemonic, *left, *right);
     } else if (mnemonic == X86_MNEMONIC_PSHUFB) {
         result = ShuffleBytes(*left, *right);
     } else if (mnemonic == X86_MNEMONIC_SHUFPS) {

@@ -44,6 +44,7 @@ enum CheckBit : std::uint64_t {
     IntegerMath = 1ull << 12,
     AtomicSemantics = 1ull << 13,
     VectorSemantics = 1ull << 14,
+    VectorPacking = 1ull << 15,
 };
 
 struct FetchContext {
@@ -403,6 +404,51 @@ bool CheckVectorSemantics() {
     return offset == fixture.size();
 }
 
+bool CheckVectorPacking() {
+    constexpr std::array<std::uint8_t, 20> fixture{
+        0xf3, 0x0f, 0x6f, 0x07, 0xf3, 0x0f, 0x6f, 0x0e, 0x66, 0x0f,
+        0x63, 0xc1, 0x66, 0x0f, 0x74, 0x02, 0xf3, 0x0f, 0x7f, 0x01};
+    constexpr std::array<std::int16_t, 8> left{
+        -200, -128, -1, 0, 1, 127, 128, 300};
+    constexpr std::array<std::int16_t, 8> right{
+        32767, -32768, 42, -42, 255, -255, 7, 8};
+    constexpr std::array<std::uint8_t, 16> expected{
+        0x80, 0x80, 0xff, 0x00, 0x01, 0x7f, 0x7f, 0x7f,
+        0x7f, 0x80, 0x2a, 0xd6, 0x7f, 0x80, 0x07, 0x08};
+    constexpr std::uint64_t code_base = 0xee00;
+    SemanticMemoryImage image{.base = 0x150000};
+    std::memcpy(image.bytes.data(), left.data(), sizeof(left));
+    std::memcpy(image.bytes.data() + 32, right.data(), sizeof(right));
+    std::memcpy(image.bytes.data() + 64, expected.data(), expected.size());
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+    WriteInteger(frame, IntegerRegister::Source, image.base + 32, 64);
+    WriteInteger(frame, IntegerRegister::D, image.base + 64, 64);
+    WriteInteger(frame, IntegerRegister::C, image.base + 96, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 5; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+            DecodeOutcome::Complete) {
+            return false;
+        }
+        if (ExecuteVectorInstruction(instruction, frame, memory).stop !=
+            VectorStop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    for (std::size_t index = 0; index < 16; ++index) {
+        if (image.bytes[96 + index] != 0xff) {
+            return false;
+        }
+    }
+    return offset == fixture.size();
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -517,6 +563,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(IntegerMath, CheckIntegerMath());
     run(AtomicSemantics, CheckAtomicSemantics());
     run(VectorSemantics, CheckVectorSemantics());
+    run(VectorPacking, CheckVectorPacking());
     return report;
 }
 
