@@ -18864,36 +18864,36 @@ extern "C" void executor_jit_dump_thread_states(const char* reason) {
         }
     }
 
-    JitLog("[EXECUTOR_JIT_THREAD_DUMP] reason=%s count=%zu lastSeq=%llu",
-                reason && reason[0] ? reason : "<none>", count,
-                static_cast<unsigned long long>(
-                    g_jit_thread_snapshot_seq.load(std::memory_order_relaxed)));
+    JitLog("[LSX4_TRANSLATION_SNAPSHOT] cause=%s threads=%zu watermark=%llu",
+           reason && reason[0] ? reason : "unspecified", count,
+           static_cast<unsigned long long>(
+               g_jit_thread_snapshot_seq.load(std::memory_order_relaxed)));
     for (std::size_t i = 0; i < count; ++i) {
         const auto& e = snapshot[i];
-        JitLog("[EXECUTOR_JIT_THREAD] seq=%llu tid=%u thread=\"%s\" phase=%s "
-                    "blocks=%llu rip=0x%llx next=0x%llx result=0x%llx "
-                    "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
-                    "rdi=0x%llx rsi=0x%llx rsp=0x%llx rbp=0x%llx "
-                    "r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx fs=0x%llx",
-                    static_cast<unsigned long long>(e.seq), e.tid,
-                    e.thread[0] ? e.thread : "<unnamed>", e.phase,
-                    static_cast<unsigned long long>(e.blocks),
-                    static_cast<unsigned long long>(e.rip),
-                    static_cast<unsigned long long>(e.next),
-                    static_cast<unsigned long long>(e.result),
-                    static_cast<unsigned long long>(e.rax),
-                    static_cast<unsigned long long>(e.rbx),
-                    static_cast<unsigned long long>(e.rcx),
-                    static_cast<unsigned long long>(e.rdx),
-                    static_cast<unsigned long long>(e.rdi),
-                    static_cast<unsigned long long>(e.rsi),
-                    static_cast<unsigned long long>(e.rsp),
-                    static_cast<unsigned long long>(e.rbp),
-                    static_cast<unsigned long long>(e.r12),
-                    static_cast<unsigned long long>(e.r13),
-                    static_cast<unsigned long long>(e.r14),
-                    static_cast<unsigned long long>(e.r15),
-                    static_cast<unsigned long long>(e.fsbase));
+        const auto sequence = static_cast<unsigned long long>(e.seq);
+        JitLog("[LSX4_TRANSLATION_THREAD] sample=%llu host_tid=%u label=\"%s\" stage=%s retired=%llu",
+               sequence, e.tid, e.thread[0] ? e.thread : "unnamed", e.phase,
+               static_cast<unsigned long long>(e.blocks));
+        JitLog("[LSX4_TRANSLATION_CONTROL] sample=%llu guest_pc=0x%llx successor=0x%llx outcome=0x%llx",
+               sequence, static_cast<unsigned long long>(e.rip),
+               static_cast<unsigned long long>(e.next),
+               static_cast<unsigned long long>(e.result));
+        JitLog("[LSX4_TRANSLATION_GPR_LOW] sample=%llu a=0x%llx b=0x%llx c=0x%llx d=0x%llx",
+               sequence, static_cast<unsigned long long>(e.rax),
+               static_cast<unsigned long long>(e.rbx),
+               static_cast<unsigned long long>(e.rcx),
+               static_cast<unsigned long long>(e.rdx));
+        JitLog("[LSX4_TRANSLATION_GPR_FRAME] sample=%llu di=0x%llx si=0x%llx sp=0x%llx bp=0x%llx",
+               sequence, static_cast<unsigned long long>(e.rdi),
+               static_cast<unsigned long long>(e.rsi),
+               static_cast<unsigned long long>(e.rsp),
+               static_cast<unsigned long long>(e.rbp));
+        JitLog("[LSX4_TRANSLATION_GPR_SAVED] sample=%llu v12=0x%llx v13=0x%llx v14=0x%llx v15=0x%llx fs_base=0x%llx",
+               sequence, static_cast<unsigned long long>(e.r12),
+               static_cast<unsigned long long>(e.r13),
+               static_cast<unsigned long long>(e.r14),
+               static_cast<unsigned long long>(e.r15),
+               static_cast<unsigned long long>(e.fsbase));
     }
 
 #ifdef __ANDROID__
