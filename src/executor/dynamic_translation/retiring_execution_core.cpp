@@ -16,6 +16,7 @@
 #include "executor/dynamic_translation/json_text.h"
 #include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
+#include "executor/dynamic_translation/trace_memory.h"
 #include "native_artifact_layout.h"
 #include "common/content_fingerprint.h"
 #include "core/aerolib/stubs.h"
@@ -1418,7 +1419,6 @@ bool TryExecuteJitDirectHleCall(LsxMachineImage& state, std::uint64_t thunk,
 bool TryExecuteJitDirectHleTail(LsxMachineImage& state, std::uint64_t thunk);
 bool IsStringCmpsInstruction(const LsxDecodedOp& ir);
 std::string HexBytesAt(std::uint64_t address, std::size_t size);
-bool IsTraceReadableAddress(std::uint64_t address, std::uint64_t bytes);
 bool ReadGuestBytesChecked(std::uint64_t address, void* dst, std::size_t size);
 bool WriteGuestBytesChecked(std::uint64_t address, const void* src, std::size_t size);
 std::uint64_t TraceQwordSafe(std::uint64_t address);
@@ -20099,47 +20099,7 @@ bool IsJitBlockProbeOffset(const std::uint64_t offset) {
 
 
 bool IsLikelyGuestReadableForTrace(const std::uint64_t address) {
-    // Keep this deliberately conservative. Low addresses such as 0xa0000 are
-    // valid-looking integers in mono metadata but are not mapped process memory;
-    // direct LoadGuestScalar() on them is a host SIGSEGV, not a catchable C++ error.
-    // Also reject the 32-bit 0x8xxxxxxx band: valid PS4 module VAs are in the
-    // 0x8xxxxxxxx *nine-hex-digit* range, while 0x80000018-style values are
-    // truncated sentinels/tokens seen in malformed metadata probes.
-    if (address >= 0x20000000ull && address < 0x70000000ull) {
-        return true;
-    }
-    return address >= 0x100000000ull && address < 0x900000000ull;
-}
-
-bool IsTraceReadableAddress(const std::uint64_t address, const std::uint64_t bytes = 1) {
-    if (bytes == 0) {
-        return true;
-    }
-    if (address == 0 || address > (~std::uint64_t{0} - (bytes - 1))) {
-        return false;
-    }
-    if (!IsLikelyGuestReadableForTrace(address)) {
-        return false;
-    }
-#ifdef __ANDROID__
-    static const std::uint64_t page_size =
-        static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE) > 0 ? ::sysconf(_SC_PAGESIZE) : 4096);
-    const std::uint64_t page_mask = ~(page_size - 1);
-    const std::uint64_t start = address & page_mask;
-    const std::uint64_t end = (address + bytes + page_size - 1) & page_mask;
-    if (end <= start) {
-        return false;
-    }
-    const std::uint64_t page_count = (end - start) / page_size;
-    if (page_count == 0 || page_count > 64) {
-        return false;
-    }
-    std::array<unsigned char, 64> vec{};
-    if (::mincore(reinterpret_cast<void*>(start), static_cast<std::size_t>(end - start), vec.data()) != 0) {
-        return false;
-    }
-#endif
-    return true;
+    return Lsx4::Translation::TraceMemory::IsPlausibleGuestAddress(address);
 }
 
 bool ReadGuestBytesChecked(const std::uint64_t address, void* dst, const std::size_t size) {
@@ -20154,11 +20114,7 @@ bool ReadGuestBytesChecked(const std::uint64_t address, void* dst, const std::si
                ? ExecutorJitReadGuestBytesStable(address, dst, size)
                : ExecutorJitReadGuestBytes(address, dst, size);
 #else
-    if (!IsTraceReadableAddress(address, size)) {
-        return false;
-    }
-    std::memcpy(dst, reinterpret_cast<const void*>(address), size);
-    return true;
+    return Lsx4::Translation::ReadProcessGuestMemory(address, dst, size);
 #endif
 }
 
@@ -20188,19 +20144,14 @@ bool WriteGuestBytesChecked(const std::uint64_t address, const void* src, const 
 #ifdef __ANDROID__
     return ExecutorJitWriteGuestBytes(address, src, size);
 #else
-    if (!IsTraceReadableAddress(address, size)) {
-        return false;
-    }
-    std::memcpy(reinterpret_cast<void*>(address), src, size);
-    return true;
+    return Lsx4::Translation::WriteProcessGuestMemory(address, src, size);
 #endif
 }
 
 std::uint64_t TraceQwordOrZero(const std::uint64_t address) {
-    if (!IsTraceReadableAddress(address, 8)) {
-        return 0;
-    }
-    return LoadGuestScalar(address, 8);
+    std::uint64_t value = 0;
+    (void)Lsx4::Translation::TraceMemory::ReadScalar(address, 8, value);
+    return value;
 }
 
 bool IsPlausibleHleGuestReturn(const std::uint64_t target) {
@@ -20243,37 +20194,11 @@ bool IsPlausibleHleGuestReturn(const std::uint64_t target) {
 }
 
 std::string TraceCStringOrEmpty(const std::uint64_t address, const std::size_t max_len = 47) {
-    if (!IsTraceReadableAddress(address, 1)) {
-        return {};
-    }
-    std::string out;
-    out.reserve(max_len);
-    try {
-        for (std::size_t i = 0; i < max_len; ++i) {
-            const std::uint8_t ch = static_cast<std::uint8_t>(LoadGuestScalar(address + i, 1));
-            if (ch == 0) {
-                break;
-            }
-            out.push_back(std::isprint(ch) ? static_cast<char>(ch) : '.');
-        }
-    } catch (...) {
-        if (out.empty()) {
-            out = "<unreadable>";
-        }
-    }
-    return out;
+    return Lsx4::Translation::TraceMemory::ReadText(address, max_len);
 }
 
 bool TraceReadQword(const std::uint64_t address, std::uint64_t& value) {
-    if (!IsTraceReadableAddress(address, 8)) {
-        return false;
-    }
-    try {
-        value = LoadGuestScalar(address, 8);
-        return true;
-    } catch (...) {
-        return false;
-    }
+    return Lsx4::Translation::TraceMemory::ReadScalar(address, 8, value);
 }
 
 std::uint64_t TraceQwordSafe(const std::uint64_t address) {
@@ -20282,36 +20207,21 @@ std::uint64_t TraceQwordSafe(const std::uint64_t address) {
 }
 
 std::uint16_t TraceWordSafe(const std::uint64_t address) {
-    if (!IsTraceReadableAddress(address, 2)) {
-        return 0;
-    }
-    try {
-        return static_cast<std::uint16_t>(LoadGuestScalar(address, 2));
-    } catch (...) {
-        return 0;
-    }
+    std::uint64_t value = 0;
+    (void)Lsx4::Translation::TraceMemory::ReadScalar(address, 2, value);
+    return static_cast<std::uint16_t>(value);
 }
 
 std::uint32_t TraceDwordSafe(const std::uint64_t address) {
-    if (!IsTraceReadableAddress(address, 4)) {
-        return 0;
-    }
-    try {
-        return static_cast<std::uint32_t>(LoadGuestScalar(address, 4));
-    } catch (...) {
-        return 0;
-    }
+    std::uint64_t value = 0;
+    (void)Lsx4::Translation::TraceMemory::ReadScalar(address, 4, value);
+    return static_cast<std::uint32_t>(value);
 }
 
 std::uint8_t TraceByteSafe(const std::uint64_t address) {
-    if (!IsTraceReadableAddress(address, 1)) {
-        return 0;
-    }
-    try {
-        return static_cast<std::uint8_t>(LoadGuestScalar(address, 1));
-    } catch (...) {
-        return 0;
-    }
+    std::uint64_t value = 0;
+    (void)Lsx4::Translation::TraceMemory::ReadScalar(address, 1, value);
+    return static_cast<std::uint8_t>(value);
 }
 
 std::int32_t TraceI32Safe(const std::uint64_t address) {
