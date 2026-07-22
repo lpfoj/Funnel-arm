@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstring>
 #include <optional>
 
@@ -109,6 +111,42 @@ bool WriteVectorOperand(const Instruction& instruction, const Operand& operand,
 
 std::uint32_t NormalizeMnemonic(const std::uint32_t mnemonic) noexcept {
     switch (mnemonic) {
+    case X86_MNEMONIC_VADDSS:
+        return X86_MNEMONIC_ADDSS;
+    case X86_MNEMONIC_VADDSD:
+        return X86_MNEMONIC_ADDSD;
+    case X86_MNEMONIC_VSUBSS:
+        return X86_MNEMONIC_SUBSS;
+    case X86_MNEMONIC_VSUBSD:
+        return X86_MNEMONIC_SUBSD;
+    case X86_MNEMONIC_VMULSS:
+        return X86_MNEMONIC_MULSS;
+    case X86_MNEMONIC_VMULSD:
+        return X86_MNEMONIC_MULSD;
+    case X86_MNEMONIC_VDIVSS:
+        return X86_MNEMONIC_DIVSS;
+    case X86_MNEMONIC_VDIVSD:
+        return X86_MNEMONIC_DIVSD;
+    case X86_MNEMONIC_VMINSS:
+        return X86_MNEMONIC_MINSS;
+    case X86_MNEMONIC_VMINSD:
+        return X86_MNEMONIC_MINSD;
+    case X86_MNEMONIC_VMAXSS:
+        return X86_MNEMONIC_MAXSS;
+    case X86_MNEMONIC_VMAXSD:
+        return X86_MNEMONIC_MAXSD;
+    case X86_MNEMONIC_VSQRTSS:
+        return X86_MNEMONIC_SQRTSS;
+    case X86_MNEMONIC_VSQRTSD:
+        return X86_MNEMONIC_SQRTSD;
+    case X86_MNEMONIC_VCOMISS:
+        return X86_MNEMONIC_COMISS;
+    case X86_MNEMONIC_VCOMISD:
+        return X86_MNEMONIC_COMISD;
+    case X86_MNEMONIC_VUCOMISS:
+        return X86_MNEMONIC_UCOMISS;
+    case X86_MNEMONIC_VUCOMISD:
+        return X86_MNEMONIC_UCOMISD;
     case X86_MNEMONIC_VMOVAPS:
         return X86_MNEMONIC_MOVAPS;
     case X86_MNEMONIC_VMOVUPS:
@@ -526,6 +564,205 @@ VectorValue ShiftBytes(const std::uint32_t mnemonic, const VectorValue& source,
     return result;
 }
 
+std::uint8_t ScalarFloatingBytes(const std::uint32_t mnemonic) noexcept {
+    switch (mnemonic) {
+    case X86_MNEMONIC_ADDSS:
+    case X86_MNEMONIC_SUBSS:
+    case X86_MNEMONIC_MULSS:
+    case X86_MNEMONIC_DIVSS:
+    case X86_MNEMONIC_MINSS:
+    case X86_MNEMONIC_MAXSS:
+    case X86_MNEMONIC_SQRTSS:
+    case X86_MNEMONIC_COMISS:
+    case X86_MNEMONIC_UCOMISS:
+        return 4;
+    case X86_MNEMONIC_ADDSD:
+    case X86_MNEMONIC_SUBSD:
+    case X86_MNEMONIC_MULSD:
+    case X86_MNEMONIC_DIVSD:
+    case X86_MNEMONIC_MINSD:
+    case X86_MNEMONIC_MAXSD:
+    case X86_MNEMONIC_SQRTSD:
+    case X86_MNEMONIC_COMISD:
+    case X86_MNEMONIC_UCOMISD:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+std::optional<std::uint64_t> ReadFloatingBits(const Instruction& instruction,
+                                              const Operand& operand,
+                                              const std::uint8_t bytes,
+                                              const CpuFrame& frame,
+                                              const GuestMemoryPort& memory) noexcept {
+    if (operand.form == OperandForm::Register) {
+        const auto access = VectorRegister(operand.register_id);
+        if (!access || access->bytes < 16) {
+            return std::nullopt;
+        }
+        return LoadLane(frame.vectors[access->slot].data(), bytes);
+    }
+    const auto address = ResolveGuestAddress(instruction, operand, frame);
+    std::array<std::uint8_t, 8> buffer{};
+    if (!address || !memory.read ||
+        !memory.read(*address, std::span<std::uint8_t>{buffer.data(), bytes},
+                     memory.context)) {
+        return std::nullopt;
+    }
+    return LoadLane(buffer.data(), bytes);
+}
+
+bool WriteFloatingRegister(const Instruction& instruction, const Operand& destination,
+                           const Operand& upper_source, const std::uint8_t bytes,
+                           const std::uint64_t bits, CpuFrame& frame) noexcept {
+    const auto destination_access = VectorRegister(destination.register_id);
+    const auto source_access = VectorRegister(upper_source.register_id);
+    if (destination.form != OperandForm::Register ||
+        upper_source.form != OperandForm::Register || !destination_access ||
+        !source_access) {
+        return false;
+    }
+    std::array<std::uint8_t, 16> assembled{};
+    std::memcpy(assembled.data(), frame.vectors[source_access->slot].data(), 16);
+    StoreLane(assembled.data(), bytes, bits);
+    std::memcpy(frame.vectors[destination_access->slot].data(), assembled.data(), 16);
+    if (instruction.encoding_family != X86_INSTRUCTION_ENCODING_LEGACY) {
+        std::memset(frame.vectors[destination_access->slot].data() + 16, 0, 16);
+    }
+    return true;
+}
+
+template <typename Floating>
+Floating ScalarFloatingOperation(const std::uint32_t mnemonic, const Floating left,
+                                 const Floating right) noexcept {
+    if (mnemonic == X86_MNEMONIC_ADDSS || mnemonic == X86_MNEMONIC_ADDSD) {
+        return left + right;
+    }
+    if (mnemonic == X86_MNEMONIC_SUBSS || mnemonic == X86_MNEMONIC_SUBSD) {
+        return left - right;
+    }
+    if (mnemonic == X86_MNEMONIC_MULSS || mnemonic == X86_MNEMONIC_MULSD) {
+        return left * right;
+    }
+    if (mnemonic == X86_MNEMONIC_DIVSS || mnemonic == X86_MNEMONIC_DIVSD) {
+        return left / right;
+    }
+    if (mnemonic == X86_MNEMONIC_SQRTSS || mnemonic == X86_MNEMONIC_SQRTSD) {
+        return std::sqrt(right);
+    }
+    if (std::isnan(left) || std::isnan(right)) {
+        return right;
+    }
+    if (mnemonic == X86_MNEMONIC_MINSS || mnemonic == X86_MNEMONIC_MINSD) {
+        return left < right ? left : right;
+    }
+    return left > right ? left : right;
+}
+
+bool IsFloatingComparison(const std::uint32_t mnemonic) noexcept {
+    return mnemonic == X86_MNEMONIC_COMISS || mnemonic == X86_MNEMONIC_COMISD ||
+           mnemonic == X86_MNEMONIC_UCOMISS || mnemonic == X86_MNEMONIC_UCOMISD;
+}
+
+template <typename Floating>
+void ApplyFloatingComparison(CpuFrame& frame, const Floating left,
+                             const Floating right) noexcept {
+    constexpr std::uint64_t cleared = CarryFlag | ParityFlag | AuxiliaryFlag |
+                                      ZeroFlag | SignFlag | OverflowFlag;
+    frame.condition_word &= ~cleared;
+    if (std::isnan(left) || std::isnan(right)) {
+        frame.condition_word |= CarryFlag | ParityFlag | ZeroFlag;
+    } else if (left < right) {
+        frame.condition_word |= CarryFlag;
+    } else if (left == right) {
+        frame.condition_word |= ZeroFlag;
+    }
+}
+
+VectorSemanticResult ExecuteScalarFloating(const Instruction& instruction,
+                                           const std::uint32_t mnemonic,
+                                           CpuFrame& frame,
+                                           const GuestMemoryPort& memory) noexcept {
+    const bool vex = instruction.encoding_family != X86_INSTRUCTION_ENCODING_LEGACY;
+    const bool comparison = IsFloatingComparison(mnemonic);
+    const std::size_t left_index = vex && !comparison ? 1 : 0;
+    const std::size_t right_index = vex && !comparison ? 2 : 1;
+    if (instruction.operand_count <= right_index) {
+        return Unsupported(instruction);
+    }
+    const std::uint8_t bytes = ScalarFloatingBytes(mnemonic);
+    const auto left = ReadFloatingBits(instruction, instruction.operands[left_index],
+                                       bytes, frame, memory);
+    const auto right = ReadFloatingBits(instruction, instruction.operands[right_index],
+                                        bytes, frame, memory);
+    if (!left || !right) {
+        return Fault(instruction, instruction.address);
+    }
+    if (bytes == 4) {
+        const float first = std::bit_cast<float>(static_cast<std::uint32_t>(*left));
+        const float second = std::bit_cast<float>(static_cast<std::uint32_t>(*right));
+        if (comparison) {
+            ApplyFloatingComparison(frame, first, second);
+        } else {
+            const float result = ScalarFloatingOperation(mnemonic, first, second);
+            if (!WriteFloatingRegister(instruction, instruction.operands[0],
+                                       instruction.operands[left_index], bytes,
+                                       std::bit_cast<std::uint32_t>(result), frame)) {
+                return Unsupported(instruction);
+            }
+        }
+    } else {
+        const double first = std::bit_cast<double>(*left);
+        const double second = std::bit_cast<double>(*right);
+        if (comparison) {
+            ApplyFloatingComparison(frame, first, second);
+        } else {
+            const double result = ScalarFloatingOperation(mnemonic, first, second);
+            if (!WriteFloatingRegister(instruction, instruction.operands[0],
+                                       instruction.operands[left_index], bytes,
+                                       std::bit_cast<std::uint64_t>(result), frame)) {
+                return Unsupported(instruction);
+            }
+        }
+    }
+    return {VectorStop::Continue, instruction.address + instruction.length, 0};
+}
+
+VectorSemanticResult ExecuteMxcsrTransfer(const Instruction& instruction,
+                                          CpuFrame& frame,
+                                          const GuestMemoryPort& memory) noexcept {
+    if (instruction.operand_count != 1 ||
+        instruction.operands[0].form != OperandForm::Memory) {
+        return Unsupported(instruction);
+    }
+    const auto address =
+        ResolveGuestAddress(instruction, instruction.operands[0], frame);
+    if (!address) {
+        return Unsupported(instruction);
+    }
+    std::array<std::uint8_t, 4> bytes{};
+    if (instruction.mnemonic == X86_MNEMONIC_LDMXCSR) {
+        if (!memory.read ||
+            !memory.read(*address, std::span<std::uint8_t>{bytes}, memory.context)) {
+            return Fault(instruction, *address);
+        }
+        const std::uint32_t value = static_cast<std::uint32_t>(LoadLane(bytes.data(), 4));
+        if ((value & 0xffff0000u) != 0) {
+            return Unsupported(instruction);
+        }
+        frame.simd_control = value;
+    } else {
+        StoreLane(bytes.data(), 4, frame.simd_control);
+        if (!memory.write ||
+            !memory.write(*address, std::span<const std::uint8_t>{bytes},
+                          memory.context)) {
+            return Fault(instruction, *address);
+        }
+    }
+    return {VectorStop::Continue, instruction.address + instruction.length, 0};
+}
+
 VectorValue ShuffleBytes(const VectorValue& source,
                          const VectorValue& control) noexcept {
     VectorValue result{};
@@ -598,6 +835,12 @@ VectorSemanticResult ExecuteVectorInstruction(
         return Unsupported(instruction);
     }
     const std::uint32_t mnemonic = NormalizeMnemonic(instruction.mnemonic);
+    if (mnemonic == X86_MNEMONIC_LDMXCSR || mnemonic == X86_MNEMONIC_STMXCSR) {
+        return ExecuteMxcsrTransfer(instruction, frame, memory);
+    }
+    if (ScalarFloatingBytes(mnemonic) != 0) {
+        return ExecuteScalarFloating(instruction, mnemonic, frame, memory);
+    }
     if (IsMove(mnemonic)) {
         if (instruction.operand_count != 2) {
             return Unsupported(instruction);

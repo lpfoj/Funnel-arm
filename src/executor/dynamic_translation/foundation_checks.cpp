@@ -46,6 +46,8 @@ enum CheckBit : std::uint64_t {
     VectorSemantics = 1ull << 14,
     VectorPacking = 1ull << 15,
     VectorShifts = 1ull << 16,
+    ScalarFloating = 1ull << 17,
+    MxcsrTransfer = 1ull << 18,
 };
 
 struct FetchContext {
@@ -482,6 +484,81 @@ bool CheckVectorShifts() {
            std::memcmp(image.bytes.data() + 32, expected.data(), sizeof(expected)) == 0;
 }
 
+bool CheckScalarFloating() {
+    constexpr std::array<std::uint8_t, 18> fixture{
+        0x0f, 0x10, 0x07, 0xf3, 0x0f, 0x58, 0x06, 0xf3, 0x0f,
+        0x59, 0x02, 0x0f, 0x2e, 0x01, 0x41, 0x0f, 0x11, 0x00};
+    constexpr std::uint64_t code_base = 0xf000;
+    SemanticMemoryImage image{.base = 0x170000};
+    const float first = 1.5f;
+    const float second = 2.25f;
+    const float multiplier = 4.0f;
+    const float expected = 15.0f;
+    std::memcpy(image.bytes.data(), &first, sizeof(first));
+    for (std::size_t index = 4; index < 16; ++index) {
+        image.bytes[index] = static_cast<std::uint8_t>(0xa0 + index);
+    }
+    std::memcpy(image.bytes.data() + 32, &second, sizeof(second));
+    std::memcpy(image.bytes.data() + 40, &multiplier, sizeof(multiplier));
+    std::memcpy(image.bytes.data() + 48, &expected, sizeof(expected));
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+    WriteInteger(frame, IntegerRegister::Source, image.base + 32, 64);
+    WriteInteger(frame, IntegerRegister::D, image.base + 40, 64);
+    WriteInteger(frame, IntegerRegister::C, image.base + 48, 64);
+    WriteInteger(frame, IntegerRegister::R8, image.base + 64, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 5; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+                DecodeOutcome::Complete ||
+            ExecuteVectorInstruction(instruction, frame, memory).stop !=
+                VectorStop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    float stored = 0;
+    std::memcpy(&stored, image.bytes.data() + 64, sizeof(stored));
+    return offset == fixture.size() && stored == expected &&
+           std::memcmp(image.bytes.data() + 68, image.bytes.data() + 4, 12) == 0 &&
+           (frame.condition_word & ZeroFlag) != 0 &&
+           (frame.condition_word & (CarryFlag | ParityFlag)) == 0;
+}
+
+bool CheckMxcsrTransfer() {
+    constexpr std::array<std::uint8_t, 6> fixture{
+        0x0f, 0xae, 0x17, 0x0f, 0xae, 0x1e};
+    constexpr std::uint64_t code_base = 0xf200;
+    constexpr std::uint32_t expected = 0x00005f80;
+    SemanticMemoryImage image{.base = 0x180000};
+    std::memcpy(image.bytes.data(), &expected, sizeof(expected));
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    WriteInteger(frame, IntegerRegister::Destination, image.base, 64);
+    WriteInteger(frame, IntegerRegister::Source, image.base + 16, 64);
+
+    std::size_t offset = 0;
+    for (unsigned executed = 0; executed < 2; ++executed) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) !=
+                DecodeOutcome::Complete ||
+            ExecuteVectorInstruction(instruction, frame, memory).stop !=
+                VectorStop::Continue) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+    std::uint32_t stored = 0;
+    std::memcpy(&stored, image.bytes.data() + 16, sizeof(stored));
+    return offset == fixture.size() && frame.simd_control == expected &&
+           stored == expected;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -598,6 +675,8 @@ FoundationCheckReport RunFoundationChecks() {
     run(VectorSemantics, CheckVectorSemantics());
     run(VectorPacking, CheckVectorPacking());
     run(VectorShifts, CheckVectorShifts());
+    run(ScalarFloating, CheckScalarFloating());
+    run(MxcsrTransfer, CheckMxcsrTransfer());
     return report;
 }
 
