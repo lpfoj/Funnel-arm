@@ -23977,35 +23977,33 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
-    if (IsVectorInsertF128Mnemonic(mnemonic)) {
-        if (!ReadVector128(state, ir.decoded, ir.operands[1], lhs) ||
-            !ReadVector128(state, ir.decoded, ir.operands[2], rhs)) {
+    if (const auto half_transfer = PlanHalfVectorTransfer(ir)) {
+        if (!ReadVector128(state, ir.decoded,
+                           ir.operands[half_transfer->primary_operand], lhs)) {
             return false;
         }
-        const std::uint32_t half_index =
-            static_cast<std::uint32_t>(ir.operands[3].imm.value.u);
-        if (!VectorSemantic::Replace128BitHalf(
-                result.data(), lhs.data(), rhs.data(), half_index)) {
-            return false;
+        const auto half_index = static_cast<std::uint32_t>(
+            ir.operands[half_transfer->control_operand].imm.value.u);
+        if (half_transfer->direction == HalfTransferDirection::Insert) {
+            if (!ReadVector128(state, ir.decoded,
+                               ir.operands[half_transfer->secondary_operand], rhs) ||
+                !VectorSemantic::Replace128BitHalf(
+                    result.data(), lhs.data(), rhs.data(), half_index)) {
+                return false;
+            }
+            return WriteVector128(state, ir.decoded, ir.operands[0], result);
         }
-        return WriteVector128(state, ir.decoded, ir.operands[0], result);
-    }
 
-    if (IsVectorExtractF128Mnemonic(mnemonic)) {
-        if (!ReadVector128(state, ir.decoded, ir.operands[1], lhs)) {
-            return false;
-        }
-        const std::uint32_t half_index =
-            static_cast<std::uint32_t>(ir.operands[2].imm.value.u);
-        const std::size_t source_offset = (half_index & 1u) * 16u;
+        constexpr std::size_t kHalfBytes = 16u;
+        const std::size_t source_offset = (half_index & 1u) * kHalfBytes;
         if (ir.operands[0].type == X86_OPERAND_TYPE_MEMORY) {
             const std::uint64_t address =
                 ResolveGuestOperandAddress(state, ir.decoded, ir.operands[0]);
-            CopyBytesToGuest(address, lhs.data() + source_offset, 16u);
+            CopyBytesToGuest(address, lhs.data() + source_offset, kHalfBytes);
             return true;
         }
         result.fill(0);
-        std::memcpy(result.data(), lhs.data() + source_offset, 16u);
+        std::memcpy(result.data(), lhs.data() + source_offset, kHalfBytes);
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 

@@ -29,10 +29,25 @@ struct CrossLaneMovePlan {
     bool clears_upper_half{};
 };
 
+enum class HalfTransferDirection : std::uint8_t {
+    Insert,
+    Extract,
+};
+
+struct HalfTransferPlan {
+    HalfTransferDirection direction{};
+    std::uint8_t primary_operand{};
+    std::uint8_t secondary_operand{};
+    std::uint8_t control_operand{};
+};
+
 [[nodiscard]] std::optional<PartialMovePlan> PlanPartialPackedMove(
     const LsxDecodedOp& instruction, std::uint32_t ymm_bank_offset) noexcept;
 
 [[nodiscard]] std::optional<CrossLaneMovePlan> PlanCrossLanePackedMove(
+    const LsxDecodedOp& instruction) noexcept;
+
+[[nodiscard]] std::optional<HalfTransferPlan> PlanHalfVectorTransfer(
     const LsxDecodedOp& instruction) noexcept;
 
 } // namespace Executor::Jit

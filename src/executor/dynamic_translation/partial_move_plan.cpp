@@ -140,4 +140,25 @@ std::optional<CrossLaneMovePlan> PlanCrossLanePackedMove(
     };
 }
 
+std::optional<HalfTransferPlan> PlanHalfVectorTransfer(
+    const LsxDecodedOp& instruction) noexcept {
+    const auto mnemonic = static_cast<X86Mnemonic>(instruction.mnemonic);
+    if ((mnemonic == X86_MNEMONIC_VINSERTF128 ||
+         mnemonic == X86_MNEMONIC_VINSERTI128) &&
+        instruction.operand_count >= 4) {
+        return HalfTransferPlan{.direction = HalfTransferDirection::Insert,
+                                .primary_operand = 1,
+                                .secondary_operand = 2,
+                                .control_operand = 3};
+    }
+    if ((mnemonic == X86_MNEMONIC_VEXTRACTF128 ||
+         mnemonic == X86_MNEMONIC_VEXTRACTI128) &&
+        instruction.operand_count >= 3) {
+        return HalfTransferPlan{.direction = HalfTransferDirection::Extract,
+                                .primary_operand = 1,
+                                .control_operand = 2};
+    }
+    return std::nullopt;
+}
+
 } // namespace Executor::Jit
