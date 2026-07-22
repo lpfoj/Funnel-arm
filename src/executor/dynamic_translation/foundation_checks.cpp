@@ -13,6 +13,7 @@
 #include "executor/dynamic_translation/region_plan.h"
 #include "executor/dynamic_translation/region_registry.h"
 #include "executor/dynamic_translation/scalar_ir_builder.h"
+#include "executor/dynamic_translation/scalar_semantics.h"
 #include "executor/dynamic_translation/value_residency.h"
 
 #include <algorithm>
@@ -36,12 +37,48 @@ enum CheckBit : std::uint64_t {
     IntermediateRepresentation = 1ull << 8,
     ScalarIrBuilder = 1ull << 9,
     NativeIrCompiler = 1ull << 10,
+    ScalarSemantics = 1ull << 11,
 };
 
 struct FetchContext {
     std::uint64_t first{};
     std::span<const std::uint8_t> bytes{};
 };
+
+struct SemanticMemoryImage {
+    std::uint64_t base{};
+    std::array<std::uint8_t, 128> bytes{};
+};
+
+bool ReadSemanticMemory(const std::uint64_t address,
+                        const std::span<std::uint8_t> destination,
+                        void* const opaque) noexcept {
+    const auto& image = *static_cast<const SemanticMemoryImage*>(opaque);
+    if (address < image.base || address - image.base > image.bytes.size()) {
+        return false;
+    }
+    const std::size_t offset = static_cast<std::size_t>(address - image.base);
+    if (destination.size() > image.bytes.size() - offset) {
+        return false;
+    }
+    std::memcpy(destination.data(), image.bytes.data() + offset, destination.size());
+    return true;
+}
+
+bool WriteSemanticMemory(const std::uint64_t address,
+                         const std::span<const std::uint8_t> source,
+                         void* const opaque) noexcept {
+    auto& image = *static_cast<SemanticMemoryImage*>(opaque);
+    if (address < image.base || address - image.base > image.bytes.size()) {
+        return false;
+    }
+    const std::size_t offset = static_cast<std::size_t>(address - image.base);
+    if (source.size() > image.bytes.size() - offset) {
+        return false;
+    }
+    std::memcpy(image.bytes.data() + offset, source.data(), source.size());
+    return true;
+}
 
 std::size_t FetchFixture(const std::uint64_t address,
                          const std::span<std::uint8_t> destination,
@@ -199,6 +236,42 @@ bool CheckNativeIrCompiler() {
 #endif
 }
 
+bool CheckScalarSemantics() {
+    constexpr std::array<std::uint8_t, 18> fixture{
+        0xb8, 0xff, 0xff, 0xff, 0xff, 0x83, 0xc0, 0x02, 0x50,
+        0x59, 0x48, 0x83, 0xf9, 0x01, 0x74, 0x02, 0x31, 0xd2};
+    constexpr std::uint64_t code_base = 0xe000;
+    SemanticMemoryImage image{.base = 0x120000};
+    GuestMemoryPort memory{ReadSemanticMemory, WriteSemanticMemory, &image};
+    CpuFrame frame{};
+    frame.integer[RegisterIndex(IntegerRegister::Stack)] = image.base + 96;
+    const std::uint64_t original_stack = frame.integer[RegisterIndex(IntegerRegister::Stack)];
+
+    std::size_t offset = 0;
+    SemanticResult last{};
+    unsigned executed = 0;
+    while (offset < fixture.size() && executed < 6) {
+        Instruction instruction{};
+        if (DecodeInstruction(std::span<const std::uint8_t>{fixture}.subspan(offset),
+                              code_base + offset, instruction) != DecodeOutcome::Complete) {
+            return false;
+        }
+        last = ExecuteScalarInstruction(instruction, frame, memory);
+        offset += instruction.length;
+        ++executed;
+        if (last.stop != SemanticStop::Continue) {
+            break;
+        }
+    }
+    std::uint64_t stacked = 0;
+    std::memcpy(&stacked, image.bytes.data() + 88, sizeof(stacked));
+    return executed == 6 && last.stop == SemanticStop::Transfer &&
+           last.next_address == code_base + fixture.size() && frame.integer[0] == 1 &&
+           frame.integer[1] == 1 && frame.integer[4] == original_stack && stacked == 1 &&
+           (frame.condition_word & ZeroFlag) != 0 &&
+           (frame.condition_word & CarryFlag) == 0;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -309,6 +382,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(IntermediateRepresentation, CheckIntermediateRepresentation());
     run(ScalarIrBuilder, CheckScalarIrBuilder());
     run(NativeIrCompiler, CheckNativeIrCompiler());
+    run(ScalarSemantics, CheckScalarSemantics());
     return report;
 }
 

@@ -1182,6 +1182,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/register_access.cpp
     src/executor/dynamic_translation/region_registry.cpp
     src/executor/dynamic_translation/scalar_ir_builder.cpp
+    src/executor/dynamic_translation/scalar_semantics.cpp
     src/executor/dynamic_translation/value_residency.cpp
     src/executor/jit/lsx_translation_engine.cpp
     src/executor/jit/jit_ir_cache.cpp
