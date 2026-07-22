@@ -7,6 +7,7 @@
 #include "executor/dynamic_translation/code_witness.h"
 #include "executor/dynamic_translation/edge_portal.h"
 #include "executor/dynamic_translation/machine_state.h"
+#include "executor/dynamic_translation/native_encoder.h"
 #include "executor/dynamic_translation/region_plan.h"
 #include "executor/dynamic_translation/region_registry.h"
 #include "executor/dynamic_translation/value_residency.h"
@@ -28,6 +29,7 @@ enum CheckBit : std::uint64_t {
     OutgoingEdge = 1ull << 4,
     RegionPublication = 1ull << 5,
     ResidencyEvents = 1ull << 6,
+    NativeEncoding = 1ull << 7,
 };
 
 struct FetchContext {
@@ -88,6 +90,38 @@ bool CheckExecutableMemory() {
     arena.Publish(reservation);
     return arena.CommittedBytes() == reservation.writable.size() &&
            arena.Owns(reinterpret_cast<std::uintptr_t>(reservation.executable.data()));
+}
+
+bool CheckNativeEncoding() {
+    ArmWordStream stream{};
+    const CodeLabel taken = stream.NewLabel();
+    stream.PutConstant(ArmRegister::X0, 0);
+    stream.JumpIfZero(ArmRegister::X0, taken);
+    stream.PutConstant(ArmRegister::X0, 99);
+    stream.Return();
+    if (!stream.Place(taken)) {
+        return false;
+    }
+    stream.PutConstant(ArmRegister::X0, 42);
+    stream.Return();
+    if (!stream.Finalize()) {
+        return false;
+    }
+
+    ExecutableArena arena{64 * 1024};
+    CodeReservation reservation = arena.Reserve(stream.ByteSize(), 16);
+    if (!reservation.IsValid() || !stream.CopyTo(reservation.writable)) {
+        return false;
+    }
+    arena.Publish(reservation);
+#if defined(__aarch64__)
+    using GeneratedFunction = std::uint64_t (*)();
+    const auto function = reinterpret_cast<GeneratedFunction>(
+        const_cast<std::uint8_t*>(reservation.executable.data()));
+    return function() == 42;
+#else
+    return true;
+#endif
 }
 
 bool CheckMutationWitness() {
@@ -196,6 +230,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(OutgoingEdge, CheckOutgoingEdge());
     run(RegionPublication, CheckRegionPublication());
     run(ResidencyEvents, CheckResidencyEvents());
+    run(NativeEncoding, CheckNativeEncoding());
     return report;
 }
 
