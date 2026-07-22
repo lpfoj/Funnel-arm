@@ -8,6 +8,7 @@
 #include "executor/dynamic_translation/edge_portal.h"
 #include "executor/dynamic_translation/machine_state.h"
 #include "executor/dynamic_translation/native_encoder.h"
+#include "executor/dynamic_translation/operation_ir.h"
 #include "executor/dynamic_translation/region_plan.h"
 #include "executor/dynamic_translation/region_registry.h"
 #include "executor/dynamic_translation/value_residency.h"
@@ -30,6 +31,7 @@ enum CheckBit : std::uint64_t {
     RegionPublication = 1ull << 5,
     ResidencyEvents = 1ull << 6,
     NativeEncoding = 1ull << 7,
+    IntermediateRepresentation = 1ull << 8,
 };
 
 struct FetchContext {
@@ -122,6 +124,22 @@ bool CheckNativeEncoding() {
 #else
     return true;
 #endif
+}
+
+bool CheckIntermediateRepresentation() {
+    OperationIr ir{0xb400};
+    const IrValue left = ir.AddValue(IrAction::Constant, IrType::Integer64, {}, 17);
+    const IrValue right = ir.AddValue(IrAction::Constant, IrType::Integer64, {}, 25);
+    const std::array<IrValue, 2> operands{left, right};
+    const IrValue sum = ir.AddValue(IrAction::Add, IrType::Integer64, operands);
+    const std::array<IrValue, 1> destination{sum};
+    if (!ir.AddEffect(IrAction::WriteInteger, destination, 0, 3) ||
+        !ir.AddEffect(IrAction::ExitDirect, {}, 0xb410)) {
+        return false;
+    }
+    const auto lifetimes = ir.AnalyzeLifetimes();
+    return ir.Validate() && ir.Steps().size() == 5 && lifetimes[left.id].use_count == 1 &&
+           lifetimes[right.id].last_use == 2 && lifetimes[sum.id].last_use == 3;
 }
 
 bool CheckMutationWitness() {
@@ -231,6 +249,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(RegionPublication, CheckRegionPublication());
     run(ResidencyEvents, CheckResidencyEvents());
     run(NativeEncoding, CheckNativeEncoding());
+    run(IntermediateRepresentation, CheckIntermediateRepresentation());
     return report;
 }
 
