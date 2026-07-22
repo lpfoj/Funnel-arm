@@ -16,22 +16,22 @@
 namespace Executor::Jit {
 
 enum class LsxGpr : std::uint8_t {
-    Rax = 0,
-    Rcx = 1,
-    Rdx = 2,
-    Rbx = 3,
-    Rsp = 4,
-    Rbp = 5,
-    Rsi = 6,
-    Rdi = 7,
-    R8 = 8,
-    R9 = 9,
-    R10 = 10,
-    R11 = 11,
-    R12 = 12,
-    R13 = 13,
-    R14 = 14,
-    R15 = 15,
+    Rax,
+    Rcx,
+    Rdx,
+    Rbx,
+    Rsp,
+    Rbp,
+    Rsi,
+    Rdi,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
 };
 
 // The state bank follows the architectural register encoding directly.  Keeping one canonical
@@ -153,53 +153,57 @@ static_assert(offsetof(LsxMachineImage, native_fault_ir) == 0x348);
 static_assert(sizeof(LsxMachineImage) == 0x360);
 
 struct LsxEntryPacket {
-    std::array<std::uint64_t, 8> args{};
-    std::uint32_t arg_count = 0;
-    std::uint8_t stack_args_enabled = 0;
-    std::uint8_t allow_guest_return_sentinel = 1;
+    using Argument = std::uint64_t;
+    using Count = std::uint32_t;
+    using Switch = std::uint8_t;
+
+    std::array<Argument, 8> args{};
+    Count arg_count{};
+    Switch stack_args_enabled{};
+    Switch allow_guest_return_sentinel{1};
     std::array<std::uint8_t, 2> reserved_46{};
-    std::uint64_t segment_base = 0;
-    std::uint64_t stack_base = 0;
-    std::uint64_t stack_size = 0;
+    Argument segment_base{};
+    Argument stack_base{};
+    Argument stack_size{};
 };
 
-static_assert(std::is_standard_layout_v<LsxEntryPacket>);
-static_assert(offsetof(LsxEntryPacket, args) == 0x00);
-static_assert(offsetof(LsxEntryPacket, arg_count) == 0x40);
-static_assert(offsetof(LsxEntryPacket, stack_args_enabled) == 0x44);
-static_assert(offsetof(LsxEntryPacket, segment_base) == 0x48);
-static_assert(offsetof(LsxEntryPacket, stack_base) == 0x50);
-static_assert(offsetof(LsxEntryPacket, stack_size) == 0x58);
-static_assert(sizeof(LsxEntryPacket) == 0x60);
+static_assert(std::is_standard_layout_v<LsxEntryPacket> &&
+              offsetof(LsxEntryPacket, args) == 0x00 &&
+              offsetof(LsxEntryPacket, arg_count) == 0x40 &&
+              offsetof(LsxEntryPacket, stack_args_enabled) == 0x44 &&
+              offsetof(LsxEntryPacket, segment_base) == 0x48 &&
+              offsetof(LsxEntryPacket, stack_base) == 0x50 &&
+              offsetof(LsxEntryPacket, stack_size) == 0x58 &&
+              sizeof(LsxEntryPacket) == 0x60);
 
 using Arm64BlockEntry = std::uint64_t (*)(LsxMachineImage*);
 
 struct TranslationRecord {
-    Arm64BlockEntry entry = nullptr;
-    std::uint32_t guest_size = 0;
-    std::uint32_t reserved_0c = 0;
-    std::uint64_t guest_hash = 0;
-    std::uint32_t flags = 0;
-    std::uint32_t reserved_1c = 0;
+    Arm64BlockEntry entry{};
+    std::uint32_t guest_size{};
+    std::uint32_t reserved_0c{};
+    std::uint64_t guest_hash{};
+    std::uint32_t flags{};
+    std::uint32_t reserved_1c{};
 };
 
-static_assert(std::is_standard_layout_v<TranslationRecord>);
-static_assert(offsetof(TranslationRecord, entry) == 0x00);
-static_assert(offsetof(TranslationRecord, guest_size) == 0x08);
-static_assert(offsetof(TranslationRecord, guest_hash) == 0x10);
-static_assert(offsetof(TranslationRecord, flags) == 0x18);
-static_assert(sizeof(TranslationRecord) == 0x20);
+static_assert(std::is_standard_layout_v<TranslationRecord> &&
+              offsetof(TranslationRecord, entry) == 0x00 &&
+              offsetof(TranslationRecord, guest_size) == 0x08 &&
+              offsetof(TranslationRecord, guest_hash) == 0x10 &&
+              offsetof(TranslationRecord, flags) == 0x18 &&
+              sizeof(TranslationRecord) == 0x20);
 
 enum class LsxOpClass : std::uint8_t {
-    Unsupported = 0,
-    Branch = 1,
-    Return = 2,
-    Call = 3,
-    Basic = 4,
-    Conditional = 5,
-    Memory = 6,
-    Simd = 7,
-    System = 8,
+    Unsupported,
+    Branch,
+    Return,
+    Call,
+    Basic,
+    Conditional,
+    Memory,
+    Simd,
+    System,
 };
 
 // Runtime execution retains only the scalar decode summary consumed by address calculation,
@@ -335,30 +339,31 @@ struct LsxDecodedRegion {
 };
 
 struct LsxStackReservoir {
-    std::uint8_t* allocation = nullptr;
-    std::uint8_t* low = nullptr;
-    std::uint8_t* top = nullptr;
-    std::uint8_t* current = nullptr;
+    using BytePointer = std::uint8_t*;
+    BytePointer allocation{};
+    BytePointer low{};
+    BytePointer top{};
+    BytePointer current{};
 };
 
-static_assert(std::is_standard_layout_v<LsxStackReservoir>);
-static_assert(offsetof(LsxStackReservoir, allocation) == 0x00);
-static_assert(offsetof(LsxStackReservoir, low) == 0x08);
-static_assert(offsetof(LsxStackReservoir, top) == 0x10);
-static_assert(offsetof(LsxStackReservoir, current) == 0x18);
-static_assert(sizeof(LsxStackReservoir) == 0x20);
+static_assert(std::is_standard_layout_v<LsxStackReservoir> &&
+              offsetof(LsxStackReservoir, allocation) == 0x00 &&
+              offsetof(LsxStackReservoir, low) == 0x08 &&
+              offsetof(LsxStackReservoir, top) == 0x10 &&
+              offsetof(LsxStackReservoir, current) == 0x18 &&
+              sizeof(LsxStackReservoir) == 0x20);
 
 struct LsxStackLease {
-    std::uint64_t stack_low = 0;
-    std::uint64_t current_sp = 0;
-    std::uint64_t previous_current_sp = 0;
+    std::uint64_t stack_low{};
+    std::uint64_t current_sp{};
+    std::uint64_t previous_current_sp{};
 };
 
-static_assert(std::is_standard_layout_v<LsxStackLease>);
-static_assert(offsetof(LsxStackLease, stack_low) == 0x00);
-static_assert(offsetof(LsxStackLease, current_sp) == 0x08);
-static_assert(offsetof(LsxStackLease, previous_current_sp) == 0x10);
-static_assert(sizeof(LsxStackLease) == 0x18);
+static_assert(std::is_standard_layout_v<LsxStackLease> &&
+              offsetof(LsxStackLease, stack_low) == 0x00 &&
+              offsetof(LsxStackLease, current_sp) == 0x08 &&
+              offsetof(LsxStackLease, previous_current_sp) == 0x10 &&
+              sizeof(LsxStackLease) == 0x18);
 
 struct LsxEngineReport {
     bool compiled = true;
