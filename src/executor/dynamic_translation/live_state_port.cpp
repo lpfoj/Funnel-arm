@@ -19,6 +19,7 @@ constexpr std::uintptr_t StorageKey =
 
 thread_local SealedStorage active_storage{};
 thread_local SealedStorage continuation_storage{};
+thread_local bool replacement_requested = false;
 
 void Seal(SealedStorage& slot, const void* storage) noexcept {
     slot.proof = 0;
@@ -145,6 +146,20 @@ bool SnapshotContinuationState(CpuFrame& destination) noexcept {
     }
     std::memcpy(&destination, storage, sizeof(destination));
     return true;
+}
+
+bool RequestLiveStateReplacement() noexcept {
+    if (Open(active_storage) == nullptr) {
+        return false;
+    }
+    replacement_requested = true;
+    return true;
+}
+
+bool ConsumeLiveStateReplacementRequest() noexcept {
+    const bool requested = replacement_requested;
+    replacement_requested = false;
+    return requested;
 }
 
 } // namespace Lsx4::Translation

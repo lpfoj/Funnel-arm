@@ -42,5 +42,7 @@ private:
 [[nodiscard]] void* ExchangeLiveStateStorage(void* storage) noexcept;
 [[nodiscard]] const void* ExchangeContinuationStorage(const void* storage) noexcept;
 [[nodiscard]] bool SnapshotContinuationState(CpuFrame& destination) noexcept;
+[[nodiscard]] bool RequestLiveStateReplacement() noexcept;
+[[nodiscard]] bool ConsumeLiveStateReplacementRequest() noexcept;
 
 } // namespace Lsx4::Translation

@@ -10,6 +10,8 @@
 #include "executor/dynamic_translation/execution_context.h"
 #include "executor/dynamic_translation/execution_driver.h"
 #include "executor/dynamic_translation/live_state_port.h"
+#include "executor/dynamic_translation/process_memory.h"
+#include "executor/dynamic_translation/stack_windows.h"
 #include "executor/dynamic_translation/machine_state.h"
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/native_encoder.h"
@@ -65,6 +67,7 @@ enum CheckBit : std::uint64_t {
     DriverSemanticAccounting = 1ull << 27,
     DriverContextCleanup = 1ull << 28,
     LiveStatePublication = 1ull << 29,
+    StackWindowMemory = 1ull << 30,
 };
 
 struct FetchContext {
@@ -743,6 +746,9 @@ bool CheckLiveStatePort() {
     view.SetResumeAddress(0x5678);
     CpuFrame observed{};
     const bool copied = view.CopyTo(observed);
+    const bool replacement_posted = RequestLiveStateReplacement();
+    const bool replacement_consumed = ConsumeLiveStateReplacementRequest() &&
+                                      !ConsumeLiveStateReplacementRequest();
 
     CpuFrame continuation{};
     continuation.integer[RegisterIndex(IntegerRegister::Stack)] = 0x9abc;
@@ -754,12 +760,27 @@ bool CheckLiveStatePort() {
     (void)ExchangeContinuationStorage(old_continuation);
     (void)ExchangeLiveStateStorage(previous);
 
-    return previous == nullptr && initial && copied &&
+    return previous == nullptr && initial && copied && replacement_posted &&
+           replacement_consumed &&
            observed.integer[RegisterIndex(IntegerRegister::R13)] == 0xa55a &&
            observed.resume_address == 0x5678 && continuation_copied &&
            continuation_copy.integer[RegisterIndex(IntegerRegister::Stack)] ==
                0x9abc &&
            !static_cast<bool>(PublishedLiveState());
+}
+
+bool CheckStackWindowMemory() {
+    const StackWindow window = AcquireStackWindow({});
+    if (!window.IsValid()) {
+        return false;
+    }
+    const std::uint64_t cell = (window.stack_pointer & ~std::uint64_t{15}) - 16;
+    constexpr std::uint64_t pattern = 0x74c1a92e5b6308dfull;
+    std::uint64_t observed{};
+    const bool stored = WriteProcessGuestScalar(cell, pattern);
+    const bool loaded = ReadProcessGuestScalar(cell, observed);
+    ReleaseStackWindow(window);
+    return stored && loaded && observed == pattern;
 }
 
 struct DriverCheckResult {
@@ -931,6 +952,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(TranslationOrchestration, CheckTranslationOrchestration());
     run(ExecutionContext, CheckExecutionContext());
     run(LiveStatePublication, CheckLiveStatePort());
+    run(StackWindowMemory, CheckStackWindowMemory());
     const DriverCheckResult driver = CheckExecutionDriver();
     run(DriverCompletion, driver.completed);
     run(DriverValue, driver.value);

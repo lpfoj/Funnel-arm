@@ -22351,6 +22351,7 @@ bool AnnounceGuestStateReplacement() {
         return false;
     }
     g_hle_guest_state_override = true;
+    (void)Lsx4::Translation::RequestLiveStateReplacement();
 #ifdef __ANDROID__
     if (std::getenv("EXECUTOR_DIAG_FIBER_TRANSITIONS") != nullptr) {
         JitLog("[EXECUTOR_FIBER_OVERRIDE] phase=mark rip=0x%llx rsp=0x%llx",
@@ -22363,7 +22364,8 @@ bool AnnounceGuestStateReplacement() {
 }
 
 bool TakeGuestStateReplacementNotice() {
-    const bool requested = g_hle_guest_state_override;
+    const bool requested = g_hle_guest_state_override |
+                           Lsx4::Translation::ConsumeLiveStateReplacementRequest();
     g_hle_guest_state_override = false;
 #ifdef __ANDROID__
     if (requested && std::getenv("EXECUTOR_DIAG_FIBER_TRANSITIONS") != nullptr) {
