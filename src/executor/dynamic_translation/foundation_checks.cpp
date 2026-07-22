@@ -8,6 +8,7 @@
 #include "executor/dynamic_translation/edge_portal.h"
 #include "executor/dynamic_translation/machine_state.h"
 #include "executor/dynamic_translation/native_encoder.h"
+#include "executor/dynamic_translation/native_compiler.h"
 #include "executor/dynamic_translation/operation_ir.h"
 #include "executor/dynamic_translation/region_plan.h"
 #include "executor/dynamic_translation/region_registry.h"
@@ -34,6 +35,7 @@ enum CheckBit : std::uint64_t {
     NativeEncoding = 1ull << 7,
     IntermediateRepresentation = 1ull << 8,
     ScalarIrBuilder = 1ull << 9,
+    NativeIrCompiler = 1ull << 10,
 };
 
 struct FetchContext {
@@ -157,6 +159,46 @@ bool CheckScalarIrBuilder() {
            program.ir.Steps().back().action == IrAction::ExitReturn;
 }
 
+bool CheckNativeIrCompiler() {
+    TranslationProgram program{0xd000};
+    const IrValue left =
+        program.ir.AddValue(IrAction::Constant, IrType::Integer32, {}, 0xffffffffu);
+    const IrValue right =
+        program.ir.AddValue(IrAction::Constant, IrType::Integer32, {}, 2);
+    const std::array<IrValue, 2> operands{left, right};
+    const IrValue sum =
+        program.ir.AddValue(IrAction::Add, IrType::Integer32, operands);
+    const std::array<IrValue, 1> sum_input{sum};
+    if (!program.ir.AddEffect(IrAction::WriteInteger, sum_input, 0,
+                              PackIntegerAccess({0, 32, false}))) {
+        return false;
+    }
+    const std::array<IrValue, 3> flag_inputs{left, right, sum};
+    const IrValue flags = program.ir.AddValue(
+        IrAction::ComposeFlags, IrType::FlagSet, flag_inputs, 0,
+        static_cast<std::uint32_t>(FlagFormula::Addition));
+    const std::array<IrValue, 1> flags_input{flags};
+    if (!program.ir.AddEffect(IrAction::WriteFlags, flags_input) ||
+        !program.ir.AddEffect(IrAction::ExitDirect, {}, 0xd040)) {
+        return false;
+    }
+
+    ExecutableArena arena{64 * 1024};
+    const NativeArtifact artifact = CompileScalarIr(program, arena);
+    if (!artifact.Succeeded()) {
+        return false;
+    }
+#if defined(__aarch64__)
+    CpuFrame frame{};
+    frame.integer[0] = ~std::uint64_t{};
+    const std::uint64_t next = artifact.entry(&frame);
+    return next == 0xd040 && frame.resume_address == 0xd040 &&
+           frame.integer[0] == 1 && (frame.condition_word & CarryFlag) != 0;
+#else
+    return true;
+#endif
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -266,6 +308,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(NativeEncoding, CheckNativeEncoding());
     run(IntermediateRepresentation, CheckIntermediateRepresentation());
     run(ScalarIrBuilder, CheckScalarIrBuilder());
+    run(NativeIrCompiler, CheckNativeIrCompiler());
     return report;
 }
 

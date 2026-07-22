@@ -35,6 +35,11 @@ enum class ArmCondition : std::uint8_t {
     Always = 14,
 };
 
+enum class ArmIntegerWidth : std::uint8_t {
+    Bits32,
+    Bits64,
+};
+
 struct CodeLabel {
     std::uint32_t id{};
 };
@@ -48,18 +53,25 @@ public:
     void Return(ArmRegister target = ArmRegister::X30);
     void JumpRegister(ArmRegister target);
     void CallRegister(ArmRegister target);
-    void CopyRegister(ArmRegister destination, ArmRegister source);
-    void PutConstant(ArmRegister destination, std::uint64_t value);
+    void CopyRegister(ArmRegister destination, ArmRegister source,
+                      ArmIntegerWidth width = ArmIntegerWidth::Bits64);
+    void PutConstant(ArmRegister destination, std::uint64_t value,
+                     ArmIntegerWidth width = ArmIntegerWidth::Bits64);
 
     [[nodiscard]] bool AddImmediate(ArmRegister destination, ArmRegister source,
                                     std::uint16_t value, bool left_shift_12 = false);
     [[nodiscard]] bool SubtractImmediate(ArmRegister destination, ArmRegister source,
                                          std::uint16_t value, bool left_shift_12 = false);
-    void AddRegisters(ArmRegister destination, ArmRegister left, ArmRegister right);
-    void SubtractRegisters(ArmRegister destination, ArmRegister left, ArmRegister right);
-    void AndRegisters(ArmRegister destination, ArmRegister left, ArmRegister right);
-    void OrRegisters(ArmRegister destination, ArmRegister left, ArmRegister right);
-    void XorRegisters(ArmRegister destination, ArmRegister left, ArmRegister right);
+    void AddRegisters(ArmRegister destination, ArmRegister left, ArmRegister right,
+                      ArmIntegerWidth width = ArmIntegerWidth::Bits64);
+    void SubtractRegisters(ArmRegister destination, ArmRegister left, ArmRegister right,
+                           ArmIntegerWidth width = ArmIntegerWidth::Bits64);
+    void AndRegisters(ArmRegister destination, ArmRegister left, ArmRegister right,
+                      ArmIntegerWidth width = ArmIntegerWidth::Bits64);
+    void OrRegisters(ArmRegister destination, ArmRegister left, ArmRegister right,
+                     ArmIntegerWidth width = ArmIntegerWidth::Bits64);
+    void XorRegisters(ArmRegister destination, ArmRegister left, ArmRegister right,
+                      ArmIntegerWidth width = ArmIntegerWidth::Bits64);
 
     [[nodiscard]] bool Load(ArmRegister destination, ArmRegister base,
                             std::uint16_t byte_offset, std::uint8_t width_bytes);

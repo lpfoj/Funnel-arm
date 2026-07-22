@@ -72,18 +72,29 @@ void ArmWordStream::CallRegister(const ArmRegister target) {
     Append(0xd63f0000u | (RegisterBits(target) << 5));
 }
 
-void ArmWordStream::CopyRegister(const ArmRegister destination, const ArmRegister source) {
-    Append(0xaa0003e0u | (RegisterBits(source) << 16) | RegisterBits(destination));
+void ArmWordStream::CopyRegister(const ArmRegister destination, const ArmRegister source,
+                                 const ArmIntegerWidth width) {
+    const std::uint32_t base =
+        width == ArmIntegerWidth::Bits64 ? 0xaa0003e0u : 0x2a0003e0u;
+    Append(base | (RegisterBits(source) << 16) | RegisterBits(destination));
 }
 
-void ArmWordStream::PutConstant(const ArmRegister destination, const std::uint64_t value) {
+void ArmWordStream::PutConstant(const ArmRegister destination, const std::uint64_t value,
+                                const ArmIntegerWidth width) {
     bool emitted = false;
-    for (unsigned lane = 0; lane < 4; ++lane) {
-        const std::uint32_t part = static_cast<std::uint32_t>((value >> (lane * 16u)) & 0xffffu);
-        if (part == 0 && (emitted || value != 0)) {
+    const unsigned lane_count = width == ArmIntegerWidth::Bits64 ? 4 : 2;
+    const std::uint64_t narrowed = width == ArmIntegerWidth::Bits64
+                                       ? value
+                                       : static_cast<std::uint32_t>(value);
+    for (unsigned lane = 0; lane < lane_count; ++lane) {
+        const std::uint32_t part =
+            static_cast<std::uint32_t>((narrowed >> (lane * 16u)) & 0xffffu);
+        if (part == 0 && (emitted || narrowed != 0)) {
             continue;
         }
-        const std::uint32_t base = emitted ? 0xf2800000u : 0xd2800000u;
+        const bool wide = width == ArmIntegerWidth::Bits64;
+        const std::uint32_t base = emitted ? (wide ? 0xf2800000u : 0x72800000u)
+                                           : (wide ? 0xd2800000u : 0x52800000u);
         Append(base | (lane << 21) | (part << 5) | RegisterBits(destination));
         emitted = true;
     }
@@ -113,32 +124,43 @@ bool ArmWordStream::SubtractImmediate(const ArmRegister destination,
 }
 
 void ArmWordStream::AddRegisters(const ArmRegister destination, const ArmRegister left,
-                                 const ArmRegister right) {
-    Append(0x8b000000u | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
+                                 const ArmRegister right, const ArmIntegerWidth width) {
+    const std::uint32_t base =
+        width == ArmIntegerWidth::Bits64 ? 0x8b000000u : 0x0b000000u;
+    Append(base | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
            RegisterBits(destination));
 }
 
 void ArmWordStream::SubtractRegisters(const ArmRegister destination,
-                                      const ArmRegister left, const ArmRegister right) {
-    Append(0xcb000000u | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
+                                      const ArmRegister left, const ArmRegister right,
+                                      const ArmIntegerWidth width) {
+    const std::uint32_t base =
+        width == ArmIntegerWidth::Bits64 ? 0xcb000000u : 0x4b000000u;
+    Append(base | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
            RegisterBits(destination));
 }
 
 void ArmWordStream::AndRegisters(const ArmRegister destination, const ArmRegister left,
-                                 const ArmRegister right) {
-    Append(0x8a000000u | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
+                                 const ArmRegister right, const ArmIntegerWidth width) {
+    const std::uint32_t base =
+        width == ArmIntegerWidth::Bits64 ? 0x8a000000u : 0x0a000000u;
+    Append(base | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
            RegisterBits(destination));
 }
 
 void ArmWordStream::OrRegisters(const ArmRegister destination, const ArmRegister left,
-                                const ArmRegister right) {
-    Append(0xaa000000u | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
+                                const ArmRegister right, const ArmIntegerWidth width) {
+    const std::uint32_t base =
+        width == ArmIntegerWidth::Bits64 ? 0xaa000000u : 0x2a000000u;
+    Append(base | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
            RegisterBits(destination));
 }
 
 void ArmWordStream::XorRegisters(const ArmRegister destination, const ArmRegister left,
-                                 const ArmRegister right) {
-    Append(0xca000000u | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
+                                 const ArmRegister right, const ArmIntegerWidth width) {
+    const std::uint32_t base =
+        width == ArmIntegerWidth::Bits64 ? 0xca000000u : 0x4a000000u;
+    Append(base | (RegisterBits(right) << 16) | (RegisterBits(left) << 5) |
            RegisterBits(destination));
 }
 
