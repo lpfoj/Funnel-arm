@@ -14,6 +14,7 @@
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/instruction_diagnostics.h"
 #include "executor/dynamic_translation/json_text.h"
+#include "executor/dynamic_translation/native_address_emitter.h"
 #include "executor/dynamic_translation/native_status_emitter.h"
 #include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
@@ -17868,62 +17869,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         if (operand.type != X86_OPERAND_TYPE_MEMORY) {
             return false;
         }
-
-        const auto emit_gpr64 = [&](const LsxRegisterCode reg, const XReg& out) {
-            std::uint32_t state_offset = 0;
-            std::uint32_t size_bits = 0;
-            if (!register_state_offset(reg, state_offset, size_bits) || size_bits != 64) {
-                return false;
-            }
-            code.ldr(out, Xbyak_aarch64::ptr(code.x0, state_offset));
-            return true;
+        const NativeAddress::MachineAddressLayout address_layout{
+            .gpr_base_offset = 0,
+            .fs_origin_offset = kFsBaseStateOffset,
+            .gs_origin_offset = kGsBaseStateOffset,
         };
-
-        if (operand.mem.base == X86_REGISTER_RIP ||
-            operand.mem.base == X86_REGISTER_EIP) {
-            const std::uint64_t absolute =
-                instr.guest_rip + instr.length +
-                static_cast<std::uint64_t>(SignedMemoryDisplacement(operand));
-            code.mov(code.x11, absolute);
-        } else {
-            code.mov(code.x11, 0);
-            if (operand.mem.base != X86_REGISTER_NONE) {
-                if (!emit_gpr64(operand.mem.base, code.x11)) {
-                    return false;
-                }
-            }
-            const std::int64_t disp = SignedMemoryDisplacement(operand);
-            if (disp != 0) {
-                if (disp > 0) {
-                    code.mov(code.x13, static_cast<std::uint64_t>(disp));
-                    code.add(code.x11, code.x11, code.x13);
-                } else {
-                    code.mov(code.x13, static_cast<std::uint64_t>(-disp));
-                    code.sub(code.x11, code.x11, code.x13);
-                }
-            }
-        }
-        if (operand.mem.index != X86_REGISTER_NONE) {
-            if (!emit_gpr64(operand.mem.index, code.x12)) {
-                return false;
-            }
-            switch (operand.mem.scale) {
-            case 0:
-            case 1:
-                break;
-            case 2:
-                code.lsl(code.x12, code.x12, 1);
-                break;
-            case 4:
-                code.lsl(code.x12, code.x12, 2);
-                break;
-            case 8:
-                code.lsl(code.x12, code.x12, 3);
-                break;
-            default:
-                return false;
-            }
-            code.add(code.x11, code.x11, code.x12);
+        if (!NativeAddress::EmitGuestEffectiveAddress(
+                code, instr, operand, code.x11, code.x12, code.x13,
+                address_layout, NativeAddress::SegmentPolicy::Ignore)) {
+            return false;
         }
         // CALL/JMP r/m64 always consume a 64-bit absolute target. Some X86
         // control-flow memory operands don't carry a 64-bit operand.size, so
@@ -18011,73 +17965,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     const auto emit_partial_move_address = [&](Xbyak_aarch64::CodeGenerator& code,
                                                const LsxOperandRecord& operand,
                                                const XReg& dst) {
-        if (operand.type != X86_OPERAND_TYPE_MEMORY) {
-            return false;
-        }
-        const auto emit_gpr64 = [&](const LsxRegisterCode reg, const XReg& out) {
-            std::uint32_t state_offset = 0;
-            std::uint32_t size_bits = 0;
-            if (!register_state_offset(reg, state_offset, size_bits) || size_bits != 64) {
-                return false;
-            }
-            code.ldr(out, Xbyak_aarch64::ptr(code.x0, state_offset));
-            return true;
+        const NativeAddress::MachineAddressLayout address_layout{
+            .gpr_base_offset = 0,
+            .fs_origin_offset = kFsBaseStateOffset,
+            .gs_origin_offset = kGsBaseStateOffset,
         };
-
-        if (operand.mem.base == X86_REGISTER_RIP ||
-            operand.mem.base == X86_REGISTER_EIP) {
-            const std::uint64_t absolute =
-                ir.guest_rip + ir.length +
-                static_cast<std::uint64_t>(SignedMemoryDisplacement(operand));
-            code.mov(dst, absolute);
-        } else {
-            code.mov(dst, 0);
-            if (operand.mem.base != X86_REGISTER_NONE &&
-                !emit_gpr64(operand.mem.base, dst)) {
-                return false;
-            }
-            if (operand.mem.index != X86_REGISTER_NONE) {
-                if (!emit_gpr64(operand.mem.index, code.x12)) {
-                    return false;
-                }
-                switch (operand.mem.scale) {
-                case 0:
-                case 1:
-                    break;
-                case 2:
-                    code.lsl(code.x12, code.x12, 1);
-                    break;
-                case 4:
-                    code.lsl(code.x12, code.x12, 2);
-                    break;
-                case 8:
-                    code.lsl(code.x12, code.x12, 3);
-                    break;
-                default:
-                    return false;
-                }
-                code.add(dst, dst, code.x12);
-            }
-            const std::int64_t displacement = SignedMemoryDisplacement(operand);
-            if (displacement != 0) {
-                if (displacement > 0) {
-                    code.mov(code.x13, static_cast<std::uint64_t>(displacement));
-                    code.add(dst, dst, code.x13);
-                } else {
-                    code.mov(code.x13, static_cast<std::uint64_t>(-displacement));
-                    code.sub(dst, dst, code.x13);
-                }
-            }
-        }
-        if (operand.mem.segment == X86_REGISTER_FS ||
-            operand.mem.segment == X86_REGISTER_GS) {
-            const std::uint32_t segment_offset =
-                operand.mem.segment == X86_REGISTER_FS ? kFsBaseStateOffset
-                                                         : kGsBaseStateOffset;
-            code.ldr(code.x13, Xbyak_aarch64::ptr(code.x0, segment_offset));
-            code.add(dst, dst, code.x13);
-        }
-        return true;
+        return NativeAddress::EmitGuestEffectiveAddress(
+            code, ir, operand, dst, code.x12, code.x13, address_layout,
+            NativeAddress::SegmentPolicy::Apply);
     };
 
     const bool partial_packed_move =
