@@ -23285,28 +23285,29 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         return true;
     }
 
-    if (IsPartialPackedMoveMnemonic(mnemonic)) {
-        const bool high_qword = IsPartialPackedMoveHigh(mnemonic);
-        if (ir.operands[0].type == X86_OPERAND_TYPE_MEMORY) {
-            // MOVLPS/VMOVLPS stores lane[63:0]; MOVHPS/VMOVHPS stores lane[127:64].
+    if (const auto move_plan = PlanPartialPackedMove(ir, 0)) {
+        if (move_plan->writes_memory) {
             if (!ReadVector128(state, ir.decoded, ir.operands[1], lhs)) {
                 return false;
             }
             const std::uint64_t value =
-                LoadUnaligned<std::uint64_t>(lhs.data() + (high_qword ? 8 : 0));
-            StoreGuestScalar(ResolveGuestOperandAddress(state, ir.decoded, ir.operands[0]), value, 8);
+                LoadUnaligned<std::uint64_t>(lhs.data() +
+                                             move_plan->destination_lane_offset);
+            const auto& memory_operand = ir.operands[move_plan->memory_operand];
+            StoreGuestScalar(ResolveGuestOperandAddress(state, ir.decoded, memory_operand),
+                             value, 8);
             return true;
         }
 
-        const bool vex_form = IsVexPartialPackedMove(mnemonic);
-        const auto& merge_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& memory_operand = vex_form ? ir.operands[2] : ir.operands[1];
+        const auto& merge_operand = ir.operands[move_plan->has_merge_lane ? 1 : 0];
+        const auto& memory_operand = ir.operands[move_plan->memory_operand];
         if (!ReadVector128(state, ir.decoded, merge_operand, result)) {
             return false;
         }
         const std::uint64_t value =
             LoadGuestScalar(ResolveGuestOperandAddress(state, ir.decoded, memory_operand), 8);
-        StoreUnaligned<std::uint64_t>(result.data() + (high_qword ? 8 : 0), value);
+        StoreUnaligned<std::uint64_t>(result.data() + move_plan->destination_lane_offset,
+                                      value);
         // WriteVector128 preserves legacy YMM[255:128], while a VEX destination clears it.
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
