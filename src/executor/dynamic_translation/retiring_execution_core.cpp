@@ -23312,24 +23312,19 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 
-    if (mnemonic == X86_MNEMONIC_MOVLHPS || mnemonic == X86_MNEMONIC_MOVHLPS ||
-        mnemonic == X86_MNEMONIC_VMOVLHPS || mnemonic == X86_MNEMONIC_VMOVHLPS) {
-        const bool vex_form = mnemonic == X86_MNEMONIC_VMOVLHPS ||
-                              mnemonic == X86_MNEMONIC_VMOVHLPS;
-        const auto& merge_operand = vex_form ? ir.operands[1] : ir.operands[0];
-        const auto& source_operand = vex_form ? ir.operands[2] : ir.operands[1];
-        if (!ReadVector128(state, ir.decoded, merge_operand, lhs) ||
-            !ReadVector128(state, ir.decoded, source_operand, rhs)) {
+    if (const auto lane_move = PlanCrossLanePackedMove(ir)) {
+        if (!ReadVector128(state, ir.decoded,
+                           ir.operands[lane_move->lower_operand], lhs) ||
+            !ReadVector128(state, ir.decoded,
+                           ir.operands[lane_move->upper_operand], rhs)) {
             return false;
         }
         result.fill(0);
-        if (mnemonic == X86_MNEMONIC_MOVLHPS || mnemonic == X86_MNEMONIC_VMOVLHPS) {
-            std::memcpy(result.data(), lhs.data(), 8);
-            std::memcpy(result.data() + 8, rhs.data(), 8);
-        } else {
-            std::memcpy(result.data(), rhs.data() + 8, 8);
-            std::memcpy(result.data() + 8, lhs.data() + 8, 8);
-        }
+        constexpr std::size_t kLaneBytes = sizeof(std::uint64_t);
+        std::memcpy(result.data(), lhs.data() + lane_move->lower_source_offset,
+                    kLaneBytes);
+        std::memcpy(result.data() + kLaneBytes,
+                    rhs.data() + lane_move->upper_source_offset, kLaneBytes);
         return WriteVector128(state, ir.decoded, ir.operands[0], result);
     }
 

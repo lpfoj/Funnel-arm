@@ -110,4 +110,34 @@ std::optional<PartialMovePlan> PlanPartialPackedMove(
     return plan;
 }
 
+std::optional<CrossLaneMovePlan> PlanCrossLanePackedMove(
+    const LsxDecodedOp& instruction) noexcept {
+    const auto mnemonic = static_cast<X86Mnemonic>(instruction.mnemonic);
+    const bool low_to_high = mnemonic == X86_MNEMONIC_MOVLHPS ||
+                             mnemonic == X86_MNEMONIC_VMOVLHPS;
+    const bool high_to_low = mnemonic == X86_MNEMONIC_MOVHLPS ||
+                             mnemonic == X86_MNEMONIC_VMOVHLPS;
+    if ((!low_to_high && !high_to_low) || instruction.operand_count < 2) {
+        return std::nullopt;
+    }
+
+    const bool vector_prefix = mnemonic == X86_MNEMONIC_VMOVLHPS ||
+                               mnemonic == X86_MNEMONIC_VMOVHLPS;
+    const std::uint8_t old_destination = vector_prefix ? 1u : 0u;
+    const std::uint8_t new_source = vector_prefix ? 2u : 1u;
+    if (instruction.operand_count <= new_source) {
+        return std::nullopt;
+    }
+
+    // Both instructions assemble two qwords, but MOVHLPS takes the upper qword
+    // from each input whereas MOVLHPS takes each input's lower qword.
+    return CrossLaneMovePlan{
+        .lower_operand = high_to_low ? new_source : old_destination,
+        .upper_operand = high_to_low ? old_destination : new_source,
+        .lower_source_offset = static_cast<std::uint8_t>(high_to_low ? 8u : 0u),
+        .upper_source_offset = static_cast<std::uint8_t>(high_to_low ? 8u : 0u),
+        .clears_upper_half = vector_prefix,
+    };
+}
+
 } // namespace Executor::Jit

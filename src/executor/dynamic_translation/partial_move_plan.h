@@ -21,7 +21,18 @@ struct PartialMovePlan {
     std::uint32_t merge_offset{};
 };
 
+struct CrossLaneMovePlan {
+    std::uint8_t lower_operand{};
+    std::uint8_t upper_operand{};
+    std::uint8_t lower_source_offset{};
+    std::uint8_t upper_source_offset{};
+    bool clears_upper_half{};
+};
+
 [[nodiscard]] std::optional<PartialMovePlan> PlanPartialPackedMove(
     const LsxDecodedOp& instruction, std::uint32_t ymm_bank_offset) noexcept;
+
+[[nodiscard]] std::optional<CrossLaneMovePlan> PlanCrossLanePackedMove(
+    const LsxDecodedOp& instruction) noexcept;
 
 } // namespace Executor::Jit
