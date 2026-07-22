@@ -11,6 +11,7 @@
 #include "executor/dynamic_translation/operation_ir.h"
 #include "executor/dynamic_translation/region_plan.h"
 #include "executor/dynamic_translation/region_registry.h"
+#include "executor/dynamic_translation/scalar_ir_builder.h"
 #include "executor/dynamic_translation/value_residency.h"
 
 #include <algorithm>
@@ -32,6 +33,7 @@ enum CheckBit : std::uint64_t {
     ResidencyEvents = 1ull << 6,
     NativeEncoding = 1ull << 7,
     IntermediateRepresentation = 1ull << 8,
+    ScalarIrBuilder = 1ull << 9,
 };
 
 struct FetchContext {
@@ -142,6 +144,19 @@ bool CheckIntermediateRepresentation() {
            lifetimes[right.id].last_use == 2 && lifetimes[sum.id].last_use == 3;
 }
 
+bool CheckScalarIrBuilder() {
+    constexpr std::array<std::uint8_t, 9> fixture{
+        0xb8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x07, 0xc3};
+    FetchContext context{0xc800, fixture};
+    const RegionPlan plan = PlanRegion(context.first, 6, FetchFixture, &context);
+    if (!plan.IsExecutable() || plan.sequence.size() != 3) {
+        return false;
+    }
+    const TranslationProgram program = BuildScalarProgram(plan);
+    return program.ir.Validate() && program.semantic_steps.empty() &&
+           program.ir.Steps().back().action == IrAction::ExitReturn;
+}
+
 bool CheckMutationWitness() {
     constexpr std::uint64_t guest_base = 0x1ff0;
     std::vector<std::uint8_t> image(96);
@@ -250,6 +265,7 @@ FoundationCheckReport RunFoundationChecks() {
     run(ResidencyEvents, CheckResidencyEvents());
     run(NativeEncoding, CheckNativeEncoding());
     run(IntermediateRepresentation, CheckIntermediateRepresentation());
+    run(ScalarIrBuilder, CheckScalarIrBuilder());
     return report;
 }
 
