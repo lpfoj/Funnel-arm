@@ -8,13 +8,6 @@
 
 namespace Executor::Jit::VectorSemantic {
 
-enum class BooleanOperation : std::uint8_t {
-    ExclusiveOr,
-    Conjunction,
-    Disjunction,
-    ConjunctionWithInvertedLeft,
-};
-
 struct PackedBitTestResult {
     bool intersection_is_zero{};
     bool masked_complement_is_zero{};
@@ -24,8 +17,6 @@ struct PackedBitTestResult {
 // interpreter/semantic leaf while the native emitter uses the same operation
 // classification to produce direct NEON. Keeping state/flags outside this layer
 // makes fault ordering and architectural writeback explicit at the caller.
-bool ApplyBoolean(void* destination, const void* left, const void* right,
-                  std::size_t width, BooleanOperation operation) noexcept;
 PackedBitTestResult TestPackedBits(const void* left, const void* right,
                                    std::size_t width) noexcept;
 bool DuplicateDwordParity(void* destination, const void* source,

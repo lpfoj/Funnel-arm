@@ -73,13 +73,6 @@ enum class BitTestOp : std::uint8_t {
     Toggle,
 };
 
-enum class VectorLogicOp : std::uint8_t {
-    ExclusiveOr,
-    Intersection,
-    Union,
-    SubtractMask,
-};
-
 enum class ScalarArithOp : std::uint8_t {
     Sum,
     Difference,

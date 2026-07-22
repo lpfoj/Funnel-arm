@@ -239,9 +239,6 @@ void BroadcastVectorHalf(void* dst, const void* src);
 void BroadcastScalarLane(void* dst, const void* src, std::size_t element_size, std::size_t total_size);
 void DuplicatePackedSingleLanes(void* dst, const void* src, bool high_source_elements, std::size_t size);
 void TestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, std::size_t size);
-void ExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, VectorLogicOp op, std::size_t size);
-void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
-              VectorLogicOp op);
 void MergePackedSingleLowFromHigh(void* dst, const void* lhs, const void* rhs, bool high_selector,
               bool full_vector);
 void MergePackedSingleHighFromLow64(void* dst, const void* old_dst_or_src, const void* src, bool high_qword,
@@ -31556,35 +31553,6 @@ void MergePackedSingleHighFromLow64(void* argument0, const void* argument1, cons
 
 void MergePackedSingleLowFromHigh(void* argument0, const void* argument1, const void* argument2, const bool argument3, const bool argument4) {
     SemanticKernelMergePackedSingleLowFromHigh(argument0, argument1, argument2, argument3, argument4);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& dst, const std::array<std::uint8_t, 16>& src,
-              const VectorLogicOp op){
-    ExecuteVectorBoolean(dst.data(), dst.data(), src.data(), op, dst.size());
-}
-
-void ExecuteLegacyVectorBoolean(std::array<std::uint8_t, 16>& argument0, const std::array<std::uint8_t, 16>& argument1, const VectorLogicOp argument2) {
-    SemanticKernelExecuteLegacyVectorBoolean(argument0, argument1, argument2);
-}
-
-[[gnu::always_inline]] static inline void SemanticKernelExecuteVectorBoolean(void* dst, const void* lhs, const void* rhs, const VectorLogicOp op,
-            const std::size_t size){
-    using VectorSemantic::BooleanOperation;
-    const auto semantic_op = [op]() {
-        switch (op) {
-        case VectorLogicOp::ExclusiveOr: return BooleanOperation::ExclusiveOr;
-        case VectorLogicOp::Intersection: return BooleanOperation::Conjunction;
-        case VectorLogicOp::Union: return BooleanOperation::Disjunction;
-        case VectorLogicOp::SubtractMask:
-            return BooleanOperation::ConjunctionWithInvertedLeft;
-        }
-        return BooleanOperation::ExclusiveOr;
-    }();
-    (void)VectorSemantic::ApplyBoolean(dst, lhs, rhs, size, semantic_op);
-}
-
-void ExecuteVectorBoolean(void* argument0, const void* argument1, const void* argument2, const VectorLogicOp argument3, const std::size_t argument4) {
-    SemanticKernelExecuteVectorBoolean(argument0, argument1, argument2, argument3, argument4);
 }
 
 [[gnu::always_inline]] static inline void SemanticKernelTestPackedVectorBits(LsxMachineImage& state, const void* lhs, const void* rhs, const std::size_t size){
