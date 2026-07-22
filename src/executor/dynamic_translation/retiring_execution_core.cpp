@@ -32182,6 +32182,9 @@ std::string ExerciseTranslationEngineJson() {
         using Lsx4::Translation::SelfTestValues::kStatePoison;
         using Lsx4::Translation::SelfTestValues::kUpperPoison;
         using Lsx4::Translation::SelfTestValues::kWideCanary;
+        using Lsx4::Translation::SelfTestValues::kLaneCanary;
+        using Lsx4::Translation::SelfTestValues::kWordCanary;
+        using Lsx4::Translation::SelfTestValues::EncodeMovEaxReturn;
         const ScopedJitSelfTestDifferential selftest_differential_scope;
         NativeSegmentDepot arena;
         auto* ret_block = arena.EmitReturnImmediateBlock(kReturnMarker);
@@ -33107,14 +33110,11 @@ std::string ExerciseTranslationEngineJson() {
         };
         std::memcpy(outbound_edge_code.data() + kDirectTargetOffset,
                     direct_target_bytes.data(), direct_target_bytes.size());
-        const std::array<std::uint8_t, 6> direct_target_callee = {
-            0xb8, 0x44, 0x33, 0x22, 0x11, 0xc3,
-        };
+        constexpr auto direct_target_callee = EncodeMovEaxReturn(kWordCanary);
         std::memcpy(outbound_edge_code.data() + kDirectTargetOffset + 2,
                     direct_target_callee.data(), direct_target_callee.size());
-        const std::array<std::uint8_t, 6> direct_mutated_callee = {
-            0xb8, 0x55, 0x33, 0x22, 0x11, 0xc3,
-        };
+        constexpr std::uint32_t kMutatedWord = kWordCanary ^ 0x11u;
+        constexpr auto direct_mutated_callee = EncodeMovEaxReturn(kMutatedWord);
         constexpr std::size_t kDirectMutatedCalleeOffset = 80;
         std::memcpy(outbound_edge_code.data() + kDirectMutatedCalleeOffset,
                     direct_mutated_callee.data(), direct_mutated_callee.size());
@@ -33420,8 +33420,8 @@ std::string ExerciseTranslationEngineJson() {
             ReadGuestGpr64(direct_mutated_state, LsxGpr::Rax) == 0xdeadbeefull &&
             ReadGuestGpr64(direct_mutated_state, LsxGpr::Rsp) == direct_mutated_rsp;
         const bool edge_tls_smc_fallback_ok =
-            direct_tls_before_mutation == 0x11223344ull &&
-            direct_tls_after_mutation == 0x11223355ull;
+            direct_tls_before_mutation == kWordCanary &&
+            direct_tls_after_mutation == kMutatedWord;
         const bool edge_e2e_ok =
             edge_precompile_null && edge_prepublish_fallback_ok &&
             edge_distinct_publish && edge_first_use_armed &&
@@ -33784,9 +33784,7 @@ std::string ExerciseTranslationEngineJson() {
         const bool x87_sqrt_contract_ok =
             x87_frontier_native_ok && x87_m32_contract_ok && x87_m80_contract_ok;
 
-        const std::array<std::uint8_t, 6> interpreter_compiler_smoke = {
-            0xb8, 0x44, 0x33, 0x22, 0x11, 0xc3,
-        };
+        constexpr auto interpreter_compiler_smoke = EncodeMovEaxReturn(kWordCanary);
         LsxDecodedRegion interpreter_smoke_block = DecodeGuestBasicRegion(
             reinterpret_cast<std::uint64_t>(interpreter_compiler_smoke.data()), 8);
         Arm64BlockEntry interpreter_smoke_entry =
@@ -33807,7 +33805,7 @@ std::string ExerciseTranslationEngineJson() {
         const bool interpreter_compiler_smoke_ok =
             interpreter_smoke_entry != nullptr &&
             interpreter_smoke_result == kInterpreterReturnSentinel &&
-            ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rax) == 0x11223344ull &&
+            ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rax) == kWordCanary &&
             ReadGuestGpr64(interpreter_smoke_state, LsxGpr::Rsp) == interpreter_rsp_before + 8;
 
         // Differential coverage for every legacy/VEX MOVLPS/MOVHPS and MOVLPD/MOVHPD
@@ -34128,7 +34126,8 @@ std::string ExerciseTranslationEngineJson() {
                 WriteGuestGpr64(state, LsxGpr::Rdi, 3);
                 WriteGuestGpr64(state, LsxGpr::Rbp, 0x1f);
                 WriteGuestGpr64(state, LsxGpr::R8,
-                         0x1122334400000000ull | initial_r8d);
+                         (static_cast<std::uint64_t>(kWordCanary) << 32u) |
+                             initial_r8d);
                 WriteGuestGpr64(state, LsxGpr::R9, 0x9999999999999999ull);
                 WriteGuestGpr64(state, LsxGpr::R11, 0x1111111111111111ull);
                 WriteGuestGpr64(state, LsxGpr::R12, 0x1212121212121212ull);
@@ -34197,7 +34196,8 @@ std::string ExerciseTranslationEngineJson() {
                 ReadGuestGpr64(native_state, LsxGpr::Rsi) ==
                     reinterpret_cast<std::uint64_t>(memory.data() + output_offset + 2) &&
                 ReadGuestGpr64(native_state, LsxGpr::R8) ==
-                    (0x1122334400000000ull | initial_r8d) &&
+                    ((static_cast<std::uint64_t>(kWordCanary) << 32u) |
+                     initial_r8d) &&
                 native_state.rflags == expected_flags.rflags;
             if (!case_ok) {
                 JitLog("[LSX4_TEST_RGB565] fixture=%s bytes=%zu operations=%zu decoded=%d semantic=%d entry=%d direct=%d",
@@ -35052,7 +35052,7 @@ std::string ExerciseTranslationEngineJson() {
                          entry_form ? mono_tree_wrong_head : mono_tree_head);
                 WriteGuestGpr64(state, LsxGpr::Rdx, kWideCanary);
                 WriteGuestGpr64(state, LsxGpr::Rsi, 0x4C53585F4D41524Bull);
-                WriteGuestGpr64(state, LsxGpr::Rdi, 0x0123456789abcdefull);
+                WriteGuestGpr64(state, LsxGpr::Rdi, kLaneCanary);
                 WriteGuestGpr64(state, LsxGpr::Rbp, 0x1020304050607080ull);
                 WriteGuestGpr64(state, LsxGpr::Rsp, guest_rsp);
                 WriteGuestGpr64(state, LsxGpr::R8, 0x8899aabbccddeeffull);
@@ -35621,7 +35621,7 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage initial_state{};
             initial_state.rflags = 0xad7;
             WriteGuestGpr64(initial_state, LsxGpr::Rax, 0xdeadbeef00000004ull);
-            WriteGuestGpr64(initial_state, LsxGpr::Rdi, 0x0123456789abcdefull);
+            WriteGuestGpr64(initial_state, LsxGpr::Rdi, kLaneCanary);
             WriteGuestGpr64(initial_state, LsxGpr::Rsi, 0);
             WriteGuestGpr64(initial_state, LsxGpr::Rdx,
                      reinterpret_cast<std::uint64_t>(memory.data() + kOutputOffset));
@@ -36124,7 +36124,8 @@ std::string ExerciseTranslationEngineJson() {
                 generic_addsub_fault_memory[0] = 0x13579bdfu ^ iteration;
                 state.rflags = (iteration & 1u) != 0 ? 0xad7u : 0x202u;
                 WriteGuestGpr64(state, LsxGpr::Rax,
-                         0x1122334400000000ull | iteration);
+                         (static_cast<std::uint64_t>(kWordCanary) << 32u) |
+                             iteration);
                 WriteGuestGpr64(state, LsxGpr::Rcx,
                          0x5566778800000000ull | (iteration * 3u));
                 WriteGuestGpr64(state, LsxGpr::R9, 0x80000000u + iteration);
@@ -36162,7 +36163,8 @@ std::string ExerciseTranslationEngineJson() {
                 };
                 state.rflags = (iteration & 1u) != 0 ? 0xad7u : 0x202u;
                 WriteGuestGpr64(state, LsxGpr::Rax,
-                         0x1122334400000000ull | values[iteration % values.size()]);
+                         (static_cast<std::uint64_t>(kWordCanary) << 32u) |
+                             values[iteration % values.size()]);
                 WriteGuestGpr64(state, LsxGpr::Rcx,
                          values[(iteration + 1u) % values.size()]);
                 WriteGuestGpr64(state, LsxGpr::Rbx,
@@ -37852,7 +37854,7 @@ std::string ExerciseTranslationEngineJson() {
                 WriteGuestGpr64(state, LsxGpr::Rax,
                          reinterpret_cast<std::uint64_t>(memory.data()));
                 constexpr std::array<std::uint64_t, 4> source = {
-                    0x0123456789abcdefull, kReverseCanary,
+                    kLaneCanary, kReverseCanary,
                     0x8000000000000001ull, 0x00ff00ff00ff00ffull,
                 };
                 std::memcpy(state.ymm[1].data(), source.data(), sizeof(source));
@@ -37865,7 +37867,7 @@ std::string ExerciseTranslationEngineJson() {
             [](const LsxMachineImage& state,
                const std::array<std::uint8_t, 128>& memory) {
                 constexpr std::array<std::uint64_t, 4> source = {
-                    0x0123456789abcdefull, kReverseCanary,
+                    kLaneCanary, kReverseCanary,
                     0x8000000000000001ull, 0x00ff00ff00ff00ffull,
                 };
                 for (std::uint32_t lane = 0; lane < source.size(); ++lane) {
@@ -38053,7 +38055,10 @@ std::string ExerciseTranslationEngineJson() {
                 state.mxcsr = 0x5f80u;
                 WriteGuestGpr64(state, LsxGpr::Rax,
                          reinterpret_cast<std::uint64_t>(memory.data()));
-                WriteGuestGpr64(state, LsxGpr::Rcx, 0xdeadbeef11223344ull);
+                WriteGuestGpr64(
+                    state, LsxGpr::Rcx,
+                    Lsx4::Translation::SelfTestValues::kUpperPoison |
+                        Lsx4::Translation::SelfTestValues::kWordCanary);
                 StoreUnaligned<std::uint32_t>(memory.data() + 4, 0x89abcdefu);
                 for (std::uint32_t byte = 0; byte < 32; ++byte) {
                     state.ymm[0][byte] = static_cast<std::uint8_t>(0x20u + byte);
@@ -38063,11 +38068,13 @@ std::string ExerciseTranslationEngineJson() {
             },
             [](const LsxMachineImage& state,
                const std::array<std::uint8_t, 128>& memory) {
-                if (ReadGuestGpr64(state, LsxGpr::Rdx) != 0x11223344u ||
+                constexpr auto expected =
+                    Lsx4::Translation::SelfTestValues::kWordCanary;
+                if (ReadGuestGpr64(state, LsxGpr::Rdx) != expected ||
                     ReadGuestGpr64(state, LsxGpr::Rcx) != 0x89abcdefu ||
-                    LoadUnaligned<std::uint32_t>(memory.data()) != 0x11223344u ||
-                    LoadUnaligned<std::uint32_t>(state.ymm[0].data()) != 0x11223344u ||
-                    LoadUnaligned<std::uint32_t>(state.ymm[2].data()) != 0x11223344u ||
+                    LoadUnaligned<std::uint32_t>(memory.data()) != expected ||
+                    LoadUnaligned<std::uint32_t>(state.ymm[0].data()) != expected ||
+                    LoadUnaligned<std::uint32_t>(state.ymm[2].data()) != expected ||
                     LoadUnaligned<std::uint32_t>(state.ymm[3].data()) != 0x89abcdefu) {
                     return false;
                 }
@@ -38649,7 +38656,7 @@ std::string ExerciseTranslationEngineJson() {
                 WriteGuestGpr64(state, LsxGpr::Rcx,
                          0xaaaaaaaa80000000ull + iteration);
                 WriteGuestGpr64(state, LsxGpr::Rdx, 0x101u + iteration);
-                WriteGuestGpr64(state, LsxGpr::R8, 0x0123456789abcdefull);
+                WriteGuestGpr64(state, LsxGpr::R8, kLaneCanary);
                 WriteGuestGpr64(state, LsxGpr::R9, kReverseCanary);
                 WriteGuestGpr64(state, LsxGpr::R10, 0x100000000ull + iteration);
                 WriteGuestGpr64(state, LsxGpr::R13, 0x1111222233334444ull);
@@ -39393,7 +39400,7 @@ std::string ExerciseTranslationEngineJson() {
             WriteGuestGpr64(state, LsxGpr::Rdi,
                      reinterpret_cast<std::uint64_t>(memory.data()));
             WriteGuestGpr64(state, LsxGpr::R8, 0xfeedface89abcdefull);
-            WriteGuestGpr64(state, LsxGpr::R9, 0x0123456789abcdefull);
+            WriteGuestGpr64(state, LsxGpr::R9, kLaneCanary);
         };
         LsxMachineImage generic_interpreter_state{};
         LsxMachineImage generic_native_state{};
@@ -39426,7 +39433,7 @@ std::string ExerciseTranslationEngineJson() {
             LoadUnaligned<std::uint32_t>(generic_native_memory.data() + 4) ==
                 0x89abcdefu &&
             LoadUnaligned<std::uint64_t>(generic_native_memory.data() + 8) ==
-                0x0123456789abcdefull;
+                kLaneCanary;
         const bool generic_memory_write_no_double_ok =
             generic_native_memory[0x10] == 0x13 &&
             generic_interpreter_memory[0x10] == 0x13;
@@ -39583,8 +39590,8 @@ std::string ExerciseTranslationEngineJson() {
             generic_memory_rmw_block.instructions.size() == 3 &&
             generic_memory_rmw_entry != nullptr && generic_memory_rmw_direct != nullptr &&
             generic_memory_rmw_entry != generic_memory_rmw_direct &&
-            run_generic_memory_rmw_case(0x11223344u, 0u, false) &&
-            run_generic_memory_rmw_case(0x11223344u, 7u, false) &&
+            run_generic_memory_rmw_case(kWordCanary, 0u, false) &&
+            run_generic_memory_rmw_case(kWordCanary, 7u, false) &&
             run_generic_memory_rmw_case(0xffffffffu, 0u, true);
 
         const std::array<std::uint8_t, 10> bounded_split_program = {
