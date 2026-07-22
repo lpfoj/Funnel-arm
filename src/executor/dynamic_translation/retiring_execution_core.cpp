@@ -4381,10 +4381,9 @@ public:
                     const std::uint32_t n =
                         s_fault_resume_budget.fetch_add(1, std::memory_order_relaxed);
                     if (n < 64) {
-                        JitLog("[EXECUTOR_JIT_SYNC_FAULT_RESUME] n=%u "
-                                    "faultRip=0x%llx recoveryRip=0x%llx",
-                                    n, static_cast<unsigned long long>(rip),
-                                    static_cast<unsigned long long>(state.rip_or_exit));
+                        JitLog("[LSX4_FAULT_RESUME] sample=%u fault_pc=0x%llx continuation_pc=0x%llx",
+                               n, static_cast<unsigned long long>(rip),
+                               static_cast<unsigned long long>(state.rip_or_exit));
                     }
                 }
             } catch (const std::exception& e) {
@@ -4429,15 +4428,13 @@ public:
                 const std::uint32_t n =
                     s_zero_ret_budget.fetch_add(1, std::memory_order_relaxed);
                 if (n < 64) {
-                    JitLog("[EXECUTOR_JIT_ZERO_RET_EXIT] n=%u rip=0x%llx "
-                                "size=0x%x flags=0x%x rax=0x%llx rsp=0x%llx rbp=0x%llx",
-                                n,
-                                static_cast<unsigned long long>(rip),
-                                block.guest_size,
-                                block.flags,
-                                static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rax)),
-                                static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rsp)),
-                                static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbp)));
+                    JitLog("[LSX4_MAPPED_RETURN] sample=%u pc=0x%llx bytes=%u attributes=0x%x",
+                           n, static_cast<unsigned long long>(rip), block.guest_size,
+                           block.flags);
+                    JitLog("[LSX4_MAPPED_RETURN_STATE] sample=%u accumulator=0x%llx stack=0x%llx frame=0x%llx",
+                           n, static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rax)),
+                           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rsp)),
+                           static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbp)));
                 }
                 result = kRunStopMarker;
                 state.rip_or_exit = kRunStopMarker;
@@ -4459,18 +4456,14 @@ public:
                         AppendDecodedBlockDump(block_dump, decoded_block);
                         static std::atomic<int> s_exit_choke_detail_budget{16};
                         if (s_exit_choke_detail_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
-                            JitLog("[EXECUTOR_JIT_EXIT_CHOKE_BLOCK] blocks=%llu "
-                                        "rip=0x%llx result=0x%llx exitRequested=%d size=0x%x "
-                                        "flags=0x%x bytes=%s %s%s",
-                                        static_cast<unsigned long long>(executed_blocks),
-                                        static_cast<unsigned long long>(rip),
-                                        static_cast<unsigned long long>(result),
-                                        exit_requested ? 1 : 0,
-                                        block.guest_size,
-                                        block.flags,
-                                        active_bytes.c_str(),
-                                        block_summary.c_str(),
-                                        block_dump.str().c_str());
+                            JitLog("[LSX4_EXIT_FRONTIER] retired=%llu pc=0x%llx outcome=0x%llx requested=%d",
+                                   static_cast<unsigned long long>(executed_blocks),
+                                   static_cast<unsigned long long>(rip),
+                                   static_cast<unsigned long long>(result),
+                                   exit_requested ? 1 : 0);
+                            JitLog("[LSX4_EXIT_FRONTIER_REGION] bytes=%u attributes=0x%x image=%s summary=%s decode=%s",
+                                   block.guest_size, block.flags, active_bytes.c_str(),
+                                   block_summary.c_str(), block_dump.str().c_str());
                         }
                     }
                     std::ostringstream error;
@@ -7094,25 +7087,22 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
         static std::atomic<std::uint32_t> s_mismatch_budget{0};
         const std::uint32_t n = s_mismatch_budget.fetch_add(1, std::memory_order_relaxed);
         if (n < 64) {
-            JitLog("[EXECUTOR_JIT_NATIVE_CHECK_FAIL] n=%u rip=0x%llx "
-                        "nativeNext=0x%llx refNext=0x%llx nativeResult=0x%llx "
-                        "refResult=0x%llx nativeFlags=0x%llx refFlags=0x%llx",
-                        n,
-                        static_cast<unsigned long long>(context->block->start_rip),
-                        static_cast<unsigned long long>(native_next),
-                        static_cast<unsigned long long>(interpreter_next),
-                        static_cast<unsigned long long>(native_result),
-                        static_cast<unsigned long long>(interpreter_result),
-                        static_cast<unsigned long long>(native_state.rflags),
-                        static_cast<unsigned long long>(interpreter_state.rflags));
+            JitLog("[LSX4_DIFFERENTIAL_MISMATCH] sample=%u pc=0x%llx native_next=0x%llx semantic_next=0x%llx",
+                   n, static_cast<unsigned long long>(context->block->start_rip),
+                   static_cast<unsigned long long>(native_next),
+                   static_cast<unsigned long long>(interpreter_next));
+            JitLog("[LSX4_DIFFERENTIAL_STATE] sample=%u native_outcome=0x%llx semantic_outcome=0x%llx native_flags=0x%llx semantic_flags=0x%llx",
+                   n, static_cast<unsigned long long>(native_result),
+                   static_cast<unsigned long long>(interpreter_result),
+                   static_cast<unsigned long long>(native_state.rflags),
+                   static_cast<unsigned long long>(interpreter_state.rflags));
             // Persist to a file (survives logcat rotation + app exit on a flaky device) and record
             // exactly WHICH register the native handler mis-computed vs the semantic interpreter.
             std::FILE* cf = std::fopen(
                 "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a");
             if (cf != nullptr) {
                 std::fprintf(cf,
-                             "rip=0x%llx nNext=0x%llx rNext=0x%llx nRes=0x%llx rRes=0x%llx "
-                             "nFlags=0x%llx rFlags=0x%llx",
+                             "kind=differential pc=0x%llx native_next=0x%llx semantic_next=0x%llx native_outcome=0x%llx semantic_outcome=0x%llx native_flags=0x%llx semantic_flags=0x%llx",
                              static_cast<unsigned long long>(context->block->start_rip),
                              static_cast<unsigned long long>(native_next),
                              static_cast<unsigned long long>(interpreter_next),
@@ -7122,7 +7112,7 @@ std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlo
                              static_cast<unsigned long long>(interpreter_state.rflags));
                 for (std::size_t i = 0; i < native_state.gpr.size(); ++i) {
                     if (native_state.gpr[i] != interpreter_state.gpr[i]) {
-                        std::fprintf(cf, " gpr[%zu]:n=0x%llx,r=0x%llx", i,
+                        std::fprintf(cf, " register=%zu native=0x%llx semantic=0x%llx", i,
                                      static_cast<unsigned long long>(native_state.gpr[i]),
                                      static_cast<unsigned long long>(interpreter_state.gpr[i]));
                     }
@@ -19145,8 +19135,7 @@ void CopyBytesToGuest(const std::uint64_t guest_va, const void* src, const std::
             static std::atomic<std::uint32_t> s_hostimg_budget{0};
             const std::uint32_t n = s_hostimg_budget.fetch_add(1, std::memory_order_relaxed);
             if (n < 128) {
-                JitLog("[EXECUTOR_JIT_STORE_INTO_HOST_IMAGE] n=%u rip=0x%llx activeRip=0x%llx "
-                            "guest_va=0x%llx size=%u image=[0x%llx,0x%llx)",
+                JitLog("[LSX4_PROTECTED_STORE] sample=%u instruction_pc=0x%llx active_pc=0x%llx target=0x%llx bytes=%u image_begin=0x%llx image_end=0x%llx",
                             n,
                             static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
                                                                 ? CurrentPublishedFaultIr()->guest_rip
@@ -19160,8 +19149,7 @@ void CopyBytesToGuest(const std::uint64_t guest_va, const void* src, const std::
                     "a");
                 if (cf != nullptr) {
                     std::fprintf(cf,
-                                 "STORE_INTO_HOST_IMAGE rip=0x%llx activeRip=0x%llx guest_va=0x%llx "
-                                 "size=%u\n",
+                                 "kind=protected-store instruction_pc=0x%llx active_pc=0x%llx target=0x%llx bytes=%u\n",
                                  static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
                                                                      ? CurrentPublishedFaultIr()->guest_rip
                                                                      : g_active_block_rip),
@@ -19535,8 +19523,7 @@ LsxStackLease InitializeGuestEntryFrame(LsxMachineImage& state, const std::uint6
             guest_rsp = aligned_current - 24;
             StoreGuestScalar(guest_rsp, entry_param_q0, 8);
             StoreGuestScalar(guest_rsp + 8, entry_param_q1, 8);
-            JitLog("[EXECUTOR_JIT_MAIN_ENTRY_STACK] params=0x%llx q0=0x%llx "
-                        "q1=0x%llx rsp=0x%llx aligned=0x%llx",
+            JitLog("[LSX4_ENTRY_FRAME] parameters=0x%llx first=0x%llx second=0x%llx stack=0x%llx alignment_base=0x%llx",
                         static_cast<unsigned long long>(ctx.args[0]),
                         static_cast<unsigned long long>(entry_param_q0),
                         static_cast<unsigned long long>(entry_param_q1),
@@ -19805,7 +19792,7 @@ void AppendDecodedBlockDump(std::ostringstream& error, const LsxDecodedRegion* b
 }
 
 void AppendRecentDecodedBlockDumps(std::ostringstream& error) {
-    error << " recentBlockInsns=[";
+    error << " recent_regions=[";
     const std::uint32_t recent_count = g_recent_block_count < g_recent_block_rips.size()
         ? g_recent_block_count
         : static_cast<std::uint32_t>(g_recent_block_rips.size());
@@ -26933,14 +26920,12 @@ bool TryExecuteJitDirectHle(LsxMachineImage& state, const std::uint64_t thunk,
                                                                std::memory_order_relaxed)) {
         }
         if (n != 0) {
-            JitLog("[EXECUTOR_JIT_DIRECT_HLE_ZERO] n=%u mode=%s thunk=0x%llx "
-                        "ret=0x%llx guestRsp=0x%llx finalRsp=0x%llx",
-                        n,
-                        mode != nullptr ? mode : "?",
-                        static_cast<unsigned long long>(thunk),
-                        static_cast<unsigned long long>(return_rip),
-                        static_cast<unsigned long long>(guest_rsp),
-                        static_cast<unsigned long long>(final_rsp));
+            JitLog("[LSX4_HLE_ZERO] sample=%u mode=%s thunk=0x%llx return_pc=0x%llx stack_before=0x%llx stack_after=0x%llx",
+                   n, mode != nullptr ? mode : "unspecified",
+                   static_cast<unsigned long long>(thunk),
+                   static_cast<unsigned long long>(return_rip),
+                   static_cast<unsigned long long>(guest_rsp),
+                   static_cast<unsigned long long>(final_rsp));
         }
         WriteGuestGpr64(state, LsxGpr::Rax, 0);
         WriteGuestGpr64(state, LsxGpr::Rsp, final_rsp);
@@ -26967,29 +26952,24 @@ bool TryExecuteJitDirectHle(LsxMachineImage& state, const std::uint64_t thunk,
                                                           std::memory_order_relaxed)) {
     }
     if (n != 0) {
-        JitLog("[EXECUTOR_JIT_DIRECT_HLE] n=%u mode=%s thunk=0x%llx native=0x%llx "
-                    "ret=0x%llx guestRsp=0x%llx finalRsp=0x%llx "
-                    "rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx "
-                    "rbx=0x%llx rbp=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx",
-                    n,
-                    mode != nullptr ? mode : "?",
-                    static_cast<unsigned long long>(thunk),
-                    static_cast<unsigned long long>(native_function),
-                    static_cast<unsigned long long>(return_rip),
-                    static_cast<unsigned long long>(guest_rsp),
-                    static_cast<unsigned long long>(final_rsp),
-                    static_cast<unsigned long long>(arg0),
-                    static_cast<unsigned long long>(arg1),
-                    static_cast<unsigned long long>(arg2),
-                    static_cast<unsigned long long>(arg3),
-                    static_cast<unsigned long long>(arg4),
-                    static_cast<unsigned long long>(arg5),
-                    static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbx)),
-                    static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbp)),
-                    static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R12)),
-                    static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R13)),
-                    static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R14)),
-                    static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R15)));
+        JitLog("[LSX4_HLE_FRONTIER] sample=%u mode=%s thunk=0x%llx host=0x%llx return_pc=0x%llx stack_before=0x%llx stack_after=0x%llx",
+               n, mode != nullptr ? mode : "unspecified",
+               static_cast<unsigned long long>(thunk),
+               static_cast<unsigned long long>(native_function),
+               static_cast<unsigned long long>(return_rip),
+               static_cast<unsigned long long>(guest_rsp),
+               static_cast<unsigned long long>(final_rsp));
+        JitLog("[LSX4_HLE_ARGUMENTS] sample=%u a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx",
+               n, static_cast<unsigned long long>(arg0), static_cast<unsigned long long>(arg1),
+               static_cast<unsigned long long>(arg2), static_cast<unsigned long long>(arg3),
+               static_cast<unsigned long long>(arg4), static_cast<unsigned long long>(arg5));
+        JitLog("[LSX4_HLE_PRESERVED] sample=%u b=0x%llx bp=0x%llx v12=0x%llx v13=0x%llx v14=0x%llx v15=0x%llx",
+               n, static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbx)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::Rbp)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R12)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R13)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R14)),
+               static_cast<unsigned long long>(ReadGuestGpr64(state, LsxGpr::R15)));
     }
 
     const std::uint64_t saved_rbx = ReadGuestGpr64(state, LsxGpr::Rbx);
@@ -27208,8 +27188,7 @@ std::uint64_t InterpretDecodedInstructionScoped(LsxMachineImage* state,
             const std::uint32_t n =
                 s_zero_ret_insn_budget.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
-                JitLog("[EXECUTOR_JIT_ZERO_RET_INSN] n=%u rip=0x%llx "
-                            "rax=0x%llx rsp=0x%llx rbp=0x%llx",
+                JitLog("[LSX4_SEMANTIC_RETURN] sample=%u pc=0x%llx accumulator=0x%llx stack=0x%llx frame=0x%llx",
                             n,
                             static_cast<unsigned long long>(ir->guest_rip),
                             static_cast<unsigned long long>(ReadGuestGpr64(*state, LsxGpr::Rax)),
@@ -29055,8 +29034,7 @@ void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, const s
             static std::atomic<std::uint32_t> b{0};
             const std::uint32_t n = b.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
-                JitLog("[EXECUTOR_JIT_XCHG_INTO_HOST_IMAGE] n=%u target=0x%llx sizeBits=%u "
-                            "rip=0x%llx activeRip=0x%llx image=[0x%llx,0x%llx)",
+                JitLog("[LSX4_PROTECTED_EXCHANGE] sample=%u target=0x%llx width=%u instruction_pc=0x%llx active_pc=0x%llx image_begin=0x%llx image_end=0x%llx",
                             n, static_cast<unsigned long long>(taddr), size_bits,
                             static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
                                                                 ? CurrentPublishedFaultIr()->guest_rip
@@ -29068,7 +29046,7 @@ void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, const s
                     "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt",
                     "a");
                 if (cf != nullptr) {
-                    std::fprintf(cf, "XCHG_INTO_HOST_IMAGE target=0x%llx rip=0x%llx\n",
+                    std::fprintf(cf, "kind=protected-exchange target=0x%llx instruction_pc=0x%llx\n",
                                  static_cast<unsigned long long>(taddr),
                                  static_cast<unsigned long long>(CurrentPublishedFaultIr() != nullptr
                                                                      ? CurrentPublishedFaultIr()->guest_rip
@@ -30665,15 +30643,14 @@ bool IsProtectedHostCmpxchgTarget(void* target, const std::uint32_t width, const
     const auto rip = CurrentPublishedFaultIr() != nullptr
                          ? CurrentPublishedFaultIr()->guest_rip
                          : g_active_block_rip;
-    JitLog("[EXECUTOR_JIT_CMPXCHG_INTO_HOST_IMAGE] n=%u target=0x%llx sizeBits=%u "
-           "rip=0x%llx image=[0x%llx,0x%llx)", report,
+    JitLog("[LSX4_PROTECTED_COMPARE_EXCHANGE] sample=%u target=0x%llx width=%u instruction_pc=0x%llx image_begin=0x%llx image_end=0x%llx", report,
            static_cast<unsigned long long>(address), width,
            static_cast<unsigned long long>(rip),
            static_cast<unsigned long long>(image_begin),
            static_cast<unsigned long long>(image_end));
     if (std::FILE* file = std::fopen(
             "/data/data/app.lsx4.android/files/lsx4-home/jit-checkfail.txt", "a")) {
-        std::fprintf(file, "CMPXCHG_INTO_HOST_IMAGE target=0x%llx rip=0x%llx\n",
+        std::fprintf(file, "kind=protected-compare-exchange target=0x%llx instruction_pc=0x%llx\n",
                      static_cast<unsigned long long>(address),
                      static_cast<unsigned long long>(rip));
         std::fclose(file);
