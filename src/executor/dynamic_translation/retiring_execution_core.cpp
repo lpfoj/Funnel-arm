@@ -20099,6 +20099,31 @@ bool ReadScalar64(const LsxMachineImage& state, const DecodeSummary& instruction
     return false;
 }
 
+bool ReadFloatingPair(const LsxMachineImage& state, const DecodeSummary& instruction,
+                      const LsxOperandRecord& left_operand,
+                      const LsxOperandRecord& right_operand, const bool double_width,
+                      double& left, double& right) {
+    if (double_width) {
+        std::uint64_t bits[2]{};
+        if (!ReadScalar64(state, instruction, left_operand, bits[0]) ||
+            !ReadScalar64(state, instruction, right_operand, bits[1])) {
+            return false;
+        }
+        left = LoadUnaligned<double>(&bits[0]);
+        right = LoadUnaligned<double>(&bits[1]);
+        return true;
+    }
+
+    std::uint32_t bits[2]{};
+    if (!ReadScalar32(state, instruction, left_operand, bits[0]) ||
+        !ReadScalar32(state, instruction, right_operand, bits[1])) {
+        return false;
+    }
+    left = static_cast<double>(LoadUnaligned<float>(&bits[0]));
+    right = static_cast<double>(LoadUnaligned<float>(&bits[1]));
+    return true;
+}
+
 bool WriteVector128(LsxMachineImage& state, const DecodeSummary& instruction,
                     const LsxOperandRecord& operand,
                     const std::array<std::uint8_t, kXmmRegisterBytes>& value) {
@@ -22585,34 +22610,25 @@ bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& i
                                     mnemonic == X86_MNEMONIC_VCOMISD ||
                                     mnemonic == X86_MNEMONIC_UCOMISD ||
                                     mnemonic == X86_MNEMONIC_VUCOMISD;
-        std::uint32_t rhs_bits = 0;
-        std::uint64_t lhs64 = 0;
-        std::uint64_t rhs64 = 0;
-        const bool ok = compare_double
-            ? (ReadScalar64(state, ir.decoded, ir.operands[0], lhs64) &&
-               ReadScalar64(state, ir.decoded, ir.operands[1], rhs64))
-            : (ReadScalar32(state, ir.decoded, ir.operands[0], scalar_bits) &&
-               ReadScalar32(state, ir.decoded, ir.operands[1], rhs_bits));
-        if (!ok) {
+        double left = 0.0;
+        double right = 0.0;
+        if (!ReadFloatingPair(state, ir.decoded, ir.operands[0], ir.operands[1],
+                              compare_double, left, right)) {
             return false;
         }
-        const double lhs = compare_double ? LoadUnaligned<double>(&lhs64)
-                                          : static_cast<double>(LoadUnaligned<float>(&scalar_bits));
-        const double rhs = compare_double ? LoadUnaligned<double>(&rhs64)
-                                          : static_cast<double>(LoadUnaligned<float>(&rhs_bits));
-        const bool unordered = std::isnan(lhs) || std::isnan(rhs);
-        const bool equal = !unordered && lhs == rhs;
-        const bool less = !unordered && lhs < rhs;
-
         std::uint64_t comparison_flags = 0;
-        if (unordered || equal) {
-            comparison_flags |= kFlagZf;
-        }
-        if (unordered) {
-            comparison_flags |= kFlagPf;
-        }
-        if (unordered || less) {
-            comparison_flags |= kFlagCf;
+        switch (Lsx4::Translation::ClassifyFloatingOrder(left, right)) {
+        case Lsx4::Translation::FloatingOrder::Unordered:
+            comparison_flags = kFlagZf | kFlagPf | kFlagCf;
+            break;
+        case Lsx4::Translation::FloatingOrder::Less:
+            comparison_flags = kFlagCf;
+            break;
+        case Lsx4::Translation::FloatingOrder::Equal:
+            comparison_flags = kFlagZf;
+            break;
+        case Lsx4::Translation::FloatingOrder::Greater:
+            break;
         }
         StoreStatusFlags(state, comparison_flags);
         return true;
@@ -22627,26 +22643,15 @@ bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& i
         if (!ReadVector128(state, ir.decoded, merge_operand, dst)) {
             return false;
         }
-
-        std::uint64_t lhs64 = 0;
-        std::uint64_t rhs64 = 0;
-        std::uint32_t rhs_bits = 0;
-        const bool ok = compare_double
-            ? (ReadScalar64(state, ir.decoded, merge_operand, lhs64) &&
-               ReadScalar64(state, ir.decoded, rhs_operand, rhs64))
-            : (ReadScalar32(state, ir.decoded, merge_operand, scalar_bits) &&
-               ReadScalar32(state, ir.decoded, rhs_operand, rhs_bits));
-        if (!ok) {
+        double left = 0.0;
+        double right = 0.0;
+        if (!ReadFloatingPair(state, ir.decoded, merge_operand, rhs_operand,
+                              compare_double, left, right)) {
             return false;
         }
-
-        const double lhs = compare_double ? LoadUnaligned<double>(&lhs64)
-                                          : static_cast<double>(LoadUnaligned<float>(&scalar_bits));
-        const double rhs = compare_double ? LoadUnaligned<double>(&rhs64)
-                                          : static_cast<double>(LoadUnaligned<float>(&rhs_bits));
         const std::uint32_t predicate =
             static_cast<std::uint32_t>(predicate_operand.imm.value.u & 0x1fu);
-        const bool matched = EvaluateFloatComparePredicate(lhs, rhs, predicate);
+        const bool matched = Lsx4::Translation::FloatingRelationMatches(left, right, predicate);
         if (compare_double) {
             StoreUnaligned<std::uint64_t>(dst.data(), matched ? UINT64_MAX : 0u);
         } else {
@@ -22677,14 +22682,16 @@ bool ExecuteScalarFloatInstruction(LsxMachineImage& state, const LsxDecodedOp& i
                 return false;
             }
             StoreUnaligned<double>(dst.data(),
-                                   ApplyScalarRound(LoadUnaligned<double>(&scalar64), mode));
+                                   Lsx4::Translation::RoundFloatingValue(
+                                       LoadUnaligned<double>(&scalar64), mode));
         } else {
             if (!ReadScalar32(state, ir.decoded, source_operand, scalar_bits)) {
                 return false;
             }
             StoreUnaligned<float>(dst.data(),
                                   static_cast<float>(
-                                      ApplyScalarRound(LoadUnaligned<float>(&scalar_bits), mode)));
+                                      Lsx4::Translation::RoundFloatingValue(
+                                          LoadUnaligned<float>(&scalar_bits), mode)));
         }
         std::memset(dst.data() + 16, 0, 16);
         return WriteVector128(state, ir.decoded, ir.operands[0], dst);
@@ -31558,17 +31565,7 @@ void StoreScalarMinMax(void* dst, const void* lhs_ptr, const void* rhs_ptr,
 }
 
 double ApplyScalarRound(const double value, const std::uint32_t mode) {
-    switch (mode & 3u) {
-    case 0:
-        return std::nearbyint(value);
-    case 1:
-        return std::floor(value);
-    case 2:
-        return std::ceil(value);
-    case 3:
-        return std::trunc(value);
-    }
-    return value;
+    return Lsx4::Translation::RoundFloatingValue(value, mode);
 }
 } // namespace
 
