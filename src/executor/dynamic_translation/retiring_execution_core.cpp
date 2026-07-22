@@ -14,6 +14,7 @@
 #include "executor/dynamic_translation/integer_math.h"
 #include "executor/dynamic_translation/instruction_diagnostics.h"
 #include "executor/dynamic_translation/json_text.h"
+#include "executor/dynamic_translation/native_status_emitter.h"
 #include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "executor/dynamic_translation/trace_memory.h"
@@ -8837,63 +8838,22 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     // into the byte-load suffix of the following slot.  Recognize the structural immediates so all
     // fifteen full entries and all fifteen suffix entries share one lowering, then cover the slot-0
     // header and final lookup/loop-back block explicitly.
+    const NativeStatus::X86FlagLayout inline_flag_layout{
+        .state_offset = kStateRflagsOffset,
+        .parity_bit = kPfBit,
+        .adjust_bit = kAfBit,
+        .zero_bit = kZfBit,
+        .sign_bit = kSfBit,
+        .overflow_bit = kOfBit,
+        .arithmetic_mask = kArithmeticStatusBits,
+    };
     const auto emit_inline_test_byte_flags = [&](Xbyak_aarch64::CodeGenerator& code,
-                                                  const WReg& value) {
-        // TEST of a zero-extended byte as RCX: SF is necessarily clear. Compute even parity of
-        // the low byte with three XOR folds and replace exactly x86's six arithmetic status bits.
-        code.mov(code.w14, value);
-        code.lsr(code.w15, code.w14, 4);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 2);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 1);
-        code.eor(code.w14, code.w14, code.w15);
-        code.mov(code.w15, 1);
-        code.and_(code.w14, code.w14, code.w15);
-        code.eor(code.w14, code.w14, code.w15); // one for even parity
-        code.lsl(code.x14, code.x14, kPfBit);
-        code.cmp(value, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.ldr(code.x16, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x17, kArithmeticStatusBits);
-        code.bic(code.x16, code.x16, code.x17);
-        code.orr(code.x16, code.x16, code.x14);
-        code.str(code.x16, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+                                                   const WReg& value) {
+        NativeStatus::EmitTestByte(code, value, false, inline_flag_layout);
     };
     const auto emit_inline_test8_flags = [&](Xbyak_aarch64::CodeGenerator& code,
                                               const WReg& value) {
-        // TEST r/m8,r8 differs from the zero-extended RCX form above only in SF: bit 7 of the
-        // tested byte is the sign bit.  Keep the same parity fold and merge SF explicitly.
-        code.mov(code.w14, value);
-        code.lsr(code.w15, code.w14, 4);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 2);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 1);
-        code.eor(code.w14, code.w14, code.w15);
-        code.mov(code.w15, 1);
-        code.and_(code.w14, code.w14, code.w15);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsl(code.x14, code.x14, kPfBit);
-        code.mov(code.w15, value);
-        code.lsr(code.w15, code.w15, 7);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.mov(code.w15, 0xff);
-        code.and_(code.w15, value, code.w15);
-        code.cmp(code.w15, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.ldr(code.x16, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x17, kArithmeticStatusBits);
-        code.bic(code.x16, code.x16, code.x17);
-        code.orr(code.x16, code.x16, code.x14);
-        code.str(code.x16, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+        NativeStatus::EmitTestByte(code, value, true, inline_flag_layout);
     };
     const auto emit_byte_test_return = [&](Xbyak_aarch64::CodeGenerator& code,
                                            const std::uint64_t fallthrough,
@@ -8909,288 +8869,41 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     };
 
     const auto emit_inline_add64_flags = [&](Xbyak_aarch64::CodeGenerator& code,
-                                               const XReg& lhs, const XReg& rhs,
-                                               const XReg& result) {
-        // AArch64 ADDS gives us x86 ADD's CF/ZF/SF/OF directly.  Derive PF from the low
-        // result byte and AF from lhs^rhs^result, then replace exactly the six arithmetic
-        // status bits.  Keeping this inline matters for the per-pixel lookup loops below:
-        // a C++ flag-helper call for every non-zero source byte would become their new ceiling.
-        code.adds(result, lhs, rhs);
-        code.cset(code.x14, Xbyak_aarch64::CS);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::MI);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::VS);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, WReg(result.getIdx()));
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.eor(code.x15, lhs, rhs);
-        code.eor(code.x15, code.x15, result);
-        code.lsr(code.x15, code.x15, 4);
-        code.mov(code.x16, 1);
-        code.and_(code.x15, code.x15, code.x16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits);
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+                                                const XReg& lhs, const XReg& rhs,
+                                                const XReg& result) {
+        NativeStatus::EmitAdd64(code, lhs, rhs, result, inline_flag_layout);
     };
 
     const auto emit_inline_sub32_flags = [&](Xbyak_aarch64::CodeGenerator& code,
-                                               const WReg& lhs, const WReg& rhs,
-                                               const WReg& result) {
-        // AArch64 C is "no borrow", the inverse of x86 SUB/ CMP CF. N/Z/V map directly.
-        code.subs(result, lhs, rhs);
-        code.cset(code.x14, Xbyak_aarch64::CC);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::MI);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::VS);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, result);
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.eor(code.w15, lhs, rhs);
-        code.eor(code.w15, code.w15, result);
-        code.lsr(code.w15, code.w15, 4);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits);
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+                                                const WReg& lhs, const WReg& rhs,
+                                                const WReg& result) {
+        NativeStatus::EmitSubtract32(code, lhs, rhs, result, inline_flag_layout);
     };
 
     const auto emit_inline_test32_flags = [&](Xbyak_aarch64::CodeGenerator& code,
-                                                const WReg& value) {
-        code.mov(code.w14, value);
-        code.lsr(code.w15, code.w14, 4);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 2);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 1);
-        code.eor(code.w14, code.w14, code.w15);
-        code.mov(code.w15, 1);
-        code.and_(code.w14, code.w14, code.w15);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsl(code.x14, code.x14, kPfBit);
-        code.lsr(code.w15, value, 31);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cmp(value, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits);
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+                                                 const WReg& value) {
+        NativeStatus::EmitTest32(code, value, inline_flag_layout);
     };
 
     const auto emit_inline_test64_flags = [&](Xbyak_aarch64::CodeGenerator& code,
-                                                const XReg& value) {
-        code.mov(code.w14, WReg(value.getIdx()));
-        code.lsr(code.w15, code.w14, 4);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 2);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsr(code.w15, code.w14, 1);
-        code.eor(code.w14, code.w14, code.w15);
-        code.mov(code.w15, 1);
-        code.and_(code.w14, code.w14, code.w15);
-        code.eor(code.w14, code.w14, code.w15);
-        code.lsl(code.x14, code.x14, kPfBit);
-        code.lsr(code.x15, value, 63);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cmp(value, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits);
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+                                                 const XReg& value) {
+        NativeStatus::EmitTest64(code, value, inline_flag_layout);
     };
 
     const auto emit_inline_sub8_flags = [&]
         (Xbyak_aarch64::CodeGenerator& code, const WReg& lhs, const WReg& rhs,
          const WReg& result) {
-        code.sub(result, lhs, rhs);
-        code.mov(code.w13, 0xff);
-        code.and_(result, result, code.w13);
-        code.cmp(lhs, rhs);
-        code.cset(code.x14, Xbyak_aarch64::CC);
-        code.cmp(result, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.lsr(code.w15, result, 7);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.eor(code.w15, lhs, rhs);
-        code.eor(code.w16, lhs, result);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsr(code.w15, code.w15, 7);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.eor(code.w15, lhs, rhs);
-        code.eor(code.w15, code.w15, result);
-        code.lsr(code.w15, code.w15, 4);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, result);
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits);
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+        NativeStatus::EmitSubtract8(code, lhs, rhs, result, inline_flag_layout);
     };
 
     const auto emit_inline_inc64_flags_preserve_cf = [&]
         (Xbyak_aarch64::CodeGenerator& code, const XReg& lhs, const XReg& result) {
-        code.adds(result, lhs, 1);
-        code.mov(code.x14, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::MI);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::VS);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, WReg(result.getIdx()));
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.x16, 1);
-        code.eor(code.x15, lhs, code.x16);
-        code.eor(code.x15, code.x15, result);
-        code.lsr(code.x15, code.x15, 4);
-        code.and_(code.x15, code.x15, code.x16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits & ~std::uint64_t{1});
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+        NativeStatus::EmitIncrement64(code, lhs, result, inline_flag_layout);
     };
 
     const auto emit_inline_dec64_flags_preserve_cf = [&]
         (Xbyak_aarch64::CodeGenerator& code, const XReg& lhs, const XReg& result) {
-        // DEC has SUB64 status flags but, unlike SUB, preserves the incoming x86 carry.
-        // Keep this inline for the byte-at-a-time libc comparison loops below.
-        code.subs(result, lhs, 1);
-        code.mov(code.x14, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::MI);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::VS);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, WReg(result.getIdx()));
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.x16, 1);
-        code.eor(code.x15, lhs, code.x16);
-        code.eor(code.x15, code.x15, result);
-        code.lsr(code.x15, code.x15, 4);
-        code.and_(code.x15, code.x15, code.x16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits & ~std::uint64_t{1});
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+        NativeStatus::EmitDecrement64(code, lhs, result, inline_flag_layout);
     };
 
     // mono_image_init_name_cache resolves both the type name and namespace through
@@ -9322,46 +9035,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
 
     const auto emit_inline_inc32_flags_preserve_cf = [&]
         (Xbyak_aarch64::CodeGenerator& code, const WReg& lhs, const WReg& result) {
-        // INC publishes ADD32 flags except that x86 preserves the carry from the preceding
-        // instruction.  The caller has already written that carry into state.rflags.
-        code.adds(result, lhs, 1);
-        code.mov(code.x14, 0);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::MI);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::VS);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, result);
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w16, 1);
-        code.eor(code.w15, lhs, code.w16);
-        code.eor(code.w15, code.w15, result);
-        code.lsr(code.w15, code.w15, 4);
-        code.and_(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits & ~std::uint64_t{1});
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+        NativeStatus::EmitIncrement32(code, lhs, result, inline_flag_layout);
     };
 
     // Guest-loop replacements installed by ExecutorInstallMonoLibcStringFastpath.  Fuse the

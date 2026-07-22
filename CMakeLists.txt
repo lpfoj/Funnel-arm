@@ -1190,6 +1190,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/json_text.cpp
     src/executor/dynamic_translation/machine_state.cpp
     src/executor/dynamic_translation/native_encoder.cpp
+    src/executor/dynamic_translation/native_status_emitter.cpp
     src/executor/dynamic_translation/native_compiler.cpp
     src/executor/dynamic_translation/operation_ir.cpp
     src/executor/dynamic_translation/region_plan.cpp
