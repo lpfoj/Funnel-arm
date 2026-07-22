@@ -3259,16 +3259,16 @@ static_assert(offsetof(JitExecutionCacheWay, needs_initial_inspection) == 0x24);
 static_assert(offsetof(JitExecutionCacheWay, valid) == 0x25);
 static_assert(sizeof(JitExecutionCacheWay) == 0x30);
 
-class LsxTranslationEngine;
+class RetiringTranslationRuntime;
 
 struct alignas(64) JitThreadExecutionCache {
-    const LsxTranslationEngine* backend = nullptr;
+    const RetiringTranslationRuntime* backend = nullptr;
     std::uint32_t sampling_state = 1;
     std::uint32_t placement_cursor = 0;
     std::array<JitExecutionCacheWay, kJitExecutionNearBankCount> near_bank{};
     std::array<JitExecutionCacheWay, kJitExecutionAlternateBankCount> alternate_bank{};
 
-    void Reset(const LsxTranslationEngine* const owner) {
+    void Reset(const RetiringTranslationRuntime* const owner) {
         backend = owner;
         sampling_state = static_cast<std::uint32_t>(
             reinterpret_cast<std::uintptr_t>(owner)) | 1u;
@@ -3284,7 +3284,7 @@ thread_local JitThreadExecutionCache g_jit_thread_execution_cache{};
 
 struct alignas(16) OutboundEdgeState {
     explicit OutboundEdgeState(const std::uint64_t rip,
-                            LsxTranslationEngine* edge_owner = nullptr)
+                            RetiringTranslationRuntime* edge_owner = nullptr)
         : guest_rip(rip), owner(edge_owner) {}
 
     // Keep target first: emitted consumers perform one AArch64 LDAR directly
@@ -3296,7 +3296,7 @@ struct alignas(16) OutboundEdgeState {
     // Immutable IR owns the exact byte snapshot used to compile the destination. Publication of
     // target release-orders this pointer, allowing validation to compare bytes without hashing.
     std::atomic<const PublishedCodeWitness*> code_witness{nullptr};
-    LsxTranslationEngine* const owner = nullptr;
+    RetiringTranslationRuntime* const owner = nullptr;
     bool enters_resident_frame = false;
     std::atomic<std::uint8_t> inspection_pending{1};
 };
@@ -3342,7 +3342,7 @@ struct alignas(64) IndirectEdgeFanout {
     static constexpr std::uint32_t kJumpWayCount = 8;
     static constexpr std::uint32_t kReturnWayCount = 16;
 
-    IndirectEdgeFanout(LsxTranslationEngine* backend, const std::uint64_t rip,
+    IndirectEdgeFanout(RetiringTranslationRuntime* backend, const std::uint64_t rip,
                      const bool return_site = false)
         : owner(backend), source_rip(rip),
           way_count(return_site ? kReturnWayCount : kJumpWayCount) {}
@@ -3354,7 +3354,7 @@ struct alignas(64) IndirectEdgeFanout {
         }
     }
 
-    LsxTranslationEngine* const owner = nullptr;
+    RetiringTranslationRuntime* const owner = nullptr;
     const std::uint64_t source_rip = 0;
     const std::uint32_t way_count = kJumpWayCount;
     std::array<std::atomic<OutboundEdgeState*>, kReturnWayCount> ways{};
@@ -4011,9 +4011,9 @@ private:
     std::vector<std::unique_ptr<CheckedNativeBlockContext>> checked_native_contexts_;
 };
 
-class LsxTranslationEngine final {
+class RetiringTranslationRuntime final {
 public:
-    LsxTranslationEngine() {
+    RetiringTranslationRuntime() {
         // AAA executables currently discover roughly 330k unique blocks before gameplay.
         // Pre-sizing above that production class removes repeated synchronous rehash walks from
         // the cache-miss/compile critical section. This reserves only bucket arrays; nodes and IR
@@ -4027,7 +4027,7 @@ public:
         retired_decoded_blocks_.reserve(64);
     }
 
-    ~LsxTranslationEngine() {
+    ~RetiringTranslationRuntime() {
         if (g_jit_thread_execution_cache.backend == this) {
             g_jit_thread_execution_cache.Reset(nullptr);
         }
@@ -5891,7 +5891,7 @@ private:
 #endif
 };
 
-LsxTranslationEngine g_lsx_translation_engine{};
+RetiringTranslationRuntime g_translation_runtime{};
 thread_local LsxStackReservoir g_lsx_stack_reservoir{};
 constexpr std::uintptr_t kGuestMachineBindingSalt =
     static_cast<std::uintptr_t>(0x6c73'7834'a55a'19e3ull);
@@ -18967,7 +18967,7 @@ extern "C" void executor_jit_record_current_thread_state(const char* reason) {
 void ConfigureTranslationStore(const std::string& root_dir, const std::string& title_id,
                                    const std::uint64_t executable_fingerprint,
                                    const bool enabled) {
-    g_lsx_translation_engine.ConfigurePersistentCache(root_dir, title_id,
+    g_translation_runtime.ConfigurePersistentCache(root_dir, title_id,
                                                    executable_fingerprint, enabled);
     // Configuration publishes paths and identity consumed by later execution. Retaining a compiler
     // publication boundary here also keeps this API as an owning call rather than a tail alias.
@@ -18975,7 +18975,7 @@ void ConfigureTranslationStore(const std::string& root_dir, const std::string& t
 }
 
 std::uint64_t DispatchGuestOnArm64(const std::uint64_t guest_rip, const LsxEntryPacket& ctx) {
-    return g_lsx_translation_engine.RunGuest(guest_rip, ctx);
+    return g_translation_runtime.RunGuest(guest_rip, ctx);
 }
 
 std::uint64_t ReadGuestGpr64(const LsxMachineImage& state, const LsxGpr reg) {
@@ -31269,7 +31269,7 @@ std::string DescribeTranslationEngineJson() {
     document["compiled"] = status.compiled;
     document["executable"] = status.executable;
     document["reason"] = status.reason;
-    document["engine"] = g_lsx_translation_engine.Name();
+    document["engine"] = g_translation_runtime.Name();
     document["runtimeBlocks"] = {
         {"decoded", relaxed(g_jit_blocks_decoded)},
         {"native", relaxed(g_jit_blocks_native)},
@@ -33000,7 +33000,7 @@ std::string ExerciseTranslationEngineJson() {
         // changing the guest bytes must retire the old entry, clear any
         // separately published direct target, preserve the slot address, and
         // execute the new instruction stream.
-        LsxTranslationEngine smc_backend;
+        RetiringTranslationRuntime smc_backend;
         const std::uint64_t smc_rip =
             reinterpret_cast<std::uint64_t>(mapped_entry.data());
         const std::uint64_t mismatch_before =
@@ -33384,7 +33384,7 @@ std::string ExerciseTranslationEngineJson() {
             // A cold way installs the target's stable OutboundEdgeState before falling back. Once
             // normal publication fills that slot, the same emitted block must chain without a
             // second binder call.
-            LsxTranslationEngine pic_backend;
+            RetiringTranslationRuntime pic_backend;
             IndirectEdgeFanout cold_site(&pic_backend, pic_jmp_block.start_rip);
             Arm64BlockEntry cold_jmp_direct = nullptr;
             bool cold_jmp_used = false;
@@ -33473,7 +33473,7 @@ std::string ExerciseTranslationEngineJson() {
             constexpr std::array<std::uint8_t, 16> kRetNineSequence = {
                 0, 3, 0, 7, 0, 2, 0, 8, 0, 5, 0, 1, 0, 6, 0, 4,
             };
-            LsxTranslationEngine ret_nine_backend;
+            RetiringTranslationRuntime ret_nine_backend;
             std::array<std::uint64_t, kRetNineTargetCount> ret_nine_guest_targets{};
             std::array<std::uint64_t, kRetNineTargetCount> ret_nine_markers{};
             for (std::size_t index = 0; index < kRetNineTargetCount; ++index) {
@@ -33768,7 +33768,7 @@ std::string ExerciseTranslationEngineJson() {
         const std::uint64_t direct_backward_multi_jmp_consumer_rip =
             reinterpret_cast<std::uint64_t>(
                 outbound_edge_code.data() + kDirectBackwardMultiJmpConsumerOffset);
-        LsxTranslationEngine direct_backend;
+        RetiringTranslationRuntime direct_backend;
         OutboundEdgeState* direct_edge_precompile =
             direct_backend.CreateOutboundEdge(direct_target_rip);
         const Arm64BlockEntry direct_precompile_entry =
@@ -34066,7 +34066,7 @@ std::string ExerciseTranslationEngineJson() {
         const std::uint64_t direct_fault_target_rip =
             reinterpret_cast<std::uint64_t>(direct_fault_code.data() +
                                             kDirectFaultTargetOffset);
-        LsxTranslationEngine direct_fault_backend;
+        RetiringTranslationRuntime direct_fault_backend;
         OutboundEdgeState* const direct_fault_slot =
             direct_fault_backend.CreateOutboundEdge(direct_fault_target_rip);
         const TranslationRecord direct_fault_consumer_lookup =
@@ -41013,7 +41013,7 @@ extern "C" bool ExecutorProbeTranslationMetadata(
     }
     *out = {};
     try {
-        *out = g_lsx_translation_engine.ResolveTranslation(guest_rip);
+        *out = g_translation_runtime.ResolveTranslation(guest_rip);
         return true;
     } catch (...) {
         *out = {};
@@ -41030,7 +41030,7 @@ ExecutorProbeNativeOwnership(const std::uint64_t host_pc, std::uint64_t* range_b
     *range_base = 0;
     *range_size = 0;
     try {
-        return g_lsx_translation_engine.FindGeneratedHostRange(
+        return g_translation_runtime.FindGeneratedHostRange(
             host_pc, range_base, range_size);
     } catch (...) {
         *range_base = 0;
