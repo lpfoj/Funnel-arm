@@ -10757,46 +10757,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     const auto emit_inline_sub64_flags = [&]
         (Xbyak_aarch64::CodeGenerator& code, const XReg& lhs, const XReg& rhs,
          const XReg& result) {
-        code.subs(result, lhs, rhs);
-        code.cset(code.x14, Xbyak_aarch64::CS);
-        code.mov(code.x15, 1);
-        code.eor(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::EQ);
-        code.lsl(code.x15, code.x15, kZfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::MI);
-        code.lsl(code.x15, code.x15, kSfBit);
-        code.orr(code.x14, code.x14, code.x15);
-        code.cset(code.x15, Xbyak_aarch64::VS);
-        code.lsl(code.x15, code.x15, kOfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.mov(code.w15, WReg(result.getIdx()));
-        code.lsr(code.w16, code.w15, 4);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 2);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsr(code.w16, code.w15, 1);
-        code.eor(code.w15, code.w15, code.w16);
-        code.mov(code.w16, 1);
-        code.and_(code.w15, code.w15, code.w16);
-        code.eor(code.w15, code.w15, code.w16);
-        code.lsl(code.x15, code.x15, kPfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.eor(code.x15, lhs, rhs);
-        code.eor(code.x15, code.x15, result);
-        code.lsr(code.x15, code.x15, 4);
-        code.mov(code.x16, 1);
-        code.and_(code.x15, code.x15, code.x16);
-        code.lsl(code.x15, code.x15, kAfBit);
-        code.orr(code.x14, code.x14, code.x15);
-
-        code.ldr(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
-        code.mov(code.x16, kArithmeticStatusBits);
-        code.bic(code.x15, code.x15, code.x16);
-        code.orr(code.x15, code.x15, code.x14);
-        code.str(code.x15, Xbyak_aarch64::ptr(code.x0, kStateRflagsOffset));
+        NativeStatus::EmitSubtract64(code, lhs, rhs, result, inline_flag_layout);
     };
 
     static constexpr std::array<std::uint8_t, 33> kR13RecordAdvanceJbPattern = {

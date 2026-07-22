@@ -137,6 +137,17 @@ void EmitAdd64(Xbyak_aarch64::CodeGenerator& code, const XReg& left,
     PublishStatus(code, layout, layout.arithmetic_mask);
 }
 
+void EmitSubtract64(Xbyak_aarch64::CodeGenerator& code, const XReg& left,
+                    const XReg& right, const XReg& result,
+                    const X86FlagLayout& layout) {
+    code.subs(result, left, right);
+    code.cset(code.x14, Xbyak_aarch64::CC);
+    AppendNzv(code, layout);
+    AppendParity(code, WReg(result.getIdx()), layout);
+    AppendAdjust64(code, left, right, result, layout);
+    PublishStatus(code, layout, layout.arithmetic_mask);
+}
+
 void EmitSubtract32(Xbyak_aarch64::CodeGenerator& code, const WReg& left,
                     const WReg& right, const WReg& result,
                     const X86FlagLayout& layout) {

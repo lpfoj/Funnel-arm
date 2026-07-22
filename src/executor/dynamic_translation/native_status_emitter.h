@@ -28,6 +28,9 @@ void EmitTest64(Xbyak_aarch64::CodeGenerator& code, const XReg& value,
 void EmitAdd64(Xbyak_aarch64::CodeGenerator& code, const XReg& left,
                const XReg& right, const XReg& result,
                const X86FlagLayout& layout);
+void EmitSubtract64(Xbyak_aarch64::CodeGenerator& code, const XReg& left,
+                    const XReg& right, const XReg& result,
+                    const X86FlagLayout& layout);
 void EmitSubtract32(Xbyak_aarch64::CodeGenerator& code, const WReg& left,
                     const WReg& right, const WReg& result,
                     const X86FlagLayout& layout);
