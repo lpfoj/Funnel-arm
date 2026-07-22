@@ -1171,6 +1171,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/native_runtime_api.cpp
     src/executor/dynamic_translation/code_memory.cpp
     src/executor/dynamic_translation/decode_frontend.cpp
+    src/executor/dynamic_translation/edge_portal.cpp
     src/executor/dynamic_translation/machine_state.cpp
     src/executor/dynamic_translation/region_plan.cpp
     src/executor/jit/lsx_translation_engine.cpp
