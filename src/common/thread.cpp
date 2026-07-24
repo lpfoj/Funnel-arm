@@ -41,10 +41,8 @@ namespace Common {
 #ifdef __APPLE__
 
 void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
-    // CPU time to grant.
     const std::chrono::nanoseconds computation_ns = period_ns / 2;
 
-    // Determine the timebase for converting time to ticks.
     struct mach_timebase_info timebase{};
     mach_timebase_info(&timebase);
     const auto ticks_per_ns =
@@ -58,7 +56,6 @@ void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
     thread_time_constraint_policy policy = {
         .period = period_ticks,
         .computation = computation_ticks,
-        // Should not matter since preemptible is false, but needs to be >= computation regardless.
         .constraint = computation_ticks,
         .preemptible = false,
     };
@@ -75,7 +72,6 @@ void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
 #else
 
 void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
-    // Not implemented
 }
 
 #endif
@@ -170,9 +166,8 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 
 #endif
 
-#ifdef _WIN32
+#ifdef _MSC_VER
 
-// Sets the debugger-visible name of the current thread.
 void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
@@ -184,9 +179,8 @@ void SetThreadName(void* thread, const char* name) {
     SetThreadDescription(thread, UTF8ToUTF16W(name).data());
 }
 
-#else // !_WIN32, so must be POSIX threads
+#else
 
-// MinGW with the POSIX threading model does not support pthread_setname_np
 #if !defined(_WIN32) || defined(_MSC_VER)
 void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
@@ -199,8 +193,6 @@ void SetCurrentThreadName(const char* name) {
 #elif defined(__NetBSD__)
     pthread_setname_np(pthread_self(), "%s", (void*)name);
 #elif defined(__linux__)
-    // Linux limits thread names to 15 characters and will outright reject any
-    // attempt to set a longer name with ERANGE.
     std::string truncated(name, std::min(strlen(name), static_cast<std::size_t>(15)));
     if (int e = pthread_setname_np(pthread_self(), truncated.c_str())) {
         errno = e;
@@ -212,20 +204,17 @@ void SetCurrentThreadName(const char* name) {
 }
 
 void SetThreadName(void* thread, const char* name) {
-    // TODO
 }
 #endif
 
 #if defined(_WIN32)
-void SetCurrentThreadName(const char* name) {
+void SetCurrentThreadName(const char*) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
-    // Do Nothing on MinGW
 }
 
 void SetThreadName(void* thread, const char* name) {
-    // Do Nothing on MinGW
 }
 #endif
 
@@ -267,4 +256,4 @@ std::string GetCurrentThreadName() {
 #endif
 }
 
-} // namespace Common
+}

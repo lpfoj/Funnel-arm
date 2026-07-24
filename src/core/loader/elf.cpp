@@ -222,7 +222,7 @@ void Elf::Open(const std::filesystem::path& file_name) {
         header_size += m_elf_header.e_phnum * m_elf_header.e_phentsize;
         header_size += m_elf_header.e_shnum * m_elf_header.e_shentsize;
         header_size += 15;
-        header_size &= ~15; // Align
+        header_size &= ~15;
 
         if (m_elf_header.e_ehsize - header_size >= sizeof(elf_program_id_header)) {
             m_f.Seek(header_size, SeekOrigin::SetOrigin);
@@ -317,7 +317,7 @@ bool Elf::IsElfFile() const {
 
     if (m_elf_header.e_shentsize > 0 &&
         m_elf_header.e_shentsize !=
-            sizeof(elf_section_header)) // Commercial games doesn't appear to have section headers
+            sizeof(elf_section_header))
     {
         LOG_INFO(Loader, "e_shentsize ({}) != sizeof(elf_section_header)",
                  m_elf_header.e_shentsize);
@@ -467,7 +467,6 @@ std::string Elf::ElfPHeaderStr(u16 no) {
 
 void Elf::LoadSegment(u64 virtual_addr, u64 file_offset, u64 size) {
     if (!is_self) {
-        // It's elf file
         if (!m_f.Seek(file_offset, SeekOrigin::SetOrigin)) {
             LOG_CRITICAL(Loader, "Failed to seek to ELF header");
             return;
@@ -531,4 +530,4 @@ void Elf::PHeaderDebugDump(const std::filesystem::path& file_name) {
     }
 }
 
-} // namespace Core::Loader
+}

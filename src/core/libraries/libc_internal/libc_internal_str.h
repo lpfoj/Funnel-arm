@@ -11,4 +11,4 @@ class SymbolsResolver;
 
 namespace Libraries::LibcInternal {
 void RegisterlibSceLibcInternalStr(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::LibcInternal
+}

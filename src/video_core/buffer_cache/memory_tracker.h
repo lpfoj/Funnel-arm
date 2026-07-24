@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -11,7 +11,6 @@
 
 #include "common/debug.h"
 #include "common/types.h"
-#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
 
 namespace VideoCore {
@@ -26,7 +25,6 @@ public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
-    /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<true>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
@@ -35,7 +33,6 @@ public:
             });
     }
 
-    /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
@@ -44,7 +41,6 @@ public:
             });
     }
 
-    /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
@@ -54,7 +50,6 @@ public:
                             });
     }
 
-    /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
@@ -64,17 +59,21 @@ public:
                             });
     }
 
-    /// Removes all protection from a page and ensures GPU data has been flushed if requested
+    void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::GPU, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         IteratePages<false>(
             cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {
                 const bool should_flush = [&] {
-                    // Perform both the GPU modification check and CPU state change with the lock
-                    // in case we are racing with GPU thread trying to mark the page as GPU
-                    // modified. If we need to flush the flush function is going to perform CPU
-                    // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                    if (Config::getReadbacksMode() != Config::GpuReadbacksMode::Disabled &&
                         manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
                     }
@@ -88,7 +87,6 @@ public:
             });
     }
 
-    /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
         IteratePages<true>(query_cpu_range, query_size,
@@ -112,7 +110,6 @@ public:
                             });
     }
 
-    /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
     template <bool clear>
     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, auto&& func) {
         IteratePages<false>(query_cpu_range, query_size,
@@ -124,13 +121,6 @@ public:
     }
 
 private:
-    /**
-     * @brief IteratePages Iterates L2 word manager page table.
-     * @param cpu_address Start byte cpu address
-     * @param size Size in bytes of the region of iterate.
-     * @param func Callback for each word manager.
-     * @return
-     */
     template <bool create_region_on_fail, typename Func>
     bool IteratePages(VAddr cpu_address, size_t size, Func&& func) {
         RENDERER_TRACE;
@@ -179,7 +169,6 @@ private:
                 free_managers.push_back(&last_pool[i]);
             }
         }
-        // Each manager tracks a 4_MB virtual address space.
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
@@ -192,4 +181,4 @@ private:
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
 };
 
-} // namespace VideoCore
+}

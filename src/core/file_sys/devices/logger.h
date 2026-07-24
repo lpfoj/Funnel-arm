@@ -34,4 +34,4 @@ private:
     void log_flush();
 };
 
-} // namespace Core::Devices
+}

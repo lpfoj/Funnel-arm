@@ -19,7 +19,6 @@ layout(push_constant) uniform image_info {
     uint sizes[16];
 } info;
 
-// Inverse morton LUT, small enough to fit into K$
 const uint rmort[16] = {
     0x11011000, 0x31213020,
     0x13031202, 0x33233222,
@@ -36,7 +35,7 @@ const uint rmort[16] = {
 #define TEXELS_PER_ELEMENT  (1)
 
 void main() {
-    uint tile_base = gl_GlobalInvocationID.x - gl_LocalInvocationID.x; // WG*16
+    uint tile_base = gl_GlobalInvocationID.x - gl_LocalInvocationID.x;
     uint p0 = in_data[gl_GlobalInvocationID.x];
     uint bit_ofs = 8 * (gl_LocalInvocationID.x % 4);
     uint packed_pos = rmort[gl_LocalInvocationID.x >> 2] >> bit_ofs;

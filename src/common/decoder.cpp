@@ -7,42 +7,42 @@
 namespace Common {
 
 DecoderImpl::DecoderImpl() {
-    ZydisDecoderInit(&m_decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-    ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+    X86DecoderInit(&m_decoder, X86_MACHINE_MODE_LONG_64, X86_STACK_WIDTH_64);
+    X86FormatterInit(&m_formatter, X86_FORMATTER_STYLE_INTEL);
 }
 
 DecoderImpl::~DecoderImpl() = default;
 
-std::string DecoderImpl::disassembleInst(ZydisDecodedInstruction& inst,
-                                         ZydisDecodedOperand* operands, u64 address) {
+std::string DecoderImpl::disassembleInst(X86DecodedInstruction& inst,
+                                         X86DecodedOperand* operands, u64 address) {
     const int bufLen = 256;
     char szBuffer[bufLen];
-    ZydisFormatterFormatInstruction(&m_formatter, &inst, operands, inst.operand_count_visible,
-                                    szBuffer, sizeof(szBuffer), address, ZYAN_NULL);
+    X86FormatterFormatInstruction(&m_formatter, &inst, operands, inst.operand_count_visible,
+                                    szBuffer, sizeof(szBuffer), address, nullptr);
     return szBuffer;
 }
 
 void DecoderImpl::printInstruction(void* code, u64 address) {
-    ZydisDecodedInstruction instruction;
-    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE];
-    ZyanStatus status =
-        ZydisDecoderDecodeFull(&m_decoder, code, sizeof(code), &instruction, operands);
-    if (!ZYAN_SUCCESS(status)) {
+    X86DecodedInstruction instruction;
+    X86DecodedOperand operands[X86_MAX_OPERAND_COUNT_VISIBLE];
+    X86DecodeStatus status = X86DecoderDecodeFull(
+        &m_decoder, code, X86_MAX_INSTRUCTION_LENGTH, &instruction, operands);
+    if (!X86_SUCCESS(status)) {
         fmt::print("decode instruction failed at {}\n", fmt::ptr(code));
     } else {
         printInst(instruction, operands, address);
     }
 }
 
-void DecoderImpl::printInst(ZydisDecodedInstruction& inst, ZydisDecodedOperand* operands,
+void DecoderImpl::printInst(X86DecodedInstruction& inst, X86DecodedOperand* operands,
                             u64 address) {
     std::string s = disassembleInst(inst, operands, address);
     fmt::print("instruction: {}\n", s);
 }
 
-ZyanStatus DecoderImpl::decodeInstruction(ZydisDecodedInstruction& inst,
-                                          ZydisDecodedOperand* operands, void* data, u64 size) {
-    return ZydisDecoderDecodeFull(&m_decoder, data, size, &inst, operands);
+X86DecodeStatus DecoderImpl::decodeInstruction(X86DecodedInstruction& inst,
+                                          X86DecodedOperand* operands, void* data, u64 size) {
+    return X86DecoderDecodeFull(&m_decoder, data, size, &inst, operands);
 }
 
-} // namespace Common
+}

@@ -42,7 +42,7 @@ constexpr ScopeGuard<F> operator+(ScopeGuardOnExit, F&& f) {
     return ScopeGuard<F>(std::forward<F>(f));
 }
 
-} // namespace detail
+}
 
 #define CONCATENATE_IMPL(s1, s2) s1##s2
 #define CONCATENATE(s1, s2) CONCATENATE_IMPL(s1, s2)
@@ -53,27 +53,6 @@ constexpr ScopeGuard<F> operator+(ScopeGuardOnExit, F&& f) {
 #define ANONYMOUS_VARIABLE(pref) CONCATENATE(pref, __LINE__)
 #endif
 
-/**
- * This macro is similar to SCOPE_EXIT, except the object is caller managed. This is intended to be
- * used when the caller might want to cancel the ScopeExit.
- */
 #define SCOPE_GUARD detail::ScopeGuardOnExit() + [&]()
 
-/**
- * This macro allows you to conveniently specify a block of code that will run on scope exit. Handy
- * for doing ad-hoc clean-up tasks in a function with multiple returns.
- *
- * Example usage:
- * \code
- * const int saved_val = g_foo;
- * g_foo = 55;
- * SCOPE_EXIT{ g_foo = saved_val; };
- *
- * if (Bar()) {
- *     return 0;
- * } else {
- *     return 20;
- * }
- * \endcode
- */
 #define SCOPE_EXIT auto ANONYMOUS_VARIABLE(SCOPE_EXIT_STATE_) = SCOPE_GUARD

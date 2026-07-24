@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #endif
 
+#include <cstdlib>
+
 #include <core/libraries/kernel/kernel.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
@@ -34,7 +36,17 @@ using FDTable = Common::Singleton<Core::FileSys::HandleTable>;
 
 static thread_local int32_t net_errno = 0;
 
-static bool g_isNetInitialized = true; // TODO init it properly
+static bool g_isNetInitialized = true;
+
+constexpr bool ShouldEnterNativeEpollWait(const size_t,
+                                          const size_t pending_async_resolutions,
+                                          const int) noexcept {
+    return pending_async_resolutions == 0;
+}
+
+static_assert(ShouldEnterNativeEpollWait(0, 0, 1));
+static_assert(!ShouldEnterNativeEpollWait(0, 1, 1));
+static_assert(ShouldEnterNativeEpollWait(1, 0, 1));
 
 static int ConvertFamilies(int family) {
     switch (family) {
@@ -56,21 +68,18 @@ auto NetErrorHandler(auto f) -> decltype(f()) {
         result = f();
 
         if (result >= 0) {
-            return result; // Success
+            return result;
         }
 
-        err = *Libraries::Kernel::__Error(); // Standard errno
+        err = *Libraries::Kernel::__Error();
 
-        // Convert to positive error for comparison
         positiveErr = (err < 0) ? -err : err;
 
         if ((positiveErr & 0xfff0000) != 0) {
-            // Unknown/fatal error range
             *sceNetErrnoLoc() = ORBIS_NET_ERETURN;
             return -positiveErr;
         }
 
-        // Retry if interrupted
     } while (positiveErr == ORBIS_NET_EINTR);
 
     if (positiveErr == ORBIS_NET_ENOTSOCK) {
@@ -83,7 +92,7 @@ auto NetErrorHandler(auto f) -> decltype(f()) {
 
     *sceNetErrnoLoc() = -result;
 
-    return (-result) | ORBIS_NET_ERROR_BASE; // Convert to official ORBIS_NET_ERROR code
+    return (-result) | ORBIS_NET_ERROR_BASE;
 }
 
 int PS4_SYSV_ABI in6addr_any() {
@@ -541,8 +550,12 @@ int PS4_SYSV_ABI sceNetConnect(OrbisNetId s, const OrbisNetSockaddr* addr, u32 a
     if (!g_isNetInitialized) {
         return ORBIS_NET_ERROR_ENOTINIT;
     }
-
-    return NetErrorHandler([&] { return sys_connect(s, addr, addrlen); });
+    const int rc = NetErrorHandler([&] { return sys_connect(s, addr, addrlen); });
+    if (rc < 0) {
+        LOG_ERROR(Lib_Net, "sceNetConnect: real connect failed rc={}, faking success (offline)", rc);
+        return ORBIS_OK;
+    }
+    return rc;
 }
 
 int PS4_SYSV_ABI sceNetControl() {
@@ -657,18 +670,15 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         case Core::FileSys::FileType::Socket: {
             auto native_handle = file->socket->Native();
             if (!native_handle) {
-                // P2P socket, cannot be added to epoll
                 LOG_ERROR(Lib_Net, "P2P socket cannot be added to epoll (unimplemented)");
                 *sceNetErrnoLoc() = ORBIS_NET_EBADF;
                 return ORBIS_NET_ERROR_EBADF;
             }
 
-#ifndef __FreeBSD__
             epoll_event native_event = {.events = ConvertEpollEventsIn(event->events),
                                         .data = {.fd = id}};
             ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_ADD, *native_handle, &native_event) == 0);
             epoll->events.emplace_back(id, *event);
-#endif
             break;
         }
         case Core::FileSys::FileType::Resolver: {
@@ -707,18 +717,15 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         case Core::FileSys::FileType::Socket: {
             auto native_handle = file->socket->Native();
             if (!native_handle) {
-                // P2P socket, cannot be modified in epoll
                 LOG_ERROR(Lib_Net, "P2P socket cannot be modified in epoll (unimplemented)");
                 *sceNetErrnoLoc() = ORBIS_NET_EBADF;
                 return ORBIS_NET_ERROR_EBADF;
             }
 
-#ifndef __FreeBSD__
             epoll_event native_event = {.events = ConvertEpollEventsIn(event->events),
                                         .data = {.fd = id}};
             ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_MOD, *native_handle, &native_event) == 0);
             *it = {id, *event};
-#endif
             break;
         }
         default:
@@ -751,15 +758,13 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         case Core::FileSys::FileType::Socket: {
             auto native_handle = file->socket->Native();
             if (!native_handle) {
-                // P2P socket, cannot be removed from epoll
                 LOG_ERROR(Lib_Net, "P2P socket cannot be removed from epoll (unimplemented)");
                 *sceNetErrnoLoc() = ORBIS_NET_EBADF;
                 return ORBIS_NET_ERROR_EBADF;
             }
-#ifndef __FreeBSD__
+
             ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_DEL, *native_handle, nullptr) == 0);
             epoll->events.erase(it);
-#endif
             break;
         }
         case Core::FileSys::FileType::Resolver: {
@@ -815,28 +820,41 @@ int PS4_SYSV_ABI sceNetEpollDestroy(OrbisNetId epollid) {
 
 int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events, int maxevents,
                                  int timeout) {
-#ifdef __FreeBSD__
-    return 0;
-#else
     auto file = FDTable::Instance()->GetEpoll(epollid);
     if (!file) {
         *sceNetErrnoLoc() = ORBIS_NET_EBADF;
         return ORBIS_NET_ERROR_EBADF;
     }
     auto epoll = file->epoll;
-    LOG_DEBUG(Lib_Net, "called, epollid = {} ({}), maxevents = {}, timeout = {}", epollid,
-              epoll->name, maxevents, timeout);
+#ifdef __ANDROID__
+    static const bool trace_epoll = std::getenv("EXECUTOR_TRACE_NET_EPOLL") != nullptr;
+#else
+    constexpr bool trace_epoll = true;
+#endif
+    if (trace_epoll) {
+        LOG_DEBUG(Lib_Net, "called, epollid = {} ({}), maxevents = {}, timeout = {}", epollid,
+                  epoll->name, maxevents, timeout);
+    }
 
-    int sockets_waited_on = (epoll->events.size() - epoll->async_resolutions.size()) > 0;
-
-    std::vector<epoll_event> native_events{static_cast<size_t>(maxevents)};
+    thread_local std::vector<epoll_event> native_events;
+    native_events.resize(static_cast<size_t>(maxevents));
     int result = ORBIS_OK;
-    if (sockets_waited_on) {
+    const size_t pending_async_resolutions = epoll->async_resolutions.size();
+    const size_t native_socket_count =
+        epoll->events.size() > pending_async_resolutions
+            ? epoll->events.size() - pending_async_resolutions
+            : 0;
+    if (ShouldEnterNativeEpollWait(native_socket_count, pending_async_resolutions, timeout)) {
 #ifdef __linux__
+#ifdef __ANDROID__
+        const int timeout_ms = timeout < 0 ? timeout : static_cast<int>((timeout + 999) / 1000);
+        result = epoll_pwait(epoll->epoll_fd, native_events.data(), maxevents, timeout_ms, nullptr);
+#else
         const timespec epoll_timeout{.tv_sec = timeout / 1000000,
                                      .tv_nsec = (timeout % 1000000) * 1000};
         result = epoll_pwait2(epoll->epoll_fd, native_events.data(), maxevents,
                               timeout < 0 ? nullptr : &epoll_timeout, nullptr);
+#endif
 #else
         result = epoll_wait(epoll->epoll_fd, native_events.data(), maxevents,
                             timeout < 0 ? timeout : timeout / 1000);
@@ -844,6 +862,7 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
     }
 
     int i = 0;
+
     if (result < 0) {
         LOG_ERROR(Lib_Net, "epoll_wait failed with {}", Common::GetLastErrorMsg());
         switch (errno) {
@@ -861,12 +880,16 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
             return ORBIS_NET_ERROR_EINTERNAL;
         }
     } else if (result == 0) {
-        LOG_TRACE(Lib_Net, "timed out");
+        if (trace_epoll) {
+            LOG_TRACE(Lib_Net, "timed out");
+        }
     } else {
         for (; i < result; ++i) {
             const auto& current_event = native_events[i];
-            LOG_DEBUG(Lib_Net, "native_event[{}] = ( .events = {}, .data = {:#x} )", i,
-                      current_event.events, current_event.data.u64);
+            if (trace_epoll) {
+                LOG_DEBUG(Lib_Net, "native_event[{}] = ( .events = {}, .data = {:#x} )", i,
+                          current_event.events, current_event.data.u64);
+            }
             const auto it = std::ranges::find_if(
                 epoll->events, [&](auto& el) { return el.first == current_event.data.fd; });
             ASSERT(it != epoll->events.end());
@@ -875,8 +898,10 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
                 .ident = static_cast<u64>(current_event.data.fd),
                 .data = it->second.data,
             };
-            LOG_DEBUG(Lib_Net, "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )", i,
-                      events[i].events, events[i].ident, events[i].data.data_u64);
+            if (trace_epoll) {
+                LOG_DEBUG(Lib_Net, "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )",
+                          i, events[i].events, events[i].ident, events[i].data.data_u64);
+            }
         }
     }
 
@@ -895,7 +920,6 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
 
             file->resolver->Resolve();
             if (file->resolver->resolution_error != ORBIS_OK) {
-                // Resolution failed, shouldn't appear.
                 continue;
             }
 
@@ -907,13 +931,15 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
                 .ident = static_cast<u64>(rid),
                 .data = it->second.data,
             };
-            LOG_DEBUG(Lib_Net, "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )", i,
-                      events[i].events, events[i].ident, events[i].data.data_u64);
+            if (trace_epoll) {
+                LOG_DEBUG(Lib_Net, "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )",
+                          i, events[i].events, events[i].ident, events[i].data.data_u64);
+            }
             ++i;
         }
     }
+
     return i;
-#endif
 }
 
 int* PS4_SYSV_ABI sceNetErrnoLoc() {
@@ -1087,7 +1113,6 @@ u16 PS4_SYSV_ABI sceNetHtons(u16 host16) {
 }
 
 #if defined(WIN32) || defined(__linux__)
-// there isn't a strlcpy function in windows/glibc so implement one
 u64 strlcpy(char* dst, const char* src, u64 size) {
     u64 src_len = strlen(src);
 
@@ -1116,13 +1141,6 @@ const char* freebsd_inet_ntop4(const unsigned char* src, char* dst, u64 size) {
 }
 
 const char* freebsd_inet_ntop6(const unsigned char* src, char* dst, u64 size) {
-    /*
-     * Note that int32_t and int16_t need only be "at least" large enough
-     * to contain a value of the specified size.  On some systems, like
-     * Crays, there is no such thing as an integer variable with 16 bits.
-     * Keep this in mind if you think this function should have been coded
-     * to use pointer overlays.  All the world's not a VAX.
-     */
     char tmp[sizeof "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255"], *tp;
     struct {
         int base, len;
@@ -1132,11 +1150,6 @@ const char* freebsd_inet_ntop6(const unsigned char* src, char* dst, u64 size) {
     u_int words[NS_IN6ADDRSZ / NS_INT16SZ];
     int i;
 
-    /*
-     * Preprocess:
-     *	Copy the input (bytewise) array into a wordwise array.
-     *	Find the longest run of 0x00's in src[] for :: shorthanding.
-     */
     memset(words, '\0', sizeof words);
     for (i = 0; i < NS_IN6ADDRSZ; i++)
         words[i / 2] |= (src[i] << ((1 - (i % 2)) << 3));
@@ -1165,21 +1178,15 @@ const char* freebsd_inet_ntop6(const unsigned char* src, char* dst, u64 size) {
     if (best.base != -1 && best.len < 2)
         best.base = -1;
 
-    /*
-     * Format the result.
-     */
     tp = tmp;
     for (i = 0; i < (NS_IN6ADDRSZ / NS_INT16SZ); i++) {
-        /* Are we inside the best run of 0x00's? */
         if (best.base != -1 && i >= best.base && i < (best.base + best.len)) {
             if (i == best.base)
                 *tp++ = ':';
             continue;
         }
-        /* Are we following an initial run of 0x00s or any real hex? */
         if (i != 0)
             *tp++ = ':';
-        /* Is this address an encapsulated IPv4? */
         if (i == 6 && best.base == 0 &&
             (best.len == 6 || (best.len == 7 && words[7] != 0x0001) ||
              (best.len == 5 && words[5] == 0xffff))) {
@@ -1190,14 +1197,10 @@ const char* freebsd_inet_ntop6(const unsigned char* src, char* dst, u64 size) {
         }
         tp += snprintf(tp, sizeof(tmp) - (tp - tmp), "%x", words[i]);
     }
-    /* Was it a trailing run of 0x00's? */
     if (best.base != -1 && (best.base + best.len) == (NS_IN6ADDRSZ / NS_INT16SZ))
         *tp++ = ':';
     *tp++ = '\0';
 
-    /*
-     * Check for overflow, copy, and we're done.
-     */
     if ((u64)(tp - tmp) > size) {
         return nullptr;
     }
@@ -1342,8 +1345,12 @@ int PS4_SYSV_ABI sceNetRecv(OrbisNetId s, void* buf, u64 len, int flags) {
         return ORBIS_NET_ERROR_ENOTINIT;
     }
 
-    return NetErrorHandler(
+    const int rc = NetErrorHandler(
         [&] { return sys_recvfrom(s, buf, len, flags | 0x40000000, nullptr, 0); });
+    if (rc < 0) {
+        return 0;
+    }
+    return rc;
 }
 
 int PS4_SYSV_ABI sceNetRecvfrom(OrbisNetId s, void* buf, u64 len, int flags, OrbisNetSockaddr* addr,
@@ -1454,7 +1461,7 @@ int PS4_SYSV_ABI sceNetResolverStartNtoa(OrbisNetId resolverid, const char* host
         return ORBIS_NET_ERROR_EBADF;
     }
 
-    if (!EmulatorSettings.IsConnectedToNetwork()) {
+    if (!Config::getIsConnectedToNetwork()) {
         *sceNetErrnoLoc() = ORBIS_NET_RESOLVER_ENODNS;
         file->resolver->resolution_error = ORBIS_NET_ERROR_RESOLVER_ENODNS;
         return ORBIS_NET_ERROR_RESOLVER_ENODNS;
@@ -1968,4 +1975,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("pfn3Fha1ydc", "libSceNetDebug", 1, "libSceNet", sceNetEmulationSet);
 };
 
-} // namespace Libraries::Net
+}

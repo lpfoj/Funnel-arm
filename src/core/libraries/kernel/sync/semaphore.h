@@ -132,6 +132,6 @@ private:
 };
 
 using BinarySemaphore = Semaphore<1>;
-using CountingSemaphore = Semaphore<0x7FFFFFFF /*ORBIS_KERNEL_SEM_VALUE_MAX*/>;
+using CountingSemaphore = Semaphore<0x7FFFFFFF>;
 
-} // namespace Libraries::Kernel
+}

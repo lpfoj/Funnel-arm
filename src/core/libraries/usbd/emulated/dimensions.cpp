@@ -43,8 +43,6 @@ u32 DimensionsToypad::LoadDimensionsFigure(const std::array<u8, 0x2D * 0x04>& bu
     figure.pad = pad;
     figure.index = index + 1;
     figure.data = buf;
-    // When a figure is added to the toypad, respond to the game with the pad they were added to,
-    // their index, the direction (0x00 in byte 6 for added) and their UID
     std::array<u8, 32> figureChangeResponse = {0x56,   0x0b,   figure.pad, 0x00,   figure.index,
                                                0x00,   buf[0], buf[1],     buf[2], buf[4],
                                                buf[5], buf[6], buf[7]};
@@ -61,8 +59,6 @@ void DimensionsToypad::RemoveFigure(u8 pad, u8 index, bool fullRemove) {
     if (figure.index == 255)
         return;
 
-    // When a figure is removed from the toypad, respond to the game with the pad they were removed
-    // from, their index, the direction (0x01 in byte 6 for removed) and their UID
     if (fullRemove) {
         std::array<u8, 32> figureChangeResponse = {
             0x56,           0x0b,           figure.pad,     0x00,           figure.index,
@@ -81,14 +77,10 @@ void DimensionsToypad::RemoveFigure(u8 pad, u8 index, bool fullRemove) {
 
 void DimensionsToypad::MoveFigure(u8 new_pad, u8 new_index, u8 old_pad, u8 old_index) {
     if (old_index == new_index) {
-        // Don't bother removing and loading again, just send response to the game
         CancelRemoveFigure(new_index);
         return;
     }
 
-    // When moving figures between spaces on the toypad, remove any figure from the space they are
-    // moving to, then remove them from their current space, then load them to the space they are
-    // moving to
     RemoveFigure(new_pad, new_index, true);
 
     DimensionsFigure& figure = GetFigureByIndex(old_index);
@@ -107,8 +99,6 @@ void DimensionsToypad::TempRemoveFigure(u8 index) {
     if (figure.index == 255)
         return;
 
-    // Send a response to the game that the figure has been "Picked up" from existing slot,
-    // until either the movement is cancelled, or user chooses a space to move to
     std::array<u8, 32> figureChangeResponse = {
         0x56,           0x0b,           figure.pad,     0x00,           figure.index,
         0x01,           figure.data[0], figure.data[1], figure.data[2], figure.data[4],
@@ -125,7 +115,6 @@ void DimensionsToypad::CancelRemoveFigure(u8 index) {
     if (figure.index == 255)
         return;
 
-    // Cancel the previous movement of the figure
     std::array<u8, 32> figureChangeResponse = {
         0x56,           0x0b,           figure.pad,     0x00,           figure.index,
         0x00,           figure.data[0], figure.data[1], figure.data[2], figure.data[4],
@@ -153,22 +142,14 @@ void DimensionsToypad::GetBlankResponse(u8 type, u8 sequence, std::array<u8, 32>
 
 void DimensionsToypad::GenerateRandomNumber(const u8* buf, u8 sequence,
                                             std::array<u8, 32>& reply_buf) {
-    // Decrypt payload into an 8 byte array
     const std::array<u8, 8> value = Decrypt(buf, std::nullopt);
-    // Seed is the first 4 bytes (little endian) of the decrypted payload
     const u32 seed = (u32&)value[0];
-    // Confirmation is the second 4 bytes (big endian) of the decrypted payload
-    // const u32 conf = (u32be&)value[4];
-    // Initialize rng using the seed from decrypted payload
     InitializeRNG(seed);
-    // Encrypt 8 bytes, first 4 bytes is the decrypted confirmation from payload, 2nd 4 bytes are
-    // blank
     std::array<u8, 8> value_to_encrypt = {value[4], value[5], value[6], value[7], 0, 0, 0, 0};
     const std::array<u8, 8> encrypted = Encrypt(value_to_encrypt.data(), std::nullopt);
     reply_buf[0] = 0x55;
     reply_buf[1] = 0x09;
     reply_buf[2] = sequence;
-    // Copy encrypted value to response data
     std::memcpy(&reply_buf[3], encrypted.data(), encrypted.size());
     reply_buf[11] = GenerateChecksum(reply_buf, 11);
 }
@@ -194,11 +175,9 @@ u32 DimensionsToypad::GetNext() {
 }
 
 std::array<u8, 8> DimensionsToypad::Decrypt(const u8* buf, std::optional<std::array<u8, 16>> key) {
-    // Value to decrypt is separated in to two little endian 32 bit unsigned integers
     u32 data_one = u32(buf[0]) | (u32(buf[1]) << 8) | (u32(buf[2]) << 16) | (u32(buf[3]) << 24);
     u32 data_two = u32(buf[4]) | (u32(buf[5]) << 8) | (u32(buf[6]) << 16) | (u32(buf[7]) << 24);
 
-    // Use the key as 4 32 bit little endian unsigned integers
     u32 key_one;
     u32 key_two;
     u32 key_three;
@@ -244,11 +223,9 @@ std::array<u8, 8> DimensionsToypad::Decrypt(const u8* buf, std::optional<std::ar
 }
 
 std::array<u8, 8> DimensionsToypad::Encrypt(const u8* buf, std::optional<std::array<u8, 16>> key) {
-    // Value to encrypt is separated in to two little endian 32 bit unsigned integers
     u32 data_one = u32(buf[0]) | (u32(buf[1]) << 8) | (u32(buf[2]) << 16) | (u32(buf[3]) << 24);
     u32 data_two = u32(buf[4]) | (u32(buf[5]) << 8) | (u32(buf[6]) << 16) | (u32(buf[7]) << 24);
 
-    // Use the key as 4 32 bit little endian unsigned integers
     u32 key_one;
     u32 key_two;
     u32 key_three;
@@ -354,11 +331,9 @@ u32 DimensionsToypad::GetFigureId(const std::array<u8, 0x2D * 0x04>& buf) {
 
     const u32 fig_num = u32(decrypted[0]) | (u32(decrypted[1]) << 8) | (u32(decrypted[2]) << 16) |
                         (u32(decrypted[3]) << 24);
-    // Characters have their model number encrypted in page 36
     if (fig_num < 1000) {
         return fig_num;
     }
-    // Vehicles/Gadgets have their model number written as little endian in page 36
     return u32(buf[36 * 4]) | (u32(buf[(36 * 4) + 1]) << 8) | (u32(buf[(36 * 4) + 2]) << 16) |
            (u32(buf[(36 * 4) + 3]) << 24);
 }
@@ -379,14 +354,8 @@ void DimensionsToypad::RandomUID(u8* uid_buffer) {
 
 void DimensionsToypad::GetChallengeResponse(const u8* buf, u8 sequence,
                                             std::array<u8, 32>& reply_buf) {
-    // Decrypt payload into an 8 byte array
     const std::array<u8, 8> value = Decrypt(buf, std::nullopt);
-    // Confirmation is the first 4 bytes of the decrypted payload
-    // const u32 conf = read_from_ptr<be_t<u32>>(value);
-    // Generate next random number based on RNG
     const u32 next_random = GetNext();
-    // Encrypt an 8 byte array, first 4 bytes are the next random number (little endian)
-    // followed by the confirmation from the decrypted payload
     std::array<u8, 8> value_to_encrypt = {u8(next_random & 0xFF),
                                           u8((next_random >> 8) & 0xFF),
                                           u8((next_random >> 16) & 0xFF),
@@ -399,7 +368,6 @@ void DimensionsToypad::GetChallengeResponse(const u8* buf, u8 sequence,
     reply_buf[0] = 0x55;
     reply_buf[1] = 0x09;
     reply_buf[2] = sequence;
-    // Copy encrypted value to response data
     std::memcpy(&reply_buf[3], encrypted.data(), encrypted.size());
     reply_buf[11] = GenerateChecksum(reply_buf, 11);
 }
@@ -412,11 +380,9 @@ void DimensionsToypad::QueryBlock(u8 index, u8 page, std::array<u8, 32>& reply_b
     reply_buf[2] = sequence;
     reply_buf[3] = 0x00;
 
-    // Index from game begins at 1 rather than 0, so minus 1 here
     if (const u8 figure_index = index - 1; figure_index < MAX_DIMENSIONS_FIGURES) {
         const DimensionsFigure& figure = GetFigureByIndex(figure_index);
 
-        // Query 4 pages of 4 bytes from the figure, copy this to the response
         if (figure.index != 255 && (4 * page) < ((0x2D * 4) - 16)) {
             std::memcpy(&reply_buf[4], figure.data.data() + (4 * page), 16);
         }
@@ -433,13 +399,10 @@ void DimensionsToypad::WriteBlock(u8 index, u8 page, const u8* to_write_buf,
     reply_buf[2] = sequence;
     reply_buf[3] = 0x00;
 
-    // Index from game begins at 1 rather than 0, so minus 1 here
     if (const u8 figure_index = index - 1; figure_index < MAX_DIMENSIONS_FIGURES) {
         DimensionsFigure& figure = GetFigureByIndex(figure_index);
 
-        // Copy 4 bytes to the page on the figure requested by the game
         if (figure.index != 255 && page < 0x2D) {
-            // Id is written to page 36
             if (page == 36) {
                 figure.id = u32(to_write_buf[0]) | (u32(to_write_buf[1]) << 8) |
                             (u32(to_write_buf[2]) << 16) | (u32(to_write_buf[3]) << 24);
@@ -452,13 +415,9 @@ void DimensionsToypad::WriteBlock(u8 index, u8 page, const u8* to_write_buf,
 }
 
 void DimensionsToypad::GetModel(const u8* buf, u8 sequence, std::array<u8, 32>& reply_buf) {
-    // Decrypt payload to 8 byte array, byte 1 is the index, 4-7 are the confirmation
     const std::array<u8, 8> value = Decrypt(buf, std::nullopt);
     const u8 index = value[0];
-    // const u32 conf = read_from_ptr<be_t<u32>>(value, 4);
     std::array<u8, 8> value_to_encrypt = {};
-    // Response is the figure's id (little endian) followed by the confirmation from payload
-    // Index from game begins at 1 rather than 0, so minus 1 here
     if (const u8 figure_index = index - 1; figure_index < MAX_DIMENSIONS_FIGURES) {
         const DimensionsFigure& figure = GetFigureByIndex(figure_index);
         value_to_encrypt = {u8(figure.id & 0xFF),
@@ -475,7 +434,6 @@ void DimensionsToypad::GetModel(const u8* buf, u8 sequence, std::array<u8, 32>& 
     reply_buf[1] = 0x0a;
     reply_buf[2] = sequence;
     reply_buf[3] = 0x00;
-    // Copy encrypted message to response
     std::memcpy(&reply_buf[4], encrypted.data(), encrypted.size());
     reply_buf[12] = GenerateChecksum(reply_buf, 12);
 }
@@ -516,8 +474,6 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
 
     switch (transfer->endpoint) {
     case 0x81: {
-        // Read Endpoint, wait to respond with either an added/removed figure response, or a queued
-        // response from a previous write
         bool responded = false;
         while (!responded) {
             std::lock_guard lock(m_query_mutex);
@@ -537,73 +493,62 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
         break;
     }
     case 0x01: {
-        // Write endpoint, similar structure of request to the Infinity Base with a command for byte
-        // 3, sequence for byte 4, the payload after that, then a checksum for the final byte.
-
         const u8 command = transfer->buffer[2];
         const u8 sequence = transfer->buffer[3];
 
         std::array<u8, 32> q_result{};
 
         switch (command) {
-        case 0xB0: // Wake
+        case 0xB0:
         {
-            // Consistent device response to the wake command
             q_result = {0x55, 0x0e, 0x01, 0x28, 0x63, 0x29, 0x20, 0x4c, 0x45,
                         0x47, 0x4f, 0x20, 0x32, 0x30, 0x31, 0x34, 0x46};
             break;
         }
-        case 0xB1: // Seed
+        case 0xB1:
         {
-            // Initialise a random number generator using the seed provided
             m_dimensions_toypad->GenerateRandomNumber(&transfer->buffer[4], sequence, q_result);
             break;
         }
-        case 0xB3: // Challenge
+        case 0xB3:
         {
-            // Get the next number in the sequence based on the RNG from 0xB1 command
             m_dimensions_toypad->GetChallengeResponse(&transfer->buffer[4], sequence, q_result);
             break;
         }
-        case 0xC0: // Color
-        case 0xC1: // Get Pad Color
-        case 0xC2: // Fade
-        case 0xC3: // Flash
-        case 0xC4: // Fade Random
-        case 0xC6: // Fade All
-        case 0xC7: // Flash All
-        case 0xC8: // Color All
+        case 0xC0:
+        case 0xC1:
+        case 0xC2:
+        case 0xC3:
+        case 0xC4:
+        case 0xC6:
+        case 0xC7:
+        case 0xC8:
         {
-            // Send a blank response to acknowledge color has been sent to toypad
             m_dimensions_toypad->GetBlankResponse(0x01, sequence, q_result);
             break;
         }
-        case 0xD2: // Read
+        case 0xD2:
         {
-            // Read 4 pages from the figure at index (buf[4]), starting with page buf[5]
             m_dimensions_toypad->QueryBlock(transfer->buffer[4], transfer->buffer[5], q_result,
                                             sequence);
             break;
         }
-        case 0xD3: // Write
+        case 0xD3:
         {
-            // Write 4 bytes to page buf[5] to the figure at index buf[4]
             m_dimensions_toypad->WriteBlock(transfer->buffer[4], transfer->buffer[5],
                                             &transfer->buffer[6], q_result, sequence);
             break;
         }
-        case 0xD4: // Model
+        case 0xD4:
         {
-            // Get the model id of the figure at index buf[4]
             m_dimensions_toypad->GetModel(&transfer->buffer[4], sequence, q_result);
             break;
         }
-        case 0xD0: // Tag List
-        case 0xE1: // PWD
-        case 0xE5: // Active
-        case 0xFF: // LEDS Query
+        case 0xD0:
+        case 0xE1:
+        case 0xE5:
+        case 0xFF:
         {
-            // Further investigation required
             LOG_ERROR(Lib_Usbd, "Unimplemented LD Function: {:x}", command);
             break;
         }
@@ -675,4 +620,4 @@ void DimensionsFigure::Save() {
     dimFile.Seek(0);
     dimFile.Write(data);
 }
-} // namespace Libraries::Usbd
+}

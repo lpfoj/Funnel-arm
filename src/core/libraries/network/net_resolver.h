@@ -36,4 +36,4 @@ private:
     std::mutex m_mutex;
 };
 
-} // namespace Libraries::Net
+}

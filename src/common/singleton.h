@@ -25,4 +25,4 @@ private:
     static inline std::unique_ptr<T> m_instance{};
 };
 
-} // namespace Common
+}

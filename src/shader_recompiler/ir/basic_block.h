@@ -38,44 +38,34 @@ public:
     Block(Block&&) = default;
     Block& operator=(Block&&) = default;
 
-    /// Appends a new instruction to the end of this basic block.
     void AppendNewInst(Opcode op, std::initializer_list<Value> args);
 
-    /// Prepends a copy of an instruction to this basic block before the insertion point.
     iterator PrependNewInst(iterator insertion_point, const Inst& base_inst);
 
-    /// Prepends a new instruction to this basic block before the insertion point.
     iterator PrependNewInst(iterator insertion_point, Opcode op,
                             std::initializer_list<Value> args = {}, u32 flags = 0);
 
-    /// Adds a new branch to this basic block.
     void AddBranch(Block* block);
 
-    /// Gets a mutable reference to the instruction list for this basic block.
     [[nodiscard]] InstructionList& Instructions() noexcept {
         return instructions;
     }
-    /// Gets an immutable reference to the instruction list for this basic block.
     [[nodiscard]] const InstructionList& Instructions() const noexcept {
         return instructions;
     }
 
-    /// Gets an immutable span to the immediate predecessors.
     [[nodiscard]] std::span<Block* const> ImmPredecessors() const noexcept {
         return imm_predecessors;
     }
-    /// Gets an immutable span to the immediate successors.
     [[nodiscard]] std::span<Block* const> ImmSuccessors() const noexcept {
         return imm_successors;
     }
 
-    /// Intrusively store the host definition of this instruction.
     template <typename T>
     void SetDefinition(T def) {
         definition = std::bit_cast<u32>(def);
     }
 
-    /// Return the intrusively stored host definition of this instruction.
     template <typename T>
     [[nodiscard]] T Definition() const noexcept {
         return std::bit_cast<T>(definition);
@@ -149,31 +139,22 @@ public:
         return instructions.crend();
     }
 
-    /// Intrusively store the value of a register in the block.
     std::array<Value, NumScalarRegs> ssa_sreg_values;
     std::array<Value, NumScalarRegs> ssa_sbit_values;
     std::array<Value, NumVectorRegs> ssa_vreg_values;
 
-    /// Block of the CFG that corresponds to this IR block.
-    /// It can be null as IR has additional control flow blocks.
     const Shader::Gcn::Block* cfg_block{};
 
 private:
-    /// Memory pool for instruction list
     Common::ObjectPool<Inst>* inst_pool;
 
-    /// List of instructions in this block
     InstructionList instructions;
 
-    /// Block immediate predecessors
     std::vector<Block*> imm_predecessors;
-    /// Block immediate successors
     std::vector<Block*> imm_successors;
 
-    /// Intrusively store if the block is sealed in the SSA pass.
     bool is_ssa_sealed{false};
 
-    /// Intrusively stored host definition of this block.
     u32 definition{};
 };
 
@@ -186,4 +167,4 @@ using BlockList = std::vector<Block*>;
                                     std::map<const Inst*, size_t>& inst_to_index,
                                     size_t& inst_index);
 
-} // namespace Shader::IR
+}

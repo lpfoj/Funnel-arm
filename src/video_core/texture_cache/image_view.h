@@ -19,7 +19,7 @@ struct ImageResource;
 namespace Vulkan {
 class Instance;
 class Scheduler;
-} // namespace Vulkan
+}
 
 namespace VideoCore {
 
@@ -55,4 +55,4 @@ struct ImageView {
     vk::UniqueImageView image_view;
 };
 
-} // namespace VideoCore
+}

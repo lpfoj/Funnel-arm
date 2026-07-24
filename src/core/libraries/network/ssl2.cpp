@@ -121,7 +121,6 @@ int PS4_SYSV_ABI sceSslFreeCaCerts(s32 ssl_ctx_id, OrbisSslCaCerts* certs) {
         delete (certs->certs);
     }
 
-    // delete (certs->pool);
     return ORBIS_OK;
 }
 
@@ -145,7 +144,6 @@ int PS4_SYSV_ABI sceSslGetCaCerts(s32 ssl_ctx_id, OrbisSslCaCerts* certs) {
     if (certs == nullptr) {
         return ORBIS_SSL_ERROR_INVALID_ARGUMENT;
     }
-    // Allocate a buffer to store dummy data in.
     const char* dummy_data = "dummy";
     u64 dummy_length = strlen(dummy_data) + 1;
     char* data = static_cast<char*>(malloc(dummy_length));
@@ -228,7 +226,6 @@ int PS4_SYSV_ABI sceSslGetSubjectName() {
 
 int PS4_SYSV_ABI sceSslInit(std::size_t poolSize) {
     LOG_ERROR(Lib_Ssl2, "(DUMMY) called poolSize = {}", poolSize);
-    // return a value >1
     static int id = 0;
     return ++id;
 }
@@ -372,4 +369,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("KPh5GncdOcc", "libSceSsl", 1, "libSceSsl", Func_28F8791A771D39C7);
 };
 
-} // namespace Libraries::Ssl2
+}

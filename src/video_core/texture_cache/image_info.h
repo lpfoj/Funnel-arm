@@ -14,7 +14,7 @@ struct ColorBuffer;
 struct DepthBuffer;
 struct Image;
 enum class ImageType : u64;
-} // namespace AmdGpu
+}
 
 namespace Libraries::VideoOut {
 struct BufferAttributeGroup;
@@ -90,4 +90,4 @@ struct ImageInfo {
     u32 stencil_size{};
 };
 
-} // namespace VideoCore
+}

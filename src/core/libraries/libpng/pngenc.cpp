@@ -192,9 +192,6 @@ s32 PS4_SYSV_ABI scePngEncEncode(OrbisPngEncHandle handle, const OrbisPngEncEnco
             }
         }
     } else {
-        // our input data is always rgba but when outputting without an alpha channel, libpng
-        // expects the input to not have alpha either, i couldn't find a way around this easily?
-        // png_strip_alpha is for reading and set_background wasn't working, this seems fine...?
         std::vector<uint8_t> rgb_row(param->image_width * 3);
 
         for (; processed_height < param->image_height; ++processed_height) {
@@ -207,7 +204,7 @@ s32 PS4_SYSV_ABI scePngEncEncode(OrbisPngEncHandle handle, const OrbisPngEncEnco
                 dst[0] = src[0];
                 dst[1] = src[1];
                 dst[2] = src[2];
-                src += 4; // skip reading alpha channel
+                src += 4;
                 dst += 3;
             }
 
@@ -263,4 +260,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("9030RnBDoh4", "libScePngEnc", 1, "libScePngEnc", scePngEncQueryMemorySize);
 };
 
-} // namespace Libraries::PngEnc
+}

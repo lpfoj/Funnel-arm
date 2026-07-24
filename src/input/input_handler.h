@@ -7,7 +7,6 @@
 #include <map>
 #include <string>
 #include <unordered_set>
-#include <vector>
 
 #include "SDL3/SDL_events.h"
 #include "SDL3/SDL_timer.h"
@@ -18,7 +17,6 @@
 #include "fmt/format.h"
 #include "input/controller.h"
 
-// +1 and +2 is taken
 #define SDL_MOUSE_WHEEL_UP SDL_EVENT_MOUSE_WHEEL + 3
 #define SDL_MOUSE_WHEEL_DOWN SDL_EVENT_MOUSE_WHEEL + 4
 #define SDL_MOUSE_WHEEL_LEFT SDL_EVENT_MOUSE_WHEEL + 5
@@ -36,13 +34,9 @@
 #define SDL_EVENT_MOUSE_TO_JOYSTICK SDL_EVENT_USER + 6
 #define SDL_EVENT_MOUSE_TO_GYRO SDL_EVENT_USER + 7
 #define SDL_EVENT_MOUSE_TO_TOUCHPAD SDL_EVENT_USER + 8
-#define SDL_EVENT_QUIT_DIALOG SDL_EVENT_USER + 9
-#define SDL_EVENT_MOUSE_WHEEL_OFF SDL_EVENT_USER + 10
-#define SDL_EVENT_ADD_VIRTUAL_USER SDL_EVENT_USER + 11
-#define SDL_EVENT_REMOVE_VIRTUAL_USER SDL_EVENT_USER + 12
-#define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 13
-#define SDL_EVENT_SCREENSHOT_WITH_OVERLAYS SDL_EVENT_USER + 14
-#define SDL_EVENT_TOGGLE_FRIENDS SDL_EVENT_USER + 15
+#define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 9
+#define SDL_EVENT_QUIT_DIALOG SDL_EVENT_USER + 10
+#define SDL_EVENT_MOUSE_WHEEL_OFF SDL_EVENT_USER + 11
 
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
@@ -62,11 +56,6 @@
 #define HOTKEY_RENDERDOC 0xf0000009
 #define HOTKEY_VOLUME_UP 0xf000000a
 #define HOTKEY_VOLUME_DOWN 0xf000000b
-#define HOTKEY_ADD_VIRTUAL_USER 0xf000000c
-#define HOTKEY_REMOVE_VIRTUAL_USER 0xf000000d
-#define HOTKEY_SCREENSHOT_WITH_OVERLAYS 0xf000000e
-#define HOTKEY_OPEN_EMULATOR_SETTINGS 0xf000000f
-#define HOTKEY_TOGGLE_FRIENDS 0xf0000010
 
 #define SDL_UNMAPPED UINT32_MAX - 1
 
@@ -87,24 +76,21 @@ class InputID {
 public:
     InputType type;
     u32 sdl_id;
-    u8 gamepad_id;
-    InputID(InputType d = InputType::Count, u32 i = (u32)-1, u8 g = 1)
-        : type(d), sdl_id(i), gamepad_id(g) {}
+    InputID(InputType d = InputType::Count, u32 i = SDL_UNMAPPED) : type(d), sdl_id(i) {}
     bool operator==(const InputID& o) const {
-        return type == o.type && sdl_id == o.sdl_id && gamepad_id == o.gamepad_id;
+        return type == o.type && sdl_id == o.sdl_id;
     }
     bool operator!=(const InputID& o) const {
-        return type != o.type || sdl_id != o.sdl_id || gamepad_id != o.gamepad_id;
+        return type != o.type || sdl_id != o.sdl_id;
     }
-    auto operator<=>(const InputID& o) const {
-        return std::tie(gamepad_id, type, sdl_id, gamepad_id) <=>
-               std::tie(o.gamepad_id, o.type, o.sdl_id, o.gamepad_id);
+    bool operator<=(const InputID& o) const {
+        return type <= o.type && sdl_id <= o.sdl_id;
     }
     bool IsValid() const {
         return *this != InputID();
     }
     std::string ToString() {
-        return fmt::format("({}. {}: {:x})", gamepad_id, input_type_names[(u8)type], sdl_id);
+        return fmt::format("({}: {:x})", input_type_names[static_cast<u8>(type)], sdl_id);
     }
 };
 
@@ -120,7 +106,6 @@ public:
         : input(d, i), active(a), axis_value(v) {}
 };
 
-// i strongly suggest you collapse these maps
 const std::map<std::string, u32> string_to_cbutton_map = {
     {"triangle", SDL_GAMEPAD_BUTTON_NORTH},
     {"circle", SDL_GAMEPAD_BUTTON_EAST},
@@ -136,14 +121,12 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"pad_right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
     {"options", SDL_GAMEPAD_BUTTON_START},
 
-    // these are outputs only (touchpad can only be bound to itself)
     {"touchpad_left", SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT},
     {"touchpad_center", SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER},
     {"touchpad_right", SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT},
     {"leftjoystick_halfmode", LEFTJOYSTICK_HALFMODE},
     {"rightjoystick_halfmode", RIGHTJOYSTICK_HALFMODE},
 
-    // this is only for input
     {"back", SDL_GAMEPAD_BUTTON_BACK},
     {"share", SDL_GAMEPAD_BUTTON_BACK},
     {"lpaddle_high", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
@@ -151,11 +134,6 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"rpaddle_high", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
     {"rpaddle_low", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
     {"mouse_gyro_roll_mode", MOUSE_GYRO_ROLL_MODE},
-    {"qam", SDL_GAMEPAD_BUTTON_MISC1},
-    {"r4", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
-    {"l4", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
-    {"r5", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
-    {"l5", SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
 };
 const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_pause", HOTKEY_PAUSE},
@@ -166,15 +144,9 @@ const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_toggle_mouse_to_joystick", HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK},
     {"hotkey_toggle_mouse_to_gyro", HOTKEY_TOGGLE_MOUSE_TO_GYRO},
     {"hotkey_toggle_mouse_to_touchpad", HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD},
-    {"hotkey_capture_frame", HOTKEY_RENDERDOC},
-    {"hotkey_screenshot_with_overlays", HOTKEY_SCREENSHOT_WITH_OVERLAYS},
     {"hotkey_renderdoc_capture", HOTKEY_RENDERDOC},
-    {"hotkey_add_virtual_user", HOTKEY_ADD_VIRTUAL_USER},
-    {"hotkey_remove_virtual_user", HOTKEY_REMOVE_VIRTUAL_USER},
     {"hotkey_volume_up", HOTKEY_VOLUME_UP},
     {"hotkey_volume_down", HOTKEY_VOLUME_DOWN},
-    {"hotkey_emulator_settings", HOTKEY_OPEN_EMULATOR_SETTINGS},
-    {"hotkey_toggle_friends", HOTKEY_TOGGLE_FRIENDS},
 };
 
 const std::map<std::string, AxisMapping> string_to_axis_map = {
@@ -190,14 +162,12 @@ const std::map<std::string, AxisMapping> string_to_axis_map = {
     {"l2", {SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 127}},
     {"r2", {SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 127}},
 
-    // should only use these to bind analog inputs to analog outputs
     {"axis_left_x", {SDL_GAMEPAD_AXIS_LEFTX, 127}},
     {"axis_left_y", {SDL_GAMEPAD_AXIS_LEFTY, 127}},
     {"axis_right_x", {SDL_GAMEPAD_AXIS_RIGHTX, 127}},
     {"axis_right_y", {SDL_GAMEPAD_AXIS_RIGHTY, 127}},
 };
 const std::map<std::string, u32> string_to_keyboard_key_map = {
-    // alphanumeric
     {"a", SDLK_A},
     {"b", SDLK_B},
     {"c", SDLK_C},
@@ -235,7 +205,6 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"8", SDLK_8},
     {"9", SDLK_9},
 
-    // F keys
     {"f1", SDLK_F1},
     {"f2", SDLK_F2},
     {"f3", SDLK_F3},
@@ -249,7 +218,6 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"f11", SDLK_F11},
     {"f12", SDLK_F12},
 
-    // symbols
     {"grave", SDLK_GRAVE},
     {"tilde", SDLK_TILDE},
     {"exclamation", SDLK_EXCLAIM},
@@ -283,7 +251,6 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"slash", SDLK_SLASH},
     {"question", SDLK_QUESTION},
 
-    // special keys
     {"escape", SDLK_ESCAPE},
     {"printscreen", SDLK_PRINTSCREEN},
     {"scrolllock", SDLK_SCROLLLOCK},
@@ -314,7 +281,6 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"left", SDLK_LEFT},
     {"right", SDLK_RIGHT},
 
-    // keypad
     {"kp0", SDLK_KP_0},
     {"kp1", SDLK_KP_1},
     {"kp2", SDLK_KP_2},
@@ -334,7 +300,6 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"kpequals", SDLK_KP_EQUALS},
     {"kpenter", SDLK_KP_ENTER},
 
-    // mouse
     {"leftbutton", SDL_BUTTON_LEFT},
     {"rightbutton", SDL_BUTTON_RIGHT},
     {"middlebutton", SDL_BUTTON_MIDDLE},
@@ -345,7 +310,6 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
     {"mousewheelleft", SDL_MOUSE_WHEEL_LEFT},
     {"mousewheelright", SDL_MOUSE_WHEEL_RIGHT},
 
-    // no binding
     {"unmapped", SDL_UNMAPPED},
 };
 
@@ -355,10 +319,7 @@ class InputBinding {
 public:
     InputID keys[3];
     InputBinding(InputID k1 = InputID(), InputID k2 = InputID(), InputID k3 = InputID()) {
-        // we format the keys so comparing them will be very fast, because we will only have to
-        // compare 3 sorted elements, where the only possible duplicate item is 0
 
-        // duplicate entries get changed to one original, one null
         if (k1 == k2 && k1 != InputID()) {
             k2 = InputID();
         }
@@ -368,7 +329,6 @@ public:
         if (k3 == k2 && k2 != InputID()) {
             k2 = InputID();
         }
-        // this sorts them
         if (k1 <= k2 && k1 <= k3) {
             keys[0] = k1;
             if (k2 <= k3) {
@@ -398,7 +358,6 @@ public:
             }
         }
     }
-    // copy ctor
     InputBinding(const InputBinding& o) {
         keys[0] = o.keys[0];
         keys[1] = o.keys[1];
@@ -406,19 +365,14 @@ public:
     }
 
     inline bool operator==(const InputBinding& o) {
-        // InputID() signifies an unused slot
         return (keys[0] == o.keys[0] || keys[0] == InputID() || o.keys[0] == InputID()) &&
                (keys[1] == o.keys[1] || keys[1] == InputID() || o.keys[1] == InputID()) &&
                (keys[2] == o.keys[2] || keys[2] == InputID() || o.keys[2] == InputID());
-        // it is already very fast,
-        // but reverse order makes it check the actual keys first instead of possible 0-s,
-        // potenially skipping the later expressions of the three-way AND
     }
     inline int KeyCount() const {
         return (keys[0].IsValid() ? 1 : 0) + (keys[1].IsValid() ? 1 : 0) +
                (keys[2].IsValid() ? 1 : 0);
     }
-    // Sorts by the amount of non zero keys - left side is 'bigger' here
     bool operator<(const InputBinding& other) const {
         return KeyCount() > other.KeyCount();
     }
@@ -439,22 +393,18 @@ public:
         }
     }
 
-    // returns an InputEvent based on the event type (keyboard, mouse buttons/wheel, or controller)
     static InputEvent GetInputEventFromSDLEvent(const SDL_Event& e);
 };
 
 class ControllerOutput {
+    static GameController* controller;
+
 public:
-    static GameControllers controllers;
-    static void GetGetGamepadIndexFromSDLJoystickID(const SDL_JoystickID id) {}
+    static void SetControllerOutputController(GameController* c);
     static void LinkJoystickAxes();
 
     u32 button;
     u32 axis;
-    u8 gamepad_id;
-    // these are only used as s8,
-    // but I added some padding to avoid overflow if it's activated by multiple inputs
-    // axis_plus and axis_minus pairs share a common new_param, the other outputs have their own
     s16 old_param;
     s16* new_param;
     bool old_button_state, new_button_state, state_changed, positive_axis;
@@ -465,7 +415,6 @@ public:
         new_param = new s16(0);
         old_param = 0;
         positive_axis = p;
-        gamepad_id = 0;
     }
     ControllerOutput(const ControllerOutput& o) : button(o.button), axis(o.axis) {
         new_param = new s16(*o.new_param);
@@ -473,7 +422,7 @@ public:
     ~ControllerOutput() {
         delete new_param;
     }
-    inline bool operator==(const ControllerOutput& o) const { // fucking consts everywhere
+    inline bool operator==(const ControllerOutput& o) const {
         return button == o.button && axis == o.axis;
     }
     inline bool operator!=(const ControllerOutput& o) const {
@@ -491,7 +440,7 @@ public:
 
     void ResetUpdate();
     void AddUpdate(InputEvent event);
-    void FinalizeUpdate(u8 gamepad_index);
+    void FinalizeUpdate();
 };
 class BindingConnection {
 public:
@@ -506,16 +455,7 @@ public:
         output = out;
         toggle = t;
     }
-    BindingConnection& operator=(const BindingConnection& o) {
-        binding = o.binding;
-        output = o.output;
-        axis_param = o.axis_param;
-        toggle = o.toggle;
-        return *this;
-    }
     bool operator<(const BindingConnection& other) const {
-        // a button is a higher priority than an axis, as buttons can influence axes
-        // (e.g. joystick_halfmode)
         if (output->IsButton() &&
             (other.output->IsAxis() && (other.output->axis != SDL_GAMEPAD_AXIS_LEFT_TRIGGER &&
                                         other.output->axis != SDL_GAMEPAD_AXIS_RIGHT_TRIGGER))) {
@@ -526,89 +466,11 @@ public:
         }
         return false;
     }
-    bool HasGamepadInput() {
-        for (auto& key : binding.keys) {
-            if (key.type == InputType::Controller || key.type == InputType::Axis) {
-                return true;
-            }
-        }
-        return false;
-    }
-    BindingConnection CopyWithChangedGamepadId(u8 gamepad);
     InputEvent ProcessBinding();
 };
 
-class ControllerAllOutputs {
-public:
-    static constexpr u64 output_count = 43;
-    std::array<ControllerOutput, output_count> data = {
-        // Important: these have to be the first, or else they will update in the wrong order
-        ControllerOutput(LEFTJOYSTICK_HALFMODE),
-        ControllerOutput(RIGHTJOYSTICK_HALFMODE),
-        ControllerOutput(KEY_TOGGLE),
-        ControllerOutput(MOUSE_GYRO_ROLL_MODE),
-
-        // Button mappings
-        ControllerOutput(SDL_GAMEPAD_BUTTON_NORTH),           // Triangle
-        ControllerOutput(SDL_GAMEPAD_BUTTON_EAST),            // Circle
-        ControllerOutput(SDL_GAMEPAD_BUTTON_SOUTH),           // Cross
-        ControllerOutput(SDL_GAMEPAD_BUTTON_WEST),            // Square
-        ControllerOutput(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER),   // L1
-        ControllerOutput(SDL_GAMEPAD_BUTTON_LEFT_STICK),      // L3
-        ControllerOutput(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER),  // R1
-        ControllerOutput(SDL_GAMEPAD_BUTTON_RIGHT_STICK),     // R3
-        ControllerOutput(SDL_GAMEPAD_BUTTON_START),           // Options
-        ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT),   // TouchPad
-        ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER), // TouchPad
-        ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT),  // TouchPad
-        ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_UP),         // Up
-        ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_DOWN),       // Down
-        ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_LEFT),       // Left
-        ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_RIGHT),      // Right
-
-        // Axis mappings
-        // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX, false),
-        // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTY, false),
-        // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTX, false),
-        // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTY, false),
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX),
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTY),
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTX),
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTY),
-
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFT_TRIGGER),
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER),
-
-        ControllerOutput(HOTKEY_FULLSCREEN),
-        ControllerOutput(HOTKEY_PAUSE),
-        ControllerOutput(HOTKEY_SIMPLE_FPS),
-        ControllerOutput(HOTKEY_QUIT),
-        ControllerOutput(HOTKEY_RELOAD_INPUTS),
-        ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK),
-        ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_GYRO),
-        ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD),
-        ControllerOutput(HOTKEY_RENDERDOC),
-        ControllerOutput(HOTKEY_SCREENSHOT_WITH_OVERLAYS),
-        ControllerOutput(HOTKEY_ADD_VIRTUAL_USER),
-        ControllerOutput(HOTKEY_REMOVE_VIRTUAL_USER),
-        ControllerOutput(HOTKEY_VOLUME_UP),
-        ControllerOutput(HOTKEY_VOLUME_DOWN),
-        ControllerOutput(HOTKEY_OPEN_EMULATOR_SETTINGS),
-        ControllerOutput(HOTKEY_TOGGLE_FRIENDS),
-
-        ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_INVALID),
-    };
-    ControllerAllOutputs(u8 g) {
-        for (int i = 0; i < output_count; i++) {
-            data[i].gamepad_id = g;
-        }
-    }
-};
-
-// Updates the list of pressed keys with the given input.
-// Returns whether the list was updated or not.
 bool UpdatePressedKeys(InputEvent event);
 
 void ActivateOutputsFromInputs();
 
-} // namespace Input
+}

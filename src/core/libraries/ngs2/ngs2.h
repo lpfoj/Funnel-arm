@@ -271,4 +271,4 @@ struct OrbisNgs2VoiceState {
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Ngs2
+}

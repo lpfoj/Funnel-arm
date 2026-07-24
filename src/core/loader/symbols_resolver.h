@@ -76,4 +76,4 @@ private:
     std::vector<SymbolRecord> m_symbols;
 };
 
-} // namespace Core::Loader
+}

@@ -28,7 +28,6 @@ enum {
     DW_EH_PE_omit = 0xFF
 };
 
-/// Information encoded in the EH frame header.
 struct EHHeaderInfo {
     uintptr_t eh_frame_ptr;
     size_t fde_count;
@@ -38,4 +37,4 @@ struct EHHeaderInfo {
 
 bool DecodeEHHdr(uintptr_t ehHdrStart, uintptr_t ehHdrEnd, EHHeaderInfo& ehHdrInfo);
 
-} // namespace Dwarf
+}

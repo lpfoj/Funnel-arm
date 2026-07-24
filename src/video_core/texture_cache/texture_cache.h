@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
@@ -31,7 +33,6 @@ class BufferCache;
 class PageManager;
 
 class TextureCache {
-    // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
@@ -53,6 +54,17 @@ public:
         RenderTarget,
         DepthTarget,
         VideoOut,
+    };
+
+    enum class ExecutorGpuContentRole : u32 {
+        SampledBeforeDraw,
+        ColorBeforeDraw,
+        DepthBeforeDraw,
+        StorageAfterDispatch,
+        ColorAfterDraw,
+        DepthAfterDraw,
+        ColorPassEnd,
+        DepthPassEnd,
     };
 
     struct ImageDesc {
@@ -84,34 +96,44 @@ public:
         return tile_manager;
     }
 
-    /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
-    /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
-    /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
-    /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
-    /// Retrieves the image handle of the image with the provided attributes.
+    ImageId executor_replay_color_target{};
+    std::vector<ImageId> executor_replay_color_candidates;
+    std::vector<ImageId> executor_live_drawn_color_candidates;
+    std::atomic<u32> executor_live_last_color_target{};
+    std::mutex executor_replay_candidates_mutex;
+    void ExecutorReplayReadbackColorTarget();
+    void ExecutorTrackLiveDrawnColorTarget(ImageId image_id);
+    [[nodiscard]] ImageId ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height,
+                                                               ImageId preferred = {});
+
+    void ExecutorTraceVideoOutSource(ImageId image_id, u64 sequence, u32 flags_before_refresh);
+
+    [[nodiscard]] bool ExecutorGpuContentProbeEnabled() const;
+    [[nodiscard]] bool ExecutorGpuContentProbeDrawSelected(
+        u64 sequence, u64 fragment_hash, u64 attachment_signature, u32 color_attachment_count,
+        u32 color_width, u32 color_height, bool has_depth, u32 element_count, bool indirect) const;
+    [[nodiscard]] bool ExecutorGpuContentProbeDispatchSelected(u64 sequence) const;
+    void ExecutorGpuContentProbe(ImageId image_id, ExecutorGpuContentRole role, u32 stage,
+                                 u64 stage_hash, u64 sequence);
+
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
-    /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
-    /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
-    /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 
-    /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
-    /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
@@ -120,39 +142,31 @@ public:
         RefreshImage(image);
     }
 
-    /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,
                                                                ImageId cache_img_id,
                                                                ImageId merged_image_id);
 
-    /// Resolves depth overlap and either re-creates the image or returns existing one
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);
 
-    /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
-    /// Reuploads image contents.
     void RefreshImage(Image& image);
 
-    /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base);
 
-    /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
         TouchImage(image);
         return image;
     }
 
-    /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];
     }
 
-    /// Get the associated depth stencil image if it is still valid.
     ImageId GetAssociatedDepth(Image& image) {
         if (!image.depth_id) {
             return {};
@@ -164,17 +178,14 @@ public:
                 return image.depth_id;
             }
         }
-        // The linked depth image is no longer valid, disassociate it.
         image.DisassociateDepth();
         return {};
     }
 
-    /// Returns true if the specified address is a metadata surface.
     bool IsMeta(VAddr address) const {
         return surface_metas.contains(address);
     }
 
-    /// Returns true if a slice of the specified metadata surface has been cleared.
     bool IsMetaCleared(VAddr address, u32 slice) const {
         const auto& it = surface_metas.find(address);
         if (it != surface_metas.end()) {
@@ -183,7 +194,6 @@ public:
         return false;
     }
 
-    /// Clears all slices of the specified metadata surface.
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
@@ -193,7 +203,6 @@ public:
         return false;
     }
 
-    /// Updates the state of a slice of the specified metadata surface.
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
@@ -207,8 +216,7 @@ public:
         return false;
     }
 
-    /// Runs the garbage collector.
-    void RunGarbageCollector();
+    void RunGarbageCollector(std::optional<size_t> sampled_device_memory = std::nullopt);
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -252,7 +260,6 @@ public:
     }
 
 private:
-    /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {
         static constexpr bool RETURNS_BOOL = std::is_same_v<std::invoke_result<Func, u64>, bool>;
@@ -268,37 +275,30 @@ private:
         }
     }
 
-    /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    ImageId GetNullImage(vk::Format format);
 
-    /// Thread function for copying downloaded images out to CPU memory.
+    bool DownloadImageMemory(ImageId image_id, bool sync = false);
+
     void DownloadedImagesThread(const std::stop_token& token);
 
-    /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
 
-    /// Register image in the page table
     void RegisterImage(ImageId image);
 
-    /// Unregister image from the page table
     void UnregisterImage(ImageId image);
 
-    /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
     void TrackImageHead(ImageId image_id);
     void TrackImageTail(ImageId image_id);
 
-    /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
-    /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
-    /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
@@ -307,7 +307,7 @@ private:
         DeleteImage(image_id);
     }
 
-    void GarbageCollectImages();
+    void GarbageCollectImages(std::optional<size_t> sampled_device_memory);
     void GarbageCollectSamplers();
 
 private:
@@ -321,6 +321,7 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+    tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
@@ -333,11 +334,9 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
-    bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;
-    std::mutex download_images_mutex;
     struct MetaDataInfo {
         enum class Type {
             CMask,
@@ -350,4 +349,4 @@ private:
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
 };
 
-} // namespace VideoCore
+}

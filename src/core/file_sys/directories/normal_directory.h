@@ -38,4 +38,4 @@ private:
 
     void RebuildDirents(void);
 };
-} // namespace Core::Directories
+}

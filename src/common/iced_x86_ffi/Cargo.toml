@@ -1,0 +1,18 @@
+[package]
+name = "lsx-iced-decoder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+iced-x86 = { path = "../../../../externals/iced-x86/src/rust/iced-x86", default-features = false, features = ["std", "decoder", "instr_info", "intel", "op_code_info"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"

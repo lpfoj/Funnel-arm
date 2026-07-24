@@ -17,4 +17,4 @@ s32 PS4_SYSV_ABI sceRandomGetRandomNumber(u8* buf, std::size_t size);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Random
+}

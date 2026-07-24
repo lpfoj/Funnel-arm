@@ -49,4 +49,4 @@ public:
     void Draw();
 };
 
-} // namespace Core::Devtools::Widget
+}

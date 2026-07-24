@@ -35,13 +35,11 @@ public:
     bool SetLooping(bool is_looping);
 
 private:
-    // Memory Replacement
     static void* PS4_SYSV_ABI Allocate(void* handle, u32 alignment, u32 size);
     static void PS4_SYSV_ABI Deallocate(void* handle, void* memory);
     static void* PS4_SYSV_ABI AllocateTexture(void* handle, u32 alignment, u32 size);
     static void PS4_SYSV_ABI DeallocateTexture(void* handle, void* memory);
 
-    // File Replacement
     static int PS4_SYSV_ABI OpenFile(void* handle, const char* filename);
     static int PS4_SYSV_ABI CloseFile(void* handle);
     static int PS4_SYSV_ABI ReadOffsetFile(void* handle, u8* buffer, u64 position, u32 length);
@@ -56,4 +54,4 @@ private:
     std::unique_ptr<AvPlayerState> m_state{};
 };
 
-} // namespace Libraries::AvPlayer
+}

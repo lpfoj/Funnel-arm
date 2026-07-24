@@ -121,8 +121,8 @@ typedef struct _OBJECT_ATTRIBUTES {
     HANDLE RootDirectory;
     PCUNICODE_STRING ObjectName;
     ULONG Attributes;
-    PVOID SecurityDescriptor;       // PSECURITY_DESCRIPTOR;
-    PVOID SecurityQualityOfService; // PSECURITY_QUALITY_OF_SERVICE
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
 } OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
 typedef const OBJECT_ATTRIBUTES* PCOBJECT_ATTRIBUTES;
@@ -231,21 +231,21 @@ typedef struct {
 } CROSS_PROCESS_WORK_LIST;
 
 typedef struct _CHPEV2_PROCESS_INFO {
-    ULONG Wow64ExecuteFlags;                       /* 000 */
-    USHORT NativeMachineType;                      /* 004 */
-    USHORT EmulatedMachineType;                    /* 006 */
-    HANDLE SectionHandle;                          /* 008 */
-    CROSS_PROCESS_WORK_LIST* CrossProcessWorkList; /* 010 */
-    void* unknown;                                 /* 018 */
+    ULONG Wow64ExecuteFlags;
+    USHORT NativeMachineType;
+    USHORT EmulatedMachineType;
+    HANDLE SectionHandle;
+    CROSS_PROCESS_WORK_LIST* CrossProcessWorkList;
+    void* unknown;
 } CHPEV2_PROCESS_INFO, *PCHPEV2_PROCESS_INFO;
 
 typedef u64(__stdcall* KERNEL_CALLBACK_PROC)(void*, ULONG);
 
-typedef struct _PEB {                 /* win32/win64 */
-    BOOLEAN InheritedAddressSpace;    /* 000/000 */
-    BOOLEAN ReadImageFileExecOptions; /* 001/001 */
-    BOOLEAN BeingDebugged;            /* 002/002 */
-    UCHAR ImageUsedLargePages : 1;    /* 003/003 */
+typedef struct _PEB {
+    BOOLEAN InheritedAddressSpace;
+    BOOLEAN ReadImageFileExecOptions;
+    BOOLEAN BeingDebugged;
+    UCHAR ImageUsedLargePages : 1;
     UCHAR IsProtectedProcess : 1;
     UCHAR IsImageDynamicallyRelocated : 1;
     UCHAR SkipPatchingUser32Forwarders : 1;
@@ -253,16 +253,16 @@ typedef struct _PEB {                 /* win32/win64 */
     UCHAR IsAppContainer : 1;
     UCHAR IsProtectedProcessLight : 1;
     UCHAR IsLongPathAwareProcess : 1;
-    HANDLE Mutant;                                  /* 004/008 */
-    HMODULE ImageBaseAddress;                       /* 008/010 */
-    PPEB_LDR_DATA LdrData;                          /* 00c/018 */
-    RTL_USER_PROCESS_PARAMETERS* ProcessParameters; /* 010/020 */
-    PVOID SubSystemData;                            /* 014/028 */
-    HANDLE ProcessHeap;                             /* 018/030 */
-    PRTL_CRITICAL_SECTION FastPebLock;              /* 01c/038 */
-    PVOID AtlThunkSListPtr;                         /* 020/040 */
-    PVOID IFEOKey;                                  /* 024/048 */
-    ULONG ProcessInJob : 1;                         /* 028/050 */
+    HANDLE Mutant;
+    HMODULE ImageBaseAddress;
+    PPEB_LDR_DATA LdrData;
+    RTL_USER_PROCESS_PARAMETERS* ProcessParameters;
+    PVOID SubSystemData;
+    HANDLE ProcessHeap;
+    PRTL_CRITICAL_SECTION FastPebLock;
+    PVOID AtlThunkSListPtr;
+    PVOID IFEOKey;
+    ULONG ProcessInJob : 1;
     ULONG ProcessInitializing : 1;
     ULONG ProcessUsingVEH : 1;
     ULONG ProcessUsingVCH : 1;
@@ -271,90 +271,90 @@ typedef struct _PEB {                 /* win32/win64 */
     ULONG ProcessCurrentlyThrottled : 1;
     ULONG ProcessImagesHotPatched : 1;
     ULONG ReservedBits0 : 24;
-    KERNEL_CALLBACK_PROC* KernelCallbackTable; /* 02c/058 */
-    ULONG Reserved;                            /* 030/060 */
-    ULONG AtlThunkSListPtr32;                  /* 034/064 */
-    PVOID ApiSetMap;                           /* 038/068 */
-    ULONG TlsExpansionCounter;                 /* 03c/070 */
-    PRTL_BITMAP TlsBitmap;                     /* 040/078 */
-    ULONG TlsBitmapBits[2];                    /* 044/080 */
-    PVOID ReadOnlySharedMemoryBase;            /* 04c/088 */
-    PVOID SharedData;                          /* 050/090 */
-    PVOID* ReadOnlyStaticServerData;           /* 054/098 */
-    PVOID AnsiCodePageData;                    /* 058/0a0 */
-    PVOID OemCodePageData;                     /* 05c/0a8 */
-    PVOID UnicodeCaseTableData;                /* 060/0b0 */
-    ULONG NumberOfProcessors;                  /* 064/0b8 */
-    ULONG NtGlobalFlag;                        /* 068/0bc */
-    LARGE_INTEGER CriticalSectionTimeout;      /* 070/0c0 */
-    SIZE_T HeapSegmentReserve;                 /* 078/0c8 */
-    SIZE_T HeapSegmentCommit;                  /* 07c/0d0 */
-    SIZE_T HeapDeCommitTotalFreeThreshold;     /* 080/0d8 */
-    SIZE_T HeapDeCommitFreeBlockThreshold;     /* 084/0e0 */
-    ULONG NumberOfHeaps;                       /* 088/0e8 */
-    ULONG MaximumNumberOfHeaps;                /* 08c/0ec */
-    PVOID* ProcessHeaps;                       /* 090/0f0 */
-    PVOID GdiSharedHandleTable;                /* 094/0f8 */
-    PVOID ProcessStarterHelper;                /* 098/100 */
-    PVOID GdiDCAttributeList;                  /* 09c/108 */
-    PVOID LoaderLock;                          /* 0a0/110 */
-    ULONG OSMajorVersion;                      /* 0a4/118 */
-    ULONG OSMinorVersion;                      /* 0a8/11c */
-    ULONG OSBuildNumber;                       /* 0ac/120 */
-    ULONG OSPlatformId;                        /* 0b0/124 */
-    ULONG ImageSubSystem;                      /* 0b4/128 */
-    ULONG ImageSubSystemMajorVersion;          /* 0b8/12c */
-    ULONG ImageSubSystemMinorVersion;          /* 0bc/130 */
-    KAFFINITY ActiveProcessAffinityMask;       /* 0c0/138 */
+    KERNEL_CALLBACK_PROC* KernelCallbackTable;
+    ULONG Reserved;
+    ULONG AtlThunkSListPtr32;
+    PVOID ApiSetMap;
+    ULONG TlsExpansionCounter;
+    PRTL_BITMAP TlsBitmap;
+    ULONG TlsBitmapBits[2];
+    PVOID ReadOnlySharedMemoryBase;
+    PVOID SharedData;
+    PVOID* ReadOnlyStaticServerData;
+    PVOID AnsiCodePageData;
+    PVOID OemCodePageData;
+    PVOID UnicodeCaseTableData;
+    ULONG NumberOfProcessors;
+    ULONG NtGlobalFlag;
+    LARGE_INTEGER CriticalSectionTimeout;
+    SIZE_T HeapSegmentReserve;
+    SIZE_T HeapSegmentCommit;
+    SIZE_T HeapDeCommitTotalFreeThreshold;
+    SIZE_T HeapDeCommitFreeBlockThreshold;
+    ULONG NumberOfHeaps;
+    ULONG MaximumNumberOfHeaps;
+    PVOID* ProcessHeaps;
+    PVOID GdiSharedHandleTable;
+    PVOID ProcessStarterHelper;
+    PVOID GdiDCAttributeList;
+    PVOID LoaderLock;
+    ULONG OSMajorVersion;
+    ULONG OSMinorVersion;
+    ULONG OSBuildNumber;
+    ULONG OSPlatformId;
+    ULONG ImageSubSystem;
+    ULONG ImageSubSystemMajorVersion;
+    ULONG ImageSubSystemMinorVersion;
+    KAFFINITY ActiveProcessAffinityMask;
 #ifdef _WIN64
-    ULONG GdiHandleBuffer[60]; /*    /140 */
+    ULONG GdiHandleBuffer[60];
 #else
-    ULONG GdiHandleBuffer[34]; /* 0c4/    */
+    ULONG GdiHandleBuffer[34];
 #endif
-    PVOID PostProcessInitRoutine;      /* 14c/230 */
-    PRTL_BITMAP TlsExpansionBitmap;    /* 150/238 */
-    ULONG TlsExpansionBitmapBits[32];  /* 154/240 */
-    ULONG SessionId;                   /* 1d4/2c0 */
-    ULARGE_INTEGER AppCompatFlags;     /* 1d8/2c8 */
-    ULARGE_INTEGER AppCompatFlagsUser; /* 1e0/2d0 */
-    PVOID ShimData;                    /* 1e8/2d8 */
-    PVOID AppCompatInfo;               /* 1ec/2e0 */
-    UNICODE_STRING CSDVersion;         /* 1f0/2e8 */
-    PVOID ActivationContextData;       /* 1f8/2f8 */
-    PVOID ProcessAssemblyStorageMap;   /* 1fc/300 */
-    PVOID SystemDefaultActivationData; /* 200/308 */
-    PVOID SystemAssemblyStorageMap;    /* 204/310 */
-    SIZE_T MinimumStackCommit;         /* 208/318 */
-    PVOID* FlsCallback;                /* 20c/320 */
-    LIST_ENTRY FlsListHead;            /* 210/328 */
+    PVOID PostProcessInitRoutine;
+    PRTL_BITMAP TlsExpansionBitmap;
+    ULONG TlsExpansionBitmapBits[32];
+    ULONG SessionId;
+    ULARGE_INTEGER AppCompatFlags;
+    ULARGE_INTEGER AppCompatFlagsUser;
+    PVOID ShimData;
+    PVOID AppCompatInfo;
+    UNICODE_STRING CSDVersion;
+    PVOID ActivationContextData;
+    PVOID ProcessAssemblyStorageMap;
+    PVOID SystemDefaultActivationData;
+    PVOID SystemAssemblyStorageMap;
+    SIZE_T MinimumStackCommit;
+    PVOID* FlsCallback;
+    LIST_ENTRY FlsListHead;
     union {
-        PRTL_BITMAP FlsBitmap; /* 218/338 */
+        PRTL_BITMAP FlsBitmap;
 #ifdef _WIN64
-        CHPEV2_PROCESS_INFO* ChpeV2ProcessInfo; /*    /338 */
+        CHPEV2_PROCESS_INFO* ChpeV2ProcessInfo;
 #endif
     };
-    ULONG FlsBitmapBits[4];       /* 21c/340 */
-    ULONG FlsHighIndex;           /* 22c/350 */
-    PVOID WerRegistrationData;    /* 230/358 */
-    PVOID WerShipAssertPtr;       /* 234/360 */
-    PVOID EcCodeBitMap;           /* 238/368 */
-    PVOID pImageHeaderHash;       /* 23c/370 */
-    ULONG HeapTracingEnabled : 1; /* 240/378 */
+    ULONG FlsBitmapBits[4];
+    ULONG FlsHighIndex;
+    PVOID WerRegistrationData;
+    PVOID WerShipAssertPtr;
+    PVOID EcCodeBitMap;
+    PVOID pImageHeaderHash;
+    ULONG HeapTracingEnabled : 1;
     ULONG CritSecTracingEnabled : 1;
     ULONG LibLoaderTracingEnabled : 1;
     ULONG SpareTracingBits : 29;
-    ULONGLONG CsrServerReadOnlySharedMemoryBase;  /* 248/380 */
-    ULONG TppWorkerpListLock;                     /* 250/388 */
-    LIST_ENTRY TppWorkerpList;                    /* 254/390 */
-    PVOID WaitOnAddressHashTable[0x80];           /* 25c/3a0 */
-    PVOID TelemetryCoverageHeader;                /* 45c/7a0 */
-    ULONG CloudFileFlags;                         /* 460/7a8 */
-    ULONG CloudFileDiagFlags;                     /* 464/7ac */
-    CHAR PlaceholderCompatibilityMode;            /* 468/7b0 */
-    CHAR PlaceholderCompatibilityModeReserved[7]; /* 469/7b1 */
-    PVOID LeapSecondData;                         /* 470/7b8 */
-    ULONG LeapSecondFlags;                        /* 474/7c0 */
-    ULONG NtGlobalFlag2;                          /* 478/7c4 */
+    ULONGLONG CsrServerReadOnlySharedMemoryBase;
+    ULONG TppWorkerpListLock;
+    LIST_ENTRY TppWorkerpList;
+    PVOID WaitOnAddressHashTable[0x80];
+    PVOID TelemetryCoverageHeader;
+    ULONG CloudFileFlags;
+    ULONG CloudFileDiagFlags;
+    CHAR PlaceholderCompatibilityMode;
+    CHAR PlaceholderCompatibilityModeReserved[7];
+    PVOID LeapSecondData;
+    ULONG LeapSecondFlags;
+    ULONG NtGlobalFlag2;
 } PEB, *PPEB;
 
 typedef struct _RTL_ACTIVATION_CONTEXT_STACK_FRAME {
@@ -388,126 +388,125 @@ typedef struct _TEB_ACTIVE_FRAME {
     TEB_ACTIVE_FRAME_CONTEXT* Context;
 } TEB_ACTIVE_FRAME, *PTEB_ACTIVE_FRAME;
 
-typedef struct _TEB {                             /* win32/win64 */
-    NT_TIB Tib;                                   /* 000/0000 */
-    PVOID EnvironmentPointer;                     /* 01c/0038 */
-    CLIENT_ID ClientId;                           /* 020/0040 */
-    PVOID ActiveRpcHandle;                        /* 028/0050 */
-    PVOID ThreadLocalStoragePointer;              /* 02c/0058 */
-    PPEB Peb;                                     /* 030/0060 */
-    ULONG LastErrorValue;                         /* 034/0068 */
-    ULONG CountOfOwnedCriticalSections;           /* 038/006c */
-    PVOID CsrClientThread;                        /* 03c/0070 */
-    PVOID Win32ThreadInfo;                        /* 040/0078 */
-    ULONG User32Reserved[26];                     /* 044/0080 */
-    ULONG UserReserved[5];                        /* 0ac/00e8 */
-    PVOID WOW32Reserved;                          /* 0c0/0100 */
-    ULONG CurrentLocale;                          /* 0c4/0108 */
-    ULONG FpSoftwareStatusRegister;               /* 0c8/010c */
-    PVOID ReservedForDebuggerInstrumentation[16]; /* 0cc/0110 */
+typedef struct _TEB {
+    NT_TIB Tib;
+    PVOID EnvironmentPointer;
+    CLIENT_ID ClientId;
+    PVOID ActiveRpcHandle;
+    PVOID ThreadLocalStoragePointer;
+    PPEB Peb;
+    ULONG LastErrorValue;
+    ULONG CountOfOwnedCriticalSections;
+    PVOID CsrClientThread;
+    PVOID Win32ThreadInfo;
+    ULONG User32Reserved[26];
+    ULONG UserReserved[5];
+    PVOID WOW32Reserved;
+    ULONG CurrentLocale;
+    ULONG FpSoftwareStatusRegister;
+    PVOID ReservedForDebuggerInstrumentation[16];
 #ifdef _WIN64
-    PVOID SystemReserved1[30]; /*    /0190 */
+    PVOID SystemReserved1[30];
 #else
-    PVOID SystemReserved1[26]; /* 10c/     */
+    PVOID SystemReserved1[26];
 #endif
-    char PlaceholderCompatibilityMode;                       /* 174/0280 */
-    BOOLEAN PlaceholderHydrationAlwaysExplicit;              /* 175/0281 */
-    char PlaceholderReserved[10];                            /* 176/0282 */
-    DWORD ProxiedProcessId;                                  /* 180/028c */
-    ACTIVATION_CONTEXT_STACK ActivationContextStack;         /* 184/0290 */
-    UCHAR WorkingOnBehalfOfTicket[8];                        /* 19c/02b8 */
-    LONG ExceptionCode;                                      /* 1a4/02c0 */
-    ACTIVATION_CONTEXT_STACK* ActivationContextStackPointer; /* 1a8/02c8 */
-    ULONG_PTR InstrumentationCallbackSp;                     /* 1ac/02d0 */
-    ULONG_PTR InstrumentationCallbackPreviousPc;             /* 1b0/02d8 */
-    ULONG_PTR InstrumentationCallbackPreviousSp;             /* 1b4/02e0 */
+    char PlaceholderCompatibilityMode;
+    BOOLEAN PlaceholderHydrationAlwaysExplicit;
+    char PlaceholderReserved[10];
+    DWORD ProxiedProcessId;
+    ACTIVATION_CONTEXT_STACK ActivationContextStack;
+    UCHAR WorkingOnBehalfOfTicket[8];
+    LONG ExceptionCode;
+    ACTIVATION_CONTEXT_STACK* ActivationContextStackPointer;
+    ULONG_PTR InstrumentationCallbackSp;
+    ULONG_PTR InstrumentationCallbackPreviousPc;
+    ULONG_PTR InstrumentationCallbackPreviousSp;
 #ifdef _WIN64
-    ULONG TxFsContext;                       /*    /02e8 */
-    BOOLEAN InstrumentationCallbackDisabled; /*    /02ec */
-    BOOLEAN UnalignedLoadStoreExceptions;    /*    /02ed */
+    ULONG TxFsContext;
+    BOOLEAN InstrumentationCallbackDisabled;
+    BOOLEAN UnalignedLoadStoreExceptions;
 #else
-    BOOLEAN InstrumentationCallbackDisabled; /* 1b8/     */
-    BYTE SpareBytes1[23];                    /* 1b9/     */
-    ULONG TxFsContext;                       /* 1d0/     */
+    BOOLEAN InstrumentationCallbackDisabled;
+    BYTE SpareBytes1[23];
+    ULONG TxFsContext;
 #endif
-    GDI_TEB_BATCH GdiTebBatch;          /* 1d4/02f0 */
-    CLIENT_ID RealClientId;             /* 6b4/07d8 */
-    HANDLE GdiCachedProcessHandle;      /* 6bc/07e8 */
-    ULONG GdiClientPID;                 /* 6c0/07f0 */
-    ULONG GdiClientTID;                 /* 6c4/07f4 */
-    PVOID GdiThreadLocaleInfo;          /* 6c8/07f8 */
-    ULONG_PTR Win32ClientInfo[62];      /* 6cc/0800 */
-    PVOID glDispatchTable[233];         /* 7c4/09f0 */
-    PVOID glReserved1[29];              /* b68/1138 */
-    PVOID glReserved2;                  /* bdc/1220 */
-    PVOID glSectionInfo;                /* be0/1228 */
-    PVOID glSection;                    /* be4/1230 */
-    PVOID glTable;                      /* be8/1238 */
-    PVOID glCurrentRC;                  /* bec/1240 */
-    PVOID glContext;                    /* bf0/1248 */
-    ULONG LastStatusValue;              /* bf4/1250 */
-    UNICODE_STRING StaticUnicodeString; /* bf8/1258 */
-    WCHAR StaticUnicodeBuffer[261];     /* c00/1268 */
-    PVOID DeallocationStack;            /* e0c/1478 */
-    PVOID TlsSlots[64];                 /* e10/1480 */
-    LIST_ENTRY TlsLinks;                /* f10/1680 */
-    PVOID Vdm;                          /* f18/1690 */
-    PVOID ReservedForNtRpc;             /* f1c/1698 */
-    PVOID DbgSsReserved[2];             /* f20/16a0 */
-    ULONG HardErrorMode;                /* f28/16b0 */
+    GDI_TEB_BATCH GdiTebBatch;
+    CLIENT_ID RealClientId;
+    HANDLE GdiCachedProcessHandle;
+    ULONG GdiClientPID;
+    ULONG GdiClientTID;
+    PVOID GdiThreadLocaleInfo;
+    ULONG_PTR Win32ClientInfo[62];
+    PVOID glDispatchTable[233];
+    PVOID glReserved1[29];
+    PVOID glReserved2;
+    PVOID glSectionInfo;
+    PVOID glSection;
+    PVOID glTable;
+    PVOID glCurrentRC;
+    PVOID glContext;
+    ULONG LastStatusValue;
+    UNICODE_STRING StaticUnicodeString;
+    WCHAR StaticUnicodeBuffer[261];
+    PVOID DeallocationStack;
+    PVOID TlsSlots[64];
+    LIST_ENTRY TlsLinks;
+    PVOID Vdm;
+    PVOID ReservedForNtRpc;
+    PVOID DbgSsReserved[2];
+    ULONG HardErrorMode;
 #ifdef _WIN64
-    PVOID Instrumentation[11]; /*    /16b8 */
+    PVOID Instrumentation[11];
 #else
-    PVOID Instrumentation[9]; /* f2c/ */
+    PVOID Instrumentation[9];
 #endif
-    GUID ActivityId;                   /* f50/1710 */
-    PVOID SubProcessTag;               /* f60/1720 */
-    PVOID PerflibData;                 /* f64/1728 */
-    PVOID EtwTraceData;                /* f68/1730 */
-    PVOID WinSockData;                 /* f6c/1738 */
-    ULONG GdiBatchCount;               /* f70/1740 */
-    ULONG IdealProcessorValue;         /* f74/1744 */
-    ULONG GuaranteedStackBytes;        /* f78/1748 */
-    PVOID ReservedForPerf;             /* f7c/1750 */
-    PVOID ReservedForOle;              /* f80/1758 */
-    ULONG WaitingOnLoaderLock;         /* f84/1760 */
-    PVOID SavedPriorityState;          /* f88/1768 */
-    ULONG_PTR ReservedForCodeCoverage; /* f8c/1770 */
-    PVOID ThreadPoolData;              /* f90/1778 */
-    PVOID* TlsExpansionSlots;          /* f94/1780 */
+    GUID ActivityId;
+    PVOID SubProcessTag;
+    PVOID PerflibData;
+    PVOID EtwTraceData;
+    PVOID WinSockData;
+    ULONG GdiBatchCount;
+    ULONG IdealProcessorValue;
+    ULONG GuaranteedStackBytes;
+    PVOID ReservedForPerf;
+    PVOID ReservedForOle;
+    ULONG WaitingOnLoaderLock;
+    PVOID SavedPriorityState;
+    ULONG_PTR ReservedForCodeCoverage;
+    PVOID ThreadPoolData;
+    PVOID* TlsExpansionSlots;
 #ifdef _WIN64
     union {
-        PVOID DeallocationBStore; /*    /1788 */
-        PVOID* ChpeV2CpuAreaInfo; /*    /1788 */
+        PVOID DeallocationBStore;
+        PVOID* ChpeV2CpuAreaInfo;
     } DUMMYUNIONNAME;
-    PVOID BStoreLimit; /*    /1790 */
+    PVOID BStoreLimit;
 #endif
-    ULONG MuiGeneration;            /* f98/1798 */
-    ULONG IsImpersonating;          /* f9c/179c */
-    PVOID NlsCache;                 /* fa0/17a0 */
-    PVOID ShimData;                 /* fa4/17a8 */
-    ULONG HeapVirtualAffinity;      /* fa8/17b0 */
-    PVOID CurrentTransactionHandle; /* fac/17b8 */
-    TEB_ACTIVE_FRAME* ActiveFrame;  /* fb0/17c0 */
-    PVOID* FlsSlots;                /* fb4/17c8 */
-    PVOID PreferredLanguages;       /* fb8/17d0 */
-    PVOID UserPrefLanguages;        /* fbc/17d8 */
-    PVOID MergedPrefLanguages;      /* fc0/17e0 */
-    ULONG MuiImpersonation;         /* fc4/17e8 */
-    USHORT CrossTebFlags;           /* fc8/17ec */
-    USHORT SameTebFlags;            /* fca/17ee */
-    PVOID TxnScopeEnterCallback;    /* fcc/17f0 */
-    PVOID TxnScopeExitCallback;     /* fd0/17f8 */
-    PVOID TxnScopeContext;          /* fd4/1800 */
-    ULONG LockCount;                /* fd8/1808 */
-    LONG WowTebOffset;              /* fdc/180c */
-    PVOID ResourceRetValue;         /* fe0/1810 */
-    PVOID ReservedForWdf;           /* fe4/1818 */
-    ULONGLONG ReservedForCrt;       /* fe8/1820 */
-    GUID EffectiveContainerId;      /* ff0/1828 */
+    ULONG MuiGeneration;
+    ULONG IsImpersonating;
+    PVOID NlsCache;
+    PVOID ShimData;
+    ULONG HeapVirtualAffinity;
+    PVOID CurrentTransactionHandle;
+    TEB_ACTIVE_FRAME* ActiveFrame;
+    PVOID* FlsSlots;
+    PVOID PreferredLanguages;
+    PVOID UserPrefLanguages;
+    PVOID MergedPrefLanguages;
+    ULONG MuiImpersonation;
+    USHORT CrossTebFlags;
+    USHORT SameTebFlags;
+    PVOID TxnScopeEnterCallback;
+    PVOID TxnScopeExitCallback;
+    PVOID TxnScopeContext;
+    ULONG LockCount;
+    LONG WowTebOffset;
+    PVOID ResourceRetValue;
+    PVOID ReservedForWdf;
+    ULONGLONG ReservedForCrt;
+    GUID EffectiveContainerId;
 } TEB, *PTEB;
-static_assert(offsetof(TEB, DeallocationStack) ==
-              0x1478); /* The only member we care about at the moment */
+static_assert(offsetof(TEB, DeallocationStack) == 0x1478);
 
 typedef enum _QUEUE_USER_APC_FLAGS {
     QueueUserApcFlagsNone,

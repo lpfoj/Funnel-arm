@@ -35,16 +35,16 @@
  * $FreeBSD$
  */
 
-#define IOCPARM_SHIFT 13                        /* number of bits for ioctl size */
-#define IOCPARM_MASK ((1 << IOCPARM_SHIFT) - 1) /* parameter length mask */
+#define IOCPARM_SHIFT 13
+#define IOCPARM_MASK ((1 << IOCPARM_SHIFT) - 1)
 #define IOCPARM_LEN(x) (((x) >> 16) & IOCPARM_MASK)
 #define IOCBASECMD(x) ((x) & ~(IOCPARM_MASK << 16))
 #define IOCGROUP(x) (((x) >> 8) & 0xff)
 
-#define IOCPARM_MAX (1 << IOCPARM_SHIFT) /* max size of ioctl */
-#define IOC_VOID 0x20000000              /* no parameters */
-#define IOC_OUT 0x40000000               /* copy out parameters */
-#define IOC_IN 0x80000000                /* copy in parameters */
+#define IOCPARM_MAX (1 << IOCPARM_SHIFT)
+#define IOC_VOID 0x20000000
+#define IOC_OUT 0x40000000
+#define IOC_IN 0x80000000
 #define IOC_INOUT (IOC_IN | IOC_OUT)
 #define IOC_DIRMASK (IOC_VOID | IOC_OUT | IOC_IN)
 
@@ -54,14 +54,4 @@
 #define _IOWINT(g, n) _IOC(IOC_VOID, (g), (n), sizeof(int))
 #define _IOR(g, n, t) _IOC(IOC_OUT, (g), (n), sizeof(t))
 #define _IOW(g, n, t) _IOC(IOC_IN, (g), (n), sizeof(t))
-/* this should be _IORW, but stdio got there first */
 #define _IOWR(g, n, t) _IOC(IOC_INOUT, (g), (n), sizeof(t))
-
-/*
-# Simple parse of ioctl cmd
-def parse(v):
-  print('inout', (v >> 24 & 0xFF))
-  print('len', hex(v >> 16 & 0xFF))
-  print('group', chr(v >> 8 & 0xFF))
-  print('num', hex(v & 0xFF))
-*/

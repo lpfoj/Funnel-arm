@@ -7,37 +7,27 @@
 
 namespace Libraries::SysModule {
 
-/**
- * libSceSysmodule hardcodes an array of valuable data about loading each PS4 module.
- * This header stores the contents of this array, as dumped from 12.52's libSceSysmodule,
- * and altered to fit within my simplified internal module struct.
- */
-
-// This is an internal struct. Doesn't match the real one exactly.
 struct OrbisSysmoduleModuleInternal {
-    u32 id;             // User requested ID
-    s32 handle;         // Handle of the module, once loaded
-    s32 is_loaded;      // 0 by default, set to 1 once loaded.
-    s32 flags;          // Miscellaneous details about the module
-    const char* name;   // Name of the actual SPRX/PRX library
-    const u16* to_load; // Pointer to an array of modules to load
-    s32 num_to_load;    // Number of indicies in the array of modules
+    u32 id;
+    s32 handle;
+    s32 is_loaded;
+    s32 flags;
+    const char* name;
+    const u16* to_load;
+    s32 num_to_load;
 };
 
-// This enum contains helpful identifiers for some bits used in the flags of a module.
 enum OrbisSysmoduleModuleInternalFlags : s32 {
-    IsCommon = 1,        // Module is located in /system/common/lib
-    IsPriv = 2,          // Module is located in /system/priv/lib
-    IsGame = 4,          // Module is located in /app0/sce_module
-    IsDebug = 8,         // Module should only be loaded on devkit/testkit consoles
-    IsNeo = 0x200,       // Module should only be loaded on PS4 Pro consoles
-    IsNeoMode = 0x400,   // Module should only be loaded for PS4 Pro running in enhanced mode
-    IsCommonEx = 0x1000, // Module is located in /system_ex/common_ex/lib
-    IsPrivEx = 0x2000,   // Module is located in /system_ex/priv_ex/lib
+    IsCommon = 1,
+    IsPriv = 2,
+    IsGame = 4,
+    IsDebug = 8,
+    IsNeo = 0x200,
+    IsNeoMode = 0x400,
+    IsCommonEx = 0x1000,
+    IsPrivEx = 0x2000,
 };
 
-// Array of module indexes to load in sceSysmodulePreloadModuleForLibkernel.
-// The library has three versions of this array
 u32 g_preload_list_1[36] = {0x24, 3,    4,    5,    6,    7,    8,    9,    0x25, 0xb,  0xc,  0xd,
                             0xe,  0xf,  0x10, 0x11, 0x1f, 0x12, 0x13, 0x14, 0x27, 0x28, 0x16, 0x17,
                             0x2a, 0x18, 0x29, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x26, 0x1e, 0x20, 0x21};
@@ -50,8 +40,6 @@ u32 g_preload_list_3[38] = {1,    2,    0x24, 0x22, 3,    4,    5,    6,    7,  
                             0x12, 0x23, 0x13, 0x14, 0x27, 0x28, 0x16, 0x17, 0x2a, 0x18,
                             0x29, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x26, 0x1e};
 
-// Arrays of modules to load for each module.
-// The stored values are valid indices to modules in g_modules_array.
 u16 g_libSceNet_modules[1] = {5};
 u16 g_libSceIpmi_modules[1] = {6};
 u16 g_libSceMbus_modules[2] = {7, 6};
@@ -360,7 +348,6 @@ u16 g_libSceFontGsm_modules[1] = {307};
 u16 g_libSceNpPartnerSubscription_modules[1] = {308};
 u16 g_libSceNpAuthAuthorizedAppDialog_modules[1] = {309};
 
-// This is the actual array of modules.
 constexpr u64 g_num_modules = 310;
 std::array<OrbisSysmoduleModuleInternal, g_num_modules> g_modules_array = std::to_array<
     OrbisSysmoduleModuleInternal>(
@@ -681,4 +668,4 @@ std::array<OrbisSysmoduleModuleInternal, g_num_modules> g_modules_array = std::t
      {0x139, -1, 0, 1, "libSceNpAuthAuthorizedAppDialog", g_libSceNpAuthAuthorizedAppDialog_modules,
       1}});
 
-} // namespace Libraries::SysModule
+}

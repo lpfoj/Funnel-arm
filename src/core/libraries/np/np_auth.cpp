@@ -1,22 +1,22 @@
-// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
+#include "common/config.h"
 #include "common/logging/log.h"
-#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_auth.h"
+#include "core/libraries/np/np_auth_error.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/system/userservice.h"
 
 namespace Libraries::Np::NpAuth {
 
-static bool g_shadnet_enabled = false;
+static bool g_signed_in = false;
 static s32 g_active_auth_requests = 0;
 static std::mutex g_auth_request_mutex;
 
-// Internal types for storing request-related information
 enum class NpAuthRequestState {
     None = 0,
     Ready = 1,
@@ -41,9 +41,7 @@ s32 CreateNpAuthRequest(bool async) {
 
     s32 req_index = 0;
     while (req_index < g_auth_requests.size()) {
-        // Find first nonexistant request
         if (g_auth_requests[req_index].state == NpAuthRequestState::None) {
-            // There is no request at this index, set the index to ready then break.
             g_auth_requests[req_index].state = NpAuthRequestState::Ready;
             g_auth_requests[req_index].async = async;
             break;
@@ -52,12 +50,10 @@ s32 CreateNpAuthRequest(bool async) {
     }
 
     if (req_index == g_auth_requests.size()) {
-        // There are no requests to replace.
         NpAuthRequest new_request{NpAuthRequestState::Ready, async, 0};
         g_auth_requests.emplace_back(new_request);
     }
 
-    // Offset by one, first returned ID is 0x10000001
     g_active_auth_requests++;
     LOG_DEBUG(Lib_NpAuth, "called, async = {}", async);
     return req_index + ORBIS_NP_AUTH_REQUEST_ID_OFFSET + 1;
@@ -92,7 +88,6 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
 
     std::scoped_lock lk{g_auth_request_mutex};
 
-    // From here the actual authorization code request is performed.
     s32 req_index = req_id - ORBIS_NP_AUTH_REQUEST_ID_OFFSET - 1;
     if (g_active_auth_requests == 0 || g_auth_requests.size() <= req_index ||
         g_auth_requests[req_index].state == NpAuthRequestState::None) {
@@ -109,9 +104,8 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
     }
 
     request.state = NpAuthRequestState::Complete;
-    if (!g_shadnet_enabled) {
+    if (!g_signed_in) {
         request.result = ORBIS_NP_ERROR_SIGNED_OUT;
-        // If the request is processed in some form, and it's an async request, then it returns OK.
         if (request.async) {
             return ORBIS_OK;
         }
@@ -120,11 +114,9 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
 
     LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id, request.async);
 
-    // Not sure what values are expected here, so zeroing these for now.
     std::memset(auth_code, 0, sizeof(OrbisNpAuthorizationCode));
-    std::strncpy(auth_code->code, "AUTHCODE", 9);
     if (issuer_id != nullptr) {
-        *issuer_id = 100;
+        *issuer_id = 0;
     }
     return ORBIS_OK;
 }
@@ -141,18 +133,13 @@ sceNpAuthGetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeP
     if (param->online_id == nullptr || param->client_id == nullptr || param->scope == nullptr) {
         return ORBIS_NP_AUTH_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled) {
-        // Calls sceNpManagerIntGetUserIdByOnlineId to get a user id, returning any errors.
-        // This call will not succeed while signed out because games cannot retrieve an online id.
+    if (!g_signed_in) {
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
 
-    // For simplicity, call sceUserServiceGetInitialUser to get the user_id.
     s32 user_id = 0;
     ASSERT(UserService::sceUserServiceGetInitialUser(&user_id) == 0);
 
-    // Library constructs an OrbisNpAuthGetAuthorizationCodeParameterA struct,
-    // then uses that to call GetAuthorizationCode.
     OrbisNpAuthGetAuthorizationCodeParameterA internal_params;
     std::memset(&internal_params, 0, sizeof(internal_params));
     internal_params.size = sizeof(internal_params);
@@ -190,7 +177,6 @@ s32 GetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenParameterA* param, s32 fla
 
     std::scoped_lock lk{g_auth_request_mutex};
 
-    // From here the actual authorization code request is performed.
     s32 req_index = req_id - ORBIS_NP_AUTH_REQUEST_ID_OFFSET - 1;
     if (g_active_auth_requests == 0 || g_auth_requests.size() <= req_index ||
         g_auth_requests[req_index].state == NpAuthRequestState::None) {
@@ -207,9 +193,8 @@ s32 GetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenParameterA* param, s32 fla
     }
 
     request.state = NpAuthRequestState::Complete;
-    if (!g_shadnet_enabled) {
+    if (!g_signed_in) {
         request.result = ORBIS_NP_ERROR_SIGNED_OUT;
-        // If the request is processed in some form, and it's an async request, then it returns OK.
         if (request.async) {
             return ORBIS_OK;
         }
@@ -218,9 +203,7 @@ s32 GetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenParameterA* param, s32 fla
 
     LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id, request.async);
 
-    // Not sure what values are expected here, so zeroing this for now.
     std::memset(token, 0, sizeof(OrbisNpIdToken));
-    std::strncpy(token->token, "TOKEN", 6);
     return ORBIS_OK;
 }
 
@@ -236,18 +219,13 @@ s32 PS4_SYSV_ABI sceNpAuthGetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenPara
         param->client_secret == nullptr || param->scope == nullptr) {
         return ORBIS_NP_AUTH_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled) {
-        // Calls sceNpManagerIntGetUserIdByOnlineId to get a user id, returning any errors.
-        // This call will not succeed while signed out because games cannot retrieve an online id.
+    if (!g_signed_in) {
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
 
-    // For simplicity, call sceUserServiceGetInitialUser to get the user_id.
     s32 user_id = 0;
     ASSERT(UserService::sceUserServiceGetInitialUser(&user_id) == 0);
 
-    // Library constructs an OrbisNpAuthGetIdTokenParameterA struct,
-    // then uses that to call GetIdToken.
     OrbisNpAuthGetIdTokenParameterA internal_params;
     std::memset(&internal_params, 0, sizeof(internal_params));
     internal_params.size = sizeof(internal_params);
@@ -287,7 +265,6 @@ s32 PS4_SYSV_ABI sceNpAuthAbortRequest(s32 req_id) {
     }
 
     if (g_auth_requests[req_index].state == NpAuthRequestState::Complete) {
-        // If the request is already complete, abort is ignored.
         return ORBIS_OK;
     }
 
@@ -313,8 +290,6 @@ s32 PS4_SYSV_ABI sceNpAuthWaitAsync(s32 req_id, s32* result) {
         return ORBIS_NP_AUTH_ERROR_INVALID_ID;
     }
 
-    // Since we're not actually performing any sort of network request here,
-    // we can just set result based on the request and return.
     *result = g_auth_requests[req_index].result;
     LOG_WARNING(Lib_NpAuth, "called req_id = {:#x}, returning result = {:#x}", req_id,
                 static_cast<u32>(*result));
@@ -339,8 +314,6 @@ s32 PS4_SYSV_ABI sceNpAuthPollAsync(s32 req_id, s32* result) {
         return ORBIS_NP_AUTH_ERROR_INVALID_ID;
     }
 
-    // Since we're not actually performing any sort of network request here,
-    // we can just set result based on the request and return.
     *result = g_auth_requests[req_index].result;
     LOG_WARNING(Lib_NpAuth, "called req_id = {:#x}, returning result = {:#x}", req_id,
                 static_cast<u32>(*result));
@@ -364,7 +337,7 @@ s32 PS4_SYSV_ABI sceNpAuthDeleteRequest(s32 req_id) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();
+    g_signed_in = Config::getPSNSignedIn();
 
     LIB_FUNCTION("6bwFkosYRQg", "libSceNpAuth", 1, "libSceNpAuth", sceNpAuthCreateRequest);
     LIB_FUNCTION("N+mr7GjTvr8", "libSceNpAuth", 1, "libSceNpAuth", sceNpAuthCreateAsyncRequest);
@@ -385,4 +358,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("uaB-LoJqHis", "libSceNpAuthCompat", 1, "libSceNpAuth", sceNpAuthGetIdToken);
 };
 
-} // namespace Libraries::Np::NpAuth
+}

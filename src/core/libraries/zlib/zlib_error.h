@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// Zlib library
 constexpr int ORBIS_ZLIB_ERROR_NOT_FOUND = 0x81120002;
 constexpr int ORBIS_ZLIB_ERROR_BUSY = 0x8112000B;
 constexpr int ORBIS_ZLIB_ERROR_FAULT = 0x8112000E;

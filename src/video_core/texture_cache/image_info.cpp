@@ -21,8 +21,6 @@ using VideoOutFormat = Libraries::VideoOut::PixelFormat;
 static vk::Format ConvertPixelFormat(const VideoOutFormat format) {
     switch (format) {
     case VideoOutFormat::A8B8G8R8Srgb:
-    // Remaining formats are mapped to RGBA for internal consistency and changed to BGRA in the
-    // frame image view.
     case VideoOutFormat::A8R8G8B8Srgb:
         return vk::Format::eR8G8B8A8Srgb;
     case VideoOutFormat::A2R10G10B10:
@@ -221,12 +219,10 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
         return -1;
     }
 
-    // Currently we expect only on level to be copied.
     if (resources.levels != 1) {
         return -1;
     }
 
-    // Find mip
     auto mip = -1;
     for (auto m = 0; m < info.resources.levels; ++m) {
         const auto& [mip_size, mip_pitch, mip_height, mip_ofs] = info.mips_layout[m];
@@ -247,7 +243,6 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     const auto curr_block_dim = BlockDim();
     const auto info_block_dim = info.BlockDim();
 
-    // 2D block dimensions of both images should be the same.
     const auto mip_w = std::max(info_block_dim.width >> mip, 1u);
     const auto mip_h = std::max(info_block_dim.height >> mip, 1u);
     if ((curr_block_dim.width != mip_w) || (curr_block_dim.height != mip_h)) {
@@ -256,7 +251,6 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
 
     const auto mip_d = std::max(info.size.depth >> mip, 1u);
     if (info.type == AmdGpu::ImageType::Color3D && type == AmdGpu::ImageType::Color2D) {
-        // In case of 2D array to 3D copy, make sure we have proper number of layers.
         if (resources.layers != mip_d) {
             return -1;
         }
@@ -274,7 +268,6 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
         return -1;
     }
 
-    // Array slices should be of the same type.
     if (type != info.type) {
         return -1;
     }
@@ -282,20 +275,17 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     const auto curr_block_dim = BlockDim();
     const auto info_block_dim = info.BlockDim();
 
-    // 2D block dimensions of both images should be the same.
     const auto mip_w = std::max(info_block_dim.width >> mip, 1u);
     const auto mip_h = std::max(info_block_dim.height >> mip, 1u);
     if ((curr_block_dim.width != mip_w) || (curr_block_dim.height != mip_h)) {
         return -1;
     }
 
-    // Check for size alignment.
     const u32 slice_size = info.mips_layout[mip].size / info.resources.layers;
     if (guest_size % slice_size != 0) {
         return -1;
     }
 
-    // Ensure that address is aligned too.
     const auto addr_diff = guest_address - (info.guest_address + info.mips_layout[mip].offset);
     if ((addr_diff % guest_size) != 0) {
         return -1;
@@ -304,4 +294,4 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     return addr_diff / guest_size;
 }
 
-} // namespace VideoCore
+}

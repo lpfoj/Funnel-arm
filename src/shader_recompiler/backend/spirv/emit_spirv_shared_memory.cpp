@@ -48,4 +48,4 @@ void EmitWriteSharedU64(EmitContext& ctx, Id offset, Id value) {
     ctx.OpStore(pointer, value);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

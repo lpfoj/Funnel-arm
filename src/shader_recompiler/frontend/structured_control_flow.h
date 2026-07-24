@@ -12,7 +12,7 @@ namespace Shader {
 struct Info;
 struct Profile;
 struct RuntimeInfo;
-} // namespace Shader
+}
 
 namespace Shader::Gcn {
 
@@ -21,4 +21,4 @@ namespace Shader::Gcn {
                                               Info& info, const RuntimeInfo& runtime_info,
                                               const Profile& profile);
 
-} // namespace Shader::Gcn
+}

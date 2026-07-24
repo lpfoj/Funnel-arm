@@ -36,4 +36,4 @@ private:
     };
 };
 
-} // namespace Core::Devices
+}

@@ -42,7 +42,7 @@ constexpr std::string_view NameOf(Condition condition) {
     }
 }
 
-} // namespace Shader::IR
+}
 
 template <>
 struct fmt::formatter<Shader::IR::Condition> : formatter<std::string_view> {

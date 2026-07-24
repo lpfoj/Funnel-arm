@@ -104,7 +104,6 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
-    // Create buffer object.
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = flags,
@@ -115,7 +114,6 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     const auto device = instance->GetDevice();
     Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
 
-    // Map it if it is host visible.
     VkMemoryPropertyFlags property_flags{};
     vmaGetAllocationMemoryProperties(instance->GetAllocator(), buffer.allocation, &property_flags);
     if (alloc_info.pMappedData) {
@@ -189,12 +187,10 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     if (offset + size > this->size_bytes) {
-        // The buffer would overflow, save the amount of used watches and reset the state.
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;
 
-        // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);
         wait_cursor = 0;
         wait_bound = 0;
@@ -220,19 +216,40 @@ void StreamBuffer::Commit() {
 
     offset += mapped_size;
     if (current_watch_cursor != 0 &&
-        current_watches[current_watch_cursor].tick == scheduler->CurrentTick()) {
-        current_watches[current_watch_cursor].upper_bound = offset;
+        current_watches[current_watch_cursor - 1].tick == scheduler->CurrentTick()) {
+        current_watches[current_watch_cursor - 1].upper_bound = offset;
         return;
     }
 
     if (current_watch_cursor + 1 >= current_watches.size()) {
-        // Ensure that there are enough watches.
         ReserveWatches(current_watches, WATCHES_RESERVE_CHUNK);
     }
 
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
     watch.tick = scheduler->CurrentTick();
+}
+
+void StreamBuffer::RetainCurrentAllocation() {
+    if (offset == 0) {
+        return;
+    }
+
+    const u64 current_tick = scheduler->CurrentTick();
+    if (current_watch_cursor != 0 &&
+        current_watches[current_watch_cursor - 1].tick == current_tick) {
+        current_watches[current_watch_cursor - 1].upper_bound =
+            std::max(current_watches[current_watch_cursor - 1].upper_bound, offset);
+        return;
+    }
+
+    if (current_watch_cursor + 1 >= current_watches.size()) {
+        ReserveWatches(current_watches, WATCHES_RESERVE_CHUNK);
+    }
+
+    auto& watch = current_watches[current_watch_cursor++];
+    watch.upper_bound = offset;
+    watch.tick = current_tick;
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
@@ -255,4 +272,4 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     return true;
 }
 
-} // namespace VideoCore
+}

@@ -3,8 +3,6 @@
 
 #version 450
 
-// NOTE: Current subgroup utilization is suboptimal on most GPUs, so
-// it will be nice to process two tiles at once here.
 layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) buffer input_buf {
@@ -24,7 +22,6 @@ layout(push_constant) uniform image_info {
 #define MICRO_TILE_DIM      8
 #define TEXELS_PER_ELEMENT  2
 
-// Inverse morton LUT, small enough to fit into K$
 const uint rmort[16] = {
     0x11011000, 0x31213020,
     0x13031202, 0x33233222,

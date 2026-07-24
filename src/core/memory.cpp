@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <cstdlib>
+#endif
+#include <limits>
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
-#include "core/emulator_settings.h"
+#include "core/aerolib/stubs.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -18,7 +24,6 @@ namespace Core {
 MemoryManager::MemoryManager() {
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
 
-    // Construct vma_map using the regions reserved by the address space
     auto regions = impl.GetUsableRegions();
     u64 total_usable_space = 0;
     for (auto region : regions) {
@@ -27,20 +32,30 @@ MemoryManager::MemoryManager() {
         LOG_INFO(Kernel_Vmm, "{:#x} - {:#x}", region.lower(), region.upper());
     }
 
-    // Pre-initialize direct backing
-    auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
-    if (extra_dmem != 0) {
-        total_size += extra_dmem * 1_MB;
+    if (!Core::AeroLib::ExecutorUseRealLibcAlloc()) {
+        auto it = FindVMA(EXECUTOR_LIBC_MSPACE_BASE);
+        if (it != vma_map.end() && it->second.IsFree() &&
+            it->second.Contains(EXECUTOR_LIBC_MSPACE_BASE, EXECUTOR_LIBC_MSPACE_CAPACITY)) {
+            const auto handle =
+                CarveVMA(EXECUTOR_LIBC_MSPACE_BASE, EXECUTOR_LIBC_MSPACE_CAPACITY);
+            auto& vma = handle->second;
+            vma.type = VMAType::ExecutorHeap;
+            impl.ReserveRange(EXECUTOR_LIBC_MSPACE_BASE, EXECUTOR_LIBC_MSPACE_CAPACITY);
+            vma.prot = MemoryProt::CpuReadWrite;
+            vma.name = "executor_libc_mspace";
+            executor_libc_mspace_size = EXECUTOR_LIBC_MSPACE_INITIAL_SIZE;
+            LOG_INFO(Kernel_Vmm,
+                     "Reserved Executor libc mspace capacity {:#x} - {:#x} (initial size {:#x})",
+                     EXECUTOR_LIBC_MSPACE_BASE,
+                     EXECUTOR_LIBC_MSPACE_BASE + EXECUTOR_LIBC_MSPACE_CAPACITY,
+                     executor_libc_mspace_size);
+        } else {
+            LOG_ERROR(Kernel_Vmm,
+                      "Could not reserve Executor libc mspace capacity at {:#x}; "
+                      "direct/flexible maps may collide with libc heap",
+                      EXECUTOR_LIBC_MSPACE_BASE);
+        }
     }
-    total_direct_size = total_size;
-    dmem_map.clear();
-    dmem_map.emplace(0, PhysicalMemoryArea{0, total_direct_size});
-
-    // Pre-initialize flexible backing
-    total_flexible_size = ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
-    fmem_map.clear();
-    fmem_map.emplace(total_size, PhysicalMemoryArea{total_size, total_flexible_size});
 
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&sdk_version) == 0,
                "Failed to get compiled SDK version");
@@ -48,16 +63,97 @@ MemoryManager::MemoryManager() {
 
 MemoryManager::~MemoryManager() = default;
 
+void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
+    u64 libc_mspace_size = 0;
+    {
+        std::unique_lock lk{mutex};
+        rasterizer = rasterizer_;
+        libc_mspace_size = executor_libc_mspace_size;
+    }
+
+#ifdef __ANDROID__
+    if (rasterizer == nullptr) {
+        return;
+    }
+    if (Core::AeroLib::ExecutorUseRealLibcAlloc()) {
+        LOG_INFO(Kernel_Vmm,
+                 "Guest libc allocator selected; bootstrap Executor mspace reservation disabled");
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIBC_OWNER] owner=guest-libc "
+                            "action=skip-executor-fallback-reservation");
+#endif
+    } else {
+
+        if (libc_mspace_size != 0) {
+            rasterizer->MapMemory(EXECUTOR_LIBC_MSPACE_BASE, libc_mspace_size);
+        }
+    }
+#endif
+}
+
+u64 MemoryManager::GrowExecutorLibcMspace(u64 required_size) {
+    if (required_size == 0 || required_size > EXECUTOR_LIBC_MSPACE_CAPACITY) {
+        return 0;
+    }
+
+    const u64 rounded_size =
+        std::min(EXECUTOR_LIBC_MSPACE_CAPACITY,
+                 (required_size + EXECUTOR_LIBC_MSPACE_GROW_GRANULARITY - 1) &
+                     ~(EXECUTOR_LIBC_MSPACE_GROW_GRANULARITY - 1));
+    u64 old_size = 0;
+    Vulkan::Rasterizer* active_rasterizer = nullptr;
+    {
+        std::unique_lock lk{mutex};
+        if (executor_libc_mspace_size == 0) {
+            return 0;
+        }
+        if (required_size <= executor_libc_mspace_size) {
+            return executor_libc_mspace_size;
+        }
+
+        const auto vma = FindVMA(EXECUTOR_LIBC_MSPACE_BASE);
+        if (vma == vma_map.end() || vma->second.type != VMAType::ExecutorHeap ||
+            vma->second.name != "executor_libc_mspace" ||
+            !vma->second.Contains(EXECUTOR_LIBC_MSPACE_BASE, EXECUTOR_LIBC_MSPACE_CAPACITY)) {
+            LOG_ERROR(Kernel_Vmm,
+                      "Executor libc mspace growth rejected: mapped capacity invariant lost");
+            return 0;
+        }
+
+        old_size = executor_libc_mspace_size;
+        executor_libc_mspace_size = rounded_size;
+        active_rasterizer = rasterizer;
+    }
+
+    if (active_rasterizer != nullptr && rounded_size > old_size) {
+        active_rasterizer->MapMemory(EXECUTOR_LIBC_MSPACE_BASE + old_size,
+                                     rounded_size - old_size);
+    }
+
+    LOG_INFO(Kernel_Vmm, "Grew Executor libc mspace from {:#x} to {:#x} (required {:#x})",
+             old_size, rounded_size, required_size);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIBC_MSPACE_GROW] old=0x%llx new=0x%llx "
+                        "required=0x%llx capacity=0x%llx",
+                        static_cast<unsigned long long>(old_size),
+                        static_cast<unsigned long long>(rounded_size),
+                        static_cast<unsigned long long>(required_size),
+                        static_cast<unsigned long long>(EXECUTOR_LIBC_MSPACE_CAPACITY));
+#endif
+    return rounded_size;
+}
+
 void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1,
                                        bool use_extended_mem2) {
-    // Calculate actual direct and flexible memory sizes
     const bool is_neo = ::Libraries::Kernel::sceKernelIsNeoMode();
     auto total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_PRO : ORBIS_KERNEL_TOTAL_MEM;
-    if (EmulatorSettings.IsDevKit()) {
+    if (Config::isDevKitConsole()) {
         total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_DEV_PRO : ORBIS_KERNEL_TOTAL_MEM_DEV;
     }
-    s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
-    if (extra_dmem != 0) {
+    s32 extra_dmem = Config::getExtraDmemInMbytes();
+    if (Config::getExtraDmemInMbytes() != 0) {
         LOG_WARNING(Kernel_Vmm,
                     "extraDmemInMbytes is {} MB! Old Direct Size: {:#x} -> New Direct Size: {:#x}",
                     extra_dmem, total_size, total_size + extra_dmem * 1_MB);
@@ -69,19 +165,16 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
     if (!use_extended_mem2 && !is_neo) {
         total_size -= 128_MB;
     }
-
-    // Update stored totals
-    total_flexible_size = flexible_size - ORBIS_KERNEL_FLEXIBLE_MEMORY_BASE;
-    ASSERT_MSG(total_flexible_size >= flexible_usage, "Unable to shrink flexible memory size");
-    u64 old_direct_size = total_direct_size;
+    total_flexible_size = flexible_size - ORBIS_FLEXIBLE_MEMORY_BASE;
     total_direct_size = total_size - flexible_size;
 
-    // Limit direct memory space to match actual limit
-    auto last_dmem_area = FindDmemArea(total_direct_size);
-    ASSERT_MSG(last_dmem_area->second.dma_type == PhysicalMemoryType::Free &&
-                   last_dmem_area->second.size >= old_direct_size - total_direct_size,
-               "Unable to shrink dmem map");
-    last_dmem_area->second.size -= (old_direct_size - total_direct_size);
+    dmem_map.clear();
+    dmem_map.emplace(0, PhysicalMemoryArea{0, total_direct_size});
+
+    const auto remaining_physical_space = total_size - total_direct_size;
+    fmem_map.clear();
+    fmem_map.emplace(total_direct_size,
+                     PhysicalMemoryArea{total_direct_size, remaining_physical_space});
 
     LOG_INFO(Kernel_Vmm, "Configured memory regions: flexible size = {:#x}, direct size = {:#x}",
              total_flexible_size, total_direct_size);
@@ -89,7 +182,6 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
 
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     static constexpr u64 MinSizeToClamp = 1_GB;
-    // Dont bother with clamping if the size is small so we dont pay a map lookup on every buffer.
     if (size < MinSizeToClamp) {
         return size;
     }
@@ -98,12 +190,10 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
-    // Clamp size to the remaining size of the current VMA.
     auto vma = FindVMA(virtual_addr);
     u64 clamped_size = vma->second.base + vma->second.size - virtual_addr;
     ++vma;
 
-    // Keep adding to the size while there is contigious virtual address space.
     while (vma != vma_map.end() && vma->second.IsMapped() && clamped_size < size) {
         clamped_size += vma->second.size;
         ++vma;
@@ -119,7 +209,7 @@ u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
 
 void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     PrtArea& area = prt_areas[id];
-    if (area.mapped) {
+    if (rasterizer && area.mapped) {
         rasterizer->UnmapMemory(area.start, area.end - area.start);
     }
 
@@ -127,13 +217,75 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     area.end = address + size;
     area.mapped = true;
 
-    // Pretend the entire PRT area is mapped to avoid GPU tracking errors.
-    // The caches will use CopySparseMemory to fetch data which avoids unmapped areas.
-    rasterizer->MapMemory(address, size);
+    if (rasterizer) {
+        rasterizer->MapMemory(address, size);
+    }
+}
+
+void MemoryManager::RegisterReplayMemory(VAddr base, u64 size, const u8* backing) {
+    std::unique_lock lk{mutex};
+    replay_ranges.push_back({base, size, backing});
+}
+
+void MemoryManager::ClearReplayMemory() {
+    std::unique_lock lk{mutex};
+    replay_ranges.clear();
+    replay_canaries.clear();
+}
+
+void MemoryManager::RegisterReplayCanary(VAddr addr, u32 expected) {
+    std::unique_lock lk{mutex};
+    replay_canaries.push_back({addr, expected});
+}
+
+void MemoryManager::VerifyReplayCanaries(const char* where) {
+#ifdef __ANDROID__
+    std::shared_lock lk{mutex};
+    u32 bad = 0;
+    for (const auto& c : replay_canaries) {
+        const u32 got = *reinterpret_cast<const volatile u32*>(c.addr);
+        if (got != c.expected) {
+            ++bad;
+            __android_log_print(ANDROID_LOG_ERROR, "EXECUTOR",
+                                "[EXECUTOR_CANARY] CORRUPT at=%s addr=0x%llx expected=0x%08x got=0x%08x",
+                                where, (unsigned long long)c.addr, c.expected, got);
+        }
+    }
+    if (bad == 0) {
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR", "[EXECUTOR_CANARY] ok at=%s count=%zu", where,
+                            replay_canaries.size());
+    }
+#endif
+}
+
+const MemoryManager::ReplayRange* MemoryManager::FindReplayRange(VAddr addr) const {
+    for (const auto& r : replay_ranges) {
+        if (addr >= r.base && addr < r.base + r.size) {
+            return &r;
+        }
+    }
+    return nullptr;
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     std::shared_lock lk{mutex};
+    if (!replay_ranges.empty()) {
+        while (size) {
+            const ReplayRange* rr = FindReplayRange(virtual_addr);
+            if (!rr) {
+                break;
+            }
+            const u64 avail = rr->base + rr->size - virtual_addr;
+            const u64 copy_size = std::min<u64>(avail, size);
+            std::memcpy(dest, rr->backing + (virtual_addr - rr->base), copy_size);
+            size -= copy_size;
+            virtual_addr += copy_size;
+            dest += copy_size;
+        }
+        if (size == 0) {
+            return;
+        }
+    }
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
@@ -152,43 +304,308 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
-bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
-    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
-    std::shared_lock lk{mutex};
-    ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
-               virtual_addr);
-
-    std::vector<VirtualMemoryArea> vmas_to_write;
-    auto current_vma = FindVMA(virtual_addr);
-    while (current_vma->second.Overlaps(virtual_addr, size)) {
-        if (!HasPhysicalBacking(current_vma->second)) {
-            break;
-        }
-        vmas_to_write.emplace_back(current_vma->second);
-        current_vma++;
+bool MemoryManager::IsReadableMapping(VAddr virtual_addr, u64 size, bool* address_managed) {
+    if (address_managed != nullptr) {
+        *address_managed = false;
     }
-
-    if (vmas_to_write.empty()) {
+    if (size == 0) {
         return false;
     }
 
-    for (auto& vma : vmas_to_write) {
-        auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
-        auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
-        for (; phys_handle != vma.phys_areas.end(); phys_handle++) {
-            if (!size) {
-                break;
+    std::shared_lock lk{mutex};
+    if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
+        return false;
+    }
+
+    auto vma = FindVMA(virtual_addr);
+    if (vma == vma_map.end()) {
+        return false;
+    }
+    const auto& first_area = vma->second;
+    if (first_area.size > std::numeric_limits<VAddr>::max() - first_area.base ||
+        virtual_addr < first_area.base || virtual_addr >= first_area.base + first_area.size) {
+        return false;
+    }
+    if (address_managed != nullptr) {
+        *address_managed = true;
+    }
+    if (virtual_addr > std::numeric_limits<VAddr>::max() - size) {
+        return false;
+    }
+
+    const VAddr range_end = virtual_addr + size;
+    VAddr cursor = virtual_addr;
+    while (cursor < range_end) {
+        if (vma == vma_map.end()) {
+            return false;
+        }
+        const auto& area = vma->second;
+        if (area.size > std::numeric_limits<VAddr>::max() - area.base) {
+            return false;
+        }
+        const VAddr area_end = area.base + area.size;
+        if (cursor < area.base || cursor >= area_end || !area.IsMapped() ||
+            !True(area.prot & MemoryProt::CpuRead)) {
+            return false;
+        }
+
+        cursor = std::min(range_end, area_end);
+        if (cursor < range_end) {
+            ++vma;
+            if (vma == vma_map.end() || vma->second.base != cursor) {
+                return false;
             }
-            const u64 start_in_dma =
-                std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
-            u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
-            u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
-            memcpy(backing, data, copy_size);
-            size -= copy_size;
+        }
+    }
+    return true;
+}
+
+bool MemoryManager::TryCopyReadableMemory(VAddr virtual_addr, void* dest, u64 size,
+                                          bool gpu_backing_synchronized) {
+    if (size == 0) {
+        return true;
+    }
+    if (dest == nullptr || virtual_addr > std::numeric_limits<VAddr>::max() - size) {
+        return false;
+    }
+
+    std::shared_lock lk{mutex};
+    VAddr cursor = virtual_addr;
+    u64 remaining = size;
+    auto* output = static_cast<u8*>(dest);
+
+    while (remaining != 0) {
+        if (const ReplayRange* replay = FindReplayRange(cursor)) {
+            if (replay->size > std::numeric_limits<VAddr>::max() - replay->base) {
+                return false;
+            }
+            const u64 available = replay->base + replay->size - cursor;
+            const u64 copy_size = std::min(remaining, available);
+            std::memcpy(output, replay->backing + (cursor - replay->base), copy_size);
+            cursor += copy_size;
+            output += copy_size;
+            remaining -= copy_size;
+            continue;
+        }
+
+        if (vma_map.empty() || cursor < vma_map.begin()->first) {
+            return false;
+        }
+        auto vma = FindVMA(cursor);
+        if (vma == vma_map.end()) {
+            return false;
+        }
+        const auto& area = vma->second;
+        if (area.size > std::numeric_limits<VAddr>::max() - area.base) {
+            return false;
+        }
+        const VAddr area_end = area.base + area.size;
+        const bool cpu_readable = True(area.prot & MemoryProt::CpuRead);
+        const bool synchronized_gpu_readable =
+            gpu_backing_synchronized && True(area.prot & MemoryProt::GpuRead);
+        if (cursor < area.base || cursor >= area_end || !area.IsMapped() ||
+            (!cpu_readable && !synchronized_gpu_readable)) {
+            return false;
+        }
+
+        const u64 copy_size = std::min<u64>(remaining, area_end - cursor);
+        std::memcpy(output, std::bit_cast<const void*>(cursor), copy_size);
+        cursor += copy_size;
+        output += copy_size;
+        remaining -= copy_size;
+    }
+    return true;
+}
+
+bool MemoryManager::TryCopyBackingMemory(VAddr virtual_addr, void* dest, u64 size) {
+    if (size == 0) {
+        return true;
+    }
+    if (dest == nullptr || virtual_addr > std::numeric_limits<VAddr>::max() - size) {
+        return false;
+    }
+
+    std::shared_lock lk{mutex};
+    VAddr cursor = virtual_addr;
+    u64 remaining = size;
+    auto* output = static_cast<u8*>(dest);
+
+    while (remaining != 0) {
+        if (const ReplayRange* replay = FindReplayRange(cursor)) {
+            if (replay->size > std::numeric_limits<VAddr>::max() - replay->base) {
+                return false;
+            }
+            const u64 available = replay->base + replay->size - cursor;
+            const u64 copy_size = std::min(remaining, available);
+            std::memcpy(output, replay->backing + (cursor - replay->base), copy_size);
+            cursor += copy_size;
+            output += copy_size;
+            remaining -= copy_size;
+            continue;
+        }
+
+        if (vma_map.empty() || cursor < vma_map.begin()->first) {
+            return false;
+        }
+        auto vma_handle = FindVMA(cursor);
+        if (vma_handle == vma_map.end()) {
+            return false;
+        }
+        const auto& vma = vma_handle->second;
+        if (vma.size > std::numeric_limits<VAddr>::max() - vma.base ||
+            cursor < vma.base || cursor >= vma.base + vma.size || !vma.IsMapped() ||
+            !True(vma.prot & MemoryProt::CpuRead)) {
+            return false;
+        }
+
+        if (vma.type == VMAType::ExecutorHeap || !HasPhysicalBacking(vma)) {
+            return false;
+        }
+
+        const u64 offset_in_vma = cursor - vma.base;
+        auto phys_handle = vma.phys_areas.upper_bound(offset_in_vma);
+        if (phys_handle == vma.phys_areas.begin()) {
+            return false;
+        }
+        --phys_handle;
+        const u64 phys_offset = phys_handle->first;
+        const auto& physical = phys_handle->second;
+        if (offset_in_vma < phys_offset || offset_in_vma - phys_offset >= physical.size) {
+            return false;
+        }
+
+        const u64 offset_in_physical = offset_in_vma - phys_offset;
+        const u64 vma_available = vma.size - offset_in_vma;
+        const u64 physical_available = physical.size - offset_in_physical;
+        const u64 copy_size = std::min({remaining, vma_available, physical_available});
+        if (copy_size == 0) {
+            return false;
+        }
+        std::memcpy(output, impl.BackingBase() + physical.base + offset_in_physical, copy_size);
+        cursor += copy_size;
+        output += copy_size;
+        remaining -= copy_size;
+    }
+    return true;
+}
+
+bool MemoryManager::IsWritableMapping(VAddr virtual_addr, u64 size) {
+    if (size == 0 || virtual_addr > std::numeric_limits<VAddr>::max() - size) {
+        return false;
+    }
+
+    std::shared_lock lk{mutex};
+    if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
+        return false;
+    }
+
+    const VAddr range_end = virtual_addr + size;
+    VAddr cursor = virtual_addr;
+    auto vma = FindVMA(cursor);
+    while (cursor < range_end) {
+        if (vma == vma_map.end()) {
+            return false;
+        }
+        const auto& area = vma->second;
+        if (area.size > std::numeric_limits<VAddr>::max() - area.base) {
+            return false;
+        }
+        const VAddr area_end = area.base + area.size;
+        if (cursor < area.base || cursor >= area_end || !area.IsMapped() ||
+            !True(area.prot & MemoryProt::CpuWrite)) {
+            return false;
+        }
+
+        cursor = std::min(range_end, area_end);
+        if (cursor < range_end) {
+            ++vma;
+            if (vma == vma_map.end() || vma->second.base != cursor) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    if (size == 0) {
+        return true;
+    }
+    if (address == nullptr || data == nullptr || virtual_addr > std::numeric_limits<VAddr>::max() - size) {
+        return false;
+    }
+
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+
+    const auto direct_vma = FindVMA(virtual_addr);
+    if (direct_vma != vma_map.end() && direct_vma->second.type == VMAType::ExecutorHeap) {
+        if (!direct_vma->second.Contains(virtual_addr, size)) {
+            return false;
+        }
+        std::memcpy(std::bit_cast<void*>(virtual_addr), data, size);
+        return true;
+    }
+
+    struct BackingSpan {
+        u8* destination{};
+        u64 size{};
+    };
+    std::vector<BackingSpan> spans;
+
+    VAddr cursor = virtual_addr;
+    u64 remaining = size;
+    auto vma_handle = FindVMA(cursor);
+    while (remaining != 0) {
+        if (vma_handle == vma_map.end()) {
+            return false;
+        }
+        const auto& vma = vma_handle->second;
+        if (cursor < vma.base || cursor >= vma.base + vma.size || !HasPhysicalBacking(vma)) {
+            return false;
+        }
+
+        const u64 offset_in_vma = cursor - vma.base;
+        auto phys_handle = vma.phys_areas.upper_bound(offset_in_vma);
+        if (phys_handle == vma.phys_areas.begin()) {
+            return false;
+        }
+        --phys_handle;
+        const u64 phys_offset = phys_handle->first;
+        const auto& physical = phys_handle->second;
+        if (offset_in_vma < phys_offset || offset_in_vma - phys_offset >= physical.size) {
+            return false;
+        }
+
+        const u64 offset_in_physical = offset_in_vma - phys_offset;
+        const u64 vma_available = vma.size - offset_in_vma;
+        const u64 physical_available = physical.size - offset_in_physical;
+        const u64 copy_size = std::min({remaining, vma_available, physical_available});
+        if (copy_size == 0) {
+            return false;
+        }
+        spans.push_back({impl.BackingBase() + physical.base + offset_in_physical, copy_size});
+        cursor += copy_size;
+        remaining -= copy_size;
+
+        if (remaining != 0 && cursor == vma.base + vma.size) {
+            ++vma_handle;
+            if (vma_handle == vma_map.end() || vma_handle->second.base != cursor) {
+                return false;
+            }
         }
     }
 
-    return true;
+    const auto* source = static_cast<const u8*>(data);
+    u64 source_offset = 0;
+    for (const auto& span : spans) {
+        std::memcpy(span.destination, source + source_offset, span.size);
+        source_offset += span.size;
+    }
+    return source_offset == size;
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
@@ -201,32 +618,26 @@ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, 
                              : Common::AlignUp(dmem_area->second.base, alignment);
     auto mapping_end = mapping_start + size;
 
-    // Find the first free, large enough dmem area in the range.
     while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
            dmem_area->second.GetEnd() < mapping_end) {
-        // The current dmem_area isn't suitable, move to the next one.
         dmem_area++;
         if (dmem_area == dmem_map.end()) {
             break;
         }
 
-        // Update local variables based on the new dmem_area
         mapping_start = Common::AlignUp(dmem_area->second.base, alignment);
         mapping_end = mapping_start + size;
     }
 
     if (dmem_area == dmem_map.end()) {
-        // There are no suitable mappings in this range
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
     }
 
-    // Add the allocated region to the list and commit its pages.
     auto& area = CarvePhysArea(dmem_map, mapping_start, size)->second;
     area.dma_type = PhysicalMemoryType::Pooled;
     area.memory_type = 3;
 
-    // Track how much dmem was allocated for pools.
     pool_budget += size;
 
     return mapping_start;
@@ -242,27 +653,22 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
         Common::AlignUp(std::max<PAddr>(search_start, dmem_area->second.base), alignment);
     auto mapping_end = mapping_start + size;
 
-    // Find the first free, large enough dmem area in the range.
     while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
            dmem_area->second.GetEnd() < mapping_end) {
-        // The current dmem_area isn't suitable, move to the next one.
         dmem_area++;
         if (dmem_area == dmem_map.end()) {
             break;
         }
 
-        // Update local variables based on the new dmem_area
         mapping_start = Common::AlignUp(dmem_area->second.base, alignment);
         mapping_end = mapping_start + size;
     }
 
-    if (dmem_area == dmem_map.end() || mapping_end > search_end) {
-        // There are no suitable mappings in this range
+    if (dmem_area == dmem_map.end()) {
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
     }
 
-    // Add the allocated region to the list and commit its pages.
     auto& area = CarvePhysArea(dmem_map, mapping_start, size)->second;
     area.memory_type = memory_type;
     area.dma_type = PhysicalMemoryType::Allocated;
@@ -272,7 +678,6 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
 }
 
 s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
-    // Basic bounds checking
     if (phys_addr > total_direct_size || (is_checked && phys_addr + size > total_direct_size)) {
         LOG_ERROR(Kernel_Vmm, "phys_addr {:#x}, size {:#x} goes outside dmem map", phys_addr, size);
         if (is_checked) {
@@ -282,38 +687,31 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     }
 
     std::scoped_lock lk{unmap_mutex};
-    // If this is a checked free, then all direct memory in range must be allocated.
     std::vector<std::pair<PAddr, u64>> free_list;
     u64 remaining_size = size;
     auto phys_handle = FindDmemArea(phys_addr);
     for (; phys_handle != dmem_map.end(); phys_handle++) {
         if (remaining_size == 0) {
-            // Done searching
             break;
         }
         auto& dmem_area = phys_handle->second;
         if (dmem_area.dma_type == PhysicalMemoryType::Free) {
             if (is_checked) {
-                // Checked frees will error if anything in the area isn't allocated.
-                // Unchecked frees will just ignore free areas.
                 LOG_ERROR(Kernel_Vmm, "Attempting to release a free dmem area");
                 return ORBIS_KERNEL_ERROR_ENOENT;
             }
             continue;
         }
 
-        // Store physical address and size to release
         const PAddr current_phys_addr = std::max<PAddr>(phys_addr, phys_handle->first);
         const u64 start_in_dma = current_phys_addr - phys_handle->first;
         const u64 size_in_dma =
             std::min<u64>(remaining_size, phys_handle->second.size - start_in_dma);
         free_list.emplace_back(current_phys_addr, size_in_dma);
 
-        // Track remaining size to free
         remaining_size -= size_in_dma;
     }
 
-    // Release any dmem mappings that reference this physical block.
     std::vector<std::pair<VAddr, u64>> remove_list;
     for (const auto& [addr, mapping] : vma_map) {
         if (mapping.type != VMAType::Direct) {
@@ -327,20 +725,17 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
                 const VAddr addr_in_vma = mapping.base + offset_in_vma + phys_offset;
                 const u64 unmap_size = std::min<u64>(phys_mapping.size - phys_offset, size);
 
-                // Unmapping might erase from vma_map. We can't do it here.
                 remove_list.emplace_back(addr_in_vma, unmap_size);
             }
         }
     }
 
-    // Early unmap from GPU to avoid deadlocking.
     for (auto& [addr, unmap_size] : remove_list) {
-        if (IsValidGpuMapping(addr, unmap_size)) {
+        if (rasterizer && IsValidGpuMapping(addr, unmap_size)) {
             rasterizer->UnmapMemory(addr, unmap_size);
         }
     }
 
-    // Acquire writer lock
     std::scoped_lock lk2{mutex};
 
     for (const auto& [addr, size] : remove_list) {
@@ -348,15 +743,12 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
         UnmapMemoryImpl(addr, size);
     }
 
-    // Unmap all dmem areas within this area.
     for (auto& [phys_addr, size] : free_list) {
-        // Carve a free dmem area in place of this one.
         const auto dmem_handle = CarvePhysArea(dmem_map, phys_addr, size);
         auto& new_dmem_area = dmem_handle->second;
         new_dmem_area.dma_type = PhysicalMemoryType::Free;
         new_dmem_area.memory_type = 0;
 
-        // Merge the new dmem_area with dmem_map
         MergeAdjacent(dmem_map, dmem_handle);
     }
 
@@ -369,19 +761,16 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
-    // Input addresses to PoolCommit are treated as fixed, and have a constant alignment.
     const u64 alignment = 64_KB;
     VAddr mapped_addr = Common::AlignUp(virtual_addr, alignment);
 
     auto& vma = FindVMA(mapped_addr)->second;
     if (vma.type != VMAType::PoolReserved) {
-        // If we're attempting to commit non-pooled memory, return EINVAL
         LOG_ERROR(Kernel_Vmm, "Attempting to commit non-pooled memory at {:#x}", mapped_addr);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
     if (!vma.Contains(mapped_addr, size)) {
-        // If there's not enough space to commit, return EINVAL
         LOG_ERROR(Kernel_Vmm,
                   "Pooled region {:#x} to {:#x} is not large enough to commit from {:#x} to {:#x}",
                   vma.base, vma.base + vma.size, mapped_addr, mapped_addr + size);
@@ -389,20 +778,16 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     }
 
     if (pool_budget <= size) {
-        // If there isn't enough pooled memory to perform the mapping, return ENOMEM
         LOG_ERROR(Kernel_Vmm, "Not enough pooled memory to perform mapping");
         return ORBIS_KERNEL_ERROR_ENOMEM;
     } else {
-        // Track how much pooled memory this commit will take
         pool_budget -= size;
     }
 
     if (True(prot & MemoryProt::CpuWrite)) {
-        // On PS4, read is appended to write mappings.
         prot |= MemoryProt::CpuRead;
     }
 
-    // Create the virtual mapping for the commit
     const auto new_vma_handle = CarveVMA(virtual_addr, size);
     auto& new_vma = new_vma_handle->second;
     new_vma.disallow_merge = false;
@@ -411,34 +796,26 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     new_vma.type = Core::VMAType::Pooled;
     new_vma.phys_areas.clear();
 
-    // Find suitable physical addresses
     auto handle = dmem_map.begin();
     u64 remaining_size = size;
     VAddr current_addr = mapped_addr;
     while (handle != dmem_map.end() && remaining_size > 0) {
         if (handle->second.dma_type != PhysicalMemoryType::Pooled) {
-            // Non-pooled means it's either not for pool use, or already committed.
             handle++;
             continue;
         }
 
-        // On PS4, commits can make sparse physical mappings.
         u64 size_to_map = std::min<u64>(remaining_size, handle->second.size);
 
-        // Use the start of this area as the physical backing for this mapping.
         const auto new_dmem_handle = CarvePhysArea(dmem_map, handle->second.base, size_to_map);
         auto& new_dmem_area = new_dmem_handle->second;
         new_dmem_area.dma_type = PhysicalMemoryType::Committed;
         new_dmem_area.memory_type = mtype;
 
-        // Add the dmem area to this vma, merge it with any similar tracked areas.
         new_vma.phys_areas[current_addr - mapped_addr] = new_dmem_handle->second;
         MergeAdjacent(new_vma.phys_areas, new_vma.phys_areas.find(current_addr - mapped_addr));
 
-        // Perform an address space mapping for each physical area
         void* out_addr = impl.Map(current_addr, size_to_map, new_dmem_area.base);
-        // Tracy memory tracking breaks from merging memory areas. Disabled for now.
-        // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
 
         handle = MergeAdjacent(dmem_map, new_dmem_handle);
         current_addr += size_to_map;
@@ -447,11 +824,10 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     }
     ASSERT_MSG(remaining_size == 0, "Failed to commit pooled memory");
 
-    // Merge this VMA with similar nearby areas
     MergeAdjacent(vma_map, new_vma_handle);
 
     lk2.unlock();
-    if (IsValidGpuMapping(mapped_addr, size)) {
+    if (rasterizer && IsValidGpuMapping(mapped_addr, size)) {
         rasterizer->MapMemory(mapped_addr, size);
     }
 
@@ -461,11 +837,8 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
 MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size, MemoryProt prot,
                                                    MemoryMapFlags flags, VMAType type,
                                                    std::string_view name, u64 alignment) {
-    // Locate the VMA representing the requested region
     auto vma = FindVMA(virtual_addr)->second;
     if (True(flags & MemoryMapFlags::Fixed)) {
-        // If fixed is specified, map directly to the region of virtual_addr + size.
-        // Callers should check to ensure the NoOverwrite flag is handled appropriately beforehand.
         auto unmap_addr = virtual_addr;
         auto unmap_size = size;
         while (unmap_size > 0) {
@@ -477,20 +850,15 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     }
     vma = FindVMA(virtual_addr)->second;
 
-    // By this point, vma should be free and ready to map.
-    // Caller performs address searches for non-fixed mappings before this.
     ASSERT_MSG(vma.IsFree(), "VMA to map is not free");
 
-    // Create a memory area representing this mapping.
     const auto new_vma_handle = CarveVMA(virtual_addr, size);
     auto& new_vma = new_vma_handle->second;
     const bool is_exec = True(prot & MemoryProt::CpuExec);
     if (True(prot & MemoryProt::CpuWrite)) {
-        // On PS4, read is appended to write mappings.
         prot |= MemoryProt::CpuRead;
     }
 
-    // Update VMA appropriately.
     new_vma.disallow_merge = True(flags & MemoryMapFlags::NoCoalesce);
     new_vma.prot = prot;
     new_vma.name = name;
@@ -502,8 +870,6 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
 s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
                              MemoryMapFlags flags, VMAType type, std::string_view name,
                              bool validate_dmem, PAddr phys_addr, u64 alignment) {
-    // Certain games perform flexible mappings on loop to determine
-    // the available flexible memory size. Questionable but we need to handle this.
     if (type == VMAType::Flexible && flexible_usage + size > total_flexible_size) {
         LOG_ERROR(Kernel_Vmm,
                   "Out of flexible memory, available flexible memory = {:#x}"
@@ -514,18 +880,15 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     std::scoped_lock lk{unmap_mutex};
 
     PhysHandle dmem_area;
-    // Validate the requested physical address range
     if (phys_addr != -1) {
-        if (total_direct_size < phys_addr + size) {
+        if (phys_addr > total_direct_size || size > total_direct_size - phys_addr) {
             LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at physical address {:#x}", size,
                       phys_addr);
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
 
-        // Validate direct memory areas involved in this call.
         auto dmem_area = FindDmemArea(phys_addr);
         while (dmem_area != dmem_map.end() && dmem_area->second.base < phys_addr + size) {
-            // If any requested dmem area is not allocated, return an error.
             if (dmem_area->second.dma_type != PhysicalMemoryType::Allocated &&
                 dmem_area->second.dma_type != PhysicalMemoryType::Mapped) {
                 LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at physical address {:#x}", size,
@@ -533,7 +896,6 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
                 return ORBIS_KERNEL_ERROR_ENOMEM;
             }
 
-            // If we need to perform extra validation, then check for Mapped dmem areas too.
             if (validate_dmem && dmem_area->second.dma_type == PhysicalMemoryType::Mapped) {
                 LOG_ERROR(Kernel_Vmm, "Unable to map {:#x} bytes at physical address {:#x}", size,
                           phys_addr);
@@ -545,9 +907,8 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
 
     if (True(flags & MemoryMapFlags::Fixed) && True(flags & MemoryMapFlags::NoOverwrite)) {
-        // Perform necessary error checking for Fixed & NoOverwrite case
         if (!IsValidMapping(virtual_addr, size)) {
-            LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map",
+            LOG_ERROR(Kernel_Vmm, "Unable to map non-owned range addr={:#x}, size={:#x}",
                       virtual_addr, size);
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
@@ -558,65 +919,54 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
     } else if (False(flags & MemoryMapFlags::Fixed)) {
-        // Find a free virtual addr to map
         alignment = alignment > 0 ? alignment : 16_KB;
         virtual_addr = virtual_addr == 0 ? DEFAULT_MAPPING_BASE : virtual_addr;
         virtual_addr = SearchFree(virtual_addr, size, alignment);
         if (virtual_addr == -1) {
-            // No suitable memory areas to map to
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
     }
 
-    // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
+    if (!impl.ContainsOwnedRange(virtual_addr, size) || !IsValidMapping(virtual_addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "Unable to map non-owned range addr={:#x}, size={:#x}", virtual_addr,
+                  size);
+        return ORBIS_KERNEL_ERROR_ENOMEM;
+    }
+
+    if (rasterizer && IsValidGpuMapping(virtual_addr, size)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
-    // Acquire writer lock.
     std::unique_lock lk2{mutex};
 
-    // Create VMA representing this mapping.
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, type, name, alignment);
     auto& new_vma = new_vma_handle->second;
     auto mapped_addr = new_vma.base;
     bool is_exec = True(prot & MemoryProt::CpuExec);
 
-    // If type is Flexible, we need to track how much flexible memory is used here.
-    // We also need to determine a reasonable physical base to perform this mapping at.
     if (type == VMAType::Flexible) {
-        // Find suitable physical addresses
         auto handle = fmem_map.begin();
         u64 remaining_size = size;
         VAddr current_addr = mapped_addr;
         while (handle != fmem_map.end() && remaining_size != 0) {
             if (handle->second.dma_type != PhysicalMemoryType::Free) {
-                // If the handle isn't free, we cannot use it.
                 handle++;
                 continue;
             }
 
-            // Determine the size we can map here.
             u64 size_to_map = std::min<u64>(remaining_size, handle->second.size);
 
-            // Create a physical area
             const auto new_fmem_handle = CarvePhysArea(fmem_map, handle->second.base, size_to_map);
             auto& new_fmem_area = new_fmem_handle->second;
             new_fmem_area.dma_type = PhysicalMemoryType::Flexible;
 
-            // Add the new area to the vma, merge it with any similar tracked areas.
             new_vma.phys_areas[current_addr - mapped_addr] = new_fmem_handle->second;
             MergeAdjacent(new_vma.phys_areas, new_vma.phys_areas.find(current_addr - mapped_addr));
 
-            // Perform an address space mapping for each physical area
             void* out_addr = impl.Map(current_addr, size_to_map, new_fmem_area.base, is_exec);
-            // Tracy memory tracking breaks from merging memory areas. Disabled for now.
-            // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
 
-            // Merge this handle with adjacent areas
             handle = MergeAdjacent(fmem_map, new_fmem_handle);
 
-            // Get the next flexible area.
             current_addr += size_to_map;
             remaining_size -= size_to_map;
             flexible_usage += size_to_map;
@@ -624,13 +974,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         }
         ASSERT_MSG(remaining_size == 0, "Failed to map physical memory");
     } else if (type == VMAType::Direct) {
-        // Map the physical memory for this direct memory mapping.
         auto current_phys_addr = phys_addr;
         u64 remaining_size = size;
         auto dmem_area = FindDmemArea(phys_addr);
         while (dmem_area != dmem_map.end() && remaining_size > 0) {
-            // Carve a new dmem area in place of this one with the appropriate type.
-            // Ensure the carved area only covers the current dmem area.
             const auto start_phys_addr = std::max<PAddr>(current_phys_addr, dmem_area->second.base);
             const auto offset_in_dma = start_phys_addr - dmem_area->second.base;
             const auto size_in_dma =
@@ -639,15 +986,12 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
             auto& new_dmem_area = dmem_handle->second;
             new_dmem_area.dma_type = PhysicalMemoryType::Mapped;
 
-            // Add the dmem area to this vma, merge it with any similar tracked areas.
             const u64 offset_in_vma = current_phys_addr - phys_addr;
             new_vma.phys_areas[offset_in_vma] = dmem_handle->second;
             MergeAdjacent(new_vma.phys_areas, new_vma.phys_areas.find(offset_in_vma));
 
-            // Merge the new dmem_area with dmem_map
             MergeAdjacent(dmem_map, dmem_handle);
 
-            // Get the next relevant dmem area.
             current_phys_addr += size_in_dma;
             remaining_size -= size_in_dma;
             dmem_area = FindDmemArea(current_phys_addr);
@@ -655,27 +999,21 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         ASSERT_MSG(remaining_size == 0, "Failed to map physical memory");
     }
 
-    if (new_vma.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_200) {
-        // Merge this VMA with similar nearby areas
-        // Direct memory mappings only coalesce on SDK version 2.00 or later.
+    if (new_vma.type != VMAType::Direct || sdk_version >= Common::ElfInfo::FW_20) {
         MergeAdjacent(vma_map, new_vma_handle);
     }
 
     *out_addr = std::bit_cast<void*>(mapped_addr);
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
-        // Flexible address space mappings were performed while finding direct memory areas.
         if (type != VMAType::Flexible) {
             impl.Map(mapped_addr, size, phys_addr, is_exec);
-            // Tracy memory tracking breaks from merging memory areas. Disabled for now.
-            // TRACK_ALLOC(mapped_addr, size, "VMEM");
         }
 
         lk2.unlock();
 
-        // If this is not a reservation, then map to GPU and address space
-        if (IsValidGpuMapping(mapped_addr, size)) {
-            rasterizer->MapMemory(mapped_addr, size);
-        }
+            if (rasterizer && IsValidGpuMapping(mapped_addr, size)) {
+                rasterizer->MapMemory(mapped_addr, size);
+            }
     }
 
     return ORBIS_OK;
@@ -685,7 +1023,6 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
                            MemoryMapFlags flags, s32 fd, s64 phys_addr) {
     uintptr_t handle = 0;
     std::scoped_lock lk{unmap_mutex};
-    // Get the file to map
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto file = h->GetFile(fd);
     if (file == nullptr) {
@@ -699,33 +1036,27 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     }
 
     if (True(prot & MemoryProt::CpuWrite)) {
-        // On PS4, read is appended to write mappings.
         prot |= MemoryProt::CpuRead;
     }
 
     handle = file->f.GetFileMapping();
 
-    if (False(file->f.GetAccessMode() & Common::FS::FileAccessMode::Write) &&
+    if (False(file->f.GetAccessMode() & Common::FS::FileAccessMode::Write) ||
         False(file->f.GetAccessMode() & Common::FS::FileAccessMode::Append)) {
-        // If the file does not have write access, ensure prot does not contain write
-        // permissions. On real hardware, these mappings succeed, but the memory cannot be
-        // written to.
         prot &= ~MemoryProt::CpuWrite;
     }
 
     if (prot >= MemoryProt::GpuRead) {
-        // On real hardware, GPU file mmaps cause a full system crash due to an internal error.
         ASSERT_MSG(false, "Files cannot be mapped to GPU memory");
     }
 
     if (True(prot & MemoryProt::CpuExec)) {
-        // On real hardware, execute permissions are silently removed.
         prot &= ~MemoryProt::CpuExec;
     }
 
-    if (True(flags & MemoryMapFlags::Fixed) && True(flags & MemoryMapFlags::NoOverwrite)) {
+    if (True(flags & MemoryMapFlags::Fixed) && False(flags & MemoryMapFlags::NoOverwrite)) {
         if (!IsValidMapping(virtual_addr, size)) {
-            LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map",
+            LOG_ERROR(Kernel_Vmm, "Unable to file-map non-owned range addr={:#x}, size={:#x}",
                       virtual_addr, size);
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
@@ -740,20 +1071,23 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         virtual_addr = virtual_addr == 0 ? DEFAULT_MAPPING_BASE : virtual_addr;
         virtual_addr = SearchFree(virtual_addr, size, 16_KB);
         if (virtual_addr == -1) {
-            // No suitable memory areas to map to
             return ORBIS_KERNEL_ERROR_ENOMEM;
         }
     }
 
-    // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
+
+    if (!impl.ContainsOwnedRange(virtual_addr, size) || !IsValidMapping(virtual_addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "Unable to file-map non-owned range addr={:#x}, size={:#x}",
+                  virtual_addr, size);
+        return ORBIS_KERNEL_ERROR_ENOMEM;
+    }
+
+    if (rasterizer && IsValidGpuMapping(virtual_addr, size)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
-    // Aquire writer lock
     std::scoped_lock lk2{mutex};
 
-    // Update VMA map and map to address space.
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, VMAType::File, "anon", 0);
 
     auto& new_vma = new_vma_handle->second;
@@ -769,10 +1103,12 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
 s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     std::scoped_lock lk{unmap_mutex};
-    ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
-               virtual_addr);
+    if (!impl.ContainsOwnedRange(virtual_addr, size) || !IsValidMapping(virtual_addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "Unable to decommit non-owned range addr={:#x}, size={:#x}",
+                  virtual_addr, size);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
 
-    // Do an initial search to ensure this decommit is valid.
     auto it = FindVMA(virtual_addr);
     while (it != vma_map.end() && it->second.base + it->second.size <= virtual_addr + size) {
         if (it->second.type != VMAType::PoolReserved && it->second.type != VMAType::Pooled) {
@@ -782,15 +1118,12 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
         it++;
     }
 
-    // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
+    if (rasterizer && IsValidGpuMapping(virtual_addr, size)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
-    // Aquire writer mutex
     std::scoped_lock lk2{mutex};
 
-    // Loop through all vmas in the area, unmap them.
     u64 remaining_size = size;
     VAddr current_addr = virtual_addr;
     while (remaining_size != 0) {
@@ -799,36 +1132,29 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
         const auto start_in_vma = current_addr - vma_base.base;
         const auto size_in_vma = std::min<u64>(remaining_size, vma_base.size - start_in_vma);
         if (vma_base.type == VMAType::Pooled) {
-            // Track how much pooled memory is decommitted
             pool_budget += size_in_vma;
 
-            // Re-pool the direct memory used by this mapping
             u64 size_to_free = size_in_vma;
             auto phys_handle = std::prev(vma_base.phys_areas.upper_bound(start_in_vma));
             while (phys_handle != vma_base.phys_areas.end() && size_to_free > 0) {
-                // Calculate physical memory offset, address, and size
                 u64 dma_offset =
                     std::max<PAddr>(phys_handle->first, start_in_vma) - phys_handle->first;
                 PAddr phys_addr = phys_handle->second.base + dma_offset;
                 u64 size_in_dma =
                     std::min<u64>(size_to_free, phys_handle->second.size - dma_offset);
 
-                // Create a new dmem area reflecting the pooled region
                 const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
                 auto& new_dmem_area = new_dmem_handle->second;
                 new_dmem_area.dma_type = PhysicalMemoryType::Pooled;
 
-                // Coalesce with nearby direct memory areas.
                 MergeAdjacent(dmem_map, new_dmem_handle);
 
-                // Increment loop
                 size_to_free -= size_in_dma;
                 phys_handle++;
             }
             ASSERT_MSG(size_to_free == 0, "Failed to decommit pooled memory");
         }
 
-        // Mark region as pool reserved and attempt to coalesce it with neighbours.
         const auto new_it = CarveVMA(current_addr, size_in_vma);
         auto& vma = new_it->second;
         vma.type = VMAType::PoolReserved;
@@ -842,10 +1168,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
         remaining_size -= size_in_vma;
     }
 
-    // Unmap from address space
     impl.Unmap(virtual_addr, size);
-    // Tracy memory tracking breaks from merging memory areas. Disabled for now.
-    // TRACK_FREE(virtual_addr, "VMEM");
 
     return ORBIS_OK;
 }
@@ -856,21 +1179,21 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     }
 
     std::scoped_lock lk{unmap_mutex};
-    // Align address and size appropriately
     virtual_addr = Common::AlignDown(virtual_addr, 16_KB);
+    if (size > std::numeric_limits<u64>::max() - (16_KB - 1)) {
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     size = Common::AlignUp(size, 16_KB);
-    if (!IsValidMapping(virtual_addr, size)) {
-        LOG_ERROR(Kernel_Vmm, "addr = {:#x} size = {:#x} is outside the memory map", virtual_addr,
-                  size);
+    if (!impl.ContainsOwnedRange(virtual_addr, size) || !IsValidMapping(virtual_addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "Unable to unmap non-owned range addr={:#x}, size={:#x}",
+                  virtual_addr, size);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    // If the requested range has GPU access, unmap from GPU.
-    if (IsValidGpuMapping(virtual_addr, size)) {
+    if (rasterizer && IsValidGpuMapping(virtual_addr, size)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
-    // Acquire writer lock.
     std::scoped_lock lk2{mutex};
     return UnmapMemoryImpl(virtual_addr, size);
 }
@@ -888,44 +1211,35 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
         u64 size_to_free = size_in_vma;
         auto phys_handle = std::prev(vma_base.phys_areas.upper_bound(start_in_vma));
         while (phys_handle != vma_base.phys_areas.end() && size_to_free > 0) {
-            // Calculate physical memory offset, address, and size
             u64 dma_offset = std::max<PAddr>(phys_handle->first, start_in_vma) - phys_handle->first;
             PAddr phys_addr = phys_handle->second.base + dma_offset;
             u64 size_in_dma = std::min<u64>(size_to_free, phys_handle->second.size - dma_offset);
 
-            // Create a new dmem area reflecting the pooled region
             if (vma_type == VMAType::Direct) {
                 const auto new_dmem_handle = CarvePhysArea(dmem_map, phys_addr, size_in_dma);
                 auto& new_dmem_area = new_dmem_handle->second;
                 new_dmem_area.dma_type = PhysicalMemoryType::Allocated;
 
-                // Coalesce with nearby direct memory areas.
                 MergeAdjacent(dmem_map, new_dmem_handle);
             } else if (vma_type == VMAType::Flexible) {
-                // Update fmem_map
                 const auto new_fmem_handle = CarvePhysArea(fmem_map, phys_addr, size_in_dma);
                 auto& new_fmem_area = new_fmem_handle->second;
                 new_fmem_area.dma_type = PhysicalMemoryType::Free;
 
-                // Coalesce with nearby flexible memory areas.
                 MergeAdjacent(fmem_map, new_fmem_handle);
 
-                // Zero out the old memory data
                 const auto unmap_hardware_address = impl.BackingBase() + phys_addr;
                 std::memset(unmap_hardware_address, 0, size_in_dma);
 
-                // Update flexible usage
                 flexible_usage -= size_in_dma;
             }
 
-            // Increment through loop
             size_to_free -= size_in_dma;
             phys_handle++;
         }
         ASSERT_MSG(size_to_free == 0, "Failed to unmap physical memory");
     }
 
-    // Mark region as free and attempt to coalesce it with neighbours.
     const auto new_it = CarveVMA(virtual_addr, size_in_vma);
     auto& vma = new_it->second;
     vma.type = VMAType::Free;
@@ -936,10 +1250,7 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
     MergeAdjacent(vma_map, new_it);
 
     if (vma_type != VMAType::Reserved && vma_type != VMAType::PoolReserved) {
-        // Unmap the memory region.
         impl.Unmap(virtual_addr, size_in_vma);
-        // Tracy memory tracking breaks from merging memory areas. Disabled for now.
-        // TRACK_FREE(virtual_addr, "VMEM");
     }
     return size_in_vma;
 }
@@ -960,11 +1271,7 @@ s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
 
 s32 MemoryManager::QueryProtection(VAddr addr, void** start, void** end, u32* prot) {
     std::shared_lock lk{mutex};
-    VAddr min_query_addr = impl.SystemManagedVirtualBase();
-    if (addr < min_query_addr) {
-        LOG_ERROR(Kernel_Vmm, "Address {:#x} is not mapped", addr);
-        return ORBIS_KERNEL_ERROR_EACCES;
-    }
+    ASSERT_MSG(IsValidMapping(addr), "Attempted to access invalid address {:#x}", addr);
 
     const auto it = FindVMA(addr);
     const auto& vma = it->second;
@@ -994,16 +1301,13 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
     const MemoryProt new_prot = prot;
 
     if (vma_base.type == VMAType::Free || vma_base.type == VMAType::PoolReserved) {
-        // On PS4, protecting freed memory does nothing.
         return adjusted_size;
     }
 
     if (True(prot & MemoryProt::CpuWrite)) {
-        // On PS4, read is appended to write mappings.
         prot |= MemoryProt::CpuRead;
     }
 
-    // Set permissions
     Core::MemoryPermission perms{};
 
     if (True(prot & MemoryProt::CpuRead)) {
@@ -1027,24 +1331,18 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
 
     if (vma_base.type == VMAType::Direct || vma_base.type == VMAType::Pooled ||
         vma_base.type == VMAType::File) {
-        // On PS4, execute permissions are hidden from direct memory and file mappings.
-        // Tests show that execute permissions still apply, so handle this after reading perms.
         prot &= ~MemoryProt::CpuExec;
     }
 
-    // Split VMAs and apply protection change.
     const auto new_it = CarveVMA(addr, adjusted_size);
     auto& new_vma = new_it->second;
     new_vma.prot = prot;
     MergeAdjacent(vma_map, new_it);
 
     if (vma_base.type == VMAType::Reserved) {
-        // On PS4, protections change vma_map, but don't apply.
-        // Return early to avoid protecting memory that isn't mapped in address space.
         return adjusted_size;
     }
 
-    // Perform address-space memory protections if needed.
     if (new_prot != old_prot) {
         impl.Protect(addr, adjusted_size, perms);
     }
@@ -1053,32 +1351,30 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
 }
 
 s32 MemoryManager::Protect(VAddr addr, u64 size, MemoryProt prot) {
-    // If size is zero, then there's nothing to protect
     if (size == 0) {
         return ORBIS_OK;
     }
 
-    // Ensure the range to modify is valid
     std::scoped_lock lk{mutex, unmap_mutex};
-    ASSERT_MSG(IsValidMapping(addr, size), "Attempted to access invalid address {:#x}", addr);
+    if (!impl.ContainsOwnedRange(addr, size) || !IsValidMapping(addr, size)) {
+        LOG_ERROR(Kernel_Vmm, "Unable to protect non-owned range addr={:#x}, size={:#x}", addr,
+                  size);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
 
-    // Appropriately restrict flags.
     constexpr static MemoryProt flag_mask =
         MemoryProt::CpuReadWrite | MemoryProt::CpuExec | MemoryProt::GpuReadWrite;
     MemoryProt valid_flags = prot & flag_mask;
 
-    // Protect all VMAs between addr and addr + size.
     s64 protected_bytes = 0;
     while (protected_bytes < size) {
         auto it = FindVMA(addr + protected_bytes);
         auto& vma_base = it->second;
         if (vma_base.base > addr + protected_bytes) {
-            // Account for potential gaps in memory map.
             protected_bytes += vma_base.base - (addr + protected_bytes);
         }
         auto result = ProtectBytes(addr + protected_bytes, vma_base, size - protected_bytes, prot);
         if (result < 0) {
-            // ProtectBytes returned an error, return it
             return result;
         }
         protected_bytes += result;
@@ -1089,7 +1385,6 @@ s32 MemoryManager::Protect(VAddr addr, u64 size, MemoryProt prot) {
 
 s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
                                 ::Libraries::Kernel::OrbisVirtualQueryInfo* info) {
-    // FindVMA on addresses before the vma_map return garbage data.
     auto query_addr =
         addr < impl.SystemManagedVirtualBase() ? impl.SystemManagedVirtualBase() : addr;
     if (addr < query_addr && flags == 0) {
@@ -1120,13 +1415,11 @@ s32 MemoryManager::VirtualQuery(VAddr addr, s32 flags,
     info->is_committed = vma.IsMapped() ? 1 : 0;
     info->memory_type = 0;
     if (vma.type == VMAType::Direct) {
-        // Offset is only assigned for direct mappings.
         ASSERT_MSG(vma.phys_areas.size() > 0, "No physical backing for direct mapping?");
         info->offset = vma.phys_areas.begin()->second.base;
         info->memory_type = vma.phys_areas.begin()->second.memory_type;
     }
     if (vma.type == VMAType::Reserved || vma.type == VMAType::PoolReserved) {
-        // Protection is hidden from reserved mappings.
         info->protection = 0;
     }
 
@@ -1157,8 +1450,6 @@ s32 MemoryManager::DirectMemoryQuery(PAddr addr, bool find_next,
     out_info->start = dmem_area->second.base;
     out_info->memoryType = dmem_area->second.memory_type;
 
-    // Loop through all sequential mapped or allocated dmem areas
-    // to determine the hardware accurate end.
     while (dmem_area != dmem_map.end() && dmem_area->second.memory_type == out_info->memoryType &&
            (dmem_area->second.dma_type == PhysicalMemoryType::Mapped ||
             dmem_area->second.dma_type == PhysicalMemoryType::Allocated)) {
@@ -1190,7 +1481,6 @@ s32 MemoryManager::DirectQueryAvailable(PAddr search_start, PAddr search_end, u6
             dmem_area->second.size >= alignment_size ? dmem_area->second.size - alignment_size : 0;
 
         if (dmem_area->second.base < search_start) {
-            // We need to trim remaining_size to ignore addresses before search_start
             remaining_size = remaining_size > (search_start - dmem_area->second.base)
                                  ? remaining_size - (search_start - dmem_area->second.base)
                                  : 0;
@@ -1198,7 +1488,6 @@ s32 MemoryManager::DirectQueryAvailable(PAddr search_start, PAddr search_end, u6
         }
 
         if (dmem_area->second.GetEnd() > search_end) {
-            // We need to trim remaining_size to ignore addresses beyond search_end
             remaining_size = remaining_size > (dmem_area->second.GetEnd() - search_end)
                                  ? remaining_size - (dmem_area->second.GetEnd() - search_end)
                                  : 0;
@@ -1221,46 +1510,34 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
 
     ASSERT_MSG(IsValidMapping(addr, size), "Attempted to access invalid address {:#x}", addr);
 
-    // Search through all VMAs covered by the provided range.
-    // We aren't modifying these VMAs, so it's safe to iterate through them.
     VAddr current_addr = addr;
     u64 remaining_size = size;
     auto vma_handle = FindVMA(addr);
     while (vma_handle != vma_map.end() && remaining_size > 0) {
-        // Calculate position in vma
         const VAddr start_in_vma = current_addr - vma_handle->second.base;
         const u64 size_in_vma =
             std::min<u64>(remaining_size, vma_handle->second.size - start_in_vma);
 
-        // Direct and Pooled mappings are the only ones with a memory type.
         if (vma_handle->second.type == VMAType::Direct ||
             vma_handle->second.type == VMAType::Pooled) {
-            // Split area to modify into a new VMA.
             vma_handle = CarveVMA(current_addr, size_in_vma);
             auto phys_handle = vma_handle->second.phys_areas.begin();
             while (phys_handle != vma_handle->second.phys_areas.end()) {
-                // Update internal physical areas
                 phys_handle->second.memory_type = memory_type;
 
-                // Carve a new dmem area in dmem_map, update memory type there
                 auto dmem_handle =
                     CarvePhysArea(dmem_map, phys_handle->second.base, phys_handle->second.size);
                 auto& dmem_area = dmem_handle->second;
                 dmem_area.memory_type = memory_type;
 
-                // Increment phys_handle
                 phys_handle++;
             }
+
+            vma_handle = MergeAdjacent(vma_map, vma_handle);
         }
         current_addr += size_in_vma;
         remaining_size -= size_in_vma;
-
-        // Check if VMA can be merged with adjacent areas after modifications.
-        vma_handle = MergeAdjacent(vma_map, vma_handle);
-        if (vma_handle->second.base + vma_handle->second.size <= current_addr) {
-            // If we're now in the next VMA, then go to the next handle.
-            vma_handle++;
-        }
+        vma_handle++;
     }
 
     return ORBIS_OK;
@@ -1269,9 +1546,7 @@ s32 MemoryManager::SetDirectMemoryType(VAddr addr, u64 size, s32 memory_type) {
 void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_view name) {
     std::scoped_lock lk{mutex, unmap_mutex};
 
-    // Sizes are aligned up to the nearest 16_KB
     u64 aligned_size = Common::AlignUp(size, 16_KB);
-    // Addresses are aligned down to the nearest 16_KB
     VAddr aligned_addr = Common::AlignDown(virtual_addr, 16_KB);
 
     ASSERT_MSG(IsValidMapping(aligned_addr, aligned_size),
@@ -1282,7 +1557,6 @@ void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_v
     while (remaining_size > 0 && it != vma_map.end()) {
         const u64 start_in_vma = current_addr - it->second.base;
         const u64 size_in_vma = std::min<u64>(remaining_size, it->second.size - start_in_vma);
-        // Nothing needs to be done to free VMAs
         if (!it->second.IsFree()) {
             if (size_in_vma < it->second.size) {
                 it = CarveVMA(current_addr, size_in_vma);
@@ -1293,15 +1567,10 @@ void MemoryManager::NameVirtualRange(VAddr virtual_addr, u64 size, std::string_v
                 vma.name = name;
             }
         }
+        it = MergeAdjacent(vma_map, it);
         remaining_size -= size_in_vma;
         current_addr += size_in_vma;
-
-        // Check if VMA can be merged with adjacent areas after modifications.
-        it = MergeAdjacent(vma_map, it);
-        if (it->second.base + it->second.size <= current_addr) {
-            // If we're now in the next VMA, then go to the next handle.
-            it++;
-        }
+        it++;
     }
 }
 
@@ -1328,7 +1597,8 @@ s32 MemoryManager::GetDirectMemoryType(PAddr addr, s32* directMemoryTypeOut,
 s32 MemoryManager::IsStack(VAddr addr, void** start, void** end) {
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(addr), "Attempted to access invalid address {:#x}", addr);
-    const auto& vma = FindVMA(addr)->second;
+    const auto vma_it = FindVMA(addr);
+    const auto& vma = vma_it->second;
     if (vma.IsFree()) {
         return ORBIS_KERNEL_ERROR_EACCES;
     }
@@ -1336,8 +1606,56 @@ s32 MemoryManager::IsStack(VAddr addr, void** start, void** end) {
     u64 stack_start = 0;
     u64 stack_end = 0;
     if (vma.type == VMAType::Stack) {
-        stack_start = vma.base;
-        stack_end = vma.base + vma.size;
+        auto first = vma_it;
+        while (first != vma_map.begin()) {
+            auto prev = std::prev(first);
+            if (prev->second.type != VMAType::Stack ||
+                prev->second.base + prev->second.size != first->second.base) {
+                break;
+            }
+            first = prev;
+        }
+
+        auto last = vma_it;
+        while (std::next(last) != vma_map.end()) {
+            auto next = std::next(last);
+            if (next->second.type != VMAType::Stack ||
+                last->second.base + last->second.size != next->second.base) {
+                break;
+            }
+            last = next;
+        }
+
+        bool found_readable = false;
+        for (auto it = first;; ++it) {
+            const auto& stack_vma = it->second;
+            if (stack_vma.prot != MemoryProt::NoAccess) {
+                if (!found_readable) {
+                    stack_start = stack_vma.base;
+                    found_readable = true;
+                }
+                stack_end = stack_vma.base + stack_vma.size;
+            } else if (found_readable) {
+                break;
+            }
+            if (it == last) {
+                break;
+            }
+        }
+
+#if defined(__ANDROID__)
+        if (std::getenv("EXECUTOR_LIVE_MONO_SIGNAL_DELIVER") != nullptr &&
+            found_readable && (stack_start != first->second.base || stack_end != last->second.base + last->second.size)) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Memory",
+                "[EXECUTOR_IS_STACK_USABLE] addr=0x%llx vma=0x%llx..0x%llx usable=0x%llx..0x%llx",
+                static_cast<unsigned long long>(addr),
+                static_cast<unsigned long long>(first->second.base),
+                static_cast<unsigned long long>(last->second.base + last->second.size),
+                static_cast<unsigned long long>(stack_start),
+                static_cast<unsigned long long>(stack_end));
+        }
+#endif
     }
 
     if (start != nullptr) {
@@ -1353,7 +1671,6 @@ s32 MemoryManager::IsStack(VAddr addr, void** start, void** end) {
 s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats) {
     std::shared_lock lk{mutex};
 
-    // Run through dmem_map, determine how much physical memory is currently committed
     constexpr u64 block_size = 64_KB;
     u64 committed_size = 0;
 
@@ -1367,7 +1684,6 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
 
     stats->allocated_flushed_blocks = committed_size / block_size;
     stats->available_flushed_blocks = committed_size / block_size;
-    // TODO: Determine how "cached blocks" work
     stats->allocated_cached_blocks = 0;
     stats->available_cached_blocks = 0;
 
@@ -1381,34 +1697,24 @@ void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
 }
 
 VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
-    // Calculate the minimum and maximum addresses present in our address space.
     auto min_search_address = impl.SystemManagedVirtualBase();
     auto max_search_address = impl.UserVirtualBase() + impl.UserVirtualSize();
 
-    // If the requested address is below the mapped range, start search from the lowest address
     if (virtual_addr < min_search_address) {
         virtual_addr = min_search_address;
     }
 
-    // If the requested address is beyond the maximum our code can handle, throw an assert
-    if (!IsValidMapping(virtual_addr)) {
-        LOG_ERROR(Kernel_Vmm, "addr = {:#x} is outside the memory map", virtual_addr);
-        return -1;
-    }
+    ASSERT_MSG(IsValidMapping(virtual_addr), "Input address {:#x} is out of bounds", virtual_addr);
 
-    // Align up the virtual_addr first.
     virtual_addr = Common::AlignUp(virtual_addr, alignment);
     auto it = FindVMA(virtual_addr);
 
-    // If the VMA is free and contains the requested mapping we are done.
     if (it->second.IsFree() && it->second.Contains(virtual_addr, size)) {
         return virtual_addr;
     }
 
-    // If we didn't hit the return above, then we know the current VMA isn't suitable
     it++;
 
-    // Search for the first free VMA that fits our mapping.
     while (it != vma_map.end()) {
         if (!it->second.IsFree()) {
             it++;
@@ -1417,19 +1723,15 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
 
         const auto& vma = it->second;
         virtual_addr = Common::AlignUp(vma.base, alignment);
-        // Sometimes the alignment itself might be larger than the VMA.
         if (virtual_addr > vma.base + vma.size) {
             it++;
             continue;
         }
 
-        // Make sure the address is within our defined bounds
         if (virtual_addr >= max_search_address) {
-            // There are no free mappings within our safely usable address space.
             break;
         }
 
-        // If there's enough space in the VMA, return the address.
         const u64 remaining_size = vma.base + vma.size - virtual_addr;
         if (remaining_size >= size) {
             return virtual_addr;
@@ -1437,7 +1739,6 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
         it++;
     }
 
-    // Couldn't find a suitable VMA, return an error.
     LOG_ERROR(Kernel_Vmm, "Couldn't find a free mapping for address {:#x}, size {:#x}",
               virtual_addr, size);
     return -1;
@@ -1499,18 +1800,15 @@ MemoryManager::VMAHandle MemoryManager::CarveVMA(VAddr virtual_addr, u64 size) {
     const VAddr end_in_vma = start_in_vma + size;
 
     if (start_in_vma == 0 && size == vma.size) {
-        // if requsting the whole VMA, return it
         return vma_handle;
     }
 
     ASSERT_MSG(end_in_vma <= vma.size, "Mapping cannot fit inside free region");
 
     if (end_in_vma != vma.size) {
-        // Split VMA at the end of the allocated region
         Split(vma_handle, end_in_vma);
     }
     if (start_in_vma != 0) {
-        // Split VMA at the start of the allocated region
         vma_handle = Split(vma_handle, start_in_vma);
     }
 
@@ -1530,11 +1828,9 @@ MemoryManager::PhysHandle MemoryManager::CarvePhysArea(PhysMap& map, PAddr addr,
                size);
 
     if (end_in_vma != area.size) {
-        // Split VMA at the end of the allocated region
         Split(map, pmem_handle, end_in_vma);
     }
     if (start_in_area != 0) {
-        // Split VMA at the start of the allocated region
         pmem_handle = Split(map, pmem_handle, start_in_area);
     }
 
@@ -1551,34 +1847,27 @@ MemoryManager::VMAHandle MemoryManager::Split(VMAHandle vma_handle, u64 offset_i
     new_vma.size -= offset_in_vma;
 
     if (HasPhysicalBacking(new_vma)) {
-        // Update physical areas map for both areas
         new_vma.phys_areas.clear();
 
         std::map<uintptr_t, PhysicalMemoryArea> old_vma_phys_areas;
         for (auto& [offset, region] : old_vma.phys_areas) {
-            // Fully contained in first VMA
             if (offset + region.size <= offset_in_vma) {
                 old_vma_phys_areas[offset] = region;
             }
-            // Split between both VMAs
             if (offset < offset_in_vma && offset + region.size > offset_in_vma) {
-                // Create region in old VMA
                 u64 size_in_old = offset_in_vma - offset;
                 old_vma_phys_areas[offset] = PhysicalMemoryArea{
                     region.base, size_in_old, region.memory_type, region.dma_type};
-                // Create region in new VMA
                 PAddr new_base = region.base + size_in_old;
                 u64 size_in_new = region.size - size_in_old;
                 new_vma.phys_areas[0] =
                     PhysicalMemoryArea{new_base, size_in_new, region.memory_type, region.dma_type};
             }
-            // Fully contained in new VMA
             if (offset >= offset_in_vma) {
                 new_vma.phys_areas[offset - offset_in_vma] = region;
             }
         }
 
-        // Set old_vma's physical areas map to the newly created map
         old_vma.phys_areas = old_vma_phys_areas;
     }
 
@@ -1599,4 +1888,4 @@ MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_han
     return map.emplace_hint(std::next(phys_handle), new_area.base, new_area);
 }
 
-} // namespace Core
+}

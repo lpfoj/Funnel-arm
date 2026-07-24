@@ -20,4 +20,4 @@ struct CopyShaderData {
 
 CopyShaderData ParseCopyShader(std::span<const u32> code);
 
-} // namespace Shader
+}

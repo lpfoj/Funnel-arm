@@ -14,7 +14,6 @@ namespace Libraries::VrTracker {
 
 static bool g_library_initialized = false;
 
-// Internal memory
 static void* g_garlic_memory_pointer = nullptr;
 static u32 g_garlic_size = 0;
 static void* g_onion_memory_pointer = nullptr;
@@ -22,7 +21,6 @@ static u32 g_onion_size = 0;
 static void* g_work_memory_pointer = nullptr;
 static u32 g_work_size = 0;
 
-// Registered handles
 static s32 g_pad_handle = -1;
 static s32 g_move_handle = -1;
 static s32 g_gun_handle = -1;
@@ -37,7 +35,6 @@ s32 PS4_SYSV_ABI sceVrTrackerQueryMemory(const OrbisVrTrackerQueryMemoryParam* p
          param->profile != OrbisVrTrackerProfile::ORBIS_VR_TRACKER_PROFILE_100) ||
         param->calibration_settings.pad_position >
             OrbisVrTrackerCalibrationMode::ORBIS_VR_TRACKER_CALIBRATION_AUTO ||
-        // Hmd doesn't support auto calibration
         param->calibration_settings.hmd_position >
             OrbisVrTrackerCalibrationMode::ORBIS_VR_TRACKER_CALIBRATION_MANUAL ||
         param->calibration_settings.move_position >
@@ -47,7 +44,6 @@ s32 PS4_SYSV_ABI sceVrTrackerQueryMemory(const OrbisVrTrackerQueryMemoryParam* p
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
 
-    // Setting move_position to ORBIS_VR_TRACKER_CALIBRATION_AUTO doubles required onion memory.
     u32 required_onion_size = ORBIS_VR_TRACKER_BASE_ONION_SIZE;
     if (param->calibration_settings.move_position ==
         OrbisVrTrackerCalibrationMode::ORBIS_VR_TRACKER_CALIBRATION_AUTO) {
@@ -69,30 +65,23 @@ s32 PS4_SYSV_ABI sceVrTrackerInit(const OrbisVrTrackerInitParam* param) {
         return ORBIS_VR_TRACKER_ERROR_ALREADY_INITIALIZED;
     }
 
-    // Calculate correct onion size for parameter checks
     u32 required_onion_size = ORBIS_VR_TRACKER_BASE_ONION_SIZE;
     if (param->calibration_settings.move_position == ORBIS_VR_TRACKER_CALIBRATION_AUTO) {
         required_onion_size *= 2;
     }
 
-    // Parameter checks are fairly thorough here.
     if (param->size != sizeof(OrbisVrTrackerInitParam) ||
-        // Check garlic memory parameters
         param->direct_memory_garlic == nullptr ||
         param->direct_memory_garlic_alignment != ORBIS_VR_TRACKER_MEMORY_ALIGNMENT ||
         param->direct_memory_garlic_size != ORBIS_VR_TRACKER_GARLIC_SIZE ||
-        // Check onion memory parameters
         param->direct_memory_onion == nullptr ||
         param->direct_memory_onion_alignment != ORBIS_VR_TRACKER_MEMORY_ALIGNMENT ||
         param->direct_memory_onion_size != required_onion_size ||
-        // Check work memory parameters
         param->work_memory == nullptr ||
         param->work_memory_alignment != ORBIS_VR_TRACKER_MEMORY_ALIGNMENT ||
         param->work_memory_size != ORBIS_VR_TRACKER_WORK_SIZE ||
-        // Check compute queue parameters
         param->gpu_pipe_id >= AmdGpu::Liverpool::NumComputePipes ||
         param->gpu_queue_id >= AmdGpu::Liverpool::NumQueuesPerPipe ||
-        // Check calibration settings
         param->calibration_settings.pad_position >
             OrbisVrTrackerCalibrationMode::ORBIS_VR_TRACKER_CALIBRATION_AUTO ||
         param->calibration_settings.hmd_position >
@@ -104,12 +93,8 @@ s32 PS4_SYSV_ABI sceVrTrackerInit(const OrbisVrTrackerInitParam* param) {
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
 
-    // Real hardware will segfault if any of the supplied mappings aren't long enough,
-    // Validate each of them to ensure nothing weird can occur when this library is implemented.
     auto* memory = Core::Memory::Instance();
     Libraries::Kernel::OrbisVirtualQueryInfo info;
-    // The memory type for the whole range should be the same here,
-    // so the memory should be contained in one VMA.
     VAddr addr_to_check = std::bit_cast<VAddr>(param->direct_memory_garlic);
     s32 result = memory->VirtualQuery(addr_to_check, 0, &info);
     ASSERT_MSG(result == 0 && info.end - addr_to_check >= param->direct_memory_garlic_size,
@@ -134,7 +119,6 @@ s32 PS4_SYSV_ABI sceVrTrackerInit(const OrbisVrTrackerInitParam* param) {
     g_work_memory_pointer = param->work_memory;
     g_work_size = param->work_memory_size;
 
-    // All initialization checks passed.
     LOG_WARNING(Lib_VrTracker, "PSVR headsets are not supported yet");
     g_library_initialized = true;
 
@@ -164,7 +148,6 @@ s32 PS4_SYSV_ABI sceVrTrackerRegisterDeviceInternal(const OrbisVrTrackerDeviceTy
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
 
-    // Ignore handle handle validation for now, since most of that logic isn't really handled.
     switch (device_type) {
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_HMD: {
         if (g_hmd_handle != -1) {
@@ -195,7 +178,6 @@ s32 PS4_SYSV_ABI sceVrTrackerRegisterDeviceInternal(const OrbisVrTrackerDeviceTy
         break;
     }
     default: {
-        // Shouldn't be possible to hit this.
         UNREACHABLE();
     }
     }
@@ -237,7 +219,6 @@ s32 PS4_SYSV_ABI sceVrTrackerGpuSubmit(const OrbisVrTrackerGpuSubmitParam* param
         return ORBIS_VR_TRACKER_ERROR_NOT_INIT;
     }
 
-    // Impossible to submit valid data here since sceCameraGetFrameData returns an error.
     return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
 }
 
@@ -250,7 +231,6 @@ s32 PS4_SYSV_ABI sceVrTrackerGpuWait(const OrbisVrTrackerGpuWaitParam* param) {
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
 
-    // Impossible to perform GPU submits
     return ORBIS_VR_TRACKER_ERROR_NOT_EXECUTE_GPU_SUBMIT;
 }
 
@@ -260,7 +240,6 @@ s32 PS4_SYSV_ABI sceVrTrackerGpuWaitAndCpuProcess() {
         return ORBIS_VR_TRACKER_ERROR_NOT_INIT;
     }
 
-    // Impossible to perform GPU submits
     return ORBIS_VR_TRACKER_ERROR_NOT_EXECUTE_GPU_SUBMIT;
 }
 
@@ -283,7 +262,6 @@ s32 PS4_SYSV_ABI sceVrTrackerRecalibrate(const OrbisVrTrackerRecalibrateParam* p
     OrbisVrTrackerDeviceType device_type = param->device_type;
     switch (device_type) {
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_HMD: {
-        // Seems like the lack of a connected hmd results in this?
         return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
         break;
     }
@@ -306,12 +284,10 @@ s32 PS4_SYSV_ABI sceVrTrackerRecalibrate(const OrbisVrTrackerRecalibrateParam* p
         break;
     }
     default: {
-        // Shouldn't be possible to hit this.
         UNREACHABLE();
     }
     }
 
-    // TODO: handle internal recalibration behaviors.
     return ORBIS_OK;
 }
 
@@ -341,7 +317,6 @@ s32 PS4_SYSV_ABI sceVrTrackerSetDurationUntilStatusNotTracking(
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
 
-    // Seems to unconditionally return 0 when parameters are valid.
     return ORBIS_OK;
 }
 
@@ -449,7 +424,6 @@ s32 PS4_SYSV_ABI sceVrTrackerUnregisterDevice(const s32 handle) {
     if (handle < 0) {
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
-    // Since this function only takes a handle, compare the handle to registered handles.
     if (handle == g_hmd_handle) {
         g_hmd_handle = -1;
     } else if (handle == g_pad_handle) {
@@ -459,7 +433,6 @@ s32 PS4_SYSV_ABI sceVrTrackerUnregisterDevice(const s32 handle) {
     } else if (handle == g_gun_handle) {
         g_gun_handle = -1;
     } else {
-        // If none of the handles match up, then return an error.
         return ORBIS_VR_TRACKER_ERROR_ARGUMENT_INVALID;
     }
 
@@ -542,4 +515,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceVrTrackerStopLiveCapture);
 };
 
-} // namespace Libraries::VrTracker
+}

@@ -11,7 +11,7 @@ Id ExtractU16(EmitContext& ctx, Id value) {
 }
 
 Id ExtractS16(EmitContext& ctx, Id value) {
-    return ctx.OpSConvert(ctx.S16, value);
+    return ctx.OpSConvert(ctx.S16, ctx.OpBitcast(ctx.S32[1], value));
 }
 
 Id ExtractU8(EmitContext& ctx, Id value) {
@@ -19,32 +19,53 @@ Id ExtractU8(EmitContext& ctx, Id value) {
 }
 
 Id ExtractS8(EmitContext& ctx, Id value) {
-    return ctx.OpSConvert(ctx.S8, value);
+    return ctx.OpSConvert(ctx.S8, ctx.OpBitcast(ctx.S32[1], value));
 }
-} // Anonymous namespace
+
+Id Signed32AsU32(EmitContext& ctx, Id value) {
+    return ctx.OpBitcast(ctx.U32[1], value);
+}
+
+Id ConvertFToSignedBits32(EmitContext& ctx, Id float_type, Id zero, Id value) {
+    const Id is_negative = ctx.OpFOrdLessThan(ctx.U1[1], value, zero);
+    const Id magnitude = ctx.OpConvertFToU(ctx.U32[1], ctx.OpFAbs(float_type, value));
+    const Id negative = ctx.OpISub(ctx.U32[1], ctx.u32_zero_value, magnitude);
+    return ctx.OpSelect(ctx.U32[1], is_negative, negative, magnitude);
+}
+
+Id ConvertFToSignedBits64(EmitContext& ctx, Id float_type, Id zero, Id value) {
+    const Id is_negative = ctx.OpFOrdLessThan(ctx.U1[1], value, zero);
+    const Id magnitude = ctx.OpConvertFToU(ctx.U64, ctx.OpFAbs(float_type, value));
+    const Id negative = ctx.OpISub(ctx.U64, ctx.u64_zero_value, magnitude);
+    return ctx.OpSelect(ctx.U64, is_negative, negative, magnitude);
+}
+}
 
 Id EmitConvertS16F32(EmitContext& ctx, Id value) {
-    return ctx.OpSConvert(ctx.U32[1], ctx.OpConvertFToS(ctx.U16, value));
+    return ConvertFToSignedBits32(ctx, ctx.F32[1], ctx.f32_zero_value, value);
 }
 
 Id EmitConvertS16F64(EmitContext& ctx, Id value) {
-    return ctx.OpSConvert(ctx.U32[1], ctx.OpConvertFToS(ctx.U16, value));
+    const Id zero = ctx.Constant(ctx.F64[1], f64{0.0});
+    return ConvertFToSignedBits32(ctx, ctx.F64[1], zero, value);
 }
 
 Id EmitConvertS32F32(EmitContext& ctx, Id value) {
-    return ctx.OpConvertFToS(ctx.U32[1], value);
+    return ConvertFToSignedBits32(ctx, ctx.F32[1], ctx.f32_zero_value, value);
 }
 
 Id EmitConvertS32F64(EmitContext& ctx, Id value) {
-    return ctx.OpConvertFToS(ctx.U32[1], value);
+    const Id zero = ctx.Constant(ctx.F64[1], f64{0.0});
+    return ConvertFToSignedBits32(ctx, ctx.F64[1], zero, value);
 }
 
 Id EmitConvertS64F32(EmitContext& ctx, Id value) {
-    return ctx.OpConvertFToS(ctx.U64, value);
+    return ConvertFToSignedBits64(ctx, ctx.F32[1], ctx.f32_zero_value, value);
 }
 
 Id EmitConvertS64F64(EmitContext& ctx, Id value) {
-    return ctx.OpConvertFToS(ctx.U64, value);
+    const Id zero = ctx.Constant(ctx.F64[1], f64{0.0});
+    return ConvertFToSignedBits64(ctx, ctx.F64[1], zero, value);
 }
 
 Id EmitConvertU16F32(EmitContext& ctx, Id value) {
@@ -104,11 +125,11 @@ Id EmitConvertF32S16(EmitContext& ctx, Id value) {
 }
 
 Id EmitConvertF32S32(EmitContext& ctx, Id value) {
-    return ctx.OpConvertSToF(ctx.F32[1], value);
+    return ctx.OpConvertSToF(ctx.F32[1], ctx.OpBitcast(ctx.S32[1], value));
 }
 
 Id EmitConvertF32S64(EmitContext& ctx, Id value) {
-    return ctx.OpConvertSToF(ctx.F32[1], value);
+    return ctx.OpConvertSToF(ctx.F32[1], ctx.OpBitcast(ctx.S64, value));
 }
 
 Id EmitConvertF32U8(EmitContext& ctx, Id value) {
@@ -136,11 +157,11 @@ Id EmitConvertF64S16(EmitContext& ctx, Id value) {
 }
 
 Id EmitConvertF64S32(EmitContext& ctx, Id value) {
-    return ctx.OpConvertSToF(ctx.F64[1], value);
+    return ctx.OpConvertSToF(ctx.F64[1], ctx.OpBitcast(ctx.S32[1], value));
 }
 
 Id EmitConvertF64S64(EmitContext& ctx, Id value) {
-    return ctx.OpConvertSToF(ctx.F64[1], value);
+    return ctx.OpConvertSToF(ctx.F64[1], ctx.OpBitcast(ctx.S64, value));
 }
 
 Id EmitConvertF64U8(EmitContext& ctx, Id value) {
@@ -176,11 +197,13 @@ Id EmitConvertU32U8(EmitContext& ctx, Id value) {
 }
 
 Id EmitConvertS32S8(EmitContext& ctx, Id value) {
-    return ctx.OpSConvert(ctx.U32[1], value);
+    const Id signed_value = ctx.OpBitcast(ctx.S8, value);
+    return Signed32AsU32(ctx, ctx.OpSConvert(ctx.S32[1], signed_value));
 }
 
 Id EmitConvertS32S16(EmitContext& ctx, Id value) {
-    return ctx.OpSConvert(ctx.U32[1], value);
+    const Id signed_value = ctx.OpBitcast(ctx.S16, value);
+    return Signed32AsU32(ctx, ctx.OpSConvert(ctx.S32[1], signed_value));
 }
 
-} // namespace Shader::Backend::SPIRV
+}

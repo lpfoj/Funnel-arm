@@ -16,7 +16,7 @@ enum class RecursiveLockType { None, Shared, Exclusive };
 bool IncrementRecursiveLock(void* mutex, RecursiveLockType type);
 bool DecrementRecursiveLock(void* mutex, RecursiveLockType type);
 
-} // namespace Detail
+}
 
 template <typename MutexType>
 class RecursiveScopedLock {
@@ -64,4 +64,4 @@ private:
     bool m_locked = false;
 };
 
-} // namespace Common
+}

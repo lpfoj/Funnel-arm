@@ -64,4 +64,4 @@ private:
     std::vector<u8> m_pcm_buffer;
 };
 
-} // namespace Libraries::Ajm
+}

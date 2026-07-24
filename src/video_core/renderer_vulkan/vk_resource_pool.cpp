@@ -26,19 +26,15 @@ std::size_t ResourcePool::CommitResource() {
         return std::nullopt;
     };
 
-    // Try to find a free resource from the hinted position to the end.
     auto found = search(hint_iterator, ticks.size());
     if (!found) {
-        // Refresh semaphore to query updated results
         master_semaphore->Refresh();
         gpu_tick = master_semaphore->KnownGpuTick();
         found = search(hint_iterator, ticks.size());
     }
     if (!found) {
-        // Search from beginning to the hinted position.
         found = search(0, hint_iterator);
         if (!found) {
-            // Both searches failed, the pool is full; handle it.
             const std::size_t free_resource = ManageOverflow();
 
             ticks[free_resource] = master_semaphore->CurrentTick();
@@ -46,7 +42,6 @@ std::size_t ResourcePool::CommitResource() {
         }
     }
 
-    // Free iterator is hinted to the resource after the one that's been commited.
     hint_iterator = (*found + 1) % ticks.size();
     return *found;
 }
@@ -121,7 +116,6 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
     const u64 set_key = std::bit_cast<u64>(set_layout);
     const auto [it, _] = descriptor_sets.try_emplace(set_key);
 
-    // Check if allocated sets exist and pick one.
     if (!it->second.empty()) {
         const auto desc_set = it->second.back();
         it.value().pop_back();
@@ -138,7 +132,6 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
         .pSetLayouts = layouts.data(),
     };
 
-    // Attempt to allocate the descriptor set batch.
     auto result = device.allocateDescriptorSets(&alloc_info, desc_sets.data());
     if (result == vk::Result::eSuccess) {
         const auto desc_set = desc_sets.back();
@@ -147,7 +140,6 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
         return desc_set;
     }
 
-    // The pool has run out. Record current tick and place it in pending list.
     ASSERT_MSG(result == vk::Result::eErrorOutOfPoolMemory ||
                    result == vk::Result::eErrorFragmentedPool,
                "Unexpected error during descriptor set allocation: {}", vk::to_string(result));
@@ -163,13 +155,11 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
         CreateDescriptorPool();
     }
 
-    // Attempt to allocate again with fresh pool.
     alloc_info.descriptorPool = curr_pool;
     result = device.allocateDescriptorSets(&alloc_info, desc_sets.data());
     ASSERT_MSG(result == vk::Result::eSuccess,
                "Unexpected error during descriptor set allocation {}", vk::to_string(result));
 
-    // We've changed pool so also reset descriptor batch cache.
     descriptor_sets.clear();
     const auto desc_set = desc_sets.back();
     desc_sets.pop_back();
@@ -190,4 +180,4 @@ void DescriptorHeap::CreateDescriptorPool() {
     curr_pool = pool;
 }
 
-} // namespace Vulkan
+}

@@ -109,4 +109,4 @@ private:
 
     std::queue<std::array<u8, 32>> m_queries;
 };
-} // namespace Libraries::Usbd
+}

@@ -40,7 +40,6 @@ foreach(FILENAME IN ITEMS ${SHADER_FILES})
             ${SOURCE_FILE}
         DEPENDS
             ${INPUT_FILE}
-            # HEADER_GENERATOR should be included here but msbuild seems to assume it's always modified
     )
     set(SHADER_HEADERS ${SHADER_HEADERS} ${SOURCE_HEADER_FILE})
 endforeach()

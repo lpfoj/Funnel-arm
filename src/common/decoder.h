@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <Zydis/Zydis.h>
+#include "common/x86_decoder.h"
 #include "common/singleton.h"
 #include "common/types.h"
 
@@ -14,18 +14,18 @@ public:
     DecoderImpl();
     ~DecoderImpl();
 
-    std::string disassembleInst(ZydisDecodedInstruction& inst, ZydisDecodedOperand* operands,
+    std::string disassembleInst(X86DecodedInstruction& inst, X86DecodedOperand* operands,
                                 u64 address);
-    void printInst(ZydisDecodedInstruction& inst, ZydisDecodedOperand* operands, u64 address);
+    void printInst(X86DecodedInstruction& inst, X86DecodedOperand* operands, u64 address);
     void printInstruction(void* code, u64 address);
-    ZyanStatus decodeInstruction(ZydisDecodedInstruction& inst, ZydisDecodedOperand* operands,
+    X86DecodeStatus decodeInstruction(X86DecodedInstruction& inst, X86DecodedOperand* operands,
                                  void* data, u64 size = 15);
 
 private:
-    ZydisDecoder m_decoder;
-    ZydisFormatter m_formatter;
+    X86Decoder m_decoder;
+    X86Formatter m_formatter;
 };
 
 using Decoder = Common::Singleton<DecoderImpl>;
 
-} // namespace Common
+}

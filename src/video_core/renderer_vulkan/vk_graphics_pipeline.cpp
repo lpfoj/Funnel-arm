@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <cstdlib>
+#endif
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
@@ -26,6 +30,15 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+static bool IsPrimitiveTopologyList(const vk::PrimitiveTopology topology) {
+    return topology == vk::PrimitiveTopology::ePointList ||
+           topology == vk::PrimitiveTopology::eLineList ||
+           topology == vk::PrimitiveTopology::eTriangleList ||
+           topology == vk::PrimitiveTopology::eLineListWithAdjacency ||
+           topology == vk::PrimitiveTopology::eTriangleListWithAdjacency ||
+           topology == vk::PrimitiveTopology::ePatchList;
+}
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
@@ -35,6 +48,7 @@ GraphicsPipeline::GraphicsPipeline(
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
+    pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
@@ -81,13 +95,24 @@ GraphicsPipeline::GraphicsPipeline(
         .pVertexAttributeDescriptions = sdata.vertex_attributes.data(),
     };
 
-    const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+#ifdef __ANDROID__
+    static const bool kBisectSkipTess = std::getenv("EXECUTOR_BISECT_SKIP_TESS") != nullptr;
+#else
+    constexpr bool kBisectSkipTess = false;
+#endif
+    auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+    if (kBisectSkipTess && (key.prim_type == AmdGpu::PrimitiveType::RectList ||
+                            key.prim_type == AmdGpu::PrimitiveType::QuadList)) {
+        topology = vk::PrimitiveTopology::eTriangleList;
+    }
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
     };
 
-    const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
-    const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    const bool is_rect_list =
+        !kBisectSkipTess && key.prim_type == AmdGpu::PrimitiveType::RectList;
+    const bool is_quad_list =
+        !kBisectSkipTess && key.prim_type == AmdGpu::PrimitiveType::QuadList;
     const vk::PipelineTessellationStateCreateInfo tessellation_state = {
         .patchControlPoints = is_rect_list ? 3U : (is_quad_list ? 4U : key.patch_control_points),
     };
@@ -96,7 +121,11 @@ GraphicsPipeline::GraphicsPipeline(
         vk::PipelineRasterizationStateCreateInfo{
             .depthClampEnable = key.depth_clamp_enable &&
                                 (!key.depth_clip_enable || instance.IsDepthClipEnableSupported()),
+#ifdef __ANDROID__
+            .rasterizerDiscardEnable = key.rasterizer_discard_enable,
+#else
             .rasterizerDiscardEnable = false,
+#endif
             .polygonMode = LiverpoolToVK::PolygonMode(key.polygon_mode),
             .lineWidth = 1.0f,
         },
@@ -143,9 +172,13 @@ GraphicsPipeline::GraphicsPipeline(
         vk::DynamicState::eStencilTestEnable,  vk::DynamicState::eStencilReference,
         vk::DynamicState::eStencilCompareMask, vk::DynamicState::eStencilWriteMask,
         vk::DynamicState::eStencilOp,          vk::DynamicState::eCullMode,
-        vk::DynamicState::eFrontFace,          vk::DynamicState::eRasterizerDiscardEnable,
-        vk::DynamicState::eLineWidth,          vk::DynamicState::ePrimitiveRestartEnable,
+        vk::DynamicState::eFrontFace,          vk::DynamicState::eLineWidth,
+        vk::DynamicState::ePrimitiveRestartEnable,
     };
+
+#ifndef __ANDROID__
+    dynamic_states.push_back(vk::DynamicState::eRasterizerDiscardEnable);
+#endif
 
     if (instance.IsDepthBoundsSupported()) {
         dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
@@ -153,6 +186,9 @@ GraphicsPipeline::GraphicsPipeline(
     }
     if (instance.IsDynamicColorWriteMaskSupported()) {
         dynamic_states.push_back(vk::DynamicState::eColorWriteMaskEXT);
+    }
+    if (instance.IsCoarseFragmentShadingSupported()) {
+        dynamic_states.push_back(vk::DynamicState::eFragmentShadingRateKHR);
     }
     if (instance.IsVertexInputDynamicState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
@@ -230,10 +266,15 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
-    const auto depth_format =
+    const bool has_tessellation_stages =
+        is_rect_list || is_quad_list ||
+        infos[u32(Shader::LogicalStage::TessellationControl)] != nullptr ||
+        infos[u32(Shader::LogicalStage::TessellationEval)] != nullptr;
+
+    depth_format =
         instance.GetSupportedFormat(LiverpoolToVK::DepthFormat(key.z_format, key.stencil_format),
                                     vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
-    std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats;
+    std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats{};
     for (s32 i = 0; i < key.num_color_attachments; ++i) {
         const auto& col_buf = key.color_buffers[i];
         const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format);
@@ -246,6 +287,9 @@ GraphicsPipeline::GraphicsPipeline(
                         vk::to_string(color_format));
         }
         color_formats[i] = color_format;
+    }
+    if (key.num_color_attachments != 0) {
+        color_format0 = color_formats[0];
     }
 
     std::array<vk::SampleCountFlagBits, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
@@ -316,12 +360,6 @@ GraphicsPipeline::GraphicsPipeline(
                     : key.write_masks[i],
         };
 
-        // On GCN GPU there is an additional mask which allows to control color components exported
-        // from a pixel shader. A situation possible, when the game may mask out the alpha channel,
-        // while it is still need to be used in blending ops. For such cases, HW will default alpha
-        // to 1 and perform the blending, while shader normally outputs 0 in the last component.
-        // Unfortunatelly, Vulkan doesn't provide any control on blend inputs, so below we detecting
-        // such cases and override alpha value in order to emulate HW behaviour.
         const auto has_alpha_masked_out =
             (key.cb_shader_mask.GetMask(i) & AmdGpu::ColorBufferMask::ComponentA) == 0;
         const auto has_src_alpha_in_src_blend = src_color == vk::BlendFactor::eSrcAlpha ||
@@ -331,12 +369,12 @@ GraphicsPipeline::GraphicsPipeline(
         if (has_alpha_masked_out && has_src_alpha_in_src_blend) {
             attachments[i].srcColorBlendFactor = src_color == vk::BlendFactor::eSrcAlpha
                                                      ? vk::BlendFactor::eOne
-                                                     : vk::BlendFactor::eZero; // 1-A
+                                                     : vk::BlendFactor::eZero;
         }
         if (has_alpha_masked_out && has_src_alpha_in_dst_blend) {
             attachments[i].dstColorBlendFactor = dst_color == vk::BlendFactor::eSrcAlpha
                                                      ? vk::BlendFactor::eOne
-                                                     : vk::BlendFactor::eZero; // 1-A
+                                                     : vk::BlendFactor::eZero;
         }
     }
 
@@ -349,8 +387,6 @@ GraphicsPipeline::GraphicsPipeline(
         .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},
     };
 
-    // Required by spec unless VK_EXT_extended_dynamic_state3 is supported.
-    // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
@@ -359,7 +395,7 @@ GraphicsPipeline::GraphicsPipeline(
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
         .pInputAssemblyState = &input_assembly,
-        .pTessellationState = &tessellation_state,
+        .pTessellationState = has_tessellation_stages ? &tessellation_state : nullptr,
         .pViewportState = &viewport_info,
         .pRasterizationState = &raster_chain.get(),
         .pMultisampleState = &sdata.multisampling,
@@ -370,6 +406,44 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
+#ifdef __ANDROID__
+    static std::atomic<unsigned> pipeline_ci_log_budget{0};
+    const unsigned pipeline_ci_log_index =
+        pipeline_ci_log_budget.fetch_add(1, std::memory_order_relaxed);
+    if (pipeline_ci_log_index < 16 ||
+        std::getenv("EXECUTOR_TRACE_PIPELINE_CREATE_INFO") != nullptr) {
+        __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                        "[EXECUTOR_PIPELINE_CI_COUNTS] hash=0x%llx vs=0x%llx ps=0x%llx "
+                        "stages=%u vtxBindings=%u vtxAttrs=%u divisors=%u colorAttach=%u "
+                        "dynStates=%u tessState=%u tessPoints=%u prim=%u samples=%u color0Samples=%u "
+                        "colorFmt0=%u depthFmt=%u stencilFmt=%u",
+                        static_cast<unsigned long long>(pipeline_hash),
+                        static_cast<unsigned long long>(
+                            key.stage_hashes[u32(Shader::LogicalStage::Vertex)]),
+                        static_cast<unsigned long long>(
+                            key.stage_hashes[u32(Shader::LogicalStage::Fragment)]),
+                        static_cast<unsigned>(shader_stages.size()),
+                        static_cast<unsigned>(sdata.vertex_bindings.size()),
+                        static_cast<unsigned>(sdata.vertex_attributes.size()),
+                        static_cast<unsigned>(sdata.divisors.size()),
+                        static_cast<unsigned>(key.num_color_attachments),
+                        static_cast<unsigned>(dynamic_states.size()),
+                        has_tessellation_stages ? 1U : 0U,
+                        static_cast<unsigned>(tessellation_state.patchControlPoints),
+                        static_cast<unsigned>(key.prim_type), static_cast<unsigned>(key.num_samples),
+                        static_cast<unsigned>(key.color_samples[0]),
+                        static_cast<unsigned>(color_format0), static_cast<unsigned>(depth_format),
+                        static_cast<unsigned>(key.stencil_format));
+    }
+    static const bool kBisectSkipVkPipelineCreate =
+        std::getenv("EXECUTOR_BISECT_SKIP_VK_PIPELINE_CREATE") != nullptr;
+    if (kBisectSkipVkPipelineCreate) {
+        __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                            "[EXECUTOR_BISECT_SKIP_VK_PIPELINE_CREATE] active (skipping "
+                            "vkCreateGraphicsPipelines)");
+        return;
+    }
+#endif
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
@@ -391,6 +465,18 @@ void GraphicsPipeline::GetVertexInputs(
     }
     const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
     for (const auto& attrib : fetch_shader->attributes) {
+        if (attributes.size() >= MaxVertexBufferCount || bindings.size() >= MaxVertexBufferCount ||
+            guest_buffers.size() >= MaxVertexBufferCount) {
+            static std::atomic<u32> b{0};
+            if (b.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Vulkan,
+                          "GetVertexInputs: fetch_shader->attributes={} exceeds MaxVertexBufferCount={}"
+                          " (garbage/unrelocated fetch shader); truncating to avoid static_vector "
+                          "overflow",
+                          fetch_shader->attributes.size(), MaxVertexBufferCount);
+            }
+            break;
+        }
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
         attributes.push_back(Attribute{
@@ -420,7 +506,6 @@ void GraphicsPipeline::GetVertexInputs(
     }
 }
 
-// Declare templated GetVertexInputs for necessary types.
 template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputAttributeDescription>& attributes,
     VertexInputs<vk::VertexInputBindingDescription>& bindings,
@@ -444,7 +529,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         for (const auto& buffer : stage->buffers) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
-                           : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+                           : buffer.GetSharp(*stage);
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
@@ -473,7 +558,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    uses_push_descriptors = binding <= instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};
@@ -489,4 +574,4 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     desc_layout = std::move(layout);
 }
 
-} // namespace Vulkan
+}

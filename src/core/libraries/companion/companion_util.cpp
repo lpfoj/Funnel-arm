@@ -68,4 +68,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceCompanionUtilTerminate);
 };
 
-} // namespace Libraries::CompanionUtil
+}

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -14,13 +14,29 @@ struct SDL_Gamepad;
 union SDL_Event;
 
 namespace Input {
-class GameController;
+
+class SDLInputEngine : public Engine {
+public:
+    ~SDLInputEngine() override;
+    void Init() override;
+    void SetLightBarRGB(u8 r, u8 g, u8 b) override;
+    void SetVibration(u8 smallMotor, u8 largeMotor) override;
+    float GetGyroPollRate() const override;
+    float GetAccelPollRate() const override;
+    State ReadState() override;
+
+private:
+    float m_gyro_poll_rate = 0.0f;
+    float m_accel_poll_rate = 0.0f;
+};
+
 }
 
 namespace Frontend {
 
 enum class WindowSystemType : u8 {
     Headless,
+    Android,
     Windows,
     X11,
     Wayland,
@@ -28,18 +44,12 @@ enum class WindowSystemType : u8 {
 };
 
 struct WindowSystemInfo {
-    // Connection to a display server. This is used on X11 and Wayland platforms.
     void* display_connection = nullptr;
 
-    // Render surface. This is a pointer to the native window handle, which depends
-    // on the platform. e.g. HWND for Windows, Window for X11. If the surface is
-    // set to nullptr, the video backend will run in headless mode.
     void* render_surface = nullptr;
 
-    // Scale of the render surface. For hidpi systems, this will be >1.
     float render_surface_scale = 1.0f;
 
-    // Window system type. Determines which GL context or Vulkan WSI is used.
     WindowSystemType type = WindowSystemType::Headless;
 };
 
@@ -47,8 +57,11 @@ class WindowSDL {
     int keyboard_grab = 0;
 
 public:
-    explicit WindowSDL(s32 width, s32 height, Input::GameControllers* controllers,
+    explicit WindowSDL(s32 width, s32 height, Input::GameController* controller,
                        std::string_view window_title);
+#if defined(__ANDROID__)
+    WindowSDL(s32 width, s32 height, void* native_window);
+#endif
     ~WindowSDL();
 
     s32 GetWidth() const {
@@ -71,8 +84,6 @@ public:
         return window_info;
     }
 
-    void SetIcon(const std::filesystem::path& path);
-
     void WaitEvent();
     void InitTimers();
 
@@ -87,14 +98,11 @@ private:
 private:
     s32 width;
     s32 height;
-    Input::GameControllers controllers{};
+    Input::GameController* controller;
     WindowSystemInfo window_info{};
     SDL_Window* window{};
     bool is_shown{};
     bool is_open{true};
 };
 
-void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png);
-void SetDefaultWindowIcon(SDL_Window* window);
-
-} // namespace Frontend
+}

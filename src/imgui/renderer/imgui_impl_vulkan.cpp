@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Based on imgui_impl_vulkan.cpp from Dear ImGui repository
-
 #include <cstdio>
 #include <mutex>
 
@@ -24,20 +22,17 @@ struct RenderBuffer {
     vk::Buffer buffer{};
 };
 
-// Reusable buffers used for rendering 1 current in-flight frame, for RenderDrawData()
 struct FrameRenderBuffers {
     RenderBuffer vertex;
     RenderBuffer index;
 };
 
-// Each viewport will hold 1 WindowRenderBuffers
 struct WindowRenderBuffers {
     uint32_t index{};
     uint32_t count{};
     std::vector<FrameRenderBuffers> frame_render_buffers{};
 };
 
-// Vulkan data
 struct VkData {
     const InitInfo init_info;
     vk::DeviceSize buffer_memory_alignment = 256;
@@ -53,14 +48,12 @@ struct VkData {
     vk::CommandPool command_pool{};
     vk::Sampler simple_sampler{};
 
-    // Font data
     vk::DeviceMemory font_memory{};
     vk::Image font_image{};
     vk::ImageView font_view{};
     ImTextureID font_texture{};
     vk::CommandBuffer font_command_buffer{};
 
-    // Render buffers
     WindowRenderBuffers render_buffers{};
     bool enabled_blending{true};
 
@@ -70,29 +63,6 @@ struct VkData {
     }
 };
 
-//-----------------------------------------------------------------------------
-// SHADERS
-//-----------------------------------------------------------------------------
-
-// backends/vulkan/glsl_shader.vert, compiled with:
-// # glslangValidator -V -x -o glsl_shader.vert.u32 glsl_shader.vert
-/*
-#version 450 core
-layout(location = 0) in vec2 aPos;
-layout(location = 1) in vec2 aUV;
-layout(location = 2) in vec4 aColor;
-layout(push_constant) uniform uPushConstant { vec2 uScale; vec2 uTranslate; } pc;
-
-out gl_PerVertex { vec4 gl_Position; };
-layout(location = 0) out struct { vec4 Color; vec2 UV; } Out;
-
-void main()
-{
-    Out.Color = aColor;
-    Out.UV = aUV;
-    gl_Position = vec4(aPos * pc.uScale + pc.uTranslate, 0, 1);
-}
-*/
 static uint32_t glsl_shader_vert_spv[] = {
     0x07230203, 0x00010000, 0x00080001, 0x0000002e, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -136,18 +106,6 @@ static uint32_t glsl_shader_vert_spv[] = {
     0x00000028, 0x00000029, 0x00050041, 0x00000011, 0x0000002d, 0x0000001b, 0x0000000d, 0x0003003e,
     0x0000002d, 0x0000002c, 0x000100fd, 0x00010038};
 
-// backends/vulkan/glsl_shader.frag, compiled with:
-// # glslangValidator -V -x -o glsl_shader.frag.u32 glsl_shader.frag
-/*
-#version 450 core
-layout(location = 0) out vec4 fColor;
-layout(set=0, binding=0) uniform sampler2D sTexture;
-layout(location = 0) in struct { vec4 Color; vec2 UV; } In;
-void main()
-{
-    fColor = In.Color * texture(sTexture, In.UV.st);
-}
-*/
 static uint32_t glsl_shader_frag_spv[] = {
     0x07230203, 0x00010000, 0x00080001, 0x0000001e, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -175,9 +133,6 @@ static uint32_t glsl_shader_frag_spv[] = {
     0x00000007, 0x0000001d, 0x00000012, 0x0000001c, 0x0003003e, 0x00000009, 0x0000001d, 0x000100fd,
     0x00010038};
 
-// Backend data stored in io.BackendRendererUserData to allow support for multiple Dear ImGui
-// contexts It is STRONGLY preferred that you use docking branch with multi-viewports (== single
-// Dear ImGui context + multiple windows) instead of multiple Dear ImGui contexts.
 static VkData* GetBackendData() {
     return ImGui::GetCurrentContext() ? (VkData*)ImGui::GetIO().BackendRendererUserData : nullptr;
 }
@@ -189,7 +144,7 @@ static uint32_t FindMemoryType(vk::MemoryPropertyFlags properties, uint32_t type
     for (uint32_t i = 0; i < prop.memoryTypeCount; i++)
         if ((prop.memoryTypes[i].propertyFlags & properties) == properties && type_bits & (1 << i))
             return i;
-    return 0xFFFFFFFF; // Unable to find memoryType
+    return 0xFFFFFFFF;
 }
 
 template <typename T>
@@ -222,7 +177,6 @@ static void CheckVkErr(vk::Result res) {
     }
 }
 
-// Same as IM_MEMALIGN(). 'alignment' must be a power of two.
 static inline vk::DeviceSize AlignBufferSize(vk::DeviceSize size, vk::DeviceSize alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
 }
@@ -264,7 +218,6 @@ void UploadTextureData::Destroy() {
     image_memory = VK_NULL_HANDLE;
 }
 
-// Register a texture
 ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
                        vk::Sampler sampler) {
     VkData* bd = GetBackendData();
@@ -274,7 +227,6 @@ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
         sampler = bd->simple_sampler;
     }
 
-    // Create Descriptor Set:
     vk::DescriptorSet descriptor_set;
     {
         vk::DescriptorSetAllocateInfo alloc_info{
@@ -285,7 +237,6 @@ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
         descriptor_set = CheckVkResult(v.device.allocateDescriptorSets(alloc_info)).front();
     }
 
-    // Update the Descriptor Set:
     {
         vk::DescriptorImageInfo desc_image[1]{
             {
@@ -328,7 +279,6 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
         }));
     }
 
-    // Create Image
     {
         vk::ImageCreateInfo image_info{
             .imageType = vk::ImageType::e2D,
@@ -357,7 +307,6 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
         CheckVkErr(v.device.bindImageMemory(info.image, info.image_memory, 0));
     }
 
-    // Create Image View
     {
         vk::ImageViewCreateInfo view_info{
             .image = info.image,
@@ -372,10 +321,8 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
         info.image_view = CheckVkResult(v.device.createImageView(view_info, v.allocator));
     }
 
-    // Create descriptor set (ImTextureID)
     info.im_texture = AddTexture(info.image_view, vk::ImageLayout::eShaderReadOnlyOptimal);
 
-    // Create Upload Buffer
     {
         vk::BufferCreateInfo buffer_info{
             .size = size,
@@ -394,7 +341,6 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
         CheckVkErr(v.device.bindBufferMemory(info.upload_buffer, info.upload_buffer_memory, 0));
     }
 
-    // Upload to Buffer
     {
         char* map = (char*)CheckVkResult(v.device.mapMemory(info.upload_buffer_memory, 0, size));
         memcpy(map, data, size);
@@ -408,7 +354,6 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
         v.device.unmapMemory(info.upload_buffer_memory);
     }
 
-    // Copy to Image
     {
         vk::ImageMemoryBarrier copy_barrier[1]{
             {
@@ -512,10 +457,8 @@ static void SetupRenderState(ImDrawData& draw_data, vk::Pipeline pipeline, vk::C
                              FrameRenderBuffers& frb, int fb_width, int fb_height) {
     VkData* bd = GetBackendData();
 
-    // Bind pipeline:
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
 
-    // Bind Vertex And Index Buffer:
     if (draw_data.TotalVtxCount > 0) {
         vk::Buffer vertex_buffers[1] = {frb.vertex.buffer};
         vk::DeviceSize vertex_offset[1] = {0};
@@ -524,7 +467,6 @@ static void SetupRenderState(ImDrawData& draw_data, vk::Pipeline pipeline, vk::C
                                IDX_SIZE == 2 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
     }
 
-    // Setup viewport:
     {
         vk::Viewport viewport{
             .x = 0,
@@ -537,10 +479,6 @@ static void SetupRenderState(ImDrawData& draw_data, vk::Pipeline pipeline, vk::C
         cmdbuf.setViewport(0, {viewport});
     }
 
-    // Setup scale and translation:
-    // Our visible imgui space lies from draw_data->DisplayPps (top left) to
-    // draw_data->DisplayPos+data_data->DisplaySize (bottom right). DisplayPos is (0,0) for single
-    // viewport apps.
     {
         float scale[2];
         scale[0] = 2.0f / draw_data.DisplaySize.x;
@@ -555,11 +493,8 @@ static void SetupRenderState(ImDrawData& draw_data, vk::Pipeline pipeline, vk::C
     }
 }
 
-// Render function
 void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
                     vk::Pipeline pipeline) {
-    // Avoid rendering when minimized, scale coordinates for retina displays (screen coordinates !=
-    // framebuffer coordinates)
     int fb_width = (int)(draw_data.DisplaySize.x * draw_data.FramebufferScale.x);
     int fb_height = (int)(draw_data.DisplaySize.y * draw_data.FramebufferScale.y);
     if (fb_width <= 0 || fb_height <= 0) {
@@ -572,13 +507,11 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
         pipeline = bd->pipeline;
     }
 
-    // Allocate array to store enough vertex/index buffers
     WindowRenderBuffers& wrb = bd->render_buffers;
     wrb.index = (wrb.index + 1) % wrb.count;
     FrameRenderBuffers& frb = wrb.frame_render_buffers[wrb.index];
 
     if (draw_data.TotalVtxCount > 0) {
-        // Create or resize the vertex/index buffers
         size_t vertex_size = AlignBufferSize(draw_data.TotalVtxCount * sizeof(ImDrawVert),
                                              bd->buffer_memory_alignment);
         size_t index_size =
@@ -590,7 +523,6 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
             CreateOrResizeBuffer(frb.index, index_size, vk::BufferUsageFlagBits::eIndexBuffer);
         }
 
-        // Upload vertex/index data into a single contiguous GPU buffer
         ImDrawVert* vtx_dst = nullptr;
         ImDrawIdx* idx_dst = nullptr;
         vtx_dst = (ImDrawVert*)CheckVkResult(
@@ -620,18 +552,11 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
         v.device.unmapMemory(frb.index.buffer_memory);
     }
 
-    // Setup desired Vulkan state
     SetupRenderState(draw_data, pipeline, command_buffer, frb, fb_width, fb_height);
 
-    // Will project scissor/clipping rectangles into framebuffer space
-
-    // (0,0) unless using multi-viewports
     ImVec2 clip_off = draw_data.DisplayPos;
-    // (1,1) unless using retina display which are often (2,2)
     ImVec2 clip_scale = draw_data.FramebufferScale;
 
-    // Render command lists
-    // (Because we merged all buffers into a single one, we maintain our own offset into them)
     int global_vtx_offset = 0;
     int global_idx_offset = 0;
     for (int n = 0; n < draw_data.CmdListsCount; n++) {
@@ -639,22 +564,17 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
         for (int cmd_i = 0; cmd_i < cmd_list->CmdBuffer.Size; cmd_i++) {
             const ImDrawCmd* pcmd = &cmd_list->CmdBuffer[cmd_i];
             if (pcmd->UserCallback != nullptr) {
-                // User callback, registered via ImDrawList::AddCallback()
-                // (ImDrawCallback_ResetRenderState is a special callback value used by the user to
-                // request the renderer to reset render state.)
                 if (pcmd->UserCallback == ImDrawCallback_ResetRenderState) {
                     SetupRenderState(draw_data, pipeline, command_buffer, frb, fb_width, fb_height);
                 } else {
                     pcmd->UserCallback(cmd_list, pcmd);
                 }
             } else {
-                // Project scissor/clipping rectangles into framebuffer space
                 ImVec2 clip_min((pcmd->ClipRect.x - clip_off.x) * clip_scale.x,
                                 (pcmd->ClipRect.y - clip_off.y) * clip_scale.y);
                 ImVec2 clip_max((pcmd->ClipRect.z - clip_off.x) * clip_scale.x,
                                 (pcmd->ClipRect.w - clip_off.y) * clip_scale.y);
 
-                // Clamp to viewport as vk::CmdSetScissor() won't accept values that are off bounds
                 if (clip_min.x < 0.0f) {
                     clip_min.x = 0.0f;
                 }
@@ -670,7 +590,6 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
                 if (clip_max.x <= clip_min.x || clip_max.y <= clip_min.y)
                     continue;
 
-                // Apply scissor/clipping rectangle
                 vk::Rect2D scissor{
                     .offset{
                         .x = (int32_t)(clip_min.x),
@@ -683,12 +602,10 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
                 };
                 command_buffer.setScissor(0, 1, &scissor);
 
-                // Bind DescriptorSet with font or user texture
                 vk::DescriptorSet desc_set[1]{pcmd->TextureId->descriptor_set};
                 command_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                                   bd->pipeline_layout, 0, {desc_set}, {});
 
-                // Draw
                 command_buffer.drawIndexed(pcmd->ElemCount, 1, pcmd->IdxOffset + global_idx_offset,
                                            pcmd->VtxOffset + global_vtx_offset, 0);
             }
@@ -696,8 +613,6 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
         global_idx_offset += cmd_list->IdxBuffer.Size;
         global_vtx_offset += cmd_list->VtxBuffer.Size;
     }
-    //    vk::Rect2D scissor = {{0, 0}, {(uint32_t)fb_width, (uint32_t)fb_height}};
-    //    command_buffer.setScissor(0, 1, &scissor);
 }
 
 static void DestroyFontsTexture();
@@ -707,13 +622,11 @@ static bool CreateFontsTexture() {
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
 
-    // Destroy existing texture (if any)
     if (bd->font_view || bd->font_image || bd->font_memory || bd->font_texture) {
         CheckVkErr(v.queue.waitIdle());
         DestroyFontsTexture();
     }
 
-    // Create command buffer
     if (bd->font_command_buffer == VK_NULL_HANDLE) {
         vk::CommandBufferAllocateInfo info{
             .commandPool = bd->command_pool,
@@ -723,7 +636,6 @@ static bool CreateFontsTexture() {
         bd->font_command_buffer = CheckVkResult(v.device.allocateCommandBuffers(info)).front();
     }
 
-    // Start command buffer
     {
         CheckVkErr(bd->font_command_buffer.reset());
         vk::CommandBufferBeginInfo begin_info{};
@@ -736,7 +648,6 @@ static bool CreateFontsTexture() {
     io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
     size_t upload_size = width * height * 4 * sizeof(char);
 
-    // Create the Image:
     {
         vk::ImageCreateInfo info{
             .imageType = vk::ImageType::e2D,
@@ -765,7 +676,6 @@ static bool CreateFontsTexture() {
         CheckVkErr(v.device.bindImageMemory(bd->font_image, bd->font_memory, 0));
     }
 
-    // Create the Image View:
     {
         vk::ImageViewCreateInfo info{
             .image = bd->font_image,
@@ -780,10 +690,8 @@ static bool CreateFontsTexture() {
         bd->font_view = CheckVkResult(v.device.createImageView(info, v.allocator));
     }
 
-    // Create the Descriptor Set:
     bd->font_texture = AddTexture(bd->font_view, vk::ImageLayout::eShaderReadOnlyOptimal);
 
-    // Create the Upload Buffer:
     vk::DeviceMemory upload_buffer_memory{};
     vk::Buffer upload_buffer{};
     {
@@ -804,7 +712,6 @@ static bool CreateFontsTexture() {
         CheckVkErr(v.device.bindBufferMemory(upload_buffer, upload_buffer_memory, 0));
     }
 
-    // Upload to Buffer:
     {
         char* map = (char*)CheckVkResult(v.device.mapMemory(upload_buffer_memory, 0, upload_size));
         memcpy(map, pixels, upload_size);
@@ -818,7 +725,6 @@ static bool CreateFontsTexture() {
         v.device.unmapMemory(upload_buffer_memory);
     }
 
-    // Copy to Image:
     {
         vk::ImageMemoryBarrier copy_barrier[1]{
             {
@@ -872,10 +778,8 @@ static bool CreateFontsTexture() {
                                                 {}, {use_barrier});
     }
 
-    // Store our identifier
     io.Fonts->SetTexID(bd->font_texture);
 
-    // End command buffer
     vk::SubmitInfo end_info = {};
     end_info.commandBufferCount = 1;
     end_info.pCommandBuffers = &bd->font_command_buffer;
@@ -890,8 +794,6 @@ static bool CreateFontsTexture() {
     return true;
 }
 
-// You probably never need to call this, as it is called by CreateFontsTexture()
-// and Shutdown().
 static void DestroyFontsTexture() {
     ImGuiIO& io = ImGui::GetIO();
     VkData* bd = GetBackendData();
@@ -941,7 +843,6 @@ static void DestroyWindowRenderBuffers(vk::Device device, WindowRenderBuffers& b
 }
 
 static void CreateShaderModules(vk::Device device, const vk::AllocationCallbacks* allocator) {
-    // Create the shader modules
     VkData* bd = GetBackendData();
     if (bd->shader_module_vert == VK_NULL_HANDLE) {
         vk::ShaderModuleCreateInfo vert_info{
@@ -1093,7 +994,6 @@ bool CreateDeviceObjects() {
     vk::Result err;
 
     if (!bd->descriptor_pool) {
-        // large enough descriptor pool
         vk::DescriptorPoolSize pool_sizes[]{
             {vk::DescriptorType::eSampler, 1000},
             {vk::DescriptorType::eCombinedImageSampler, 1000},
@@ -1135,8 +1035,6 @@ bool CreateDeviceObjects() {
     }
 
     if (!bd->pipeline_layout) {
-        // Constants: we are using 'vec2 offset' and 'vec2 scale' instead of a full 3d projection
-        // matrix
         vk::PushConstantRange push_constants[1]{
             {
                 .stageFlags = vk::ShaderStageFlagBits::eVertex,
@@ -1167,9 +1065,6 @@ bool CreateDeviceObjects() {
     }
 
     if (!bd->simple_sampler) {
-        // Bilinear sampling is required by default. Set 'io.Fonts->Flags |=
-        // ImFontAtlasFlags_NoBakedLines' or 'style.AntiAliasedLinesUseTex = false' to allow
-        // point/nearest sampling.
         vk::SamplerCreateInfo info{
             .magFilter = vk::Filter::eLinear,
             .minFilter = vk::Filter::eLinear,
@@ -1219,10 +1114,6 @@ void ImGuiImplVulkanDestroyDeviceObjects() {
         v.device.destroyDescriptorSetLayout(bd->descriptor_set_layout, v.allocator);
         bd->descriptor_set_layout = VK_NULL_HANDLE;
     }
-    if (bd->descriptor_pool) {
-        v.device.destroyDescriptorPool(bd->descriptor_pool, v.allocator);
-        bd->descriptor_pool = VK_NULL_HANDLE;
-    }
     if (bd->pipeline_layout) {
         v.device.destroyPipelineLayout(bd->pipeline_layout, v.allocator);
         bd->pipeline_layout = VK_NULL_HANDLE;
@@ -1244,11 +1135,9 @@ bool Init(InitInfo info) {
     IMGUI_CHECKVERSION();
     IM_ASSERT(io.BackendRendererUserData == nullptr && "Already initialized a renderer backend!");
 
-    // Setup backend capabilities flags
     auto* bd = IM_NEW(VkData)(info);
     io.BackendRendererUserData = (void*)bd;
     io.BackendRendererName = "imgui_impl_vulkan_shadps4";
-    // We can honor the ImDrawCmd::VtxOffset field, allowing for large meshes.
     io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
 
     CreateDeviceObjects();
@@ -1285,4 +1174,4 @@ void OnSurfaceFormatChange(vk::Format surface_format) {
     }
 }
 
-} // namespace ImGui::Vulkan
+}

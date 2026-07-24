@@ -1,7 +1,5 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-// reference :
-// https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/_types/user.h
 #pragma once
 
 #include "common/types.h"
@@ -12,17 +10,16 @@ class SymbolsResolver;
 
 namespace Libraries::UserService {
 
-// Maximum number of users that can be logged in at once
 constexpr int ORBIS_USER_SERVICE_MAX_LOGIN_USERS = 4;
-// Maximum number of users that can be registered in the system
 constexpr int ORBIS_USER_SERVICE_MAX_REGISTER_USERS = 16;
-// Maximum user name length
 constexpr int ORBIS_USER_SERVICE_MAX_USER_NAME_LENGTH = 16;
 
 constexpr int ORBIS_USER_SERVICE_USER_ID_SYSTEM = 0xFF;
 constexpr int ORBIS_USER_SERVICE_USER_ID_INVALID = -1;
 
 using OrbisUserServiceUserId = s32;
+
+constexpr OrbisUserServiceUserId ORBIS_USER_SERVICE_DEFAULT_USER_ID = 1000;
 
 constexpr int ORBIS_KERNEL_PRIO_FIFO_LOWEST = 0x2FF;
 constexpr int ORBIS_KERNEL_PRIO_FIFO_NORMAL = 0x2BC;
@@ -48,8 +45,8 @@ enum class OrbisUserServiceUserColor {
 };
 
 enum class OrbisUserServiceEventType {
-    Login = 0,  // Login event
-    Logout = 1, // Logout event
+    Login = 0,
+    Logout = 1,
 };
 
 struct OrbisUserServiceEvent {
@@ -57,7 +54,8 @@ struct OrbisUserServiceEvent {
     OrbisUserServiceUserId userId;
 };
 
-void AddUserServiceEvent(const OrbisUserServiceEvent e);
+void StartUserServiceSession();
+void AddUserServiceEvent(OrbisUserServiceEvent event);
 
 int PS4_SYSV_ABI sceUserServiceInitializeForShellCore();
 int PS4_SYSV_ABI sceUserServiceTerminateForShellCore();
@@ -484,4 +482,4 @@ int PS4_SYSV_ABI Func_BB9491DFE6B4953C();
 int PS4_SYSV_ABI Func_D2B814603E7B4477();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::UserService
+}

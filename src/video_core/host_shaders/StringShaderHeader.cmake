@@ -9,10 +9,8 @@ get_filename_component(CONTENTS_NAME ${SOURCE_FILE} NAME)
 string(REPLACE "." "_" CONTENTS_NAME ${CONTENTS_NAME})
 string(TOUPPER ${CONTENTS_NAME} CONTENTS_NAME)
 
-# Function to recursively parse #include directives and replace them with file contents
 function(parse_includes file_path output_content)
     file(READ ${file_path} file_content)
-    # This regex includes \n at the begin to (hackish) avoid including comments
     string(REGEX MATCHALL "\n#include +\"[^\"]+\"" includes "${file_content}")
 
     set(parsed_content "${file_content}")

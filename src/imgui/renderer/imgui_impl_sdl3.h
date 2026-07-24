@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Based on imgui_impl_sdl3.h from Dear ImGui repository
-
 #pragma once
 
 struct SDL_Window;
@@ -18,8 +16,6 @@ void NewFrame(bool is_reusing);
 bool ProcessEvent(const SDL_Event* event);
 void OnResize();
 
-// Gamepad selection automatically starts in AutoFirst mode, picking first available SDL_Gamepad.
-// You may override this. When using manual mode, caller is responsible for opening/closing gamepad.
 enum GamepadMode {
     ImGui_ImplSDL3_GamepadMode_AutoFirst,
     ImGui_ImplSDL3_GamepadMode_AutoAll,
@@ -28,4 +24,4 @@ enum GamepadMode {
 void SetGamepadMode(GamepadMode mode, SDL_Gamepad** manual_gamepads_array = NULL,
                     int manual_gamepads_count = -1);
 
-}; // namespace ImGui::Sdl
+};

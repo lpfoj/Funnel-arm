@@ -157,7 +157,7 @@ bool InitializeCompiler() {
     glslang_initialized = true;
     return true;
 }
-} // Anonymous namespace
+}
 
 vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, vk::Device device,
                          std::vector<std::string> defines) {
@@ -222,7 +222,6 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
         return {};
     }
 
-    // Even though there's only a single shader, we still need to link it to generate SPV
     auto program = std::make_unique<glslang::TProgram>();
     program->addShader(shader.get());
     if (!program->link(messages)) {
@@ -239,7 +238,6 @@ vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, v
     spv::SpvBuildLogger logger;
     glslang::SpvOptions options;
 
-    // Enable optimizations on the generated SPIR-V code.
     options.disableOptimizer = false;
     options.validate = false;
     options.optimizeSize = true;
@@ -266,4 +264,4 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
     return module;
 }
 
-} // namespace Vulkan
+}

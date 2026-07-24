@@ -53,7 +53,6 @@ bool FoldCommutative(IR::Inst& inst, ImmFn&& imm_fn) {
             inst.SetArg(0, rhs_inst->Arg(0));
             inst.SetArg(1, IR::Value{combined});
         } else {
-            // Normalize
             inst.SetArg(0, rhs);
             inst.SetArg(1, lhs);
         }
@@ -71,7 +70,7 @@ bool FoldCommutative(IR::Inst& inst, ImmFn&& imm_fn) {
 
 template <typename Func>
 bool FoldWhenAllImmediates(IR::Inst& inst, Func&& func) {
-    if (!inst.AreAllArgsImmediates() /*|| inst.HasAssociatedPseudoOperation()*/) {
+    if (!inst.AreAllArgsImmediates()) {
         return false;
     }
     using Indices = std::make_index_sequence<Common::LambdaTraits<decltype(func)>::NUM_ARGS>;
@@ -362,7 +361,6 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
         return FoldUnpack32x2(block, inst, IR::Opcode::PackUint2x32);
     case IR::Opcode::UnpackDouble2x32:
         return FoldUnpack32x2(block, inst, IR::Opcode::PackDouble2x32);
-    // 2x16
     case IR::Opcode::PackUnorm2x16:
         return FoldInverseFunc(inst, IR::Opcode::UnpackUnorm2x16);
     case IR::Opcode::UnpackUnorm2x16:
@@ -383,7 +381,6 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
         return FoldInverseFunc(inst, IR::Opcode::UnpackHalf2x16);
     case IR::Opcode::UnpackHalf2x16:
         return FoldInverseFunc(inst, IR::Opcode::PackHalf2x16);
-    // 4x8
     case IR::Opcode::PackUnorm4x8:
         return FoldInverseFunc(inst, IR::Opcode::UnpackUnorm4x8);
     case IR::Opcode::UnpackUnorm4x8:
@@ -400,12 +397,10 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
         return FoldInverseFunc(inst, IR::Opcode::UnpackSint4x8);
     case IR::Opcode::UnpackSint4x8:
         return FoldInverseFunc(inst, IR::Opcode::PackSint4x8);
-    // 10_11_11
     case IR::Opcode::PackUfloat10_11_11:
         return FoldInverseFunc(inst, IR::Opcode::UnpackUfloat10_11_11);
     case IR::Opcode::UnpackUfloat10_11_11:
         return FoldInverseFunc(inst, IR::Opcode::PackUfloat10_11_11);
-    // 2_10_10_10
     case IR::Opcode::PackUnorm2_10_10_10:
         return FoldInverseFunc(inst, IR::Opcode::UnpackUnorm2_10_10_10);
     case IR::Opcode::UnpackUnorm2_10_10_10:
@@ -600,4 +595,4 @@ void ConstantPropagationPass(IR::BlockList& program) {
     }
 }
 
-} // namespace Shader::Optimization
+}

@@ -9,4 +9,4 @@ std::string_view NameOf(Opcode op) {
     return Detail::META_TABLE[static_cast<size_t>(op)].name;
 }
 
-} // namespace Shader::IR
+}

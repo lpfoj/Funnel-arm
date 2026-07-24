@@ -42,10 +42,10 @@ enum class AvEventType {
 };
 
 union AvPlayerEventData {
-    u32 num_frames; // 20
-    AvState state;  // AvEventType::ChangeFlowState
-    s32 error;      // AvEventType::WarningId
-    u32 attempt;    // AvEventType::AddSource
+    u32 num_frames;
+    AvState state;
+    s32 error;
+    u32 attempt;
 };
 
 struct AvPlayerEvent {
@@ -56,7 +56,8 @@ struct AvPlayerEvent {
 template <class T>
 class AvPlayerQueue {
 public:
-    size_t Size() {
+    size_t Size() const {
+        std::lock_guard guard(m_mutex);
         return m_queue.size();
     }
 
@@ -65,15 +66,22 @@ public:
         m_queue.emplace(std::forward<T>(value));
     }
 
-    T& Front() {
-        return m_queue.front();
-    }
-
     std::optional<T> Pop() {
-        if (Size() == 0) {
+        std::lock_guard guard(m_mutex);
+        if (m_queue.empty()) {
             return std::nullopt;
         }
+        auto result = std::move(m_queue.front());
+        m_queue.pop();
+        return result;
+    }
+
+    template <class Predicate>
+    std::optional<T> PopIf(Predicate&& predicate) {
         std::lock_guard guard(m_mutex);
+        if (m_queue.empty() || !predicate(std::as_const(m_queue.front()))) {
+            return std::nullopt;
+        }
         auto result = std::move(m_queue.front());
         m_queue.pop();
         return result;
@@ -85,10 +93,10 @@ public:
     }
 
 private:
-    std::mutex m_mutex{};
+    mutable std::mutex m_mutex{};
     std::queue<T> m_queue{};
 };
 
 AvPlayerSourceType GetSourceType(std::string_view path);
 
-} // namespace Libraries::AvPlayer
+}

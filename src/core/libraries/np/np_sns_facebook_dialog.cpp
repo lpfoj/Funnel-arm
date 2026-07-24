@@ -19,4 +19,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpSnsFacebookDialogUpdateStatus);
 };
 
-} // namespace Libraries::Np::NpSnsFacebookDialog
+}

@@ -21,9 +21,7 @@ static u64 RoundToNearest(u64 value) {
 
 static u64 GetTimeNs() {
 #ifdef _WIN64
-    // GetSystemTimePreciseAsFileTime returns the file time in 100ns units.
     static constexpr u64 Multiplier = 100;
-    // Convert Windows epoch to Unix epoch.
     static constexpr u64 WindowsEpochToUnixEpoch = 0x19DB1DED53E8000LL;
     FILETIME filetime;
     GetSystemTimePreciseAsFileTime(&filetime);
@@ -39,22 +37,18 @@ static u64 GetTimeNs() {
 }
 
 u64 EstimateRDTSCFrequency() {
-    // Discard the first result measuring the rdtsc.
     FencedRDTSC();
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
     FencedRDTSC();
 
-    // Get the current time.
     const auto start_time = GetTimeNs();
     const u64 tsc_start = FencedRDTSC();
-    // Wait for 100 milliseconds.
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
     const auto end_time = GetTimeNs();
     const u64 tsc_end = FencedRDTSC();
-    // Calculate differences.
     const u64 tsc_diff = tsc_end - tsc_start;
     const u64 tsc_freq = MultiplyAndDivide64(tsc_diff, 1000000000ULL, end_time - start_time);
     return RoundToNearest<100'000>(tsc_freq);
 }
 
-} // namespace Common
+}

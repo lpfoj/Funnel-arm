@@ -27,7 +27,6 @@ using PAddr = uintptr_t;
 
 #define PS4_SYSV_ABI __attribute__((sysv_abi))
 
-// UDLs for memory size values
 constexpr unsigned long long operator""_KB(unsigned long long x) {
     return 1024ULL * x;
 }

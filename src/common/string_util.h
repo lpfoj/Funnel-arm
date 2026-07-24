@@ -9,7 +9,6 @@
 
 namespace Common {
 
-/// Make a string lowercase
 [[nodiscard]] std::string ToLower(std::string_view str);
 
 void ToLowerInPlace(std::string& str);
@@ -23,4 +22,4 @@ std::string_view U8stringToString(std::u8string_view u8str);
 [[nodiscard]] std::wstring UTF8ToUTF16W(std::string_view str);
 #endif
 
-} // namespace Common
+}

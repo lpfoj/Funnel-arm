@@ -11,7 +11,10 @@ public:
     static void AddLayer(Layer* layer);
     static void RemoveLayer(Layer* layer);
 
+    virtual bool CapturesGamepadInput() const {
+        return true;
+    }
     virtual void Draw() = 0;
 };
 
-} // namespace ImGui
+}

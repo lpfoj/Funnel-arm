@@ -15,37 +15,11 @@
 namespace Common::FS {
 
 enum class FileAccessMode {
-    /**
-     * If the file at path exists, it opens the file for reading.
-     * If the file at path does not exist, it fails to open the file.
-     */
     Read = 1 << 0,
-    /**
-     * If the file at path exists, it opens the file for writing.
-     * If the file at path does not exist, it fails to open the file.
-     */
     Write = 1 << 1,
-    /**
-     * If the file at path exists, it opens the file for reading and writing.
-     * If the file at path does not exist, it fails to open the file.
-     */
     ReadWrite = Read | Write,
-    /**
-     * If the file at path exists, it opens the file for appending.
-     * If the file at path does not exist, it creates and opens a new empty file for appending.
-     */
     Append = 1 << 2,
-    /**
-     * If the file at path exists, it opens the file for both reading and appending.
-     * If the file at path does not exist, it creates and opens a new empty file for both
-     * reading and appending.
-     */
     ReadAppend = Read | Append,
-    /**
-     * If the file at path exists, the existing contents of the file are erased.
-     * The empty file is then opened for writing.
-     * If the file at path does not exist, it creates and opens a new empty file for writing.
-     */
     Create = 1 << 3,
 };
 DECLARE_ENUM_FLAG_OPERATORS(FileAccessMode);
@@ -56,16 +30,16 @@ enum class FileType {
 };
 
 enum class FileShareFlag {
-    ShareNone,      // Provides exclusive access to the file.
-    ShareReadOnly,  // Provides read only shared access to the file.
-    ShareWriteOnly, // Provides write only shared access to the file.
-    ShareReadWrite, // Provides read and write shared access to the file.
+    ShareNone,
+    ShareReadOnly,
+    ShareWriteOnly,
+    ShareReadWrite,
 };
 
 enum class SeekOrigin : u32 {
-    SetOrigin,       // Seeks from the start of the file.
-    CurrentPosition, // Seeks from the current file pointer position.
-    End,             // Seeks from the end of the file.
+    SetOrigin,
+    CurrentPosition,
+    End,
 };
 
 class IOFile final {
@@ -235,4 +209,4 @@ private:
 
 u64 GetDirectorySize(const std::filesystem::path& path);
 
-} // namespace Common::FS
+}

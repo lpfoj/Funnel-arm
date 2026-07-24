@@ -32,4 +32,4 @@ s32 PS4_SYSV_ABI sceKernelGetModuleInfoForUnwind(VAddr addr, s32 flags,
 
 void RegisterProcess(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Kernel
+}

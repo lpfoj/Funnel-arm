@@ -35,4 +35,4 @@ private:
     SwsContext* mSwsContext = nullptr;
 };
 
-} // namespace Libraries::Videodec
+}

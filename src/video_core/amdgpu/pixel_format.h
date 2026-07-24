@@ -10,7 +10,6 @@
 
 namespace AmdGpu {
 
-// Table 8.13 Data and Image Formats [Sea Islands Series Instruction Set Architecture]
 enum class DataFormat : u32 {
     FormatInvalid = 0,
     Format8 = 1,
@@ -225,8 +224,6 @@ constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFo
         case DataFormat::FormatBc4:
         case DataFormat::FormatBc5:
         case DataFormat::FormatBc6:
-            // BC4/BC5 store non-color data (single/two-channel, used for normal maps),
-            // and BC6 is HDR float — none have sRGB Vulkan equivalents.
             return NumberFormat::Unorm;
         default:
             return format;
@@ -240,9 +237,6 @@ constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFo
         return NumberFormat::Unorm;
     case NumberFormat::Float:
         if (data_format == DataFormat::Format8) {
-            // Games may ask for 8-bit float when they want to access the stencil component
-            // of a depth-stencil image. Change to unsigned int to match the stencil format.
-            // This is also the closest approximation to pass the bits through unconverted.
             return NumberFormat::Uint;
         }
         [[fallthrough]];
@@ -271,7 +265,6 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
         return result;
     }
     case DataFormat::Format4_4_4_4: {
-        // Remap to a more supported component order.
         CompMapping result;
         result.r = swizzle.g;
         result.g = swizzle.b;
@@ -280,7 +273,6 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
         return result;
     }
     case DataFormat::Format5_6_5: {
-        // Remap to a more supported component order.
         CompMapping result;
         result.r = swizzle.b;
         result.g = swizzle.g;
@@ -291,13 +283,10 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     case DataFormat::Format8:
     case DataFormat::Format16:
     case DataFormat::Format32: {
-        // PS4 single-channel formats expose the texel as either R or A depending on dst_sel,
-        // but Vulkan single-channel formats expose it only via R. Redirect any selector
-        // that points at Alpha to Red so the texel is read correctly.
         CompMapping result = swizzle;
-        const auto remap_alpha_to_red = [](CompSwizzle& c) {
-            if (c == CompSwizzle::Alpha) {
-                c = CompSwizzle::Red;
+        const auto remap_alpha_to_red = [](CompSwizzle& component) {
+            if (component == CompSwizzle::Alpha) {
+                component = CompSwizzle::Red;
             }
         };
         remap_alpha_to_red(result.r);
@@ -329,7 +318,6 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         switch (data_fmt) {
         case DataFormat::FormatBc4:
         case DataFormat::FormatBc5:
-            // BC4/BC5 have no sRGB variant; no conversion needed (treated as Unorm).
             return NumberConversion::None;
         case DataFormat::FormatBc6:
             return NumberConversion::SrgbToNorm;
@@ -396,7 +384,7 @@ u32 NumComponents(DataFormat format);
 u32 NumBitsPerBlock(DataFormat format);
 u32 NumBitsPerElement(DataFormat format);
 
-} // namespace AmdGpu
+}
 
 template <>
 struct fmt::formatter<AmdGpu::DataFormat> {

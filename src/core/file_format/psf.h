@@ -35,9 +35,9 @@ struct PSFRawEntry {
 static_assert(sizeof(PSFRawEntry) == 0x10);
 
 enum class PSFEntryFmt : u16 {
-    Binary = 0x0004,  // Binary data
-    Text = 0x0204,    // String in UTF-8 format and NULL terminated
-    Integer = 0x0404, // Signed 32-bit integer
+    Binary = 0x0004,
+    Text = 0x0204,
+    Integer = 0x0404,
 };
 
 class PSF {
@@ -68,7 +68,7 @@ public:
     std::optional<s32> GetInteger(std::string_view key) const;
 
     void AddBinary(std::string key, std::vector<u8> value, bool update = false);
-    void AddBinary(std::string key, uint64_t value, bool update = false); // rsv4 format
+    void AddBinary(std::string key, uint64_t value, bool update = false);
     void AddString(std::string key, std::string value, bool update = false);
     void AddInteger(std::string key, s32 value, bool update = false);
 

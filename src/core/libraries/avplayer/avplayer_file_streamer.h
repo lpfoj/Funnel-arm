@@ -35,4 +35,4 @@ private:
     AVIOContext* m_avio_context{};
 };
 
-} // namespace Libraries::AvPlayer
+}

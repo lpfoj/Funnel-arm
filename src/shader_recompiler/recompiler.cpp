@@ -1,6 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+#include <algorithm>
+#include <fmt/format.h>
+#include "common/config.h"
+#include "common/io_file.h"
+#include "common/path_util.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
@@ -30,7 +38,6 @@ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& profile) {
-    // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {
         LOG_WARNING(Render_Recompiler, "First instruction is not s_mov_b32 vcc_hi, #imm");
@@ -39,31 +46,53 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
     Gcn::GcnDecodeContext decoder;
 
-    // Decode and save instructions
     IR::Program program{info};
     program.ins_list.reserve(code.size());
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
     }
 
-    // Clear any previous pooled data.
+    const bool has_terminator =
+        std::ranges::any_of(program.ins_list, [](const Gcn::GcnInst& inst) {
+            return inst.opcode == Gcn::Opcode::S_ENDPGM;
+        });
+    if (!has_terminator) {
+        Gcn::GcnInst endpgm{};
+        endpgm.opcode = Gcn::Opcode::S_ENDPGM;
+        endpgm.category = Gcn::InstCategory::FlowControl;
+        endpgm.length = 4;
+        program.ins_list.push_back(endpgm);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                            "[EXECUTOR_SHADER_NO_ENDPGM] stage=%u hash=%#llx appended implicit S_ENDPGM "
+                            "(malformed shader; using a bounded terminal path)",
+                            static_cast<u32>(info.stage),
+                            static_cast<unsigned long long>(info.pgm_hash));
+#endif
+    }
+
     pools.ReleaseContents();
 
-    // Create control flow graph
     Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
     Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+    if (Config::dumpShaders()) {
+        const auto dump_dir =
+            Common::FS::GetUserPath(Common::FS::PathType::ShaderDir) / "dumps";
+        std::filesystem::create_directories(dump_dir);
+        const auto filename =
+            fmt::format("{}_{:#018x}.cfg.dot", info.stage, info.pgm_hash);
+        Common::FS::IOFile file{dump_dir / filename, Common::FS::FileAccessMode::Create,
+                                Common::FS::FileType::TextFile};
+        file.WriteString(cfg.Dot());
+    }
 
-    // Structurize control flow graph and create program.
     program.syntax_list =
         Shader::Gcn::BuildASL(pools.inst_pool, pools.block_pool, cfg, info, runtime_info, profile);
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = Shader::IR::PostOrder(program.syntax_list.front());
 
-    // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate
-    // it with expensive discard in PS.
     Shader::InjectClipDistanceAttributes(program, runtime_info);
 
-    // Run optimization passes
     if (!profile.support_float64) {
         Shader::Optimization::LowerFp64ToFp32(program);
     }
@@ -95,4 +124,4 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     return program;
 }
 
-} // namespace Shader
+}

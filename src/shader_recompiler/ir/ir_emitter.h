@@ -118,7 +118,7 @@ public:
     [[nodiscard]] T SharedAtomicDec(const U32& address, bool is_gds);
 
     [[nodiscard]] U32 ReadConst(const Value& base, const U32& offset);
-    [[nodiscard]] U32 ReadConstBuffer(const Value& handle, const U32& index, BufferInstInfo info);
+    [[nodiscard]] U32 ReadConstBuffer(const Value& handle, const U32& index);
 
     [[nodiscard]] U8 LoadBufferU8(const Value& handle, const Value& address, BufferInstInfo info);
     [[nodiscard]] U16 LoadBufferU16(const Value& handle, const Value& address, BufferInstInfo info);
@@ -262,8 +262,8 @@ public:
     [[nodiscard]] U1 FPCmpClass32(const F32& value, const U32& op);
     [[nodiscard]] U1 FPOrdered(const F32F64& lhs, const F32F64& rhs);
     [[nodiscard]] U1 FPUnordered(const F32F64& lhs, const F32F64& rhs);
-    [[nodiscard]] F32F64 FPMax(const F32F64& lhs, const F32F64& rhs);
-    [[nodiscard]] F32F64 FPMin(const F32F64& lhs, const F32F64& rhs);
+    [[nodiscard]] F32F64 FPMax(const F32F64& lhs, const F32F64& rhs, bool is_legacy = false);
+    [[nodiscard]] F32F64 FPMin(const F32F64& lhs, const F32F64& rhs, bool is_legacy = false);
     [[nodiscard]] F32F64 FPMinTri(const F32F64& a, const F32F64& b, const F32F64& c);
     [[nodiscard]] F32F64 FPMaxTri(const F32F64& a, const F32F64& b, const F32F64& c);
     [[nodiscard]] F32F64 FPMedTri(const F32F64& a, const F32F64& b, const F32F64& c);
@@ -425,7 +425,7 @@ private:
     }
 
     template <typename T>
-        requires(sizeof(T) <= sizeof(u64) && std::is_trivially_copyable_v<T>)
+        requires(sizeof(T) <= sizeof(u32) && std::is_trivially_copyable_v<T>)
     struct Flags {
         Flags() = default;
         Flags(T proxy_) : proxy{proxy_} {}
@@ -435,7 +435,7 @@ private:
 
     template <typename T = Value, typename FlagType, typename... Args>
     T Inst(Opcode op, Flags<FlagType> flags, Args... args) {
-        u64 raw_flags{};
+        u32 raw_flags{};
         std::memcpy(&raw_flags, &flags.proxy, sizeof(flags.proxy));
         auto it{block->PrependNewInst(insertion_point, op, {Value{args}...}, raw_flags)};
         it->SetParent(block);
@@ -443,4 +443,4 @@ private:
     }
 };
 
-} // namespace Shader::IR
+}

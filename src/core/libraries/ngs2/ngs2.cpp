@@ -3,6 +3,7 @@
 
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
+#include "core/libraries/guest_callback.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/ngs2/ngs2.h"
 #include "core/libraries/ngs2/ngs2_custom.h"
@@ -12,27 +13,326 @@
 #include "core/libraries/ngs2/ngs2_pan.h"
 #include "core/libraries/ngs2/ngs2_report.h"
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <limits>
+
+#include "libatrac9.h"
+
 namespace Libraries::Ngs2 {
 
-// Ngs2
+namespace {
+
+constexpr u32 RiffTag = 0x46464952;
+constexpr u32 WaveTag = 0x45564157;
+constexpr u32 FormatTag = 0x20746d66;
+constexpr u32 FactTag = 0x74636166;
+constexpr u32 DataTag = 0x61746164;
+constexpr u32 SampleTag = 0x6c706d73;
+constexpr u16 WaveFormatPcm = 0x0001;
+constexpr u16 WaveFormatFloat = 0x0003;
+constexpr u16 WaveFormatExtensible = 0xfffe;
+constexpr u32 Ngs2WaveformAtrac9 = 0x00010000;
+constexpr std::array<u8, 16> Atrac9Guid{0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d,
+                                                0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c};
+
+template <typename T>
+bool ReadWaveValue(const u8* bytes, size_t size, size_t offset, T& value) {
+    if (offset > size || sizeof(T) > size - offset) {
+        return false;
+    }
+    std::memcpy(&value, bytes + offset, sizeof(T));
+    return true;
+}
+
+bool IsAtrac9Format(const OrbisNgs2WaveformFormat& format) {
+    if (format.waveformType == Ngs2WaveformAtrac9) {
+        return true;
+    }
+    const u8 first = static_cast<u8>(format.configData);
+    return first == 0xfe;
+}
+
+bool GetAtrac9Info(const OrbisNgs2WaveformFormat& format, Atrac9CodecInfo& info) {
+    std::array<u8, ATRAC9_CONFIG_DATA_SIZE> config{};
+    std::memcpy(config.data(), &format.configData, config.size());
+    void* handle = Atrac9GetHandle();
+    if (handle == nullptr) {
+        return false;
+    }
+    const int init_result = Atrac9InitDecoder(handle, config.data());
+    const int info_result = init_result == 0 ? Atrac9GetCodecInfo(handle, &info) : init_result;
+    Atrac9ReleaseHandle(handle);
+    return init_result == 0 && info_result == 0 && info.superframeSize > 0 &&
+           info.framesInSuperframe > 0 && info.frameSamples > 0;
+}
+
+s32 ParseRiffWaveform(const void* data, size_t data_size, OrbisNgs2WaveformInfo* out_info) {
+    if (data == nullptr) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_ADDRESS;
+    }
+    if (out_info == nullptr) {
+        return ORBIS_NGS2_ERROR_INVALID_OUT_ADDRESS;
+    }
+    if (data_size < 12) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SIZE;
+    }
+
+    const auto* bytes = static_cast<const u8*>(data);
+    u32 riff = 0;
+    u32 wave = 0;
+    if (!ReadWaveValue(bytes, data_size, 0, riff) ||
+        !ReadWaveValue(bytes, data_size, 8, wave) || riff != RiffTag || wave != WaveTag) {
+        return ORBIS_NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+    }
+
+    OrbisNgs2WaveformInfo parsed{};
+    u16 format_tag = 0;
+    u16 block_align = 0;
+    u16 bits_per_sample = 0;
+    u32 average_bytes_per_second = 0;
+    u32 fact_samples = 0;
+    u32 encoder_delay = 0;
+    bool found_format = false;
+    bool found_data = false;
+    bool atrac9 = false;
+    Atrac9CodecInfo atrac9_info{};
+
+    size_t cursor = 12;
+    while (cursor <= data_size && data_size - cursor >= 8) {
+        u32 chunk_tag = 0;
+        u32 chunk_size = 0;
+        ReadWaveValue(bytes, data_size, cursor, chunk_tag);
+        ReadWaveValue(bytes, data_size, cursor + 4, chunk_size);
+        const size_t payload = cursor + 8;
+        const size_t available = payload <= data_size ? data_size - payload : 0;
+
+        if (chunk_tag == FormatTag) {
+            if (chunk_size < 16 || available < std::min<size_t>(chunk_size, 16)) {
+                return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+            }
+            u16 channels = 0;
+            u32 sample_rate = 0;
+            ReadWaveValue(bytes, data_size, payload, format_tag);
+            ReadWaveValue(bytes, data_size, payload + 2, channels);
+            ReadWaveValue(bytes, data_size, payload + 4, sample_rate);
+            ReadWaveValue(bytes, data_size, payload + 8, average_bytes_per_second);
+            ReadWaveValue(bytes, data_size, payload + 12, block_align);
+            ReadWaveValue(bytes, data_size, payload + 14, bits_per_sample);
+            if (channels == 0 || channels > ORBIS_NGS2_MAX_VOICE_CHANNELS) {
+                return ORBIS_NGS2_ERROR_INVALID_NUM_CHANNELS;
+            }
+            if (sample_rate == 0) {
+                return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SAMPLE_RATE;
+            }
+
+            parsed.format.numChannels = channels;
+            parsed.format.sampleRate = sample_rate;
+            parsed.format.waveformType = format_tag;
+            parsed.format.configData = static_cast<u32>(bits_per_sample) |
+                                       (static_cast<u32>(block_align) << 16);
+
+            if (format_tag == WaveFormatExtensible && chunk_size >= 48 && available >= 48) {
+                atrac9 = std::equal(Atrac9Guid.begin(), Atrac9Guid.end(), bytes + payload + 24);
+                if (atrac9) {
+                    parsed.format.waveformType = Ngs2WaveformAtrac9;
+                    std::memcpy(&parsed.format.configData, bytes + payload + 44,
+                                sizeof(parsed.format.configData));
+                    if (!GetAtrac9Info(parsed.format, atrac9_info)) {
+                        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_CONFIG;
+                    }
+                    parsed.audioUnitSize = static_cast<u32>(atrac9_info.superframeSize);
+                    parsed.numAudioUnitSamples = static_cast<u32>(
+                        atrac9_info.framesInSuperframe * atrac9_info.frameSamples);
+                    parsed.numAudioUnitPerFrame =
+                        static_cast<u32>(atrac9_info.framesInSuperframe);
+                    parsed.audioFrameSize = static_cast<u32>(
+                        atrac9_info.superframeSize / atrac9_info.framesInSuperframe);
+                    parsed.numAudioFrameSamples = static_cast<u32>(atrac9_info.frameSamples);
+                }
+            }
+
+            if (!atrac9 && format_tag != WaveFormatPcm && format_tag != WaveFormatFloat) {
+                return ORBIS_NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+            }
+            if (!atrac9) {
+                const u32 frame_size = block_align != 0
+                                           ? block_align
+                                           : static_cast<u32>(channels) *
+                                                 std::max<u32>(1, bits_per_sample / 8);
+                parsed.audioUnitSize = frame_size;
+                parsed.numAudioUnitSamples = 1;
+                parsed.numAudioUnitPerFrame = 1;
+                parsed.audioFrameSize = frame_size;
+                parsed.numAudioFrameSamples = 1;
+            }
+            found_format = true;
+        } else if (chunk_tag == FactTag && chunk_size >= 4 && available >= 4) {
+            ReadWaveValue(bytes, data_size, payload, fact_samples);
+            if (chunk_size >= 8 && available >= 8) {
+                ReadWaveValue(bytes, data_size, payload + 4, encoder_delay);
+            }
+        } else if (chunk_tag == SampleTag && chunk_size >= 60 && available >= 60) {
+            u32 loop_count = 0;
+            ReadWaveValue(bytes, data_size, payload + 28, loop_count);
+            if (loop_count != 0) {
+                ReadWaveValue(bytes, data_size, payload + 44, parsed.loopBeginPosition);
+                ReadWaveValue(bytes, data_size, payload + 48, parsed.loopEndPosition);
+                if (parsed.loopEndPosition != std::numeric_limits<u32>::max()) {
+                    ++parsed.loopEndPosition;
+                }
+            }
+        } else if (chunk_tag == DataTag) {
+            if (payload > std::numeric_limits<u32>::max()) {
+                return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SIZE;
+            }
+            parsed.dataOffset = static_cast<u32>(payload);
+            parsed.dataSize = chunk_size;
+            found_data = true;
+            break;
+        }
+
+        if (chunk_size > std::numeric_limits<size_t>::max() - payload) {
+            return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SIZE;
+        }
+        const size_t next = payload + chunk_size + (chunk_size & 1u);
+        if (next <= cursor || next > data_size) {
+            break;
+        }
+        cursor = next;
+    }
+
+    if (!found_format || !found_data || parsed.dataSize == 0) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_DATA;
+    }
+
+    parsed.numDelaySamples = encoder_delay;
+    if (fact_samples != 0) {
+        parsed.numSamples = fact_samples;
+    } else if (parsed.audioUnitSize != 0 && parsed.numAudioUnitSamples != 0) {
+        const u64 units = parsed.dataSize / parsed.audioUnitSize;
+        parsed.numSamples = static_cast<u32>(std::min<u64>(
+            units * parsed.numAudioUnitSamples, std::numeric_limits<u32>::max()));
+    } else if (average_bytes_per_second != 0) {
+        const u64 samples = static_cast<u64>(parsed.dataSize) * parsed.format.sampleRate /
+                            average_bytes_per_second;
+        parsed.numSamples =
+            static_cast<u32>(std::min<u64>(samples, std::numeric_limits<u32>::max()));
+    }
+    if (parsed.numSamples == 0) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_DATA;
+    }
+
+    parsed.numBlocks = 1;
+    parsed.aBlock[0].dataOffset = 0;
+    parsed.aBlock[0].dataSize = parsed.dataSize;
+    parsed.aBlock[0].numSkipSamples = encoder_delay;
+    parsed.aBlock[0].numSamples = parsed.numSamples;
+    *out_info = parsed;
+    return ORBIS_OK;
+}
+
+}
+
 
 s32 PS4_SYSV_ABI sceNgs2CalcWaveformBlock(const OrbisNgs2WaveformFormat* format, u32 samplePos,
                                           u32 numSamples, OrbisNgs2WaveformBlock* outBlock) {
-    LOG_ERROR(Lib_Ngs2, "samplePos = {}, numSamples = {}", samplePos, numSamples);
+    if (format == nullptr) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+    }
+    if (outBlock == nullptr) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_BLOCK_ADDRESS;
+    }
+    if (format->numChannels == 0 || format->numChannels > ORBIS_NGS2_MAX_VOICE_CHANNELS) {
+        return ORBIS_NGS2_ERROR_INVALID_NUM_CHANNELS;
+    }
+
+    OrbisNgs2WaveformBlock block{};
+    if (IsAtrac9Format(*format)) {
+        Atrac9CodecInfo info{};
+        if (!GetAtrac9Info(*format, info)) {
+            return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_CONFIG;
+        }
+        const u64 unit_samples =
+            static_cast<u64>(info.framesInSuperframe) * info.frameSamples;
+        const u64 first_unit = samplePos / unit_samples;
+        const u64 skip = samplePos % unit_samples;
+        const u64 requested = static_cast<u64>(numSamples) + skip;
+        const u64 units = requested == 0 ? 0 : (requested + unit_samples - 1) / unit_samples;
+        const u64 offset = first_unit * static_cast<u64>(info.superframeSize);
+        const u64 size = units * static_cast<u64>(info.superframeSize);
+        if (offset > std::numeric_limits<u32>::max() || size > std::numeric_limits<u32>::max()) {
+            return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SIZE;
+        }
+        block.dataOffset = static_cast<u32>(offset);
+        block.dataSize = static_cast<u32>(size);
+        block.numSkipSamples = static_cast<u32>(skip);
+        block.numSamples = numSamples;
+    } else {
+        const u32 block_align = format->configData >> 16;
+        const u32 bytes_per_frame = block_align != 0 ? block_align : format->numChannels * 2;
+        const u64 offset = static_cast<u64>(samplePos) * bytes_per_frame;
+        const u64 size = static_cast<u64>(numSamples) * bytes_per_frame;
+        if (offset > std::numeric_limits<u32>::max() || size > std::numeric_limits<u32>::max()) {
+            return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SIZE;
+        }
+        block.dataOffset = static_cast<u32>(offset);
+        block.dataSize = static_cast<u32>(size);
+        block.numSamples = numSamples;
+    }
+    *outBlock = block;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2GetWaveformFrameInfo(const OrbisNgs2WaveformFormat* format,
                                              u32* outFrameSize, u32* outNumFrameSamples,
                                              u32* outUnitsPerFrame, u32* outNumDelaySamples) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    if (format == nullptr) {
+        return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+    }
+    if (outFrameSize == nullptr && outNumFrameSamples == nullptr && outUnitsPerFrame == nullptr &&
+        outNumDelaySamples == nullptr) {
+        return ORBIS_NGS2_ERROR_INVALID_OUT_ADDRESS;
+    }
+
+    u32 frame_size = 0;
+    u32 frame_samples = 0;
+    u32 units_per_frame = 0;
+    u32 delay_samples = 0;
+    if (IsAtrac9Format(*format)) {
+        Atrac9CodecInfo info{};
+        if (!GetAtrac9Info(*format, info)) {
+            return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_CONFIG;
+        }
+        frame_size = static_cast<u32>(info.superframeSize / info.framesInSuperframe);
+        frame_samples = static_cast<u32>(info.frameSamples);
+        units_per_frame = static_cast<u32>(info.framesInSuperframe);
+        delay_samples = format->frameOffset;
+    } else {
+        const u32 block_align = format->configData >> 16;
+        frame_size = block_align != 0 ? block_align : format->numChannels * 2;
+        frame_samples = 1;
+        units_per_frame = 1;
+    }
+    if (outFrameSize != nullptr) {
+        *outFrameSize = frame_size;
+    }
+    if (outNumFrameSamples != nullptr) {
+        *outNumFrameSamples = frame_samples;
+    }
+    if (outUnitsPerFrame != nullptr) {
+        *outUnitsPerFrame = units_per_frame;
+    }
+    if (outNumDelaySamples != nullptr) {
+        *outNumDelaySamples = delay_samples;
+    }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2ParseWaveformData(const void* data, size_t dataSize,
                                           OrbisNgs2WaveformInfo* outInfo) {
-    LOG_ERROR(Lib_Ngs2, "dataSize = {}", dataSize);
-    return ORBIS_OK;
+    return ParseRiffWaveform(data, dataSize, outInfo);
 }
 
 s32 PS4_SYSV_ABI sceNgs2ParseWaveformFile(const char* path, u64 offset,
@@ -129,9 +429,7 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreate(const OrbisNgs2SystemOption* option,
             LOG_ERROR(Lib_Ngs2, "Invalid system handle address {}", (void*)outHandle);
         }
 
-        // TODO: Report errors?
     } else {
-        // Make bufferInfo copy
         localInfo.hostBuffer = bufferInfo->hostBuffer;
         localInfo.hostBufferSize = bufferInfo->hostBufferSize;
         for (int i = 0; i < 5; i++) {
@@ -142,7 +440,6 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreate(const OrbisNgs2SystemOption* option,
         result = SystemSetup(option, &localInfo, 0, outHandle);
     }
 
-    // TODO: API reporting?
 
     LOG_INFO(Lib_Ngs2, "called");
     return result;
@@ -156,17 +453,35 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreateWithAllocator(const OrbisNgs2SystemOption* o
         OrbisNgs2BufferAllocHandler hostAlloc = allocator->allocHandler;
         if (outHandle) {
             OrbisNgs2BufferFreeHandler hostFree = allocator->freeHandler;
-            OrbisNgs2ContextBufferInfo bufferInfo;
+            OrbisNgs2ContextBufferInfo bufferInfo{};
             result = SystemSetup(option, &bufferInfo, 0, 0);
             if (result >= 0) {
-                uintptr_t sysUserData = allocator->userData;
-                result = hostAlloc(&bufferInfo);
+                bufferInfo.userData = allocator->userData;
+                u64 callback_result = 0;
+                const int callback_bridge = Libraries::RunGuestCallback4(
+                    reinterpret_cast<void*>(hostAlloc),
+                    reinterpret_cast<u64>(&bufferInfo), 0, 0, 0, 1, &callback_result,
+                    "ngs2_buffer_alloc");
+                if (callback_bridge > 0) {
+                    result = static_cast<s32>(callback_result);
+                } else if (callback_bridge < 0) {
+                    result = ORBIS_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR;
+                } else {
+                    result = hostAlloc(&bufferInfo);
+                }
                 if (result >= 0) {
                     OrbisNgs2Handle* handleCopy = outHandle;
                     result = SystemSetup(option, &bufferInfo, hostFree, handleCopy);
                     if (result < 0) {
                         if (hostFree) {
-                            hostFree(&bufferInfo);
+                            callback_result = 0;
+                            const int free_bridge = Libraries::RunGuestCallback4(
+                                reinterpret_cast<void*>(hostFree),
+                                reinterpret_cast<u64>(&bufferInfo), 0, 0, 0, 1,
+                                &callback_result, "ngs2_buffer_free_rollback");
+                            if (free_bridge == 0) {
+                                hostFree(&bufferInfo);
+                            }
                         }
                     }
                 }
@@ -342,7 +657,6 @@ s32 PS4_SYSV_ABI sceNgs2VoiceGetStateFlags(OrbisNgs2Handle voiceHandle, u32* out
     return ORBIS_OK;
 }
 
-// Ngs2Custom
 
 s32 PS4_SYSV_ABI sceNgs2CustomRackGetModuleInfo(OrbisNgs2Handle rackHandle, u32 moduleIndex,
                                                 OrbisNgs2CustomModuleInfo* outInfo,
@@ -351,7 +665,6 @@ s32 PS4_SYSV_ABI sceNgs2CustomRackGetModuleInfo(OrbisNgs2Handle rackHandle, u32 
     return ORBIS_OK;
 }
 
-// Ngs2Geom
 
 s32 PS4_SYSV_ABI sceNgs2GeomResetListenerParam(OrbisNgs2GeomListenerParam* outListenerParam) {
     LOG_ERROR(Lib_Ngs2, "called");
@@ -376,7 +689,6 @@ s32 PS4_SYSV_ABI sceNgs2GeomApply(const OrbisNgs2GeomListenerWork* listener,
     return ORBIS_OK;
 }
 
-// Ngs2Pan
 
 s32 PS4_SYSV_ABI sceNgs2PanInit(OrbisNgs2PanWork* work, const float* aSpeakerAngle, float unitAngle,
                                 u32 numSpeakers) {
@@ -391,7 +703,6 @@ s32 PS4_SYSV_ABI sceNgs2PanGetVolumeMatrix(OrbisNgs2PanWork* work, const OrbisNg
     return ORBIS_OK;
 }
 
-// Ngs2Report
 
 s32 PS4_SYSV_ABI sceNgs2ReportRegisterHandler(u32 reportType, OrbisNgs2ReportHandler handler,
                                               uintptr_t userData, OrbisNgs2Handle* outHandle) {
@@ -412,7 +723,6 @@ s32 PS4_SYSV_ABI sceNgs2ReportUnregisterHandler(OrbisNgs2Handle reportHandle) {
     return ORBIS_OK;
 }
 
-// Unknown
 
 int PS4_SYSV_ABI sceNgs2FftInit() {
     LOG_ERROR(Lib_Ngs2, "(STUBBED) called");
@@ -562,7 +872,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("4lFaRxd-aLs", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemGetUserData);
     LIB_FUNCTION("gThZqM5PYlQ", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemLock);
     LIB_FUNCTION("pgFAiLR5qT4", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemQueryBufferSize);
-    LIB_FUNCTION("3oIK7y7O4k0", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemQueryInfo);
+    LIB_FUNCTION("3oIK7y7O4k0", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemQueryInfo)
     LIB_FUNCTION("i0VnXM-C9fc", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemRender);
     LIB_FUNCTION("AQkj7C0f3PY", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemResetOption);
     LIB_FUNCTION("gXiormHoZZ4", "libSceNgs2", 1, "libSceNgs2", sceNgs2SystemRunCommands);
@@ -588,4 +898,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("AbYvTOZ8Pts", "libSceNgs2", 1, "libSceNgs2", sceNgs2VoiceRunCommands);
 };
 
-} // namespace Libraries::Ngs2
+}

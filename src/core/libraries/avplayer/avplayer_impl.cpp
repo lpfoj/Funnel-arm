@@ -5,12 +5,54 @@
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_impl.h"
 
+#ifdef __ANDROID__
+extern "C" int executor_lsx4_android_run_guest_callback4(
+    void* callback, std::uint64_t arg0, std::uint64_t arg1, std::uint64_t arg2,
+    std::uint64_t arg3, std::uint32_t arg_count, std::uint64_t* result_out,
+    const char* reason) __attribute__((weak));
+#endif
+
 namespace Libraries::AvPlayer {
+
+namespace {
+
+int RunGuestReplacementCallback(void* callback, const u64 arg0, const u64 arg1, const u64 arg2,
+                                const u64 arg3, const u32 arg_count, u64* result,
+                                const char* reason) {
+#ifdef __ANDROID__
+    if (executor_lsx4_android_run_guest_callback4 != nullptr) {
+        return executor_lsx4_android_run_guest_callback4(callback, arg0, arg1, arg2, arg3,
+                                                            arg_count, result, reason);
+    }
+#else
+    (void)callback;
+    (void)arg0;
+    (void)arg1;
+    (void)arg2;
+    (void)arg3;
+    (void)arg_count;
+    (void)result;
+    (void)reason;
+#endif
+    return 0;
+}
+
+}
 
 void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+    u64 result = 0;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(allocate), reinterpret_cast<u64>(ptr), alignment, size, 0, 3,
+        &result, "avplayer_allocate");
+    if (bridge > 0) {
+        return reinterpret_cast<void*>(result);
+    }
+    if (bridge < 0) {
+        return nullptr;
+    }
     return allocate(ptr, alignment, size);
 }
 
@@ -18,6 +60,12 @@ void PS4_SYSV_ABI AvPlayer::Deallocate(void* handle, void* memory) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(deallocate), reinterpret_cast<u64>(ptr),
+        reinterpret_cast<u64>(memory), 0, 0, 2, nullptr, "avplayer_deallocate");
+    if (bridge != 0) {
+        return;
+    }
     return deallocate(ptr, memory);
 }
 
@@ -25,6 +73,16 @@ void* PS4_SYSV_ABI AvPlayer::AllocateTexture(void* handle, u32 alignment, u32 si
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+    u64 result = 0;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(allocate), reinterpret_cast<u64>(ptr), alignment, size, 0, 3,
+        &result, "avplayer_allocate_texture");
+    if (bridge > 0) {
+        return reinterpret_cast<void*>(result);
+    }
+    if (bridge < 0) {
+        return nullptr;
+    }
     return allocate(ptr, alignment, size);
 }
 
@@ -32,6 +90,12 @@ void PS4_SYSV_ABI AvPlayer::DeallocateTexture(void* handle, void* memory) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(deallocate), reinterpret_cast<u64>(ptr),
+        reinterpret_cast<u64>(memory), 0, 0, 2, nullptr, "avplayer_deallocate_texture");
+    if (bridge != 0) {
+        return;
+    }
     return deallocate(ptr, memory);
 }
 
@@ -41,6 +105,16 @@ int PS4_SYSV_ABI AvPlayer::OpenFile(void* handle, const char* filename) {
 
     const auto open = self->m_init_data_original.file_replacement.open;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
+    u64 result = 0;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(open), reinterpret_cast<u64>(ptr),
+        reinterpret_cast<u64>(filename), 0, 0, 2, &result, "avplayer_open_file");
+    if (bridge > 0) {
+        return static_cast<int>(result);
+    }
+    if (bridge < 0) {
+        return -1;
+    }
     return open(ptr, filename);
 }
 
@@ -50,6 +124,16 @@ int PS4_SYSV_ABI AvPlayer::CloseFile(void* handle) {
 
     const auto close = self->m_init_data_original.file_replacement.close;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
+    u64 result = 0;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(close), reinterpret_cast<u64>(ptr), 0, 0, 0, 1, &result,
+        "avplayer_close_file");
+    if (bridge > 0) {
+        return static_cast<int>(result);
+    }
+    if (bridge < 0) {
+        return -1;
+    }
     return close(ptr);
 }
 
@@ -59,6 +143,16 @@ int PS4_SYSV_ABI AvPlayer::ReadOffsetFile(void* handle, u8* buffer, u64 position
 
     const auto read_offset = self->m_init_data_original.file_replacement.read_offset;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
+    u64 result = 0;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(read_offset), reinterpret_cast<u64>(ptr),
+        reinterpret_cast<u64>(buffer), position, length, 4, &result, "avplayer_read_offset");
+    if (bridge > 0) {
+        return static_cast<int>(result);
+    }
+    if (bridge < 0) {
+        return -1;
+    }
     return read_offset(ptr, buffer, position, length);
 }
 
@@ -68,6 +162,16 @@ u64 PS4_SYSV_ABI AvPlayer::SizeFile(void* handle) {
 
     const auto size = self->m_init_data_original.file_replacement.size;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
+    u64 result = 0;
+    const int bridge = RunGuestReplacementCallback(
+        reinterpret_cast<void*>(size), reinterpret_cast<u64>(ptr), 0, 0, 0, 1, &result,
+        "avplayer_size_file");
+    if (bridge > 0) {
+        return result;
+    }
+    if (bridge < 0) {
+        return 0;
+    }
     return size(ptr);
 }
 
@@ -224,4 +328,4 @@ bool AvPlayer::SetLooping(bool is_looping) {
     return m_state->SetLooping(is_looping);
 }
 
-} // namespace Libraries::AvPlayer
+}

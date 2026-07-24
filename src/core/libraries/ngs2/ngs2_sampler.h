@@ -37,7 +37,6 @@ struct OrbisNgs2SamplerVoiceWaveformBlocksParam {
     u32 flags;
     u32 numBlocks;
     const OrbisNgs2WaveformBlock* aBlock;
-    // Blocks
 };
 
 struct OrbisNgs2SamplerVoiceWaveformAddressParam {
@@ -159,4 +158,4 @@ struct OrbisNgs2SamplerRackInfo {
     u32 maxAjmAtrac9Decoders;
 };
 
-} // namespace Libraries::Ngs2
+}

@@ -17,4 +17,4 @@ public:
     virtual AVIOContext* GetContext() = 0;
 };
 
-} // namespace Libraries::AvPlayer
+}

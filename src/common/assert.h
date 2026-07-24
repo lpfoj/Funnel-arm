@@ -1,17 +1,13 @@
 // SPDX-FileCopyrightText: 2013 Dolphin Emulator Project
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include "common/logging/log.h"
 
-// Sometimes we want to try to continue even after hitting an assert.
-// However touching this file yields a global recompilation as this header is included almost
-// everywhere. So let's just move the handling of the failed assert to a single cpp file.
 
-void assert_fail_impl();
+void assert_fail_impl(const char* expression, const char* file, int line);
 [[noreturn]] void unreachable_impl();
 
 #ifdef _MSC_VER
@@ -21,20 +17,20 @@ void assert_fail_impl();
 #endif
 
 #define ASSERT(_a_)                                                                                \
-    do {                                                                                           \
+    ([&]() SHAD_NO_INLINE {                                                                        \
         if (!(_a_)) [[unlikely]] {                                                                 \
             LOG_CRITICAL(Debug, "Assertion Failed!");                                              \
-            assert_fail_impl();                                                                    \
+            assert_fail_impl(#_a_, __FILE__, __LINE__);                                             \
         }                                                                                          \
-    } while (false)
+    }())
 
 #define ASSERT_MSG(_a_, ...)                                                                       \
-    do {                                                                                           \
+    ([&]() SHAD_NO_INLINE {                                                                        \
         if (!(_a_)) [[unlikely]] {                                                                 \
             LOG_CRITICAL(Debug, "Assertion Failed!\n" __VA_ARGS__);                                \
-            assert_fail_impl();                                                                    \
+            assert_fail_impl(#_a_, __FILE__, __LINE__);                                             \
         }                                                                                          \
-    } while (false)
+    }())
 
 #define UNREACHABLE()                                                                              \
     do {                                                                                           \
@@ -51,7 +47,7 @@ void assert_fail_impl();
 #ifdef _DEBUG
 #define DEBUG_ASSERT(_a_) ASSERT(_a_)
 #define DEBUG_ASSERT_MSG(_a_, ...) ASSERT_MSG(_a_, __VA_ARGS__)
-#else // not debug
+#else
 #define DEBUG_ASSERT(_a_)                                                                          \
     do {                                                                                           \
     } while (0)
@@ -66,7 +62,6 @@ void assert_fail_impl();
 #define UNIMPLEMENTED_IF(cond) ASSERT_MSG(!(cond), "Unimplemented code!")
 #define UNIMPLEMENTED_IF_MSG(cond, ...) ASSERT_MSG(!(cond), __VA_ARGS__)
 
-// If the assert is ignored, execute _b_
 #define ASSERT_OR_EXECUTE(_a_, _b_)                                                                \
     do {                                                                                           \
         ASSERT(_a_);                                                                               \
@@ -75,7 +70,6 @@ void assert_fail_impl();
         }                                                                                          \
     } while (0)
 
-// If the assert is ignored, execute _b_
 #define ASSERT_OR_EXECUTE_MSG(_a_, _b_, ...)                                                       \
     do {                                                                                           \
         ASSERT_MSG(_a_, __VA_ARGS__);                                                              \

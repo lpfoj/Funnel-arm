@@ -1,17 +1,31 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/logging/log.h"
-#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 namespace Vulkan {
+
+#ifdef __ANDROID__
+static bool ExecutorTraceVulkanPresent() {
+    static const bool enabled = std::getenv("EXECUTOR_TRACE_LIVE_WIDE") != nullptr ||
+                                std::getenv("EXECUTOR_TRACE_PM4") != nullptr ||
+                                std::getenv("EXECUTOR_TRACE_VULKAN_PRESENT") != nullptr;
+    return enabled;
+}
+#endif
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -39,7 +53,10 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     Destroy();
 
-    SetSurfaceProperties();
+    if (!SetSurfaceProperties()) {
+        needs_recreation = true;
+        return;
+    }
 
     const std::array queue_family_indices = {
         instance.GetGraphicsQueueFamilyIndex(),
@@ -70,10 +87,26 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .oldSwapchain = nullptr,
     };
 
+    LOG_INFO(Render_Vulkan,
+             "EXECUTOR_VULKAN_WSI phase=create_before surfaceCurrentTransform={} "
+             "swapchainPreTransform={} aligned={}",
+             vk::to_string(surface_current_transform), vk::to_string(swapchain_info.preTransform),
+             surface_current_transform == swapchain_info.preTransform ? "YES" : "NO");
     auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
-    ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
-               vk::to_string(swapchain_result));
+    if (swapchain_result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan,
+                    "[EXECUTOR_VULKAN_WSI] createSwapchainKHR failed: {} — will retry next present",
+                    vk::to_string(swapchain_result));
+        needs_recreation = true;
+        return;
+    }
     swapchain = chain;
+    LOG_INFO(Render_Vulkan,
+             "EXECUTOR_VULKAN_WSI phase=create_after result={} surfaceCurrentTransform={} "
+             "swapchainPreTransform={} aligned={}",
+             vk::to_string(swapchain_result), vk::to_string(surface_current_transform),
+             vk::to_string(swapchain_info.preTransform),
+             surface_current_transform == swapchain_info.preTransform ? "YES" : "NO");
 
     SetupImages();
     RefreshSemaphores();
@@ -103,14 +136,44 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
+    if (terminal) {
+        return false;
+    }
+    if (!swapchain || image_acquired.empty()) {
+        needs_recreation = true;
+        return false;
+    }
     vk::Device device = instance.GetDevice();
-    vk::Result result =
-        device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
-                                   image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+    vk::Result result = device.acquireNextImageKHR(
+        swapchain,
+#ifdef __ANDROID__
+        250'000'000ULL,
+#else
+        std::numeric_limits<u64>::max(),
+#endif
+        image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
+        consecutive_acquire_timeouts = 0;
         break;
+    case vk::Result::eErrorDeviceLost:
+        terminal = true;
+        terminal_result = result;
+        needs_recreation = false;
+        return false;
+#ifdef __ANDROID__
+    case vk::Result::eTimeout:
+        needs_recreation = false;
+        if (++consecutive_acquire_timeouts >= 8) {
+            terminal = true;
+            terminal_result = result;
+            LOG_ERROR(Render_Vulkan,
+                      "[EXECUTOR_VK_TERMINAL] where=swapchain_acquire result={} terminal=1",
+                      vk::to_string(result));
+        }
+        return false;
+#endif
     case vk::Result::eSuboptimalKHR:
     case vk::Result::eErrorSurfaceLostKHR:
     case vk::Result::eErrorOutOfDateKHR:
@@ -118,9 +181,10 @@ bool Swapchain::AcquireNextImage() {
         needs_recreation = true;
         break;
     default:
-        LOG_CRITICAL(Render_Vulkan, "Swapchain acquire returned unknown result {}",
-                     vk::to_string(result));
-        UNREACHABLE();
+        LOG_WARNING(Render_Vulkan,
+                    "Swapchain acquire returned unexpected result {} — requesting recreate",
+                    vk::to_string(result));
+        needs_recreation = true;
         break;
     }
 
@@ -128,6 +192,10 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+
+    if (terminal) {
+        return false;
+    }
 
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
@@ -138,9 +206,43 @@ bool Swapchain::Present() {
     };
 
     auto result = instance.GetPresentQueue().presentKHR(present_info);
-    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
+    if (result == vk::Result::eErrorDeviceLost) {
+        terminal = true;
+        terminal_result = result;
+    }
+#ifdef __ANDROID__
+    const bool expected_identity_suboptimal =
+        result == vk::Result::eSuboptimalKHR &&
+        transform == vk::SurfaceTransformFlagBitsKHR::eIdentity &&
+        surface_current_transform != vk::SurfaceTransformFlagBitsKHR::eIdentity;
+#else
+    const bool expected_identity_suboptimal = false;
+#endif
+    const bool present_requires_attention =
+        result != vk::Result::eSuccess && !expected_identity_suboptimal;
+#ifdef __ANDROID__
+    const bool trace_present = ExecutorTraceVulkanPresent();
+#else
+    const bool trace_present = true;
+#endif
+    if (present_requires_attention || trace_present) {
+        LOG_INFO(Render_Vulkan, "EXECUTOR_VULKAN_PRESENT result={} suboptimal={} outOfDate={}",
+                 vk::to_string(result), result == vk::Result::eSuboptimalKHR ? "YES" : "NO",
+                 result == vk::Result::eErrorOutOfDateKHR ? "YES" : "NO");
+    }
+#ifdef __ANDROID__
+    if (present_requires_attention || trace_present) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_VULKAN_PRESENT] result=%s suboptimal=%d outOfDate=%d",
+                            vk::to_string(result).c_str(),
+                            result == vk::Result::eSuboptimalKHR ? 1 : 0,
+                            result == vk::Result::eErrorOutOfDateKHR ? 1 : 0);
+    }
+#endif
+    if (result == vk::Result::eErrorOutOfDateKHR ||
+        (result == vk::Result::eSuboptimalKHR && !expected_identity_suboptimal)) {
         needs_recreation = true;
-    } else {
+    } else if (!expected_identity_suboptimal) {
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
                    vk::to_string(result));
     }
@@ -156,25 +258,18 @@ void Swapchain::FindPresentFormat() {
     ASSERT_MSG(formats_result == vk::Result::eSuccess, "Failed to query surface formats: {}",
                vk::to_string(formats_result));
 
-    // Check if the device supports HDR formats. Here we care of Rec.2020 PQ only as it is expected
-    // game output. Other variants as e.g. linear Rec.2020 will require additional color space
-    // rotation
     supports_hdr =
         std::find_if(formats.begin(), formats.end(), [](const vk::SurfaceFormatKHR& format) {
             return format == SURFACE_FORMAT_HDR;
         }) != formats.end();
-    // Also make sure that user allowed us to use HDR
-    supports_hdr &= EmulatorSettings.IsHdrAllowed();
+    supports_hdr &= Config::allowHDR();
 
-    // If there is a single undefined surface format, the device doesn't care, so we'll just use
-    // RGBA sRGB.
     if (formats[0].format == vk::Format::eUndefined) {
         surface_format.format = vk::Format::eR8G8B8A8Unorm;
         surface_format.colorSpace = vk::ColorSpaceKHR::eSrgbNonlinear;
         return;
     }
 
-    // Try to find a suitable format.
     for (const vk::SurfaceFormatKHR& sformat : formats) {
         vk::Format format = sformat.format;
         if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eB8G8R8A8Unorm) {
@@ -199,7 +294,7 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
-    const auto requested_mode = EmulatorSettings.GetPresentMode();
+    const auto requested_mode = Config::getPresentMode();
     if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;
     } else if (requested_mode == "Fifo") {
@@ -208,12 +303,11 @@ void Swapchain::FindPresentMode() {
         present_mode = vk::PresentModeKHR::eImmediate;
     } else {
         LOG_ERROR(Render_Vulkan, "Unknown present mode {}, defaulting to Mailbox.",
-                  EmulatorSettings.GetPresentMode());
+                  Config::getPresentMode());
         present_mode = vk::PresentModeKHR::eMailbox;
     }
 
     if (std::ranges::find(modes, present_mode) == modes.cend()) {
-        // FIFO is guaranteed to be supported by the Vulkan spec.
         constexpr auto fallback = vk::PresentModeKHR::eFifo;
         LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
                     vk::to_string(present_mode), vk::to_string(fallback));
@@ -221,11 +315,16 @@ void Swapchain::FindPresentMode() {
     }
 }
 
-void Swapchain::SetSurfaceProperties() {
+bool Swapchain::SetSurfaceProperties() {
     const auto [capabilities_result, capabilities] =
         instance.GetPhysicalDevice().getSurfaceCapabilitiesKHR(surface);
-    ASSERT_MSG(capabilities_result == vk::Result::eSuccess,
-               "Failed to query surface capabilities: {}", vk::to_string(capabilities_result));
+    if (capabilities_result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan,
+                    "[EXECUTOR_VULKAN_WSI] surface capabilities query failed: {} — skipping "
+                    "swapchain recreate, will retry",
+                    vk::to_string(capabilities_result));
+        return false;
+    }
 
     extent = capabilities.currentExtent;
     if (capabilities.currentExtent.width == std::numeric_limits<u32>::max()) {
@@ -235,40 +334,51 @@ void Swapchain::SetSurfaceProperties() {
                                  std::min(capabilities.maxImageExtent.height, height));
     }
 
-    // Select number of images in swap chain, we prefer one buffer in the background to work on
     image_count = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
 
-    // Prefer identity transform if possible
-    transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;
-    if (!(capabilities.supportedTransforms & transform)) {
-        transform = capabilities.currentTransform;
-    }
+    surface_current_transform = capabilities.currentTransform;
 
-    // Opaque is not supported everywhere.
+    constexpr auto identity = vk::SurfaceTransformFlagBitsKHR::eIdentity;
+    transform = capabilities.supportedTransforms & identity ? identity
+                                                             : capabilities.currentTransform;
+    LOG_INFO(Render_Vulkan,
+             "EXECUTOR_VULKAN_WSI phase=surface_properties surfaceCurrentTransform={} "
+             "swapchainPreTransform={} identitySupported={} aligned={}",
+             vk::to_string(surface_current_transform), vk::to_string(transform),
+             static_cast<bool>(capabilities.supportedTransforms & identity) ? "YES" : "NO",
+             surface_current_transform == transform ? "YES" : "NO");
+
     composite_alpha = vk::CompositeAlphaFlagBitsKHR::eOpaque;
     if (!(capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque)) {
         composite_alpha = vk::CompositeAlphaFlagBitsKHR::eInherit;
     }
+    return true;
 }
 
 void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
-    if (wait_result != vk::Result::eSuccess) {
-        LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
-                    vk::to_string(wait_result));
+    if (!terminal) {
+        const auto wait_result = device.waitIdle();
+        if (wait_result != vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
+                        vk::to_string(wait_result));
+        }
     }
 
     for (auto& image_view : images_view) {
-        device.destroyImageView(image_view);
+        if (image_view) {
+            device.destroyImageView(image_view);
+        }
     }
     images_view.clear();
+    images.clear();
 
     if (swapchain) {
         device.destroySwapchainKHR(swapchain);
+        swapchain = nullptr;
     }
 
     for (const auto& sem : image_acquired) {
@@ -280,6 +390,9 @@ void Swapchain::Destroy() {
 
     image_acquired.clear();
     present_ready.clear();
+    image_count = 0;
+    image_index = 0;
+    frame_index = 0;
 }
 
 void Swapchain::RefreshSemaphores() {
@@ -341,4 +454,4 @@ void Swapchain::SetupImages() {
     }
 }
 
-} // namespace Vulkan
+}

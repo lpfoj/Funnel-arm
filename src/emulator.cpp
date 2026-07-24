@@ -8,16 +8,12 @@
 #include <sstream>
 #include <fmt/core.h>
 #include <fmt/xchar.h>
-#include <hwinfo/hwinfo.h>
-
+#include "common/config.h"
 #include "common/debug.h"
+#include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
-#include "core/emulator_settings.h"
 #include "core/ipc/ipc.h"
-#ifdef ENABLE_DISCORD_RPC
-#include "common/discord_rpc_handler.h"
-#endif
 #include "common/elf_info.h"
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
@@ -27,7 +23,6 @@
 #include "common/singleton.h"
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
-#include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
@@ -38,7 +33,6 @@
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
 #include "core/memory.h"
-#include "core/user_settings.h"
 #include "emulator.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
@@ -51,44 +45,23 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
-#include <core/file_format/npbind.h>
 
 Frontend::WindowSDL* g_window = nullptr;
 
 namespace Core {
 
-std::mutex exit_mutex{};
-
 Emulator::Emulator() {
-    // Initialize NT API functions, set high priority and disable WER
 #ifdef _WIN32
     Common::NtApi::Initialize();
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     SetErrorMode(SetErrorMode(0) | SEM_NOGPFAULTERRORBOX);
-    // need to init this in order for winsock2 to work
     WORD versionWanted = MAKEWORD(2, 2);
     WSADATA wsaData;
     WSAStartup(versionWanted, &wsaData);
 #endif
-    std::at_quick_exit([]() { Common::Singleton<Core::Emulator>::Instance()->Shutdown(); });
 }
 
 Emulator::~Emulator() {}
-
-void Emulator::Shutdown() {
-    static bool exit_done = false;
-    std::scoped_lock l{exit_mutex};
-    if (exit_done) {
-        return;
-    }
-    Common::Log::Flush();
-    if (controllers) {
-        controllers->ResetLightbarColors();
-        // need to give SDL time to do this before the runtime exits
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
-    exit_done = true;
-}
 
 s32 ReadCompiledSdkVersion(const std::filesystem::path& file) {
     Core::Loader::Elf elf;
@@ -109,85 +82,6 @@ s32 ReadCompiledSdkVersion(const std::filesystem::path& file) {
     return 0;
 }
 
-std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& npbind_path,
-                                           const std::filesystem::path& trophy_dir) {
-    std::map<s32, std::string> trophy_index_map{};
-
-    NPBindFile npbind;
-    if (!npbind.Load(npbind_path.string())) {
-        LOG_WARNING(Common_Filesystem, "Failed to load npbind.dat file");
-        return trophy_index_map;
-    }
-
-    auto np_comm_ids = npbind.GetNpCommIds();
-    if (np_comm_ids.empty()) {
-        LOG_WARNING(Common_Filesystem, "No NPCommIDs in npbind.dat");
-        return trophy_index_map;
-    }
-    auto& game_info = Common::ElfInfo::Instance();
-    game_info.SetNpCommIds(np_comm_ids);
-
-    if (!std::filesystem::exists(trophy_dir)) {
-        LOG_WARNING(Common_Filesystem, "Game does not contain a trophy directory");
-        return trophy_index_map;
-    }
-
-    std::string pattern = "trophy";
-    for (const auto& entry : std::filesystem::directory_iterator(trophy_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".trp") {
-            std::string filename = entry.path().stem().string(); // "trophy00", "trophy01", etc.
-
-            // Check if filename starts with "trophy"
-            if (filename.find(pattern) != 0) {
-                continue;
-            }
-
-            // Extract the number part
-            std::string num_str = filename.substr(pattern.length());
-            s32 trophy_index = std::stoi(num_str);
-
-            if (np_comm_ids.size() <= trophy_index) {
-                // This logic currently assumes each NPCommID corresponds to a trophy index.
-                LOG_WARNING(Common_Filesystem,
-                            "Trophy index {} does not have a corresponding NPCommId", trophy_index);
-                continue;
-            }
-
-            // Add the relevant trophies to our trophy index map.
-            // This currently assumes the order of NPCommIDs matches the order of trophies.
-            std::string np_comm_id = np_comm_ids[trophy_index];
-            trophy_index_map[trophy_index] = np_comm_id;
-            LOG_DEBUG(Loader, "Mapped trophy index {} to NPCommID: {}", trophy_index, np_comm_id);
-
-            // Extract the actual trophies if they're no extracted yet
-            const auto& trophy_output_dir =
-                Common::FS::GetUserPath(Common::FS::PathType::TrophyDir) / np_comm_id;
-            if (!std::filesystem::exists(trophy_output_dir)) {
-                TRP trp;
-                if (!trp.Extract(entry, np_comm_id, trophy_output_dir)) {
-                    LOG_ERROR(Loader, "Couldn't extract trophy file {}", filename);
-                    continue;
-                }
-            }
-
-            // Move extracted trophy contents into each user's folder
-            for (User user : UserSettings.GetUserManager().GetValidUsers()) {
-                auto const user_trophy_file = EmulatorSettings.GetHomeDir() /
-                                              std::to_string(user.user_id) / "trophy" /
-                                              (np_comm_id + ".xml");
-                if (!std::filesystem::exists(user_trophy_file)) {
-                    auto temp = user_trophy_file.parent_path();
-                    std::filesystem::create_directories(temp);
-                    std::error_code discard;
-                    std::filesystem::copy_file(trophy_output_dir / "Xml" / "TROPCONF.XML",
-                                               user_trophy_file, discard);
-                }
-            }
-        }
-    }
-    return trophy_index_map;
-}
-
 void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                    std::optional<std::filesystem::path> p_game_folder) {
     Common::SetCurrentThreadName("shadPS4:Main");
@@ -205,10 +99,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     } else {
         game_folder = file.parent_path();
         if (const auto game_folder_name = game_folder.filename().string();
-            game_folder_name.ends_with("-UPDATE") || game_folder_name.ends_with("-patch") ||
-            game_folder_name.ends_with("-mods")) {
-            // If an executable was launched from a separate update directory,
-            // use the base game directory as the game folder.
+            game_folder_name.ends_with("-UPDATE") || game_folder_name.ends_with("-patch")) {
             const std::string base_name = game_folder_name.substr(0, game_folder_name.rfind('-'));
             const auto base_path = game_folder.parent_path() / base_name;
             if (std::filesystem::is_directory(base_path)) {
@@ -219,16 +110,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     std::filesystem::path eboot_name = std::filesystem::relative(file, game_folder);
 
-    // Applications expect to be run from /app0 so mount the file's parent path as app0.
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     mnt->Mount(game_folder, "/app0", true);
-    // Certain games may use /hostapp as well such as CUSA001100
     mnt->Mount(game_folder, "/hostapp", true);
 
     const auto param_sfo_path = mnt->GetHostPath("/app0/sce_sys/param.sfo");
     const auto param_sfo_exists = std::filesystem::exists(param_sfo_path);
 
-    // Load param.sfo details if it exists
     std::string id;
     std::string title;
     std::string app_version;
@@ -253,34 +141,23 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
             psf_attributes.raw = *raw_attributes;
         }
 
-        // Extract sdk version from pubtool info.
         std::string_view pubtool_info =
             param_sfo->GetString("PUBTOOLINFO").value_or("Unknown value");
         u64 sdk_ver_offset = pubtool_info.find("sdk_ver");
 
         if (sdk_ver_offset == pubtool_info.npos) {
-            // Default to using firmware version if SDK version is not found.
             sdk_version = fw_version;
         } else {
-            // Increment offset to account for sdk_ver= part of string.
             sdk_ver_offset += 8;
             u64 sdk_ver_len = pubtool_info.find(",", sdk_ver_offset);
             if (sdk_ver_len == pubtool_info.npos) {
-                // If there's no more commas, this is likely the last entry of pubtool info.
-                // Use string length instead.
                 sdk_ver_len = pubtool_info.size();
             }
             sdk_ver_len -= sdk_ver_offset;
             std::string sdk_ver_string = pubtool_info.substr(sdk_ver_offset, sdk_ver_len).data();
-            // Number is stored in base 16.
             sdk_version = std::stoi(sdk_ver_string, nullptr, 16);
         }
     }
-
-    EmulatorSettings.Load(id);
-    // Switch to configured log
-    Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
-                                                                          : "shad_log.txt");
 
     auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
     const auto eboot_path = mnt->GetHostPath(guest_eboot_path);
@@ -302,6 +179,22 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     game_info.game_folder = game_folder;
 
+    Config::load(Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"),
+                 true);
+
+    if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) /
+                                (id + ".toml"))) {
+        EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(true);
+    } else {
+        EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(false);
+    }
+
+    if (!id.empty() && Config::getSeparateLogFilesEnabled()) {
+        Common::Log::Initialize(id + ".log");
+    } else {
+        Common::Log::Initialize();
+    }
+    Common::Log::Start();
     if (!std::filesystem::exists(file)) {
         LOG_CRITICAL(Loader, "eboot.bin does not exist: {}",
                      std::filesystem::absolute(file).string());
@@ -314,49 +207,32 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Loader, "Description {}", Common::g_scm_desc);
     LOG_INFO(Loader, "Remote {}", Common::g_scm_remote_url);
 
-    LOG_INFO(Config, "Game-specific config used: {}",
-             EmulatorState::GetInstance()->IsGameSpecifigConfigUsed());
+    const bool has_game_config = std::filesystem::exists(
+        Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"));
+    LOG_INFO(Config, "Game-specific config exists: {}", has_game_config);
 
-    LOG_INFO(Config, "General isNeo: {}", EmulatorSettings.IsNeo());
-    LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
-    LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
-    LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
-    LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
-    LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
-#ifdef _WIN32
-    LOG_INFO(Config, "Log type: {}", EmulatorSettings.GetLogType());
-#endif
-    LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
-    LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
-    LOG_INFO(Config, "GPU readbackLinearImages: {}",
-             EmulatorSettings.IsReadbackLinearImagesEnabled());
-    LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
-    LOG_INFO(Config, "GPU shouldDumpShaders: {}", EmulatorSettings.IsDumpShaders());
-    LOG_INFO(Config, "GPU vblankFrequency: {}", EmulatorSettings.GetVblankFrequency());
-    LOG_INFO(Config, "GPU shouldCopyGPUBuffers: {}", EmulatorSettings.IsCopyGpuBuffers());
-    LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
-    LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
-    LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());
-    LOG_INFO(Config, "Vulkan vkValidationSync: {}", EmulatorSettings.IsVkValidationSyncEnabled());
-    LOG_INFO(Config, "Vulkan vkValidationGpu: {}", EmulatorSettings.IsVkValidationGpuEnabled());
-    LOG_INFO(Config, "Vulkan crashDiagnostics: {}", EmulatorSettings.IsVkCrashDiagnosticEnabled());
-    LOG_INFO(Config, "Vulkan hostMarkers: {}", EmulatorSettings.IsVkHostMarkersEnabled());
-    LOG_INFO(Config, "Vulkan guestMarkers: {}", EmulatorSettings.IsVkGuestMarkersEnabled());
-    LOG_INFO(Config, "Vulkan rdocEnable: {}", EmulatorSettings.IsRenderdocEnabled());
-    LOG_INFO(Config, "Vulkan PipelineCacheEnabled: {}", EmulatorSettings.IsPipelineCacheEnabled());
-    LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
-             EmulatorSettings.IsPipelineCacheArchived());
-
-    hwinfo::Memory ram;
-    hwinfo::OS os;
-    const auto cpus = hwinfo::getAllCPUs();
-    for (const auto& cpu : cpus) {
-        LOG_INFO(Config, "CPU Model: {}", cpu.modelName());
-        LOG_INFO(Config, "CPU Physical Cores: {}, Logical Cores: {}", cpu.numPhysicalCores(),
-                 cpu.numLogicalCores());
-    }
-    LOG_INFO(Config, "Total RAM: {} GB", std::round(ram.total_Bytes() / pow(1024, 3)));
-    LOG_INFO(Config, "Operating System: {}", os.name());
+    LOG_INFO(Config, "General LogType: {}", Config::getLogType());
+    LOG_INFO(Config, "General isIdenticalLogGrouped: {}", Config::groupIdenticalLogs());
+    LOG_INFO(Config, "General isNeo: {}", Config::isNeoModeConsole());
+    LOG_INFO(Config, "General isDevKit: {}", Config::isDevKitConsole());
+    LOG_INFO(Config, "General isConnectedToNetwork: {}", Config::getIsConnectedToNetwork());
+    LOG_INFO(Config, "General isPsnSignedIn: {}", Config::getPSNSignedIn());
+    LOG_INFO(Config, "GPU isNullGpu: {}", Config::nullGpu());
+    LOG_INFO(Config, "GPU readbacksMode: {}", Config::getReadbacksMode());
+    LOG_INFO(Config, "GPU readbackLinearImages: {}", Config::readbackLinearImages());
+    LOG_INFO(Config, "GPU directMemoryAccess: {}", Config::directMemoryAccess());
+    LOG_INFO(Config, "GPU shouldDumpShaders: {}", Config::dumpShaders());
+    LOG_INFO(Config, "GPU vblankFrequency: {}", Config::vblankFreq());
+    LOG_INFO(Config, "GPU shouldCopyGPUBuffers: {}", Config::copyGPUCmdBuffers());
+    LOG_INFO(Config, "Vulkan gpuId: {}", Config::getGpuId());
+    LOG_INFO(Config, "Vulkan vkValidation: {}", Config::vkValidationEnabled());
+    LOG_INFO(Config, "Vulkan vkValidationCore: {}", Config::vkValidationCoreEnabled());
+    LOG_INFO(Config, "Vulkan vkValidationSync: {}", Config::vkValidationSyncEnabled());
+    LOG_INFO(Config, "Vulkan vkValidationGpu: {}", Config::vkValidationGpuEnabled());
+    LOG_INFO(Config, "Vulkan crashDiagnostics: {}", Config::getVkCrashDiagnosticEnabled());
+    LOG_INFO(Config, "Vulkan hostMarkers: {}", Config::getVkHostMarkersEnabled());
+    LOG_INFO(Config, "Vulkan guestMarkers: {}", Config::getVkGuestMarkersEnabled());
+    LOG_INFO(Config, "Vulkan rdocEnable: {}", Config::isRdocEnabled());
 
     if (param_sfo_exists) {
         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
@@ -374,37 +250,29 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         if (args.size() > 32) {
             LOG_ERROR(Loader, "Too many game arguments, only passing the first 32");
         }
-    } else {
-        args.insert(args.begin(), guest_eboot_path);
     }
 
-    std::filesystem::path mods_folder = game_folder;
-    mods_folder += "-mods";
-
-    if (std::filesystem::exists(mods_folder) && !std::filesystem::is_empty(mods_folder)) {
-        LOG_INFO(Loader, "Files found in game mods folder");
-    }
-
-    // Create stdin/stdout/stderr
     Common::Singleton<FileSys::HandleTable>::Instance()->CreateStdHandles();
 
-    // Initialize components
     memory = Core::Memory::Instance();
-    controllers = Common::Singleton<Input::GameControllers>::Instance();
+    controller = Common::Singleton<Input::GameController>::Instance();
     linker = Common::Singleton<Core::Linker>::Instance();
 
-    // Load renderdoc module
     VideoCore::LoadRenderDoc();
 
-    // Initialize patcher
     if (!id.empty()) {
         MemoryPatcher::g_game_serial = id;
-    }
+        Libraries::Np::NpTrophy::game_serial = id;
 
-    // Extract and load trophies
-    std::filesystem::path npbind_path = mnt->GetHostPath("/app0/sce_sys/npbind.dat");
-    std::filesystem::path trophy_dir = mnt->GetHostPath("/app0/sce_sys/trophy");
-    game_info.trophy_index_map = ExtractTrophies(npbind_path, trophy_dir);
+        const auto trophyDir =
+            Common::FS::GetUserPath(Common::FS::PathType::MetaDataDir) / id / "TrophyFiles";
+        if (!std::filesystem::exists(trophyDir)) {
+            TRP trp;
+            if (!trp.Extract(game_folder, id)) {
+                LOG_ERROR(Loader, "Couldn't extract trophies");
+            }
+        }
+    }
 
     std::string game_title = fmt::format("{} - {} <{}>", id, title, app_version);
     std::string window_title = "";
@@ -426,22 +294,16 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
-    window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
-                                                   EmulatorSettings.GetWindowHeight(), controllers,
-                                                   window_title);
+    window = std::make_unique<Frontend::WindowSDL>(
+        Config::getWindowWidth(), Config::getWindowHeight(), controller, window_title);
 
     g_window = window.get();
-
-    std::filesystem::path icon_path = mnt->GetHostPath("/app0/sce_sys/icon0.png");
-    window->SetIcon(icon_path);
 
     const auto& mount_data_dir = Common::FS::GetUserPath(Common::FS::PathType::GameDataDir);
     mnt->Mount(mount_data_dir, "/data");
 
-    // Mounting temp folders
     const auto& mount_temp_dir = Common::FS::GetUserPath(Common::FS::PathType::TempDataDir) / id;
     if (std::filesystem::exists(mount_temp_dir)) {
-        // Temp folder should be cleared on each boot.
         std::filesystem::remove_all(mount_temp_dir);
     }
     std::filesystem::create_directory(mount_temp_dir);
@@ -461,13 +323,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     VideoCore::SetOutputDir(mount_captures_dir, id);
 
-    // Mount system fonts
-    const auto& fonts_dir = EmulatorSettings.GetFontsDir();
+    const auto& fonts_dir = Config::getFontsPath();
     if (!std::filesystem::exists(fonts_dir)) {
         std::filesystem::create_directory(fonts_dir);
     }
 
-    // Fonts are mounted into the sandboxed system directory, construct the appropriate path.
     const char* sandbox_root = Libraries::Kernel::sceKernelGetFsSandboxRandomWord();
     std::string guest_font_dir = "/";
     guest_font_dir.append(sandbox_root).append("/common/font");
@@ -477,7 +337,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     mnt->Mount(host_font_dir, guest_font_dir);
 
-    // There is a second font directory, mount that too.
     guest_font_dir.append("2");
     const auto& host_font2_dir = fonts_dir / "font2";
     if (!std::filesystem::exists(host_font2_dir)) {
@@ -489,38 +348,27 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         LOG_WARNING(Loader, "No dumped system fonts, expect missing text or instability");
     }
 
-    // Initialize kernel and library facilities.
     Libraries::InitHLELibs(&linker->GetHLESymbols());
 
-    // Load the module with the linker
     if (linker->LoadModule(eboot_path) == -1) {
         LOG_CRITICAL(Loader, "Failed to load game's eboot.bin: {}",
                      Common::FS::PathToUTF8String(std::filesystem::absolute(eboot_path)));
         std::quick_exit(0);
     }
 
-#ifdef ENABLE_DISCORD_RPC
-    // Discord RPC
-    if (EmulatorSettings.IsDiscordRPCEnabled()) {
-        auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
-        if (rpc->getRPCEnabled() == false) {
-            rpc->init();
-        }
-        rpc->setStatusPlaying(game_info.title, id);
-    }
-#endif
-
     if (!id.empty()) {
         start_time = std::chrono::steady_clock::now();
 
-        play_time_thread = std::jthread([this, id](std::stop_token stop) {
-            while (Common::StoppableTimedWait(stop, std::chrono::seconds(60))) {
+        std::thread([this, id]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::seconds(60));
                 UpdatePlayTime(id);
                 start_time = std::chrono::steady_clock::now();
             }
-        });
+        }).detach();
     }
 
+    args.insert(args.begin(), eboot_name.generic_string());
     linker->Execute(args);
 
     window->InitTimers();
@@ -573,7 +421,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     LOG_INFO(Common, "Restarting the emulator with args: {}", fmt::join(args, " "));
     Libraries::SaveData::Backup::StopThread();
-    Common::Log::Shutdown();
+    Common::Log::Denitializer();
 
     auto& ipc = IPC::Instance();
 
@@ -585,7 +433,6 @@ void Emulator::Restart(std::filesystem::path eboot_path,
     }
 #if defined(_WIN32)
     std::string cmdline;
-    // Emulator executable
     cmdline += "\"";
     cmdline += executableName;
     cmdline += "\"";
@@ -609,10 +456,9 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__)
     std::vector<char*> argv;
 
-    // Emulator executable
     argv.push_back(const_cast<char*>(executableName));
 
     for (const auto& arg : args) {
@@ -622,7 +468,6 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     pid_t pid = fork();
     if (pid == 0) {
-        // Child process - execute the new instance
         execvp(executableName, argv.data());
         std::cerr << "Failed to restart game: execvp failed" << std::endl;
         std::quick_exit(1);
@@ -703,4 +548,4 @@ void Emulator::UpdatePlayTime(const std::string& serial) {
     LOG_INFO(Loader, "Playing time for {}: {}", serial, playTimeSaved);
 }
 
-} // namespace Core
+}

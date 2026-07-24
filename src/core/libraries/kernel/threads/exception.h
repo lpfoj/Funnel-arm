@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "common/types.h"
 
 namespace Core::Loader {
@@ -12,11 +14,9 @@ class SymbolsResolver;
 namespace Libraries::Kernel {
 
 using OrbisKernelExceptionHandler = PS4_SYSV_ABI void (*)(int, void*);
-struct OrbisKernelExceptionHandlerStack {
-    void* ss_sp;
-    int ss_flags;
-    size_t ss_size;
-};
+using PosixSignalHandler = PS4_SYSV_ABI void (*)(int);
+extern std::array<OrbisKernelExceptionHandler, 130> Handlers;
+extern std::array<std::uint8_t, 130> HandlerKinds;
 
 constexpr s32 POSIX_SIGHUP = 1;
 constexpr s32 POSIX_SIGINT = 2;
@@ -52,7 +52,7 @@ constexpr s32 POSIX_SIGUSR2 = 31;
 constexpr s32 POSIX_SIGTHR = 32;
 constexpr s32 POSIX_SIGLIBRT = 33;
 
-#if defined(__linux__) || defined(__FreeBSD__)
+#ifdef __linux__
 constexpr s32 _SIGEMT = 128;
 constexpr s32 _SIGINFO = 129;
 #elif !defined(_WIN32)
@@ -120,60 +120,50 @@ struct ExStack {
 };
 
 struct Sigset {
-    u32 bits[4];
+    u64 bits[2];
 };
 
 union Sigval {
-    /* Members as suggested by Annex C of POSIX 1003.1b. */
     int sival_int;
     void* sival_ptr;
-    /* 6.0 compatibility */
     int sigval_int;
     void* sigval_ptr;
 };
 
 struct Siginfo {
-    s32 _si_signo; /* signal number */
-    s32 _si_errno; /* errno association */
-    /*
-     * Cause of signal, one of the SI_ macros or signal-specific
-     * values, i.e. one of the FPE_... values for SIGFPE.  This
-     * value is equivalent to the second argument to an old-style
-     * FreeBSD signal handler.
-     */
-    s32 _si_code;           /* signal code */
-    s32 _si_pid;            /* sending process */
-    u32 _si_uid;            /* sender's ruid */
-    s32 _si_status;         /* exit value */
-    void* _si_addr;         /* faulting instruction */
-    union Sigval _si_value; /* signal value */
+    int _si_signo;
+    int _si_errno;
+    int _si_code;
+    s32 _si_pid;
+    u32 _si_uid;
+    int _si_status;
+    void* _si_addr;
+    union Sigval _si_value;
     union {
         struct {
-            s32 _trapno; /* machine specific trap code */
+            int _trapno;
         } _fault;
         struct {
-            s32 _timerid;
-            s32 _overrun;
+            int _timerid;
+            int _overrun;
         } _timer;
         struct {
-            s32 _mqd;
+            int _mqd;
         } _mesgq;
         struct {
-            s64 _band; /* band event for SIGPOLL */
-        } _poll;       /* was this ever used ? */
+            long _band;
+        } _poll;
         struct {
-            s64 __spare1__;
-            s32 __spare2__[7];
+            long __spare1__;
+            int __spare2__[7];
         } __spare__;
     } _reason;
 };
 
-using SigHandler = void PS4_SYSV_ABI (*)(int);
-
 struct Sigaction {
     union {
-        void PS4_SYSV_ABI (*handler)(int);
-        void PS4_SYSV_ABI (*sigaction)(int, struct Siginfo*, void*);
+        void (*handler)(int);
+        void (*sigaction)(int, struct Siginfo*, void*);
     } __sigaction_handler;
     int sa_flags;
     Sigset sa_mask;
@@ -190,9 +180,37 @@ struct Ucontext {
     int field7_0x4f4[3];
 };
 
+struct OrbisKernelExceptionHandlerStack {
+    void* ss_sp;
+    int ss_flags;
+    int _padding;
+    std::size_t ss_size;
+};
+static_assert(sizeof(OrbisKernelExceptionHandlerStack) == 0x18);
+
+inline void NormalizeGuestUcontext(Ucontext& ctx, void* fault_addr = nullptr) {
+    constexpr int MC_HASSEGS = 0x1;
+    constexpr int MC_HASBASES = 0x2;
+    ctx.uc_mcontext.mc_len = sizeof(Mcontext);
+    ctx.uc_mcontext.mc_flags = MC_HASSEGS | MC_HASBASES;
+    ctx.uc_mcontext.mc_cs = 0x43;
+    ctx.uc_mcontext.mc_ss = 0x3b;
+    ctx.uc_mcontext.mc_ds = 0x3b;
+    ctx.uc_mcontext.mc_es = 0x3b;
+    if (ctx.uc_mcontext.mc_rflags == 0) {
+        ctx.uc_mcontext.mc_rflags = 0x202;
+    }
+    ctx.uc_mcontext.mc_addr = reinterpret_cast<u64>(fault_addr);
+}
+
 s32 NativeToOrbisSignal(s32 s);
 s32 OrbisToNativeSignal(s32 s);
+bool HasSignalHandler(s32 sig);
+bool PS4_SYSV_ABI posix_is_signal_return(u64 address);
+s32 PS4_SYSV_ABI posix_sigalstack(const OrbisKernelExceptionHandlerStack* stack,
+                                  OrbisKernelExceptionHandlerStack* old_stack);
+PosixSignalHandler PS4_SYSV_ABI posix_signal(s32 sig, PosixSignalHandler handler);
 
 void RegisterException(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Kernel
+}

@@ -217,6 +217,40 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
 int PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg);
+bool ExecutorEnsureLiverpoolForReplay();
+bool ExecutorEnsureGnmPresenter(const char* reason);
+bool ExecutorPresentReplayRT();
+bool ExecutorLivePresentRtEnabled();
+bool ExecutorLiveDirectPresentActive();
+
+struct ExecutorGnmHudStats {
+    u64 builder_total{};
+    u64 actual_draw{};
+    u64 builder_shader{};
+    u64 submit_calls{};
+    u64 submit_done_calls{};
+    u64 present_requests{};
+};
+
+[[nodiscard]] ExecutorGnmHudStats ExecutorGetGnmHudStats() noexcept;
+
+void ExecutorSetGnmCaptureOnSubmit(bool enable, const char* dir);
+
+bool ExecutorGnmCaptureActive();
+void ExecutorGnmCaptureOnDraw();
+void ExecutorGnmRecordActualDraw(u64 count = 1) noexcept;
+void ExecutorGnmCaptureRecordResource(u32 usage, u64 guest_addr, u64 size);
+void ExecutorGnmCaptureRecordShader(u32 stage, u64 hash, u64 guest_addr, u32 code_bytes);
+
+void ExecutorReplaySetActive(bool active);
+bool ExecutorReplayActive();
+bool ExecutorReplayForcePsConst();
+void ExecutorReplayWaitGpuIdle();
+bool ExecutorReplayIsRelocated(u64 addr);
+u64 ExecutorReplayRelocate(u64 addr);
+void ExecutorReplayAddReloc(u64 old_base, u64 new_base, u64 size);
+void ExecutorReplayCheckAddr(u32 usage, u64 addr, u64 size);
+
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[],
                                             u32* dcb_sizes_in_bytes, const u32* ccb_gpu_addrs[],
                                             u32* ccb_sizes_in_bytes);
@@ -300,4 +334,4 @@ int PS4_SYSV_ABI Func_E51D44DB8151238C();
 int PS4_SYSV_ABI Func_F916890425496553();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::GnmDriver
+}

@@ -26,9 +26,9 @@ enum class PM4Predicate : u32 {
 
 union PM4Type0Header {
     u32 raw;
-    BitField<0, 16, u32> base;   ///< DWORD Memory-mapped address
-    BitField<16, 14, u32> count; ///< Count of DWORDs in the *information* body (N - 1 for N dwords)
-    BitField<30, 2, u32> type;   ///< Packet identifier. It should be 0 for type 0 packets.
+    BitField<0, 16, u32> base;
+    BitField<16, 14, u32> count;
+    BitField<30, 2, u32> type;
 
     u32 NumWords() const {
         return count + 1;
@@ -54,11 +54,11 @@ union PM4Type3Header {
     }
 
     u32 raw;
-    BitField<0, 1, PM4Predicate> predicate;    ///< Predicated version of packet when set
-    BitField<1, 1, PM4ShaderType> shader_type; ///< 0: Graphics, 1: Compute Shader
-    BitField<8, 8, PM4ItOpcode> opcode;        ///< IT opcode
-    BitField<16, 14, u32> count;               ///< Number of DWORDs - 1 in the information body.
-    BitField<30, 2, u32> type; ///< Packet identifier. It should be 3 for type 3 packets
+    BitField<0, 1, PM4Predicate> predicate;
+    BitField<1, 1, PM4ShaderType> shader_type;
+    BitField<8, 8, PM4ItOpcode> opcode;
+    BitField<16, 14, u32> count;
+    BitField<30, 2, u32> type;
 };
 
 union PM4Header {
@@ -68,7 +68,6 @@ union PM4Header {
     BitField<30, 2, u32> type;
 };
 
-// Write the PM4 header
 template <PM4ItOpcode opcode>
 constexpr u32* WriteHeader(u32* cmdbuf, u32 size,
                            PM4ShaderType type = PM4ShaderType::ShaderGraphics,
@@ -78,7 +77,6 @@ constexpr u32* WriteHeader(u32* cmdbuf, u32 size,
     return ++cmdbuf;
 }
 
-// Write arguments
 template <typename... Args>
 constexpr u32* WriteBody(u32* cmdbuf, Args... data) {
     const std::array<u32, sizeof...(Args)> args{data...};
@@ -96,98 +94,70 @@ constexpr u32* WritePacket(u32* cmdbuf, PM4ShaderType type, Args... data) {
 
 union ContextControlEnable {
     u32 raw;
-    BitField<0, 1, u32> enable_single_cntx_config_reg; ///< single context config reg
-    BitField<1, 1, u32> enable_multi_cntx_render_reg;  ///< multi context render state reg
-    BitField<15, 1, u32> enable_user_config_reg__CI;   ///< User Config Reg on CI(reserved for SI)
-    BitField<16, 1, u32> enable_gfx_sh_reg;            ///< Gfx SH Registers
-    BitField<24, 1, u32> enable_cs_sh_reg;             ///< CS SH Registers
-    BitField<31, 1, u32> enable_dw;                    ///< DW enable
+    BitField<0, 1, u32> enable_single_cntx_config_reg;
+    BitField<1, 1, u32> enable_multi_cntx_render_reg;
+    BitField<15, 1, u32> enable_user_config_reg__CI;
+    BitField<16, 1, u32> enable_gfx_sh_reg;
+    BitField<24, 1, u32> enable_cs_sh_reg;
+    BitField<31, 1, u32> enable_dw;
 };
 
 struct PM4CmdContextControl {
     PM4Type3Header header;
-    ContextControlEnable load_control;  ///< Enable bits for loading
-    ContextControlEnable shadow_enable; ///< Enable bits for shadowing
+    ContextControlEnable load_control;
+    ContextControlEnable shadow_enable;
 };
 
 union LoadAddressHigh {
     u32 raw;
     BitField<0, 16, u32>
-        addr_hi; ///< bits for the block in Memory from where the CP will fetch the state
+        addr_hi;
     BitField<31, 1, u32>
-        wait_idle; ///< if set the CP will wait for the graphics pipe to be idle by writing
-                   ///< to the GRBM Wait Until register with "Wait for 3D idle"
+        wait_idle;
 };
 
-/**
- * PM4CMDLOADDATA can be used with the following opcodes
- * - IT_LOAD_CONFIG_REG
- * - IT_LOAD_CONTEXT_REG
- * - IT_LOAD_SH_REG
- */
 struct PM4CmdLoadData {
     PM4Type3Header header;
-    u32 addr_lo; ///< low 32 address bits for the block in memory from where the CP will fetch the
-                 ///< state
+    u32 addr_lo;
     LoadAddressHigh addr_hi;
-    u32 reg_offset; ///< offset in DWords from the register base address
-    u32 num_dwords; ///< number of DWords that the CP will fetch and write into the chip. A value of
-                    ///< zero will fetch nothing
+    u32 reg_offset;
+    u32 num_dwords;
 };
 
 enum class LoadDataIndex : u32 {
-    DirectAddress = 0, /// ADDR_LO is direct address
-    Offset = 1,        /// ARRD_LO is ignored and memory offset is in addrOffset
+    DirectAddress = 0,
+    Offset = 1,
 };
 
 enum class LoadDataFormat : u32 {
-    OffsetAndSize = 0, /// Data is consecutive DWORDs
-    OffsetAndData = 1, /// Register offset and data is interleaved
+    OffsetAndSize = 0,
+    OffsetAndData = 1,
 };
 
 union LoadAddressLow {
     u32 raw;
     BitField<0, 1, LoadDataIndex> index;
-    BitField<2, 30, u32> addr_lo; ///< bits for the block in Memory from where the CP will fetch the
-                                  ///< state. DWORD aligned
+    BitField<2, 30, u32> addr_lo;
 };
 
-/**
- * PM4CMDLOADDATAINDEX can be used with the following opcodes (VI+)
- * - IT_LOAD_CONTEXT_REG_INDEX
- * - IT_LOAD_SH_REG_INDEX
- */
 struct PM4CmdLoadDataIndex {
     PM4Type3Header header;
-    LoadAddressLow addr_lo; ///< low 32 address bits for the block in memory from where the CP will
-                            ///< fetch the state
-    u32 addr_offset;        ///< addrLo.index = 1 Indexed mode
+    LoadAddressLow addr_lo;
+    u32 addr_offset;
     union {
-        BitField<0, 16, u32> reg_offset; ///< offset in DWords from the register base address
+        BitField<0, 16, u32> reg_offset;
         BitField<31, 1, LoadDataFormat> data_format;
         u32 raw;
     };
-    u32 num_dwords; ///< Number of DWords that the CP will fetch and write
-                    ///< into the chip. A value of zero will fetch nothing
+    u32 num_dwords;
 };
 
-/**
- * PM4CMDSETDATA can be used with the following opcodes:
- *
- * - IT_SET_CONFIG_REG
- * - IT_SET_CONTEXT_REG
- * - IT_SET_CONTEXT_REG_INDIRECT
- * - IT_SET_SH_REG
- * - IT_SET_SH_REG_INDEX
- * - IT_SET_UCONFIG_REG
- */
 struct PM4CmdSetData {
     PM4Type3Header header;
     union {
         u32 raw;
-        BitField<0, 16, u32> reg_offset; ///< Offset in DWords from the register base address
-        BitField<28, 4, u32> index;      ///< Index for UCONFIG/CONTEXT on CI+
-                                         ///< Program to zero for other opcodes and on SI
+        BitField<0, 16, u32> reg_offset;
+        BitField<28, 4, u32> index;
     };
     u32 data[0];
 
@@ -215,9 +185,9 @@ struct PM4CmdSetQueueReg {
     PM4Type3Header header;
     union {
         u32 raw;
-        BitField<0, 8, u32> reg_offset;  ///< Offset in DWords from the register base address
-        BitField<15, 1, u32> defer_exec; ///< Defer execution
-        BitField<16, 10, u32> vqid;      ///< Queue ID
+        BitField<0, 8, u32> reg_offset;
+        BitField<15, 1, u32> defer_exec;
+        BitField<16, 10, u32> vqid;
     };
     u32 data[0];
 
@@ -231,18 +201,18 @@ struct PM4CmdNop {
     u32 data_block[0];
 
     enum PayloadType : u32 {
-        DebugMarkerPush = 0x68750001u,      ///< Begin of GPU event scope
-        DebugMarkerPop = 0x68750002u,       ///< End of GPU event scope
-        DebugSetMarker = 0x68750003u,       ///< Set GPU event marker
-        SetVsharpInUdata = 0x68750004u,     ///< Indicates that V# will be set in the next packet
-        SetTsharpInUdata = 0x68750005u,     ///< Indicates that T# will be set in the next packet
-        SetSsharpInUdata = 0x68750006u,     ///< Indicates that S# will be set in the next packet
-        DebugColorMarkerPush = 0x6875000eu, ///< Begin of GPU event scope with color
-        PatchedFlip = 0x68750776u,          ///< Patched flip marker
-        PrepareFlip = 0x68750777u,          ///< Flip marker
-        PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
-        PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
-        PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
+        DebugMarkerPush = 0x68750001u,
+        DebugMarkerPop = 0x68750002u,
+        DebugSetMarker = 0x68750003u,
+        SetVsharpInUdata = 0x68750004u,
+        SetTsharpInUdata = 0x68750005u,
+        SetSsharpInUdata = 0x68750006u,
+        DebugColorMarkerPush = 0x6875000eu,
+        PatchedFlip = 0x68750776u,
+        PrepareFlip = 0x68750777u,
+        PrepareFlipLabel = 0x68750778u,
+        PrepareFlipInterrupt = 0x68750780u,
+        PrepareFlipInterruptLabel = 0x68750781u,
     };
 };
 
@@ -288,30 +258,27 @@ struct PM4CmdStrmoutBufferUpdate {
 
 struct PM4CmdDrawIndexOffset2 {
     PM4Type3Header header;
-    u32 max_size;       ///< Maximum number of indices
-    u32 index_offset;   ///< Zero based starting index number in the index buffer
-    u32 index_count;    ///< number of indices in the Index Buffer
-    u32 draw_initiator; ///< draw Initiator Register
+    u32 max_size;
+    u32 index_offset;
+    u32 index_count;
+    u32 draw_initiator;
 };
 
 struct PM4CmdDrawIndex2 {
     PM4Type3Header header;
-    u32 max_size;       ///< maximum number of indices
-    u32 index_base_lo;  ///< base Address Lo [31:1] of Index Buffer
-                        ///< (Word-Aligned). Written to the VGT_DMA_BASE register.
-    u32 index_base_hi;  ///< base Address Hi [39:32] of Index Buffer.
-                        ///< Written to the VGT_DMA_BASE_HI register
-    u32 index_count;    ///< number of indices in the Index Buffer.
-                        ///< Written to the VGT_NUM_INDICES register.
-    u32 draw_initiator; ///< written to the VGT_DRAW_INITIATOR register
+    u32 max_size;
+    u32 index_base_lo;
+    u32 index_base_hi;
+    u32 index_count;
+    u32 draw_initiator;
 };
 
 struct PM4CmdDrawIndexType {
     PM4Type3Header header;
     union {
         u32 raw;
-        BitField<0, 2, u32> index_type; ///< Select 16 Vs 32bit index
-        BitField<2, 2, u32> swap_mode;  ///< DMA swap mode
+        BitField<0, 2, u32> index_type;
+        BitField<2, 2, u32> swap_mode;
     };
 };
 
@@ -354,7 +321,6 @@ static u64 GetGpuPerfCounter() {
     return gpu_cycles;
 }
 
-// VGT_EVENT_INITIATOR.EVENT_TYPE
 enum class EventType : u32 {
     SampleStreamoutStats1 = 1,
     SampleStreamoutStats2 = 2,
@@ -421,9 +387,9 @@ struct PM4CmdEventWrite {
     PM4Type3Header header;
     union {
         u32 event_control;
-        BitField<0, 6, EventType> event_type;   ///< Event type written to VGT_EVENT_INITIATOR
-        BitField<8, 4, EventIndex> event_index; ///< Event index
-        BitField<20, 1, u32> inv_l2; ///< Send WBINVL2 op to the TC L2 cache when EVENT_INDEX = 0111
+        BitField<0, 6, EventType> event_type;
+        BitField<8, 4, EventIndex> event_index;
+        BitField<20, 1, u32> inv_l2;
     };
     u32 address[];
 
@@ -439,18 +405,18 @@ struct PM4CmdEventWriteEop {
     PM4Type3Header header;
     union {
         u32 event_control;
-        BitField<0, 6, u32> event_type;  ///< Event type written to VGT_EVENT_INITIATOR
-        BitField<8, 4, u32> event_index; ///< Event index
+        BitField<0, 6, u32> event_type;
+        BitField<8, 4, u32> event_index;
     };
     u32 address_lo;
     union {
         u32 data_control;
-        BitField<0, 16, u32> address_hi;          ///< High bits of address
-        BitField<24, 2, InterruptSelect> int_sel; ///< Selects interrupt action for end-of-pipe
-        BitField<29, 3, DataSelect> data_sel;     ///< Selects source of data
+        BitField<0, 16, u32> address_hi;
+        BitField<24, 2, InterruptSelect> int_sel;
+        BitField<29, 3, DataSelect> data_sel;
     };
-    u32 data_lo; ///< Value that will be written to memory when event occurs
-    u32 data_hi; ///< Value that will be written to memory when event occurs
+    u32 data_lo;
+    u32 data_hi;
 
     template <typename T>
     T* Address() const {
@@ -494,7 +460,6 @@ struct PM4CmdEventWriteEop {
 
         switch (int_sel.Value()) {
         case InterruptSelect::None: {
-            // No interrupt
             break;
         }
         case InterruptSelect::IrqOnly:
@@ -577,7 +542,6 @@ enum class CopyDataSrc : u32 {
     Memory = 1,
     TCL2 = 2,
     Gds = 3,
-    // Reserved = 4,
     Immediate = 5,
     Atomic = 6,
     GdsAtomic0 = 7,
@@ -590,7 +554,6 @@ enum class CopyDataDst : u32 {
     MemorySync = 1,
     TCL2 = 2,
     Gds = 3,
-    // Reserved = 4,
     MemoryAsync = 5,
 };
 
@@ -598,7 +561,6 @@ enum class CopyDataEngine : u32 {
     Me = 0,
     Pfp = 1,
     Ce = 2,
-    // Reserved = 3
 };
 
 struct PM4CmdCopyData {
@@ -631,8 +593,8 @@ struct PM4CmdRewind {
     PM4Type3Header header;
     union {
         u32 raw;
-        BitField<24, 1, u32> offload_enable; ///< Enable offload polling valid bit to IQ
-        BitField<31, 1, u32> valid;          ///< Set when subsequent packets are valid
+        BitField<24, 1, u32> offload_enable;
+        BitField<31, 1, u32> valid;
     };
 
     bool Valid() const {
@@ -756,20 +718,19 @@ struct PM4CmdEventWriteEos {
     PM4Type3Header header;
     union {
         u32 event_control;
-        BitField<0, 6, u32> event_type;  ///< Event type written to VGT_EVENT_INITIATOR
-        BitField<8, 4, u32> event_index; ///< Event index
+        BitField<0, 6, u32> event_type;
+        BitField<8, 4, u32> event_index;
     };
     u32 address_lo;
     union {
         u32 cmd_info;
-        BitField<0, 16, u32> address_hi;  ///< High bits of address
-        BitField<29, 3, Command> command; ///< Command
+        BitField<0, 16, u32> address_hi;
+        BitField<29, 3, Command> command;
     };
     union {
-        u32 data; ///< Fence value that will be written to memory when event occurs
-        BitField<0, 16, u32>
-            gds_index; ///< Indexed offset from the start of the segment within the partition
-        BitField<16, 16, u32> size; ///< Number of DWs to read from the GDS
+        u32 data;
+        BitField<0, 16, u32> gds_index;
+        BitField<16, 16, u32> size;
     };
 
     template <typename T = u32*>
@@ -801,8 +762,7 @@ struct PM4CmdEventWriteEos {
 struct PM4WriteConstRam {
     PM4Type3Header header;
     union {
-        BitField<0, 16, u32> offset; ///< Starting DW granularity offset into the constant RAM.
-                                     ///< Thus, bits[1:0] are zero.
+        BitField<0, 16, u32> offset;
         u32 dw1;
     };
     u32 data[0];
@@ -819,13 +779,11 @@ struct PM4WriteConstRam {
 struct PM4DumpConstRam {
     PM4Type3Header header;
     union {
-        BitField<0, 16, u32> offset; ///< Starting byte offset into the Constant RAM. The minimum
-                                     ///< granularity is 4 bytes
+        BitField<0, 16, u32> offset;
         u32 dw1;
     };
     union {
-        BitField<0, 15, u32>
-            num_dw; ///< Number of DWs to read from the constant RAM. The minimum granularity is DWs
+        BitField<0, 15, u32> num_dw;
         u32 dw2;
     };
     u32 addr_lo;
@@ -847,10 +805,10 @@ struct PM4DumpConstRam {
 
 struct PM4CmdDispatchDirect {
     PM4Type3Header header;
-    u32 dim_x;              ///< X dimensions of the array of thread groups to be dispatched
-    u32 dim_y;              ///< Y dimensions of the array of thread groups to be dispatched
-    u32 dim_z;              ///< Z dimensions of the array of thread groups to be dispatched
-    u32 dispatch_initiator; ///< Dispatch Initiator Register
+    u32 dim_x;
+    u32 dim_y;
+    u32 dim_z;
+    u32 dispatch_initiator;
 };
 
 struct PM4CmdDrawNumInstances {
@@ -871,15 +829,15 @@ struct PM4CmdDrawIndexBufferSize {
 
 struct PM4CmdIndirectBuffer {
     PM4Type3Header header;
-    u32 ibase_lo; ///< Indirect buffer base address, must be 4 byte aligned
+    u32 ibase_lo;
     union {
-        BitField<0, 16, u32> ibase_hi; ///< Indirect buffer base address
+        BitField<0, 16, u32> ibase_hi;
         u32 dw1;
     };
     union {
-        BitField<0, 20, u32> ib_size; ///< Indirect buffer size
-        BitField<20, 1, u32> chain;   ///< set to chain to IB allocations
-        BitField<24, 8, u32> vmid;    ///< Virtual memory domain ID for command buffer
+        BitField<0, 20, u32> ib_size;
+        BitField<20, 1, u32> chain;
+        BitField<24, 8, u32> vmid;
         u32 dw2;
     };
 
@@ -892,31 +850,30 @@ struct PM4CmdIndirectBuffer {
 struct PM4CmdReleaseMem {
     PM4Type3Header header;
     union {
-        BitField<0, 6, u32> event_type;  ///< Event type written to VGT_EVENT_INITIATOR
-        BitField<8, 4, u32> event_index; ///< Event index
+        BitField<0, 6, u32> event_type;
+        BitField<8, 4, u32> event_index;
         BitField<12, 1, u32> tcl1_vol_action_ena;
         BitField<13, 1, u32> tc_vol_action_ena;
         BitField<15, 1, u32> tc_wb_action_ena;
         BitField<16, 1, u32> tcl1__action_ena;
         BitField<17, 1, u32> tc_action_ena;
-        BitField<25, 2, u32> cache_policy; ///< Cache Policy setting used for writing fences and
-                                           ///< timestamps to the TCL2
+        BitField<25, 2, u32> cache_policy;
         u32 dw1;
     };
     union {
-        BitField<16, 2, u32> dst_sel;             ///< destination select
-        BitField<24, 3, InterruptSelect> int_sel; ///< selects interrupt action for end-of-pipe
-        BitField<29, 3, DataSelect> data_sel;     ///< selects source of data
+        BitField<16, 2, u32> dst_sel;
+        BitField<24, 3, InterruptSelect> int_sel;
+        BitField<29, 3, DataSelect> data_sel;
         u32 dw2;
     };
-    u32 address_lo; ///< low bits of address
-    u32 address_hi; ///< high bits of address
+    u32 address_lo;
+    u32 address_hi;
     union {
         struct {
-            u16 gds_index; ///< Byte offset into GDS to copy from
-            u16 num_dw;    ///< Number of DWORDS of GDS to copy
+            u16 gds_index;
+            u16 num_dw;
         };
-        u32 data_lo; ///< value that will be written to memory when event occurs
+        u32 data_lo;
     };
     u32 data_hi;
 
@@ -963,7 +920,6 @@ struct PM4CmdReleaseMem {
 
         switch (int_sel.Value()) {
         case InterruptSelect::None: {
-            // No interrupt
             break;
         }
         case InterruptSelect::IrqUndocumented:
@@ -1011,15 +967,15 @@ struct PM4CmdDispatchIndirect {
     };
 
     PM4Type3Header header;
-    u32 data_offset;        ///< Byte aligned offset where the required data structure starts
-    u32 dispatch_initiator; ///< Dispatch Initiator Register
+    u32 data_offset;
+    u32 dispatch_initiator;
 };
 
 struct PM4CmdDispatchIndirectMec {
     PM4Type3Header header;
     u32 address0;
     u32 address1;
-    u32 dispatch_initiator; ///< Dispatch Initiator Register
+    u32 dispatch_initiator;
 
     template <typename T>
     T Address() const {
@@ -1036,37 +992,33 @@ struct DrawIndirectArgs {
 static_assert(sizeof(DrawIndirectArgs) == 0x10u);
 
 struct PM4CmdDrawIndirect {
-    PM4Type3Header header; ///< header
-    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    PM4Type3Header header;
+    u32 data_offset;
     union {
         u32 dw2;
-        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
-                                           ///< BaseVertexLocation it fetched from memory
+        BitField<0, 16, u32> base_vtx_loc;
     };
     union {
         u32 dw3;
-        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
-                                             ///< StartInstanceLocation it fetched from memory
+        BitField<0, 16, u32> start_inst_loc;
     };
-    u32 draw_initiator; ///< Draw Initiator Register
+    u32 draw_initiator;
 };
 
 struct PM4CmdDrawIndirectMulti {
-    PM4Type3Header header; ///< header
-    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    PM4Type3Header header;
+    u32 data_offset;
     union {
         u32 dw2;
-        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
-                                           ///< BaseVertexLocation it fetched from memory
+        BitField<0, 16, u32> base_vtx_loc;
     };
     union {
         u32 dw3;
-        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
-                                             ///< StartInstanceLocation it fetched from memory
+        BitField<0, 16, u32> start_inst_loc;
     };
-    u32 count;          ///< Count of data structures to loop through before going to next packet
-    u32 stride;         ///< Stride in memory from one data structure to the next
-    u32 draw_initiator; ///< Draw Initiator Register
+    u32 count;
+    u32 stride;
+    u32 draw_initiator;
 };
 
 struct DrawIndexedIndirectArgs {
@@ -1079,64 +1031,56 @@ struct DrawIndexedIndirectArgs {
 static_assert(sizeof(DrawIndexedIndirectArgs) == 0x14u);
 
 struct PM4CmdDrawIndexIndirect {
-    PM4Type3Header header; ///< header
-    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    PM4Type3Header header;
+    u32 data_offset;
     union {
         u32 dw2;
-        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
-                                           ///< BaseVertexLocation it fetched from memory
+        BitField<0, 16, u32> base_vtx_loc;
     };
     union {
         u32 dw3;
-        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
-                                             ///< StartInstanceLocation it fetched from memory
+        BitField<0, 16, u32> start_inst_loc;
     };
-    u32 draw_initiator; ///< Draw Initiator Register
+    u32 draw_initiator;
 };
 
 struct PM4CmdDrawIndexIndirectMulti {
-    PM4Type3Header header; ///< header
-    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    PM4Type3Header header;
+    u32 data_offset;
     union {
         u32 dw2;
-        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
-                                           ///< BaseVertexLocation it fetched from memory
+        BitField<0, 16, u32> base_vtx_loc;
     };
     union {
         u32 dw3;
-        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
-                                             ///< StartInstanceLocation it fetched from memory
+        BitField<0, 16, u32> start_inst_loc;
     };
-    u32 count;          ///< Count of data structures to loop through before going to next packet
-    u32 stride;         ///< Stride in memory from one data structure to the next
-    u32 draw_initiator; ///< Draw Initiator Register
+    u32 count;
+    u32 stride;
+    u32 draw_initiator;
 };
 
 struct PM4CmdDrawIndexIndirectCountMulti {
-    PM4Type3Header header; ///< header
-    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    PM4Type3Header header;
+    u32 data_offset;
     union {
         u32 dw2;
-        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
-                                           ///< BaseVertexLocation it fetched from memory
+        BitField<0, 16, u32> base_vtx_loc;
     };
     union {
         u32 dw3;
-        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
-                                             ///< StartInstanceLocation it fetched from memory
+        BitField<0, 16, u32> start_inst_loc;
     };
     union {
         u32 dw4;
-        BitField<0, 16, u32> draw_index_loc; ///< register offset to write the Draw Index count
-        BitField<30, 1, u32>
-            count_indirect_enable; ///< Indicates the data structure count is in memory
-        BitField<31, 1, u32>
-            draw_index_enable; ///< Enables writing of Draw Index count to DRAW_INDEX_LOC
+        BitField<0, 16, u32> draw_index_loc;
+        BitField<30, 1, u32> count_indirect_enable;
+        BitField<31, 1, u32> draw_index_enable;
     };
-    u32 count;          ///< Count of data structures to loop through before going to next packet
-    u64 count_addr;     ///< DWord aligned Address[31:2]; Valid if countIndirectEnable is set
-    u32 stride;         ///< Stride in memory from one data structure to the next
-    u32 draw_initiator; ///< Draw Initiator Register
+    u32 count;
+    u64 count_addr;
+    u32 stride;
+    u32 draw_initiator;
 };
 
 struct PM4CmdMemSemaphore {
@@ -1154,18 +1098,18 @@ struct PM4CmdMemSemaphore {
         Write = 1u,
     };
 
-    PM4Type3Header header; ///< header
+    PM4Type3Header header;
     union {
         u32 dw1;
-        BitField<3, 29, u32> addr_lo; ///< Semaphore address bits [31:3]
+        BitField<3, 29, u32> addr_lo;
     };
     union {
         u32 dw2;
-        BitField<0, 8, u32> addr_hi;             ///< Semaphore address bits [39:32]
-        BitField<16, 1, u32> use_mailbox;        ///< Enables waiting until mailbox is written to
-        BitField<20, 1, SignalType> signal_type; ///< Indicates the type of signal sent
+        BitField<0, 8, u32> addr_hi;
+        BitField<16, 1, u32> use_mailbox;
+        BitField<20, 1, SignalType> signal_type;
         BitField<24, 2, ClientCode> client_code;
-        BitField<29, 3, Select> sem_sel; ///< Indicates whether to do a signal or wait operation
+        BitField<29, 3, Select> sem_sel;
     };
 
     template <typename T>
@@ -1203,16 +1147,14 @@ struct PM4CmdMemSemaphore {
 struct PM4CmdCondExec {
     PM4Type3Header header;
     union {
-        BitField<2, 30, u32> bool_addr_lo; ///< low 32 address bits for the block in memory from
-                                           ///< where the CP will fetch the condition
+        BitField<2, 30, u32> bool_addr_lo;
     };
     union {
-        BitField<0, 16, u32> bool_addr_hi; ///< high address bits for the condition
+        BitField<0, 16, u32> bool_addr_hi;
         BitField<28, 4, u32> command;
     };
     union {
-        BitField<0, 14, u32> exec_count; ///< Number of DWords that the CP will skip
-                                         ///< if bool pointed to is zero
+        BitField<0, 14, u32> exec_count;
     };
 
     bool* Address() const {
@@ -1221,4 +1163,4 @@ struct PM4CmdCondExec {
     }
 };
 
-} // namespace AmdGpu
+}

@@ -13,7 +13,7 @@ namespace ImGui {
 
 namespace Core::TextureManager {
 struct Inner;
-} // namespace Core::TextureManager
+}
 
 class RefCountedTexture {
     Core::TextureManager::Inner* inner;
@@ -45,4 +45,4 @@ public:
     explicit(false) operator bool() const;
 };
 
-}; // namespace ImGui
+};

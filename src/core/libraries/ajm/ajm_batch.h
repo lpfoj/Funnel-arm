@@ -77,4 +77,4 @@ void* BatchJobRunSplitBufferRa(void* p_buffer, u32 instance_id, u64 flags,
                                size_t num_data_output_buffers, void* p_sideband_output,
                                size_t sideband_output_size, void* p_return_address);
 
-} // namespace Libraries::Ajm
+}

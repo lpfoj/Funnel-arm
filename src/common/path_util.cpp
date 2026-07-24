@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fstream>
+#include <cstdlib>
 #include <unordered_map>
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
-#include "common/types.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CFBundle.h>
@@ -16,12 +16,10 @@
 
 #ifndef MAX_PATH
 #ifdef _WIN32
-// This is the maximum number of UTF-16 code units permissible in Windows file paths
 #define MAX_PATH 260
 #include <Shlobj.h>
 #include <windows.h>
 #else
-// This is the maximum number of UTF-8 code units permissible in all other OSes' file paths
 #define MAX_PATH 1024
 #endif
 #endif
@@ -85,12 +83,22 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 #endif
 
 static auto UserPaths = [] {
-    // Try the portable user directory first.
     auto user_dir = std::filesystem::current_path() / PORTABLE_DIR;
     if (!std::filesystem::exists(user_dir)) {
-        // If it doesn't exist, use the standard path for the platform instead.
-        // NOTE: On Windows we currently just create the portable directory instead.
-#ifdef __APPLE__
+#if defined(__ANDROID__)
+        const char* shadps4_user_dir = getenv("SHADPS4_USER_DIR");
+        if (shadps4_user_dir != nullptr && strlen(shadps4_user_dir) > 0) {
+            user_dir = std::filesystem::path(shadps4_user_dir);
+        } else {
+            const char* android_home = getenv("HOME");
+            if (android_home != nullptr && strlen(android_home) > 0) {
+                user_dir =
+                    std::filesystem::path(android_home) / "files" / "lsx4-home" / "native";
+            } else {
+                user_dir = "/data/user/0/app.lsx4.android/files/lsx4-home/native";
+            }
+        }
+#elif defined(__APPLE__)
         user_dir =
             std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
 #elif defined(__linux__)
@@ -110,7 +118,7 @@ static auto UserPaths = [] {
     std::unordered_map<PathType, fs::path> paths;
 
     const auto create_path = [&](PathType shad_path, const fs::path& new_path) {
-        std::filesystem::create_directory(new_path);
+        std::filesystem::create_directories(new_path);
         paths.insert_or_assign(shad_path, new_path);
     };
 
@@ -130,9 +138,6 @@ static auto UserPaths = [] {
     create_path(PathType::CustomConfigs, user_dir / CUSTOM_CONFIGS);
     create_path(PathType::CacheDir, user_dir / CACHE_DIR);
     create_path(PathType::FontsDir, user_dir / FONTS_DIR);
-    create_path(PathType::TrophyDir, user_dir / TROPHY_DIR);
-    create_path(PathType::HomeDir, user_dir / HOME_DIR);
-    create_path(PathType::CustomModulesDir, user_dir / CUSTOM_MODULES_DIR);
 
     std::ofstream notice_file(user_dir / CUSTOM_TROPHY / "Notice.txt");
     if (notice_file.is_open()) {
@@ -202,7 +207,6 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
         return std::nullopt;
     }
 
-    // Check if this is the game we're looking for
     if (dir.filename() == game_id && fs::exists(dir / "sce_sys" / "param.sfo")) {
         auto eboot_path = dir / "eboot.bin";
         if (fs::exists(eboot_path)) {
@@ -210,7 +214,6 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
         }
     }
 
-    // Recursively search subdirectories
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(dir, ec)) {
         if (!entry.is_directory()) {
@@ -224,4 +227,4 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
     return std::nullopt;
 }
 
-} // namespace Common::FS
+}

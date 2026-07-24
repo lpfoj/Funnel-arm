@@ -9,7 +9,7 @@
 namespace VideoCore {
 class BufferCache;
 class TextureCache;
-} // namespace VideoCore
+}
 
 namespace Serialization {
 struct Archive;
@@ -50,11 +50,15 @@ public:
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
 
+    u64 GetPipelineHash() const noexcept {
+        return compute_key.value;
+    }
+
 private:
     ComputePipelineKey compute_key;
 };
 
-} // namespace Vulkan
+}
 
 template <>
 struct std::hash<Vulkan::ComputePipelineKey> {

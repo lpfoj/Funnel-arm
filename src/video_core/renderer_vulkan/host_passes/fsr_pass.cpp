@@ -1,8 +1,8 @@
-//  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "core/emulator_settings.h"
+#include "common/config.h"
 #include "video_core/host_shaders/fsr_comp.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -164,7 +164,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         CreateImages(img);
     }
 
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+    if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/FSR",
         });
@@ -206,7 +206,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 
     if (settings.use_rcas) {
 
-        { // easu
+        {
             std::array<vk::DescriptorImageInfo, 3> img_info{{
                 {
                     .imageView = input,
@@ -277,7 +277,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .pImageMemoryBarriers = img_barrier.data(),
         });
 
-        { // rcas
+        {
             consts = {};
             FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), settings.rcas_attenuation);
             consts.Sample[0] = hdr ? 1 : 0;
@@ -326,7 +326,6 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         }
 
     } else {
-        // only easu
         std::array<vk::DescriptorImageInfo, 3> img_info{{
             {
                 .imageView = input,
@@ -387,7 +386,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .pImageMemoryBarriers = return_barrier.data(),
     });
 
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+    if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 
@@ -407,13 +406,6 @@ void FsrPass::ResizeAndInvalidate(u32 width, u32 height) {
 void FsrPass::CreateImages(Img& img) const {
     img.dirty = false;
 
-    // Destroy previous resources before re-creating at new size.
-    // Views first, then images (views reference the images).
-    img.intermediary_image_view.reset();
-    img.output_image_view.reset();
-    img.intermediary_image.Destroy();
-    img.output_image.Destroy();
-
     vk::ImageCreateInfo image_create_info{
         .imageType = vk::ImageType::e2D,
         .format = vk::Format::eR16G16B16A16Sfloat,
@@ -425,7 +417,6 @@ void FsrPass::CreateImages(Img& img) const {
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
-        // .tiling = vk::ImageTiling::eOptimal,
         .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
@@ -459,4 +450,4 @@ void FsrPass::CreateImages(Img& img) const {
     SetObjectName(device, img.output_image_view.get(), "FSR Output ImageView #{}", img.id);
 }
 
-} // namespace Vulkan::HostPasses
+}

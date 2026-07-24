@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//
-// TODO: remove this file when jthread is supported by all compilation targets
-//
 
 #pragma once
 
@@ -29,12 +26,11 @@ bool StoppableTimedWait(std::stop_token token, const std::chrono::duration<Rep, 
     std::condition_variable_any cv;
     std::mutex m;
 
-    // Perform the timed wait.
     std::unique_lock lk{m};
     return !cv.wait_for(lk, token, rel_time, [&] { return token.stop_requested(); });
 }
 
-} // namespace Common
+}
 
 #else
 
@@ -64,25 +60,19 @@ public:
         unique_lock lk{m_lock};
 
         if (m_stop_requested) {
-            // Already set, nothing to do.
             return false;
         }
 
-        // Mark stop requested.
         m_stop_requested = true;
 
         while (!m_callbacks.empty()) {
-            // Get an iterator to the first element.
             const auto it = m_callbacks.begin();
 
-            // Move the callback function out of the map.
             function<void()> f;
             swap(it->second, f);
 
-            // Erase the now-empty map element.
             m_callbacks.erase(it);
 
-            // Run the callback.
             if (f) {
                 f();
             }
@@ -100,15 +90,12 @@ public:
         unique_lock lk{m_lock};
 
         if (m_stop_requested) {
-            // Stop already requested. Don't insert anything,
-            // just run the callback synchronously.
             if (f) {
                 f();
             }
             return 0;
         }
 
-        // Insert the callback.
         stop_state_callback ret = ++m_next_callback;
         m_callbacks.emplace(ret, std::move(f));
         return ret;
@@ -126,7 +113,7 @@ private:
     bool m_stop_requested{false};
 };
 
-} // namespace polyfill
+}
 
 class stop_token;
 class stop_source;
@@ -328,7 +315,7 @@ private:
     thread m_thread;
 };
 
-} // namespace std
+}
 
 namespace Common {
 
@@ -359,7 +346,6 @@ bool StoppableTimedWait(std::stop_token token, const std::chrono::duration<Rep, 
     std::mutex m;
 
     std::stop_callback cb(token, [&] {
-        // Wake up the waiting thread.
         {
             std::scoped_lock lk{m};
             stop_requested = true;
@@ -367,11 +353,10 @@ bool StoppableTimedWait(std::stop_token token, const std::chrono::duration<Rep, 
         cv.notify_one();
     });
 
-    // Perform the timed wait.
     std::unique_lock lk{m};
     return !cv.wait_for(lk, rel_time, [&] { return stop_requested; });
 }
 
-} // namespace Common
+}
 
 #endif

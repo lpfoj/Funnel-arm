@@ -21,9 +21,6 @@ enum class MemoryPermission : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 
-/**
- * Represents the user virtual address space backed by a dmem memory block
- */
 class AddressSpace {
 public:
     explicit AddressSpace();
@@ -63,28 +60,18 @@ public:
         return user_size;
     }
 
-    /**
-     * @brief Maps memory to the specified virtual address.
-     * @param virtual_addr The base address to place the mapping.
-     *        If zero is provided an address in system managed area is picked.
-     * @param size The size of the area to map.
-     * @param phys_addr The offset of the backing file handle to map.
-     *                  The same backing region may be aliased into different virtual regions.
-     *                  If zero is provided the mapping is considered as private.
-     * @return A pointer to the mapped memory.
-     */
+    [[nodiscard]] bool ContainsOwnedRange(VAddr virtual_addr, u64 size) const noexcept;
+
     void* Map(VAddr virtual_addr, u64 size, PAddr phys_addr = -1, bool exec = false);
 
-    /// Memory maps a specified file descriptor.
     void* MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, uintptr_t fd);
 
-    /// Unmaps specified virtual memory area.
     void Unmap(VAddr virtual_addr, u64 size);
 
-    /// Protects requested region.
+    void ReserveRange(VAddr virtual_addr, u64 size);
+
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
 
-    // Returns an interval set containing all usable regions.
     boost::icl::interval_set<VAddr> GetUsableRegions();
 
 private:
@@ -99,4 +86,4 @@ private:
     u64 user_size{};
 };
 
-} // namespace Core
+}

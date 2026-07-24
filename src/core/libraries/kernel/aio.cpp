@@ -261,8 +261,6 @@ s32 PS4_SYSV_ABI sceKernelAioSubmitWriteCommands(OrbisKernelAioRWRequest req[], 
 
     id_index = (id_index + 1) % MAX_QUEUE;
 
-    // skip id_index equals 0 , because sceKernelAioCancelRequest will submit id
-    // equal to 0
     if (!id_index)
         id_index++;
 
@@ -336,4 +334,4 @@ void RegisterAio(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("lgK+oIWkJyA", "libkernel", 1, "libkernel", sceKernelAioWaitRequests);
 }
 
-} // namespace Libraries::Kernel
+}

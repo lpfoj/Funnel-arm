@@ -35,4 +35,4 @@ private:
     vk::UniqueSampler handle;
 };
 
-} // namespace VideoCore
+}

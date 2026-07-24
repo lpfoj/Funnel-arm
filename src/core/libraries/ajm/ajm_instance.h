@@ -113,4 +113,4 @@ private:
     std::unique_ptr<AjmCodec> m_codec;
 };
 
-} // namespace Libraries::Ajm
+}

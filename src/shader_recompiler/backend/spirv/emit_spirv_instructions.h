@@ -3,8 +3,14 @@
 
 #pragma once
 
+#include <span>
+#include <vector>
 #include <sirit/sirit.h>
 #include "common/types.h"
+
+namespace AmdGpu {
+enum class ImageType : u64;
+}
 
 namespace Shader::IR {
 enum class Attribute : u64;
@@ -12,7 +18,7 @@ enum class ScalarReg : u32;
 enum class Patch : u64;
 class Inst;
 class Value;
-} // namespace Shader::IR
+}
 
 namespace Shader::Backend::SPIRV {
 
@@ -20,7 +26,6 @@ using Sirit::Id;
 
 class EmitContext;
 
-// Microinstruction emitters
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst);
 void EmitVoid(EmitContext& ctx);
 Id EmitIdentity(EmitContext& ctx, const IR::Value& value);
@@ -115,6 +120,7 @@ Id EmitBufferAtomicFCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index);
 Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp);
 void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 comp);
+void EmitSetAttributeVector(EmitContext& ctx, IR::Attribute attr, std::span<const Id> values);
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index);
 void EmitSetTcsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id comp_index);
 Id EmitReadTcsGenericOuputAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
@@ -239,9 +245,9 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
-Id EmitFPMax32(EmitContext& ctx, Id a, Id b);
+Id EmitFPMax32(EmitContext& ctx, Id a, Id b, bool is_legacy = false);
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b);
-Id EmitFPMin32(EmitContext& ctx, Id a, Id b);
+Id EmitFPMin32(EmitContext& ctx, Id a, Id b, bool is_legacy = false);
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b);
 Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c);
 Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c);
@@ -425,6 +431,16 @@ Id EmitConvertU32U8(EmitContext& ctx, Id value);
 Id EmitConvertS32S8(EmitContext& ctx, Id value);
 Id EmitConvertS32S16(EmitContext& ctx, Id value);
 
+Id SignedTexelCoordinates(EmitContext& ctx, AmdGpu::ImageType view_type,
+                          const IR::Value& ir_coords, Id coords);
+bool CollectAbsorbedVectorSignedCoordinateChain(EmitContext& ctx,
+                                                AmdGpu::ImageType view_type,
+                                                const IR::Value& ir_coords,
+                                                std::vector<IR::Inst*>& instructions);
+bool CollectAbsorbedVectorFloatCoordinateChain(EmitContext& ctx,
+                                               AmdGpu::ImageType view_type,
+                                               const IR::Value& ir_coords,
+                                               std::vector<IR::Inst*>& instructions);
 Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1, Id address2,
                       Id address3, Id address4);
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
@@ -478,4 +494,4 @@ Id EmitDataConsume(EmitContext& ctx, u32 gds_addr, u32 binding);
 void EmitEmitVertex(EmitContext& ctx);
 void EmitEmitPrimitive(EmitContext& ctx);
 
-} // namespace Shader::Backend::SPIRV
+}

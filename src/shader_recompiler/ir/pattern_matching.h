@@ -6,8 +6,6 @@
 
 namespace Shader::Optimiation::PatternMatching {
 
-// Attempt at pattern matching for Insts and Values
-// Needs improvement, mostly a convenience
 
 template <typename Derived>
 struct MatchObject {
@@ -104,7 +102,6 @@ inline auto MakeInstPattern(Args&&... args) {
     return MatchInstObject<opcode, Args...>(std::forward<Args>(args)...);
 }
 
-// Conveniences. TODO probably simpler way of doing this
 #define M_READCONST(...) MakeInstPattern<IR::Opcode::ReadConst>(__VA_ARGS__)
 #define M_GETUSERDATA(...) MakeInstPattern<IR::Opcode::GetUserData>(__VA_ARGS__)
 #define M_BITFIELDUEXTRACT(...) MakeInstPattern<IR::Opcode::BitFieldUExtract>(__VA_ARGS__)
@@ -126,4 +123,4 @@ inline auto MakeInstPattern(Args&&... args) {
 #define M_COMPOSITECONSTRUCTU32X4(...)                                                             \
     MakeInstPattern<IR::Opcode::CompositeConstructU32x4>(__VA_ARGS__)
 
-} // namespace Shader::Optimiation::PatternMatching
+}

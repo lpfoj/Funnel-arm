@@ -34,6 +34,9 @@ public:
         return scheduler;
     }
 
+    [[nodiscard]] bool IsDeviceTerminal() const noexcept;
+    void MarkDeviceTerminal(vk::Result result, const char* where) noexcept;
+
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
         return buffer_cache;
     }
@@ -60,12 +63,19 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
+    void TrackPendingCompletionRead(VAddr addr, u64 size);
+    void UntrackPendingCompletionRead(VAddr addr, u64 size);
+    void TrackMemoryWaitWrite(VAddr addr, u64 size);
+    void UntrackMemoryWaitWrite(VAddr addr, u64 size);
+    [[nodiscard]] bool ConsumeMemoryWaitWriteFault(VAddr addr);
+    bool IsMemoryGpuModified(VAddr addr, u64 size);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
+    void CompletionWaitBarrier();
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -115,6 +125,54 @@ private:
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
 
+#ifdef __ANDROID__
+    void ExecutorBindGuestGraphicsPipeline(const GraphicsPipeline* pipeline,
+                                           vk::CommandBuffer cmdbuf);
+
+    struct ExecutorGpuLatePassProbeState {
+        struct ImageIdentity {
+            VideoCore::ImageId image_id{};
+            VAddr desc_guest_address{};
+            VAddr image_guest_address{};
+            u64 image_uid{};
+            u64 backing_identity{};
+            u64 image_handle{};
+            VideoCore::SubresourceRange view_range{};
+        };
+
+        u64 epoch{};
+        u64 attachment_signature{};
+        u64 selected_sequence{};
+        u64 fragment_hash{};
+        std::array<ImageIdentity, AmdGpu::NUM_COLOR_BUFFERS> color_images{};
+        u32 color_count{};
+        ImageIdentity depth_image{};
+        u32 depth_render_control_raw{};
+        u32 depth_control_raw{};
+        u32 depth_clear_enable{};
+        u32 depth_write_enable{};
+        u32 depth_effective_write{};
+        u32 scheduler_depth_test{};
+        u32 scheduler_depth_write{};
+        u32 scheduler_depth_compare{};
+        VAddr depth_read_address{};
+        VAddr depth_write_address{};
+        VAddr stencil_read_address{};
+        VAddr stencil_write_address{};
+        VAddr htile_address{};
+        VAddr desc_stencil_address{};
+        VAddr desc_htile_address{};
+        bool armed{};
+    };
+
+    void ExecutorGpuLatePassTransition(u64 next_attachment_signature, u64 next_sequence,
+                                       const char* reason);
+    void ExecutorGpuLatePassArm(u64 attachment_signature, u64 selected_sequence,
+                                u64 fragment_hash);
+    void ExecutorGpuLatePassFlush(u64 next_attachment_signature, u64 next_sequence,
+                                  const char* reason);
+#endif
+
 private:
     friend class VideoCore::BufferCache;
 
@@ -136,7 +194,6 @@ private:
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
 
-    u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
@@ -145,8 +202,38 @@ private:
     boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    struct ExecutorGpuProbeBinding {
+        VideoCore::ImageId image_id{};
+        u32 stage{};
+        u64 stage_hash{};
+    };
+    boost::container::static_vector<ExecutorGpuProbeBinding, Shader::NUM_IMAGES>
+        executor_gpu_probe_sampled_images;
+    boost::container::static_vector<ExecutorGpuProbeBinding, Shader::NUM_IMAGES>
+        executor_gpu_probe_storage_images;
+    u64 executor_gpu_probe_draw_sequence{};
+    u64 executor_gpu_probe_dispatch_sequence{};
+    u64 memory_budget_submit_counter{};
+    size_t cached_device_memory_usage{};
+    bool memory_budget_sample_valid{};
+#ifdef __ANDROID__
+    ExecutorGpuLatePassProbeState executor_gpu_late_pass_probe{};
+    vk::CommandBuffer executor_guest_graphics_cmdbuf{};
+    vk::Pipeline executor_guest_graphics_pipeline{};
+    u64 executor_guest_dynamic_epoch{};
+    u64 executor_guest_rendering_epoch{};
+    u64 executor_unpublished_actual_draws{};
+    u64 executor_completion_barrier_epoch{};
+    u64 executor_completion_barrier_tick{};
+    u64 executor_completion_work_serial{};
+    u64 executor_completion_barrier_work_serial{};
+    u64 executor_completion_barrier_calls{};
+    u64 executor_completion_barrier_emitted{};
+    u64 executor_completion_barrier_elided{};
+    bool executor_completion_barrier_valid{};
+#endif
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 };
 
-} // namespace Vulkan
+}

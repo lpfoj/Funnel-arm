@@ -31,4 +31,4 @@ private:
     vk::UniqueSampler sampler{};
 };
 
-} // namespace Vulkan::HostPasses
+}

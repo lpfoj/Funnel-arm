@@ -120,4 +120,4 @@ Id EmitCompositeShuffleF32x4(EmitContext& ctx, Id composite1, Id composite2, u32
     return ctx.OpVectorShuffle(ctx.F32[4], composite1, composite2, comp0, comp1, comp2, comp3);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

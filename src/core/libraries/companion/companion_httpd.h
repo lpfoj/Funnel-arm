@@ -13,7 +13,6 @@ class SymbolsResolver;
 
 namespace Libraries::CompanionHttpd {
 
-// OrbisCompanionHttpdEvent event codes
 constexpr int ORBIS_COMPANION_HTTPD_EVENT_CONNECT = 0x10000001;
 constexpr int ORBIS_COMPANION_HTTPD_EVENT_DISCONNECT = 0x10000002;
 
@@ -88,4 +87,4 @@ s32 PS4_SYSV_ABI sceCompanionHttpdUnregisterRequestBodyReceptionCallback();
 s32 PS4_SYSV_ABI sceCompanionHttpdUnregisterRequestCallback();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::CompanionHttpd
+}

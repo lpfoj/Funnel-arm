@@ -38,4 +38,4 @@ void SerializeOptionsConfig(ImGuiTextBuffer* buf) {
     buf->appendf("frame_dump_render_on_collapse=%d\n", Options.frame_dump_render_on_collapse);
 }
 
-} // namespace Core::Devtools
+}

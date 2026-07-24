@@ -34,4 +34,4 @@ s64 PS4_SYSV_ABI sys_recvmsg(OrbisNetId s, OrbisNetMsghdr* msg, int flags);
 int PS4_SYSV_ABI sys_htons(u16 v);
 int PS4_SYSV_ABI sys_htonl(u32 v);
 
-} // namespace Libraries::Net
+}

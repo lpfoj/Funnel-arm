@@ -5,17 +5,25 @@
 #include "common/arch.h"
 #include "common/types.h"
 
-#ifdef ARCH_X86_64
+#if defined(ARCH_X86_64)
 #include <xmmintrin.h>
-#else
-// FIXME
-typedef __int128 __m128;
 #endif
+
+namespace Common {
+
+#if defined(ARCH_X86_64)
+using VaFpReg = __m128;
+#else
+using VaFpReg = u128;
+#endif
+
+}
 
 #define VA_ARGS                                                                                    \
     uint64_t rdi, uint64_t rsi, uint64_t rdx, uint64_t rcx, uint64_t r8, uint64_t r9,              \
-        uint64_t overflow_arg_area, __m128 xmm0, __m128 xmm1, __m128 xmm2, __m128 xmm3,            \
-        __m128 xmm4, __m128 xmm5, __m128 xmm6, __m128 xmm7
+        uint64_t overflow_arg_area, ::Common::VaFpReg xmm0, ::Common::VaFpReg xmm1,                \
+        ::Common::VaFpReg xmm2, ::Common::VaFpReg xmm3, ::Common::VaFpReg xmm4,                   \
+        ::Common::VaFpReg xmm5, ::Common::VaFpReg xmm6, ::Common::VaFpReg xmm7
 
 #define VA_CTX(ctx)                                                                                \
     alignas(16)::Common::VaCtx ctx{};                                                              \
@@ -40,7 +48,6 @@ typedef __int128 __m128;
 
 namespace Common {
 
-// https://stackoverflow.com/questions/4958384/what-is-the-format-of-the-x86-64-va-list-structure
 
 struct VaList {
     u32 gp_offset;
@@ -51,7 +58,7 @@ struct VaList {
 
 struct VaRegSave {
     u64 gp[6];
-    __m128 fp[8];
+    VaFpReg fp[8];
 };
 
 struct VaCtx {
@@ -115,4 +122,4 @@ T* vaArgPtr(VaList* l) {
     return vaArgOverflowArgArea<T*, 1, 8>(l);
 }
 
-} // namespace Common
+}

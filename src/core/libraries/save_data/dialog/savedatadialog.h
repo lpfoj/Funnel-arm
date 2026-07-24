@@ -30,4 +30,4 @@ CommonDialog::Error PS4_SYSV_ABI sceSaveDataDialogTerminate();
 CommonDialog::Status PS4_SYSV_ABI sceSaveDataDialogUpdateStatus();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::SaveData::Dialog
+}

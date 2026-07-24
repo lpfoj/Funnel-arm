@@ -23,7 +23,6 @@ Error PS4_SYSV_ABI scePlayGoDialogGetResult(OrbisPlayGoDialogResult* result) {
     if (result == nullptr) {
         return Error::ARG_NULL;
     }
-    // Result value 3 allows games to proceed.
     result->result = static_cast<Result>(3);
     return Error::OK;
 }
@@ -74,4 +73,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  scePlayGoDialogUpdateStatus);
 };
 
-} // namespace Libraries::PlayGo::Dialog
+}

@@ -24,7 +24,6 @@ struct OpcodeMeta {
     std::array<Type, 6> arg_types;
 };
 
-// using enum Type;
 constexpr Type Void{Type::Void};
 constexpr Type Opaque{Type::Opaque};
 constexpr Type ScalarReg{Type::ScalarReg};
@@ -74,27 +73,23 @@ constexpr u8 NUM_ARGS[]{
 #include "opcodes.inc"
 #undef OPCODE
 };
-} // namespace Detail
+}
 
-/// Get return type of an opcode
 [[nodiscard]] inline Type TypeOf(Opcode op) noexcept {
     return Detail::META_TABLE[static_cast<size_t>(op)].type;
 }
 
-/// Get the number of arguments an opcode accepts
 [[nodiscard]] constexpr inline size_t NumArgsOf(Opcode op) noexcept {
     return static_cast<size_t>(Detail::NUM_ARGS[static_cast<size_t>(op)]);
 }
 
-/// Get the required type of an argument of an opcode
 [[nodiscard]] inline Type ArgTypeOf(Opcode op, size_t arg_index) noexcept {
     return Detail::META_TABLE[static_cast<size_t>(op)].arg_types[arg_index];
 }
 
-/// Get the name of an opcode
 [[nodiscard]] std::string_view NameOf(Opcode op);
 
-} // namespace Shader::IR
+}
 
 template <>
 struct fmt::formatter<Shader::IR::Opcode> {

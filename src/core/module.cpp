@@ -9,12 +9,39 @@
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
+#include "core/aerolib/stubs.h"
 #include "core/cpu_patches.h"
-#include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
 #include "core/module.h"
 #include "core/tls.h"
+#if defined(__ANDROID__) || defined(__linux__)
+#include <cerrno>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <sys/mman.h>
+#endif
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <dlfcn.h>
+
+extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
+                                                               std::uint64_t args,
+                                                               const void* argp,
+                                                               void* param,
+                                                               int* out_result);
+extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t seg_size);
+extern "C" int executor_lsx4_install_vtnull_probe(void* seg_host, std::size_t seg_size);
+extern "C" int executor_lsx4_install_gc_disable_collect(void* seg_host, std::size_t seg_size);
+extern "C" int executor_lsx4_install_mono_value_copy_probe(void* target_addr);
+#endif
+
+#ifdef __ANDROID__
+namespace Core::AeroLib {
+void ExecutorPatchLibcInternalAllocators(u64 exec_seg_addr, u64 exec_seg_size);
+}
+#endif
 
 namespace Core {
 
@@ -26,6 +53,69 @@ static u64 GetAlignedSize(const elf_program_header& phdr) {
     return (phdr.p_align != 0 ? (phdr.p_memsz + (phdr.p_align - 1)) & ~(phdr.p_align - 1)
                               : phdr.p_memsz);
 }
+
+static std::string SegmentProtString(const u32 flags) {
+    std::string out;
+    out += (flags & PF_READ) ? 'r' : '-';
+    out += (flags & PF_WRITE) ? 'w' : '-';
+    out += (flags & PF_EXEC) ? 'x' : '-';
+    return out;
+}
+
+static void ExecutorModuleTrace(const char* stage, const std::filesystem::path& path,
+                                const std::string& detail = {}) {
+#ifdef __ANDROID__
+    const char* trace = std::getenv("EXECUTOR_VERBOSE_MODULE_STAGE");
+    if (trace == nullptr || trace[0] == '\0' || std::strcmp(trace, "0") == 0) {
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_MODULE_STAGE] stage=%s path=%s detail=%s", stage,
+                        path.string().c_str(), detail.empty() ? "-" : detail.c_str());
+#else
+    (void)stage;
+    (void)path;
+    (void)detail;
+#endif
+}
+
+#ifdef __ANDROID__
+using ExecutorFexRegisterGuestExecutableRangeFn = int (*)(std::uint64_t address,
+                                                          std::uint64_t size,
+                                                          std::uint32_t prot);
+
+static ExecutorFexRegisterGuestExecutableRangeFn ExecutorResolveFexExecRangeRegistrar() {
+    void* sym = dlsym(RTLD_DEFAULT, "executor_fexcore_register_guest_executable_range");
+    if (sym == nullptr) {
+        void* handle = dlopen("libexecutor_fexcore_embed.so", RTLD_NOW | RTLD_NOLOAD);
+        if (handle != nullptr) {
+            sym = dlsym(handle, "executor_fexcore_register_guest_executable_range");
+        }
+    }
+    return reinterpret_cast<ExecutorFexRegisterGuestExecutableRangeFn>(sym);
+}
+
+static void ExecutorRegisterFexGuestExecutableRange(std::uint64_t address, std::uint64_t size,
+                                                    std::uint32_t prot,
+                                                    const std::filesystem::path& path,
+                                                    std::uint16_t index) {
+    if ((prot & PF_EXEC) == 0 || size == 0) {
+        return;
+    }
+    static ExecutorFexRegisterGuestExecutableRangeFn registrar =
+        ExecutorResolveFexExecRangeRegistrar();
+    if (registrar == nullptr) {
+        return;
+    }
+    const int rc = registrar(address, size, prot);
+    ExecutorModuleTrace("fex_exec_range_register", path,
+                        std::string("index=") + std::to_string(index) +
+                            ",addr=" + std::to_string(address) +
+                            ",size=" + std::to_string(size) +
+                            ",prot=" + SegmentProtString(prot) +
+                            ",rc=" + std::to_string(rc));
+}
+#endif
 
 static u64 CalculateBaseSize(const elf_header& ehdr, std::span<const elf_program_header> phdr) {
     u64 base_size = 0;
@@ -85,48 +175,150 @@ static std::string StringToNid(std::string_view symbol) {
 
 Module::Module(Core::MemoryManager* memory_, const std::filesystem::path& file_, u32& max_tls_index)
     : memory{memory_}, file{file_}, name{file.filename().string()} {
+    ExecutorModuleTrace("ctor_enter", file);
+    ExecutorModuleTrace("elf_open_begin", file);
     elf.Open(file);
+    ExecutorModuleTrace("elf_open_done", file,
+                        std::string("is_elf=") + (elf.IsElfFile() ? "1" : "0"));
     if (elf.IsElfFile()) {
+        ExecutorModuleTrace("load_memory_begin", file);
         LoadModuleToMemory(max_tls_index);
+        ExecutorModuleTrace("load_memory_done", file,
+                            std::string("base=") + std::to_string(base_virtual_addr));
+        ExecutorModuleTrace("dynamic_info_begin", file);
         LoadDynamicInfo();
+        ExecutorModuleTrace("dynamic_info_done", file,
+                            std::string("needed=") +
+                                std::to_string(dynamic_info.needed.size()) + ",imports=" +
+                                std::to_string(dynamic_info.import_modules.size()) + ",libs=" +
+                                std::to_string(dynamic_info.import_libs.size()));
+        ExecutorModuleTrace("symbols_begin", file);
         LoadSymbols();
+        ExecutorModuleTrace("symbols_done", file);
+#ifdef __ANDROID__
+        if (file.filename().string() == "mono-ps4.sprx") {
+            static const char* const kMonoHookTargets[] = {
+                "mono_value_copy",       "mono_value_copy_array", "mono_array_new",
+                "mono_object_new_ptrfree", "mono_string_new_wrapper", "mono_raise_exception",
+                "mono_gc_bzero",         "mono_field_set_value"};
+            if (std::FILE* lf = std::fopen(
+                    "/data/data/app.lsx4.android/files/executor-mono-exports.log", "a")) {
+                for (const char* fn : kMonoHookTargets) {
+                    void* a = FindByName(fn);
+                    std::fprintf(lf, "MONO_EXPORT %-26s = %p\n", fn, a);
+                }
+                std::fclose(lf);
+            }
+            if (std::fopen("/data/data/app.lsx4.android/files/run-enable-legacy-patches", "r") &&
+                FindByName("mono_value_copy")) {
+                void* mvc = FindByName("mono_value_copy");
+                const int rc = executor_lsx4_install_mono_value_copy_probe(mvc);
+                if (std::FILE* lf = std::fopen(
+                        "/data/data/app.lsx4.android/files/executor-mono-exports.log", "a")) {
+                    std::fprintf(lf, "MVC_INSTALL target=%p rc=%d\n", mvc, rc);
+                    std::fclose(lf);
+                }
+            }
+        }
+#endif
     }
+    ExecutorModuleTrace("ctor_done", file,
+                        std::string("valid=") + (IsValid() ? "1" : "0"));
+}
+
+static void RestoreHostSegmentProtection(const VAddr segment_addr, const u64 segment_size,
+                                         const u32 flags, const std::filesystem::path& path,
+                                         const u16 index) {
+#if defined(__ANDROID__) || defined(__linux__)
+    if ((flags & PF_EXEC) == 0 || segment_size == 0) {
+        return;
+    }
+
+    constexpr u64 PageSize = 0x1000;
+    const VAddr page_base = Common::AlignDown(segment_addr, PageSize);
+    const VAddr page_end = Common::AlignUp(segment_addr + segment_size, PageSize);
+    const u64 page_size = page_end - page_base;
+
+    int host_prot = PROT_NONE;
+    if (flags & PF_READ) {
+        host_prot |= PROT_READ;
+    }
+    if (flags & PF_WRITE) {
+        host_prot |= PROT_WRITE;
+    }
+    if (flags & PF_EXEC) {
+        host_prot |= PROT_EXEC;
+    }
+
+    const int rc = ::mprotect(reinterpret_cast<void*>(page_base), page_size, host_prot);
+    ExecutorModuleTrace(
+        rc == 0 ? "host_exec_protect_done" : "host_exec_protect_failed", path,
+        std::string("index=") + std::to_string(index) + ",addr=" + std::to_string(page_base) +
+            ",size=" + std::to_string(page_size) + ",prot=" + SegmentProtString(flags) +
+            ",errno=" + std::to_string(rc == 0 ? 0 : errno) +
+            (rc == 0 ? std::string{} : std::string(",error=") + std::strerror(errno)));
+#else
+    (void)segment_addr;
+    (void)segment_size;
+    (void)flags;
+    (void)path;
+    (void)index;
+#endif
 }
 
 Module::~Module() = default;
 
 s32 Module::Start(u64 args, const void* argp, void* param) {
     LOG_INFO(Core_Linker, "Module started : {}", name);
+    lifecycle_state.store(LifecycleState::Starting, std::memory_order_release);
     const VAddr addr = dynamic_info.init_virtual_addr + GetBaseAddress();
-    return reinterpret_cast<EntryFunc>(addr)(args, argp, param);
+#ifdef __ANDROID__
+    int result = 0;
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_MODULE_START_BRIDGE] path=%s function=0x%llx args=0x%llx",
+                        file.string().c_str(), static_cast<unsigned long long>(addr),
+                        static_cast<unsigned long long>(args));
+    const int rc = executor_lsx4_android_run_guest_module_start(this, args, argp, param, &result);
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_MODULE_START_BRIDGE] result path=%s rc=%d guestResult=0x%x",
+                        file.string().c_str(), rc, static_cast<unsigned>(result));
+    lifecycle_state.store(rc >= 0 ? LifecycleState::Started : LifecycleState::Loaded,
+                          std::memory_order_release);
+    return rc >= 0 ? result : rc;
+#else
+    const s32 result = reinterpret_cast<EntryFunc>(addr)(args, argp, param);
+    lifecycle_state.store(LifecycleState::Started, std::memory_order_release);
+    return result;
+#endif
 }
 
 void Module::LoadModuleToMemory(u32& max_tls_index) {
     static constexpr size_t BlockAlign = 0x1000;
     static constexpr u64 TrampolineSize = 8_MB;
+    ExecutorModuleTrace("load_memory_enter", file);
 
-    // Retrieve elf header and program header
     const auto elf_header = elf.GetElfHeader();
     const auto elf_pheader = elf.GetProgramHeader();
     const u64 base_size = CalculateBaseSize(elf_header, elf_pheader);
     aligned_base_size = Common::AlignUp(base_size, BlockAlign);
+    ExecutorModuleTrace("headers_ready", file,
+                        std::string("phnum=") + std::to_string(elf_header.e_phnum) +
+                            ",base_size=" + std::to_string(base_size) +
+                            ",aligned=" + std::to_string(aligned_base_size));
 
-    // Reserve memory area for module
     void** out_addr = reinterpret_cast<void**>(&base_virtual_addr);
-    s32 result =
-        memory->MapMemory(out_addr, ModuleLoadBase, aligned_base_size + TrampolineSize,
-                          MemoryProt::NoAccess, MemoryMapFlags::NoFlags, VMAType::Reserved, name);
-    ASSERT_MSG(result == ORBIS_OK, "Failed to reserve memory for module {}", name);
+    ExecutorModuleTrace("map_memory_begin", file,
+                        std::string("size=") +
+                            std::to_string(aligned_base_size + TrampolineSize));
+    memory->MapMemory(out_addr, ModuleLoadBase, aligned_base_size + TrampolineSize,
+                      MemoryProt::CpuReadWrite | MemoryProt::CpuExec, MemoryMapFlags::NoFlags,
+                      VMAType::Code, name);
+    ExecutorModuleTrace("map_memory_done", file,
+                        std::string("base=") + std::to_string(base_virtual_addr));
     LOG_INFO(Core_Linker, "Loading module {} to {}", name, fmt::ptr(*out_addr));
 
 #ifdef ARCH_X86_64
-    // Initialize trampoline generator.
-    VAddr trampoline_vaddr = base_virtual_addr + aligned_base_size;
-    void* trampoline_addr = std::bit_cast<void*>(trampoline_vaddr);
-    result = memory->MapMemory(&trampoline_addr, trampoline_vaddr, TrampolineSize,
-                               MemoryProt::CpuReadWrite | MemoryProt::CpuExec,
-                               MemoryMapFlags::Fixed, VMAType::Code, name);
-    ASSERT_MSG(result == ORBIS_OK, "Failed to map trampoline area for module {}", name);
+    void* trampoline_addr = std::bit_cast<void*>(base_virtual_addr + aligned_base_size);
     RegisterPatchModule(*out_addr, aligned_base_size, trampoline_addr, TrampolineSize);
 #endif
 
@@ -136,35 +328,15 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     LOG_INFO(Core_Linker, "aligned_base_size ......: {:#018x}", aligned_base_size);
 
     const auto add_segment = [this](const elf_program_header& phdr, bool do_map = true) {
-        const VAddr segment_vaddr = base_virtual_addr + phdr.p_vaddr;
-        void* segment_addr = std::bit_cast<void*>(segment_vaddr);
-        const u64 segment_size = GetAlignedSize(phdr);
+        const VAddr segment_addr = base_virtual_addr + phdr.p_vaddr;
         if (do_map) {
-            // Convert ELF flags to memory prot.
-            auto segment_prot = MemoryProt::NoAccess;
-            if ((phdr.p_flags & PF_READ) != 0) {
-                segment_prot |= MemoryProt::CpuRead;
-            }
-            if ((phdr.p_flags & PF_WRITE) != 0) {
-                segment_prot |= MemoryProt::CpuWrite;
-            }
-            if ((phdr.p_flags & PF_EXEC) != 0) {
-                segment_prot |= MemoryProt::CpuExec;
-            }
-
-            // Map module segments
-            const auto memory_type = IsSystemLib() ? VMAType::Code : VMAType::Flexible;
-            s32 result = memory->MapMemory(&segment_addr, segment_vaddr, segment_size, segment_prot,
-                                           MemoryMapFlags::Fixed, memory_type, name);
-            ASSERT_MSG(result == ORBIS_OK, "Failed to map segment at {:#x} for module {}",
-                       segment_vaddr, name);
-            elf.LoadSegment(segment_vaddr, phdr.p_offset, phdr.p_filesz);
+            elf.LoadSegment(segment_addr, phdr.p_offset, phdr.p_filesz);
         }
         if (info.num_segments < 4) {
             auto& segment = info.segments[info.num_segments++];
-            segment.address = segment_vaddr;
+            segment.address = segment_addr;
             segment.prot = phdr.p_flags;
-            segment.size = segment_size;
+            segment.size = GetAlignedSize(phdr);
         } else {
             LOG_ERROR(Core_Linker, "Attempting to add too many segments!");
         }
@@ -172,6 +344,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
     for (u16 i = 0; i < elf_header.e_phnum; i++) {
         const auto header_type = elf.ElfPheaderTypeStr(elf_pheader[i].p_type);
+        ExecutorModuleTrace("program_header_begin", file,
+                            std::string("index=") + std::to_string(i) + ",type=" +
+                                std::to_string(elf_pheader[i].p_type) + ",filesz=" +
+                                std::to_string(elf_pheader[i].p_filesz) + ",memsz=" +
+                                std::to_string(elf_pheader[i].p_memsz));
         switch (elf_pheader[i].p_type) {
         case PT_LOAD:
         case PT_SCE_RELRO: {
@@ -186,15 +363,180 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             const auto segment_mode = elf.ElfPheaderFlagsStr(elf_pheader[i].p_flags);
             LOG_INFO(Core_Linker, "program header = [{}] type = {}", i, header_type);
             LOG_INFO(Core_Linker, "segment_addr ..........: {:#018x}", segment_addr);
-            LOG_INFO(Core_Linker, "segment_file_size .....: {:#018x}", segment_file_size);
-            LOG_INFO(Core_Linker, "segment_memory_size ...: {:#018x}", segment_memory_size);
+            LOG_INFO(Core_Linker, "segment_file_size .....: {}", segment_file_size);
+            LOG_INFO(Core_Linker, "segment_memory_size ...: {}", segment_memory_size);
             LOG_INFO(Core_Linker, "segment_mode ..........: {}", segment_mode);
 
             add_segment(elf_pheader[i]);
-#ifdef ARCH_X86_64
+            ExecutorModuleTrace("load_segment_done", file,
+                                std::string("index=") + std::to_string(i));
+#if defined(ARCH_X86_64) || defined(__ANDROID__)
             if (elf_pheader[i].p_flags & PF_EXEC) {
+                if (file.filename().string() == "libc.prx") {
+                    const bool use_guest_libc_allocator =
+                        Core::AeroLib::ExecutorUseRealLibcAlloc();
+                    if (use_guest_libc_allocator) {
+                        std::fprintf(stderr,
+                                     "[EXECUTOR_LIBC_CANARY_PATCH] skipped owner=guest-libc "
+                                     "seg=0x%llx size=0x%llx\n",
+                                     (unsigned long long)segment_addr,
+                                     (unsigned long long)segment_file_size);
+                        std::fflush(stderr);
+#ifdef __ANDROID__
+                        __android_log_print(
+                            ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIBC_OWNER] owner=guest-libc action=preserve-module-bytes "
+                            "seg=0x%llx size=0x%llx",
+                            (unsigned long long)segment_addr,
+                            (unsigned long long)segment_file_size);
+#endif
+                    } else {
+                    static constexpr std::array<u8, 19> kCanarySig = {
+                        0xbe, 0xf8, 0xff, 0xff, 0xff, 0x49, 0x23, 0x77, 0xf8, 0x4a,
+                        0x33, 0x54, 0x3e, 0xf0, 0x4c, 0x39, 0xc2, 0x0f, 0x85};
+                    auto* bytes = reinterpret_cast<u8*>(segment_addr);
+                    bool patched = false;
+                    for (u64 off = 0; off + kCanarySig.size() <= segment_file_size; ++off) {
+                        if (std::memcmp(bytes + off, kCanarySig.data(), kCanarySig.size()) == 0) {
+                            std::memset(bytes + off + 17, 0x90, 6);
+                            std::fprintf(stderr,
+                                         "[EXECUTOR_LIBC_CANARY_PATCH] applied at va=0x%llx off=0x%llx\n",
+                                         (unsigned long long)(segment_addr + off + 17),
+                                         (unsigned long long)off);
+                            std::fflush(stderr);
+                            patched = true;
+                            break;
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[EXECUTOR_LIBC_CANARY_PATCH] libc.prx exec seg scanned: addr=0x%llx size=0x%llx patched=%d\n",
+                                 (unsigned long long)segment_addr,
+                                 (unsigned long long)segment_file_size, patched ? 1 : 0);
+                    std::fflush(stderr);
+                    if (std::FILE* lf = std::fopen(
+                            "/data/data/app.lsx4.android/files/executor-libc-patch.log",
+                            "a")) {
+                        std::fprintf(lf,
+                                     "CANARY seg=0x%llx size=0x%llx canary_patched=%d\n",
+                                     (unsigned long long)segment_addr,
+                                     (unsigned long long)segment_file_size, patched ? 1 : 0);
+                        std::fclose(lf);
+                    }
+#ifdef __ANDROID__
+                    Core::AeroLib::ExecutorPatchLibcInternalAllocators(segment_addr,
+                                                                       segment_file_size);
+#endif
+                    }
+                }
+#ifdef __ANDROID__
+                std::FILE* aot_flag =
+                    file.filename().string() == "mono-ps4.sprx"
+                        ? std::fopen(
+                              "/data/data/app.lsx4.android/files/executor-force-aot-deps-ok",
+                              "r")
+                        : nullptr;
+                if (aot_flag != nullptr) {
+                    std::fclose(aot_flag);
+                    static constexpr std::array<u8, 7> kAotDepSig = {0x41, 0x83, 0x7c, 0x24,
+                                                                     0x54, 0x00, 0x74};
+                    auto* bytes = reinterpret_cast<u8*>(segment_addr);
+                    int patched = 0;
+                    for (u64 off = 0; off + kAotDepSig.size() <= segment_file_size; ++off) {
+                        if (std::memcmp(bytes + off, kAotDepSig.data(), kAotDepSig.size()) == 0) {
+                            bytes[off + 6] = 0xeb;
+                            ++patched;
+                        }
+                    }
+                    if (std::FILE* lf = std::fopen(
+                            "/data/data/app.lsx4.android/files/executor-libc-patch.log", "a")) {
+                        std::fprintf(lf, "AOTDEP seg=0x%llx size=0x%llx je2jmp_patched=%d\n",
+                                     (unsigned long long)segment_addr,
+                                     (unsigned long long)segment_file_size, patched);
+                        std::fclose(lf);
+                    }
+                }
+
+                if (file.filename().string() == "mono-ps4.sprx") {
+                    const bool disable_exc_init_jit = std::filesystem::exists(
+                        "/data/data/app.lsx4.android/files/lsx4-home/run-no-exc-init-jit");
+                    if (!disable_exc_init_jit) {
+                        static constexpr std::array<u8, 19> kExcInitSig = {
+                            0x48, 0x8d, 0x05, 0x2e, 0x96, 0x12, 0x00, 0x83, 0x38, 0x00,
+                            0x74, 0x47, 0x48, 0x8d, 0x3d, 0xe0, 0xd2, 0x0d, 0x00};
+                        auto* bytes = reinterpret_cast<u8*>(segment_addr);
+                        int patched = 0;
+                        for (u64 off = 0; off + kExcInitSig.size() <= segment_file_size; ++off) {
+                            if (std::memcmp(bytes + off, kExcInitSig.data(), kExcInitSig.size()) ==
+                                0) {
+                                bytes[off + 10] = 0xeb;
+                                ++patched;
+                            }
+                        }
+                        static constexpr std::array<u8, 19> kCodemanSig = {
+                            0x48, 0x8d, 0x05, 0xd1, 0x29, 0x12, 0x00, 0x83, 0x38, 0x00,
+                            0x74, 0x15, 0x48, 0x8d, 0x15, 0x0f, 0x71, 0x0d, 0x00};
+                        int codeman_patched = 0;
+                        for (u64 off = 0; off + kCodemanSig.size() <= segment_file_size; ++off) {
+                            if (std::memcmp(bytes + off, kCodemanSig.data(),
+                                            kCodemanSig.size()) == 0) {
+                                bytes[off + 10] = 0xeb;
+                                ++codeman_patched;
+                            }
+                        }
+                        if (std::FILE* lf = std::fopen(
+                                "/data/data/app.lsx4.android/files/executor-libc-patch.log",
+                                "a")) {
+                            std::fprintf(lf,
+                                         "EXC_INIT_JIT seg=0x%llx size=0x%llx je2jmp_patched=%d "
+                                         "codeman_patched=%d\n",
+                                         (unsigned long long)segment_addr,
+                                         (unsigned long long)segment_file_size, patched,
+                                         codeman_patched);
+                            std::fclose(lf);
+                        }
+                    }
+                    const bool disable_imt_fix = std::filesystem::exists(
+                        "/data/data/app.lsx4.android/files/lsx4-home/run-disable-imt-fix");
+                    const int rc = disable_imt_fix
+                        ? 99
+                        : executor_lsx4_install_imt_dynamic_fix(
+                              reinterpret_cast<void*>(segment_addr),
+                              static_cast<std::size_t>(segment_file_size));
+                    if (std::FILE* lf = std::fopen(
+                            "/data/data/app.lsx4.android/files/executor-libc-patch.log", "a")) {
+                        std::fprintf(lf, "IMT_DYNAMIC_FIX seg=0x%llx size=0x%llx rc=%d disabled=%d\n",
+                                     (unsigned long long)segment_addr,
+                                     (unsigned long long)segment_file_size, rc, disable_imt_fix ? 1 : 0);
+                        std::fclose(lf);
+                    }
+                    if (std::fopen("/data/data/app.lsx4.android/files/run-enable-legacy-patches", "r")) {
+                        const int vrc = executor_lsx4_install_vtnull_probe(
+                            reinterpret_cast<void*>(segment_addr),
+                            static_cast<std::size_t>(segment_file_size));
+                        (void)vrc;
+                        const int grc = executor_lsx4_install_gc_disable_collect(
+                            reinterpret_cast<void*>(segment_addr),
+                            static_cast<std::size_t>(segment_file_size));
+                        if (std::FILE* lf = std::fopen(
+                                "/data/data/app.lsx4.android/files/executor-libc-patch.log", "a")) {
+                            std::fprintf(lf, "GC_DISABLE seg=0x%llx size=0x%llx rc=%d\n",
+                                         (unsigned long long)segment_addr,
+                                         (unsigned long long)segment_file_size, grc);
+                            std::fclose(lf);
+                        }
+                    }
+                }
+#endif
+#ifdef ARCH_X86_64
                 PrePatchInstructions(segment_addr, segment_file_size);
+#endif
             }
+#endif
+            RestoreHostSegmentProtection(segment_addr, segment_memory_size, elf_pheader[i].p_flags,
+                                         file, i);
+#ifdef __ANDROID__
+            ExecutorRegisterFexGuestExecutableRange(segment_addr, segment_memory_size,
+                                                    elf_pheader[i].p_flags, file, i);
 #endif
             break;
         }
@@ -204,6 +546,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 m_dynamic.resize(elf_pheader[i].p_filesz);
                 const VAddr segment_addr = std::bit_cast<VAddr>(m_dynamic.data());
                 elf.LoadSegment(segment_addr, elf_pheader[i].p_offset, elf_pheader[i].p_filesz);
+                ExecutorModuleTrace("dynamic_segment_loaded", file,
+                                    std::string("size=") +
+                                        std::to_string(elf_pheader[i].p_filesz));
             } else {
                 LOG_ERROR(Core_Linker, "p_filesz==0 in type {}", header_type);
             }
@@ -213,6 +558,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 m_dynamic_data.resize(elf_pheader[i].p_filesz);
                 const VAddr segment_addr = std::bit_cast<VAddr>(m_dynamic_data.data());
                 elf.LoadSegment(segment_addr, elf_pheader[i].p_offset, elf_pheader[i].p_filesz);
+                ExecutorModuleTrace("dynlibdata_loaded", file,
+                                    std::string("size=") +
+                                        std::to_string(elf_pheader[i].p_filesz));
             } else {
                 LOG_ERROR(Core_Linker, "p_filesz==0 in type {}", header_type);
             }
@@ -225,9 +573,15 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             tls.modid = ++max_tls_index;
             LOG_INFO(Core_Linker, "TLS virtual address = {:#x}", tls.image_virtual_addr);
             LOG_INFO(Core_Linker, "TLS image size      = {}", tls.image_size);
+            ExecutorModuleTrace("tls_seen", file,
+                                std::string("image_size=") + std::to_string(tls.image_size) +
+                                    ",modid=" + std::to_string(tls.modid));
             break;
         case PT_SCE_PROCPARAM:
             proc_param_virtual_addr = elf_pheader[i].p_vaddr + base_virtual_addr;
+            ExecutorModuleTrace("proc_param_seen", file,
+                                std::string("addr=") +
+                                    std::to_string(proc_param_virtual_addr));
             break;
         case PT_GNU_EH_FRAME: {
             eh_frame_hdr_addr = elf_pheader[i].p_vaddr;
@@ -252,39 +606,98 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
     const VAddr entry_addr = base_virtual_addr + elf.GetElfEntry();
     LOG_INFO(Core_Linker, "program entry addr ..........: {:#018x}", entry_addr);
+    ExecutorModuleTrace("segments_done", file,
+                        std::string("entry=") + std::to_string(entry_addr) + ",segments=" +
+                            std::to_string(info.num_segments));
 
     if (MemoryPatcher::g_eboot_address == 0) {
         if (name == "eboot.bin") {
+            ExecutorModuleTrace("memory_patcher_begin", file);
             MemoryPatcher::g_eboot_address = base_virtual_addr;
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::OnGameLoaded();
+            ExecutorModuleTrace("memory_patcher_done", file);
         }
     }
 }
 
 void Module::LoadDynamicInfo() {
-    for (const auto* dyn = reinterpret_cast<elf_dynamic*>(m_dynamic.data()); dyn->d_tag != DT_NULL;
-         dyn++) {
+    ExecutorModuleTrace("dynamic_parse_enter", file,
+                        std::string("dynamic=") + std::to_string(m_dynamic.size()) +
+                            ",data=" + std::to_string(m_dynamic_data.size()));
+    const auto* dynamic_begin = reinterpret_cast<elf_dynamic*>(m_dynamic.data());
+    const size_t dynamic_count = m_dynamic.size() / sizeof(elf_dynamic);
+    for (size_t dynamic_index = 0; dynamic_index < dynamic_count; dynamic_index++) {
+        const auto* dyn = dynamic_begin + dynamic_index;
+        if (dyn->d_tag == DT_NULL) {
+            break;
+        }
         switch (dyn->d_tag) {
-        case DT_SCE_HASH: // Offset of the hash table.
+        case DT_SCE_HASH:
             dynamic_info.hash_table =
                 reinterpret_cast<void*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
             break;
-        case DT_SCE_HASHSZ: // Size of the hash table
+        case DT_SCE_HASHSZ:
             dynamic_info.hash_table_size = dyn->d_un.d_val;
             break;
-        case DT_SCE_STRTAB: // Offset of the string table.
+        case DT_SCE_STRTAB:
             dynamic_info.str_table =
                 reinterpret_cast<char*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
             break;
-        case DT_SCE_STRSZ: // Size of the string table.
+        case DT_SCE_STRSZ:
             dynamic_info.str_table_size = dyn->d_un.d_val;
             break;
-        case DT_SCE_SYMTAB: // Offset of the symbol table.
+        case DT_SCE_SYMTAB:
             dynamic_info.symbol_table =
                 reinterpret_cast<elf_symbol*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
             break;
-        case DT_SCE_SYMTABSZ: // Size of the symbol table.
+        case DT_SCE_SYMTABSZ:
+            dynamic_info.symbol_table_total_size = dyn->d_un.d_val;
+            break;
+        case DT_SCE_SYMENT:
+            dynamic_info.symbol_table_entries_size = dyn->d_un.d_val;
+            break;
+        default:
+            break;
+        }
+    }
+    ExecutorModuleTrace("dynamic_prescan_done", file,
+                        std::string("strtab=") + (dynamic_info.str_table ? "1" : "0") +
+                            ",symtab=" + (dynamic_info.symbol_table ? "1" : "0") +
+                            ",entries=" + std::to_string(dynamic_count));
+    bool saw_dynamic_null = false;
+    for (size_t dynamic_index = 0; dynamic_index < dynamic_count; dynamic_index++) {
+        const auto* dyn = dynamic_begin + dynamic_index;
+        ExecutorModuleTrace("dynamic_tag", file,
+                            std::string("index=") + std::to_string(dynamic_index) + ",tag=" +
+                                std::to_string(dyn->d_tag) + ",value=" +
+                                std::to_string(dyn->d_un.d_val));
+        if (dyn->d_tag == DT_NULL) {
+            saw_dynamic_null = true;
+            ExecutorModuleTrace("dynamic_null", file,
+                                std::string("index=") + std::to_string(dynamic_index));
+            break;
+        }
+        switch (dyn->d_tag) {
+        case DT_SCE_HASH:
+            dynamic_info.hash_table =
+                reinterpret_cast<void*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
+            break;
+        case DT_SCE_HASHSZ:
+            dynamic_info.hash_table_size = dyn->d_un.d_val;
+            break;
+        case DT_SCE_STRTAB:
+            dynamic_info.str_table =
+                reinterpret_cast<char*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
+            break;
+        case DT_SCE_STRSZ:
+            dynamic_info.str_table_size = dyn->d_un.d_val;
+            break;
+        case DT_SCE_SYMTAB:
+            dynamic_info.symbol_table =
+                reinterpret_cast<elf_symbol*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
+            break;
+        case DT_SCE_SYMTABSZ:
             dynamic_info.symbol_table_total_size = dyn->d_un.d_val;
             break;
         case DT_INIT:
@@ -293,54 +706,54 @@ void Module::LoadDynamicInfo() {
         case DT_FINI:
             dynamic_info.fini_virtual_addr = dyn->d_un.d_ptr;
             break;
-        case DT_SCE_PLTGOT: // Offset of the global offset table.
+        case DT_SCE_PLTGOT:
             dynamic_info.pltgot_virtual_addr = dyn->d_un.d_ptr;
             break;
-        case DT_SCE_JMPREL: // Offset of the table containing jump slots.
+        case DT_SCE_JMPREL:
             dynamic_info.jmp_relocation_table =
                 reinterpret_cast<elf_relocation*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
             break;
-        case DT_SCE_PLTRELSZ: // Size of the global offset table.
+        case DT_SCE_PLTRELSZ:
             dynamic_info.jmp_relocation_table_size = dyn->d_un.d_val;
             break;
-        case DT_SCE_PLTREL: // The type of relocations in the relocation table. Should be DT_RELA
+        case DT_SCE_PLTREL:
             dynamic_info.jmp_relocation_type = dyn->d_un.d_val;
             if (dynamic_info.jmp_relocation_type != DT_RELA) {
                 LOG_WARNING(Core_Linker, "DT_SCE_PLTREL is NOT DT_RELA should check!");
             }
             break;
-        case DT_SCE_RELA: // Offset of the relocation table.
+        case DT_SCE_RELA:
             dynamic_info.relocation_table =
                 reinterpret_cast<elf_relocation*>(m_dynamic_data.data() + dyn->d_un.d_ptr);
             break;
-        case DT_SCE_RELASZ: // Size of the relocation table.
+        case DT_SCE_RELASZ:
             dynamic_info.relocation_table_size = dyn->d_un.d_val;
             break;
-        case DT_SCE_RELAENT: // The size of relocation table entries.
+        case DT_SCE_RELAENT:
             dynamic_info.relocation_table_entries_size = dyn->d_un.d_val;
             if (dynamic_info.relocation_table_entries_size != 0x18) {
                 LOG_WARNING(Core_Linker, "DT_SCE_RELAENT is NOT 0x18 should check!");
             }
             break;
-        case DT_INIT_ARRAY: // Address of the array of pointers to initialization functions
+        case DT_INIT_ARRAY:
             dynamic_info.init_array_virtual_addr = dyn->d_un.d_ptr;
             break;
-        case DT_FINI_ARRAY: // Address of the array of pointers to termination functions
+        case DT_FINI_ARRAY:
             dynamic_info.fini_array_virtual_addr = dyn->d_un.d_ptr;
             break;
-        case DT_INIT_ARRAYSZ: // Size in bytes of the array of initialization functions
+        case DT_INIT_ARRAYSZ:
             dynamic_info.init_array_size = dyn->d_un.d_val;
             break;
-        case DT_FINI_ARRAYSZ: // Size in bytes of the array of terminationfunctions
+        case DT_FINI_ARRAYSZ:
             dynamic_info.fini_array_size = dyn->d_un.d_val;
             break;
-        case DT_PREINIT_ARRAY: // Address of the array of pointers to pre - initialization functions
+        case DT_PREINIT_ARRAY:
             dynamic_info.preinit_array_virtual_addr = dyn->d_un.d_ptr;
             break;
-        case DT_PREINIT_ARRAYSZ: // Size in bytes of the array of pre - initialization functions
+        case DT_PREINIT_ARRAYSZ:
             dynamic_info.preinit_array_size = dyn->d_un.d_val;
             break;
-        case DT_SCE_SYMENT: // The size of symbol table entries
+        case DT_SCE_SYMENT:
             dynamic_info.symbol_table_entries_size = dyn->d_un.d_val;
             if (dynamic_info.symbol_table_entries_size != 0x18) {
                 LOG_WARNING(Core_Linker, "DT_SCE_SYMENT is NOT 0x18 should check!");
@@ -354,14 +767,11 @@ void Module::LoadDynamicInfo() {
             break;
         case DT_FLAGS:
             dynamic_info.flags = dyn->d_un.d_val;
-            // This value should always be DF_TEXTREL (0x04)
             if (dynamic_info.flags != 0x04) {
                 LOG_WARNING(Core_Linker, "DT_FLAGS is NOT 0x04 should check!");
             }
             break;
         case DT_NEEDED:
-            // Offset of the library string in the string table to be linked in.
-            // In theory this should already be filled from about just make a test case
             if (dynamic_info.str_table) {
                 dynamic_info.needed.push_back(dynamic_info.str_table + dyn->d_un.d_val);
             } else {
@@ -383,16 +793,10 @@ void Module::LoadDynamicInfo() {
             break;
         }
         case DT_SCE_FINGERPRINT:
-            // The fingerprint is a 24 byte (0x18) size buffer that contains a unique identifier for
-            // the given app. How exactly this is generated isn't known, however it is not necessary
-            // to have a valid fingerprint. While an invalid fingerprint will cause a warning to be
-            // printed to the kernel log, the ELF will still load and run.
             LOG_INFO(Core_Linker, "DT_SCE_FINGERPRINT value = {:#018x}", dyn->d_un.d_val);
             std::memcpy(info.fingerprint.data(), &dyn->d_un.d_val, sizeof(SCE_DBG_NUM_FINGERPRINT));
             break;
         case DT_SCE_IMPORT_LIB_ATTR:
-            // The upper 32-bits should contain the module index multiplied by 0x10000. The lower
-            // 32-bits should be a constant 0x9.
             LOG_INFO(Core_Linker, "unsupported DT_SCE_IMPORT_LIB_ATTR value = ......: {:#018x}",
                      dyn->d_un.d_val);
             break;
@@ -423,13 +827,40 @@ void Module::LoadDynamicInfo() {
             LOG_INFO(Core_Linker, "unsupported dynamic tag ..........: {:#018x}", dyn->d_tag);
         }
     }
+    if (!saw_dynamic_null) {
+        LOG_WARNING(Core_Linker, "Dynamic table ended without DT_NULL after {} entries",
+                    dynamic_count);
+        ExecutorModuleTrace("dynamic_parse_missing_null", file,
+                            std::string("entries=") + std::to_string(dynamic_count));
+    }
     const u32 relabits_num = dynamic_info.relocation_table_size / sizeof(elf_relocation) +
                              dynamic_info.jmp_relocation_table_size / sizeof(elf_relocation);
     rela_bits.resize((relabits_num + 7) / 8);
+    ExecutorModuleTrace("dynamic_parse_done", file,
+                        std::string("needed=") + std::to_string(dynamic_info.needed.size()) +
+                            ",import_modules=" +
+                            std::to_string(dynamic_info.import_modules.size()) +
+                            ",import_libs=" +
+                            std::to_string(dynamic_info.import_libs.size()) + ",relocs=" +
+                            std::to_string(relabits_num));
 }
 
 void Module::LoadSymbols() {
-    const auto symbol_database = [this](Loader::SymbolsResolver& symbol, bool export_func) {
+    std::size_t export_count = 0;
+    std::size_t import_count = 0;
+#ifdef __ANDROID__
+    std::size_t mono_named_exports = 0;
+    std::size_t mono_named_imports = 0;
+    std::string mono_export_samples;
+    std::string mono_import_samples;
+#endif
+    const auto symbol_database = [this, &export_count, &import_count
+#ifdef __ANDROID__
+                                  ,
+                                  &mono_named_exports, &mono_named_imports, &mono_export_samples,
+                                  &mono_import_samples
+#endif
+    ](Loader::SymbolsResolver& symbol, bool export_func) {
         if (!dynamic_info.symbol_table || !dynamic_info.str_table ||
             dynamic_info.symbol_table_total_size == 0) {
             LOG_INFO(Core_Linker, "Symbol table not found!");
@@ -481,10 +912,56 @@ void Module::LoadSymbols() {
             }
             const VAddr sym_addr = export_func ? sym->st_value + base_virtual_addr : 0;
             symbol.AddSymbol(sym_r, sym_addr);
+#ifdef __ANDROID__
+            auto append_sample = [](std::string& out, const std::string& value) {
+                if (out.size() > 512) {
+                    return;
+                }
+                if (!out.empty()) {
+                    out += ",";
+                }
+                out += value;
+            };
+            const std::string nid_name_string = nid_name ? std::string(nid_name) : std::string{};
+            if (id.find("mono") != std::string::npos ||
+                nid_name_string.find("mono") != std::string::npos) {
+                if (export_func) {
+                    mono_named_exports++;
+                    append_sample(mono_export_samples, nid_name_string + ":" + id);
+                } else {
+                    mono_named_imports++;
+                    append_sample(mono_import_samples, nid_name_string + ":" + id);
+                }
+            }
+#endif
+            if (export_func) {
+                export_count++;
+            } else {
+                import_count++;
+            }
         }
     };
     symbol_database(export_sym, true);
     symbol_database(import_sym, false);
+#ifdef __ANDROID__
+    if (file.string().find("mono-ps4") != std::string::npos) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_MONO_SYMBOLS] path=%s symtabBytes=%llu strtabBytes=%llu exports=%zu "
+            "imports=%zu exportResolver=%zu importResolver=%zu monoExports=%zu monoImports=%zu",
+            file.string().c_str(),
+            static_cast<unsigned long long>(dynamic_info.symbol_table_total_size),
+            static_cast<unsigned long long>(dynamic_info.str_table_size), export_count,
+            import_count, export_sym.GetSize(), import_sym.GetSize(), mono_named_exports,
+            mono_named_imports);
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_MONO_SYMBOL_SAMPLES] exports=%s",
+                            mono_export_samples.empty() ? "-" : mono_export_samples.c_str());
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_MONO_SYMBOL_SAMPLES] imports=%s",
+                            mono_import_samples.empty() ? "-" : mono_import_samples.c_str());
+    }
+#endif
 }
 
 OrbisKernelModuleInfoEx Module::GetModuleInfoEx() const {
@@ -554,4 +1031,4 @@ void* Module::FindByName(std::string_view name) {
     return nullptr;
 }
 
-} // namespace Core
+}

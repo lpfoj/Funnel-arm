@@ -22,9 +22,9 @@ sceCompanionHttpdGet2ndScreenStatus(Libraries::UserService::OrbisUserServiceUser
 }
 
 s32 PS4_SYSV_ABI sceCompanionHttpdGetEvent(OrbisCompanionHttpdEvent* pEvent) {
-    pEvent->event = ORBIS_COMPANION_HTTPD_EVENT_DISCONNECT; // disconnected
+    pEvent->event = ORBIS_COMPANION_HTTPD_EVENT_DISCONNECT;
     LOG_DEBUG(Lib_CompanionHttpd, "device disconnected");
-    return ORBIS_COMPANION_HTTPD_ERROR_NO_EVENT; // No events to obtain
+    return ORBIS_COMPANION_HTTPD_ERROR_NO_EVENT;
 }
 
 s32 PS4_SYSV_ABI
@@ -139,4 +139,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceCompanionHttpdUnregisterRequestCallback);
 };
 
-} // namespace Libraries::CompanionHttpd
+}

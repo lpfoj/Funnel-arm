@@ -160,7 +160,7 @@ constexpr u32 GenericPatchElement(Patch patch) {
 
 [[nodiscard]] std::string NameOf(Patch patch);
 
-} // namespace Shader::IR
+}
 
 template <>
 struct fmt::formatter<Shader::IR::Patch> {

@@ -1,11 +1,11 @@
-//  SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "frame_graph.h"
 
+#include "common/config.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
-#include "core/emulator_settings.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 
@@ -19,8 +19,6 @@ constexpr float FRAME_GRAPH_PADDING_Y = 3.0f;
 constexpr static float FRAME_GRAPH_HEIGHT = 50.0f;
 
 void FrameGraph::DrawFrameGraph() {
-    // Frame graph - inspired by
-    // https://asawicki.info/news_1758_an_idea_for_visualization_of_frame_times
     const float full_width = GetContentRegionAvail().x;
     auto pos = GetCursorScreenPos();
     const ImVec2 size{full_width, FRAME_GRAPH_HEIGHT + FRAME_GRAPH_PADDING_Y * 2.0f};
@@ -29,7 +27,7 @@ void FrameGraph::DrawFrameGraph() {
         return;
     }
 
-    float target_dt = 1.0f / (float)EmulatorSettings.GetVblankFrequency();
+    float target_dt = 1.0f / (float)Config::vblankFreq();
     float cur_pos_x = pos.x + full_width;
     pos.y += FRAME_GRAPH_PADDING_Y;
     const float final_pos_y = pos.y + FRAME_GRAPH_HEIGHT;
@@ -48,13 +46,13 @@ void FrameGraph::DrawFrameGraph() {
             std::min(std::log2(BAR_HEIGHT_MULT / dt_factor) / 3.0f, 1.0f) * FRAME_GRAPH_HEIGHT;
 
         ImU32 color;
-        if (dt_factor >= 0.95f) { // BLUE
+        if (dt_factor >= 0.95f) {
             color = IM_COL32(0x33, 0x33, 0xFF, 0xFF);
-        } else if (dt_factor >= 0.5f) { // GREEN <> YELLOW
+        } else if (dt_factor >= 0.5f) {
             float t = 1.0f - (dt_factor - 0.5f) * 2.0f;
             int r = (int)(0xFF * t);
             color = IM_COL32(r, 0xFF, 0, 0xFF);
-        } else { // YELLOW <> RED
+        } else {
             float t = dt_factor * 2.0f;
             int g = (int)(0xFF * t);
             color = IM_COL32(0xFF, g, 0, 0xFF);
@@ -105,4 +103,4 @@ void FrameGraph::Draw() {
     End();
 }
 
-} // namespace Core::Devtools::Widget
+}

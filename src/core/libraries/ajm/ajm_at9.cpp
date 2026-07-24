@@ -222,7 +222,6 @@ DecoderResult AjmAt9Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
         m_superframe_bytes_remain = m_codec_info.superframeSize;
         m_num_frames = 0;
     } else if (gapless.IsEnd()) {
-        // Drain the remaining superframe
         std::vector<s16> buf(m_codec_info.frameSamples * m_codec_info.channels, 0);
         while ((m_num_frames % m_codec_info.framesInSuperframe) != 0) {
             ret = Atrac9Decode(m_handle, in_buf.data(), buf.data(), &bytes_used,
@@ -262,4 +261,4 @@ u32 AjmAt9Decoder::GetNextFrameSize(const AjmInstanceGapless& gapless) const {
     return samples * m_codec_info.channels * GetPCMSize(m_format);
 }
 
-} // namespace Libraries::Ajm
+}

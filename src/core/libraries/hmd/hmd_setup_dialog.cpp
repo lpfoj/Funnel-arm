@@ -21,14 +21,11 @@ s32 PS4_SYSV_ABI sceHmdSetupDialogClose() {
 
 s32 PS4_SYSV_ABI sceHmdSetupDialogOpen(const OrbisHmdSetupDialogParam* param) {
     LOG_ERROR(Lib_HmdSetupDialog, "(STUBBED) called");
-    // On real hardware, a dialog would show up telling the user to connect a PSVR headset.
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceHmdSetupDialogGetResult(OrbisHmdSetupDialogResult* result) {
     LOG_ERROR(Lib_HmdSetupDialog, "(STUBBED) called");
-    // Simulates behavior of user pressing circle to cancel the dialog.
-    // Result::OK would mean a headset was connected.
     result->result = Libraries::CommonDialog::Result::USER_CANCELED;
     return ORBIS_OK;
 }
@@ -65,4 +62,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceHmdSetupDialogUpdateStatus);
 };
 
-} // namespace Libraries::HmdSetupDialog
+}

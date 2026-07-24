@@ -29,7 +29,7 @@ enum class InterruptId : u32 {
     GfxFlip = 0x08,
     GpuIdle = 0x09,
 
-    InterruptIdMax = 0x40, ///< Max possible value (GfxEop)
+    InterruptIdMax = 0x40,
 };
 
 using IrqHandler = std::function<void(InterruptId)>;
@@ -93,4 +93,4 @@ private:
 
 using IrqC = Common::Singleton<IrqController>;
 
-} // namespace Platform
+}

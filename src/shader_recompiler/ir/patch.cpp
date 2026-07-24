@@ -25,4 +25,4 @@ std::string NameOf(Patch patch) {
     }
 }
 
-} // namespace Shader::IR
+}

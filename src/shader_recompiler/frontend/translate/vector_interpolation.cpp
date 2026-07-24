@@ -36,7 +36,6 @@ static constexpr std::array DefaultValTable = {
 
 void Translator::EmitVectorInterpolation(const GcnInst& inst) {
     switch (inst.opcode) {
-        // VINTRP
     case Opcode::V_INTERP_P1_F32:
         return V_INTERP_P1_F32(inst);
     case Opcode::V_INTERP_P2_F32:
@@ -48,7 +47,6 @@ void Translator::EmitVectorInterpolation(const GcnInst& inst) {
     }
 }
 
-// VINTRP
 
 void Translator::V_INTERP_P1_F32(const GcnInst& inst) {
     if (!profile.needs_manual_interpolation) {
@@ -59,7 +57,6 @@ void Translator::V_INTERP_P1_F32(const GcnInst& inst) {
     if (attr.IsDefault()) {
         return;
     }
-    // VDST = P10 * VSRC + P0
     const IR::Attribute attrib = IR::Attribute::Param0 + attr_index;
     const IR::F32 p0 = ir.GetAttribute(attrib, inst.control.vintrp.chan, 0);
     const IR::F32 p1 = ir.GetAttribute(attrib, inst.control.vintrp.chan, 1);
@@ -84,7 +81,6 @@ void Translator::V_INTERP_P2_F32(const GcnInst& inst) {
         SetDst(inst.dst[0], ir.GetAttribute(attrib, inst.control.vintrp.chan));
         return;
     }
-    // VDST = P20 * VSRC + VDST
     const IR::F32 p0 = ir.GetAttribute(attrib, inst.control.vintrp.chan, 0);
     const IR::F32 p2 = ir.GetAttribute(attrib, inst.control.vintrp.chan, 2);
     const IR::F32 j = GetSrc<IR::F32>(inst.src[0]);
@@ -100,8 +96,8 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     auto& interp = info.fs_interpolation[attr_index];
     ASSERT(attr.is_flat || inst.src[0].code == 2);
     if (profile.supports_amd_shader_explicit_vertex_parameter ||
-        profile.supports_fragment_shader_barycentric) {
-        // VSRC 0=P10, 1=P20, 2=P0
+        (profile.supports_fragment_shader_barycentric &&
+         !profile.has_incomplete_fragment_shader_barycentric)) {
         interp.primary = Qualifier::PerVertex;
         SetDst(inst.dst[0],
                ir.GetAttribute(attrib, inst.control.vintrp.chan, (inst.src[0].code + 1) % 3));
@@ -111,4 +107,4 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     }
 }
 
-} // namespace Shader::Gcn
+}

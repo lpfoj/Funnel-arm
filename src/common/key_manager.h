@@ -16,7 +16,6 @@ using json = nlohmann::json;
 
 class KeyManager {
 public:
-    // ------------------- Nested keysets -------------------
     struct TrophyKeySet {
         std::vector<u8> ReleaseTrophyKey;
     };
@@ -25,24 +24,18 @@ public:
         KeyManager::TrophyKeySet TrophyKeySet;
     };
 
-    // ------------------- Construction -------------------
     KeyManager();
     ~KeyManager();
 
-    // ------------------- Singleton -------------------
     static std::shared_ptr<KeyManager> GetInstance();
     static void SetInstance(std::shared_ptr<KeyManager> instance);
 
-    // ------------------- File operations -------------------
-    bool TransferTrophyKey();
     bool LoadFromFile();
     bool SaveToFile();
 
-    // ------------------- Key operations -------------------
     void SetDefaultKeys();
     bool HasKeys() const;
 
-    // ------------------- Getters / Setters -------------------
     const AllKeys& GetAllKeys() const {
         return m_keys;
     }
@@ -63,7 +56,6 @@ private:
     static std::mutex s_mutex;
 };
 
-// ------------------- NLOHMANN macros -------------------
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(KeyManager::TrophyKeySet, ReleaseTrophyKey)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(KeyManager::AllKeys, TrophyKeySet)
 
@@ -77,4 +69,4 @@ struct adl_serializer<std::vector<u8>> {
         vec = KeyManager::HexStringToBytes(j.get<std::string>());
     }
 };
-} // namespace nlohmann
+}

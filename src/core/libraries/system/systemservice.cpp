@@ -1,12 +1,18 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
-#include "common/elf_info.h"
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include "common/config.h"
+#include "common/logging/log.h"
 #include "common/singleton.h"
-#include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
-#include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/systemservice.h"
 #include "core/libraries/system/systemservice_error.h"
@@ -17,10 +23,112 @@ namespace Libraries::SystemService {
 bool g_splash_status{true};
 std::queue<OrbisSystemServiceEvent> g_event_queue;
 std::mutex g_event_queue_mutex;
-s32 g_sdk_version{};
+
+namespace {
+
+std::mutex g_executor_launch_mutex;
+std::string g_executor_last_launch_title;
+int g_executor_launch_request_count = 0;
+
+std::string ExecutorReadGuestCString(const char* ptr, std::size_t limit = 256) {
+    if (!ptr || reinterpret_cast<std::uintptr_t>(ptr) < 0x10000) {
+        return {};
+    }
+    std::string out;
+    out.reserve(32);
+    for (std::size_t i = 0; i < limit; ++i) {
+        const char c = ptr[i];
+        if (c == '\0') {
+            break;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::string ExecutorTitleFromLaunchArg(const char* ptr) {
+    auto value = ExecutorReadGuestCString(ptr);
+    if (value.empty()) {
+        return {};
+    }
+    std::replace(value.begin(), value.end(), '\\', '/');
+    if (const auto title_pos = value.find("titleId="); title_pos != std::string::npos) {
+        const auto begin = title_pos + 8;
+        const auto end = value.find_first_of("&?#/", begin);
+        value = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    } else if (const auto app_pos = value.find("/user/app/"); app_pos != std::string::npos) {
+        const auto begin = app_pos + 10;
+        const auto end = value.find('/', begin);
+        value = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    } else if (const auto slash = value.find_last_of('/'); slash != std::string::npos) {
+        value = value.substr(slash + 1);
+    }
+    if (const auto dot = value.find_last_of('.'); dot != std::string::npos) {
+        value.resize(dot);
+    }
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
+                    return !(std::isalnum(ch) || ch == '_' || ch == '-');
+                }),
+                value.end());
+    return value.empty() ? std::string{"UNKNOWN"} : value;
+}
+
+void ExecutorNoteLaunchRequest(const char* op, const char* raw_title) {
+    auto title = ExecutorTitleFromLaunchArg(raw_title);
+    if (title.empty()) {
+        title = "UNKNOWN";
+    }
+    int count = 0;
+    {
+        std::scoped_lock lk{g_executor_launch_mutex};
+        g_executor_last_launch_title = title;
+        count = ++g_executor_launch_request_count;
+    }
+    std::fprintf(stderr, "[EXECUTOR_LAUNCH_MANAGER] op=%s title=%s count=%d result=0\n", op,
+                 title.c_str(), count);
+    std::fflush(stderr);
+}
+
+void ExecutorNoteLoadExecRequest(const char* op, const char* raw_path) {
+    auto title = ExecutorTitleFromLaunchArg(raw_path);
+    if (title.empty()) {
+        title = "UNKNOWN";
+    }
+    auto path = ExecutorReadGuestCString(raw_path);
+    if (path.empty()) {
+        path = "<null>";
+    }
+    int count = 0;
+    {
+        std::scoped_lock lk{g_executor_launch_mutex};
+        g_executor_last_launch_title = title;
+        count = ++g_executor_launch_request_count;
+    }
+    std::fprintf(stderr,
+                 "[EXECUTOR_LAUNCH_MANAGER] op=%s title=%s count=%d path=%s result=0\n", op,
+                 title.c_str(), count, path.c_str());
+    std::fprintf(stderr, "[EXECUTOR_LOAD_EXEC_STUB] op=%s title=%s count=%d path=%s result=0\n",
+                 op, title.c_str(), count, path.c_str());
+    std::fflush(stderr);
+}
+
+void ExecutorNoteLaunchStatus(const char* op, int value = 0) {
+    std::string title;
+    int count = 0;
+    {
+        std::scoped_lock lk{g_executor_launch_mutex};
+        title = g_executor_last_launch_title.empty() ? "UNKNOWN" : g_executor_last_launch_title;
+        count = g_executor_launch_request_count;
+    }
+    std::fprintf(stderr, "[EXECUTOR_LAUNCH_MANAGER] op=%s title=%s count=%d value=%d result=0\n",
+                 op, title.c_str(), count, value);
+    std::fflush(stderr);
+}
+
+}
 
 bool IsSplashVisible() {
-    return EmulatorSettings.IsShowSplash() && g_splash_status;
+    return Config::showSplash() && g_splash_status;
 }
 
 int PS4_SYSV_ABI sceAppMessagingClearEventFlag() {
@@ -253,8 +361,8 @@ int PS4_SYSV_ABI sceLncUtilGetResultKillApp() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceLncUtilGetResultLaunchAppByTitleId() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+int PS4_SYSV_ABI sceLncUtilGetResultLaunchAppByTitleId(const char* title_id) {
+    ExecutorNoteLaunchRequest("lnc_get_result_launch_app_by_title_id", title_id);
     return ORBIS_OK;
 }
 
@@ -269,8 +377,8 @@ int PS4_SYSV_ABI sceLncUtilIsActiveCdlg() {
 }
 
 int PS4_SYSV_ABI sceLncUtilIsAppLaunched() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
-    return ORBIS_OK;
+    ExecutorNoteLaunchStatus("lnc_is_app_launched", 1);
+    return 1;
 }
 
 int PS4_SYSV_ABI sceLncUtilIsAppSuspended() {
@@ -313,8 +421,8 @@ int PS4_SYSV_ABI sceLncUtilKillLocalProcess() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceLncUtilLaunchApp() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+int PS4_SYSV_ABI sceLncUtilLaunchApp(const char* title_id, const char*[], const void*) {
+    ExecutorNoteLaunchRequest("lnc_launch_app", title_id);
     return ORBIS_OK;
 }
 
@@ -413,8 +521,9 @@ int PS4_SYSV_ABI sceLncUtilStartKillApp() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceLncUtilStartLaunchAppByTitleId() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+int PS4_SYSV_ABI sceLncUtilStartLaunchAppByTitleId(const char* title_id, const char*[],
+                                                   const void*) {
+    ExecutorNoteLaunchRequest("lnc_start_launch_app_by_title_id", title_id);
     return ORBIS_OK;
 }
 
@@ -1173,8 +1282,8 @@ int PS4_SYSV_ABI sceShellCoreUtilIsUsbMassStorageMounted() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceShellCoreUtilLaunchByUri() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+int PS4_SYSV_ABI sceShellCoreUtilLaunchByUri(const char* uri) {
+    ExecutorNoteLaunchRequest("shellcore_launch_by_uri", uri);
     return ORBIS_OK;
 }
 
@@ -1224,7 +1333,7 @@ int PS4_SYSV_ABI sceShellCoreUtilNavigateToGoHome() {
 }
 
 int PS4_SYSV_ABI sceShellCoreUtilNavigateToLaunchedApp() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+    ExecutorNoteLaunchStatus("shellcore_navigate_to_launched_app");
     return ORBIS_OK;
 }
 
@@ -1278,8 +1387,8 @@ int PS4_SYSV_ABI sceShellCoreUtilPostErrorLog() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceShellCoreUtilPostLaunchConfirmResult() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+int PS4_SYSV_ABI sceShellCoreUtilPostLaunchConfirmResult(int result) {
+    ExecutorNoteLaunchStatus("shellcore_post_launch_confirm", result);
     return ORBIS_OK;
 }
 
@@ -1847,8 +1956,8 @@ int PS4_SYSV_ABI sceSystemServiceKillLocalProcessForPsmKit() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceSystemServiceLaunchApp() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+int PS4_SYSV_ABI sceSystemServiceLaunchApp(const char* title_id, const char*[], const void*) {
+    ExecutorNoteLaunchRequest("systemservice_launch_app", title_id);
     return ORBIS_OK;
 }
 
@@ -1874,6 +1983,20 @@ int PS4_SYSV_ABI sceSystemServiceLaunchWebBrowser() {
 
 int PS4_SYSV_ABI sceSystemServiceLoadExec(const char* path, const char* argv[]) {
     LOG_DEBUG(Lib_SystemService, "called");
+#ifdef __ANDROID__
+    const std::string guest_path = ExecutorReadGuestCString(path, 512);
+    if (guest_path.empty() || guest_path == "exit" || guest_path == "INVALID") {
+        LOG_INFO(Lib_SystemService, "[EXECUTOR_LOAD_EXEC_STUB] ignored Android probe path '{}'",
+                 path ? path : "<null>");
+        return ORBIS_OK;
+    }
+    if (guest_path == "/data/self/Store.self" || guest_path == "/app0/eboot.bin") {
+        LOG_INFO(Lib_SystemService, "[EXECUTOR_LOAD_EXEC_STUB] Store self-restart '{}'", path);
+        return ORBIS_OK;
+    }
+    ExecutorNoteLoadExecRequest("systemservice_load_exec", path);
+    return ORBIS_OK;
+#endif
     auto emu = Common::Singleton<Core::Emulator>::Instance();
     auto mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     auto hostPath = mnt->GetHostPath(std::string_view(path));
@@ -1912,33 +2035,15 @@ int PS4_SYSV_ABI sceSystemServiceNavigateToGoHome() {
 }
 
 s32 PS4_SYSV_ABI sceSystemServiceParamGetInt(OrbisSystemServiceParamId param_id, int* value) {
-    // TODO this probably should be stored in config for UI configuration
     LOG_DEBUG(Lib_SystemService, "called param_id {}", u32(param_id));
     if (value == nullptr) {
         LOG_ERROR(Lib_SystemService, "value is null");
         return ORBIS_SYSTEM_SERVICE_ERROR_PARAMETER;
     }
     switch (param_id) {
-    case OrbisSystemServiceParamId::Lang: {
-        s32 lang = EmulatorSettings.GetConsoleLanguage();
-        if (lang == 0x15 && g_sdk_version < Common::ElfInfo::FW_200) {
-            lang = 0x12;
-        }
-        if (lang == 0x16 && g_sdk_version < Common::ElfInfo::FW_250) {
-            lang = 2;
-        }
-        if ((lang >= 0x17 && lang <= 0x1a) && g_sdk_version < Common::ElfInfo::FW_500) {
-            lang = 0x12;
-        }
-        if ((lang >= 0x1b && lang <= 0x1d) && g_sdk_version < Common::ElfInfo::FW_500) {
-            lang = 1;
-        }
-        if (lang == 0x1e && g_sdk_version < Common::ElfInfo::FW_1000) {
-            lang = 0x12;
-        }
-        *value = lang;
+    case OrbisSystemServiceParamId::Lang:
+        *value = Config::GetLanguage();
         break;
-    }
     case OrbisSystemServiceParamId::DateFormat:
         *value = u32(OrbisSystemParamDateFormat::FmtDDMMYYYY);
         break;
@@ -1955,8 +2060,7 @@ s32 PS4_SYSV_ABI sceSystemServiceParamGetInt(OrbisSystemServiceParamId param_id,
         *value = u32(OrbisSystemParamGameParentalLevel::Off);
         break;
     case OrbisSystemServiceParamId::EnterButtonAssign:
-        *value = u32(EmulatorSettings.IsCircleEnter() ? OrbisSystemParamEnterButtonAssign::Circle
-                                                      : OrbisSystemParamEnterButtonAssign::Cross);
+        *value = u32(OrbisSystemParamEnterButtonAssign::Cross);
         break;
     default:
         LOG_ERROR(Lib_SystemService, "param_id {} unsupported!", u32(param_id));
@@ -2418,7 +2522,7 @@ int PS4_SYSV_ABI sceSystemServiceSaveVideoToken() {
 }
 
 int PS4_SYSV_ABI sceSystemServiceLaunchStore() {
-    LOG_ERROR(Lib_SystemService, "(STUBBED) called");
+    ExecutorNoteLaunchStatus("systemservice_launch_store");
     return ORBIS_OK;
 }
 
@@ -2468,9 +2572,6 @@ void PushSystemServiceEvent(const OrbisSystemServiceEvent& event) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_sdk_version) == 0,
-               "Failed to retrieve SDK version");
-
     LIB_FUNCTION("alZfRdr2RP8", "libSceAppMessaging", 1, "libSceSystemService",
                  sceAppMessagingClearEventFlag);
     LIB_FUNCTION("jKgAUl6cLy0", "libSceAppMessaging", 1, "libSceSystemService",
@@ -3402,4 +3503,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  "libSceSystemService", Func_CB5E885E225F69F0);
 };
 
-} // namespace Libraries::SystemService
+}

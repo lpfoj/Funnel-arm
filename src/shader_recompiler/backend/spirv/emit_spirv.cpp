@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <span>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
@@ -141,8 +143,84 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+bool UsesSignedTexelCoordinates(IR::Opcode opcode) {
+    switch (opcode) {
+    case IR::Opcode::ImageRead:
+    case IR::Opcode::ImageWrite:
+    case IR::Opcode::ImageAtomicIAdd32:
+    case IR::Opcode::ImageAtomicSMin32:
+    case IR::Opcode::ImageAtomicUMin32:
+    case IR::Opcode::ImageAtomicSMax32:
+    case IR::Opcode::ImageAtomicUMax32:
+    case IR::Opcode::ImageAtomicFMax32:
+    case IR::Opcode::ImageAtomicFMin32:
+    case IR::Opcode::ImageAtomicAnd32:
+    case IR::Opcode::ImageAtomicOr32:
+    case IR::Opcode::ImageAtomicXor32:
+    case IR::Opcode::ImageAtomicExchange32:
+    case IR::Opcode::ImageAtomicCmpSwap32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::unordered_set<IR::Inst*> FindAbsorbedVectorSignedCoordinateInstructions(
+    EmitContext& ctx, const IR::Program& program) {
+    std::unordered_set<IR::Inst*> candidates;
+    std::unordered_set<IR::Inst*> coordinate_consumers;
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (!UsesSignedTexelCoordinates(inst.GetOpcode()) || !inst.Arg(0).IsImmediate()) {
+                continue;
+            }
+            const u32 image_index = inst.Arg(0).U32() & 0xFFFF;
+            if (image_index >= ctx.images.size()) {
+                continue;
+            }
+
+            std::vector<IR::Inst*> chain;
+            const bool collected = CollectAbsorbedVectorSignedCoordinateChain(
+                ctx, ctx.images[image_index].view_type, inst.Arg(1), chain);
+            if (!collected) {
+                continue;
+            }
+            candidates.insert(chain.begin(), chain.end());
+            coordinate_consumers.insert(&inst);
+        }
+    }
+
+    bool changed;
+    do {
+        changed = false;
+        std::vector<IR::Inst*> rejected;
+        for (IR::Inst* const inst : candidates) {
+            bool can_suppress = !inst->MayHaveSideEffects();
+            if (can_suppress) {
+                for (const IR::Use& use : inst->Uses()) {
+                    const bool consumed_by_vector_coordinate =
+                        use.operand == 1 && coordinate_consumers.contains(use.user);
+                    if (!candidates.contains(use.user) && !consumed_by_vector_coordinate) {
+                        can_suppress = false;
+                        break;
+                    }
+                }
+            }
+            if (!can_suppress) {
+                rejected.push_back(inst);
+            }
+        }
+        for (IR::Inst* const inst : rejected) {
+            changed |= candidates.erase(inst) != 0;
+        }
+    } while (changed);
+    return candidates;
+}
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    bool is_entry_block{true};
+    std::unordered_set<IR::Inst*> absorbed_coordinate_instructions;
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -152,8 +230,60 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
-            for (IR::Inst& inst : node.data.block->Instructions()) {
+            ctx.ResetSampledImageDescriptorCache();
+            if (std::exchange(is_entry_block, false)) {
+                ctx.LoadBuiltInVectorInputs();
+                absorbed_coordinate_instructions =
+                    FindAbsorbedVectorSignedCoordinateInstructions(ctx, program);
+            }
+            auto& instructions = node.data.block->Instructions();
+            for (auto inst_it = instructions.begin(); inst_it != instructions.end();) {
+                IR::Inst& inst = *inst_it;
+
+                if (absorbed_coordinate_instructions.contains(&inst)) {
+                    ++inst_it;
+                    continue;
+                }
+
+                if (ctx.stage == Stage::Fragment &&
+                    inst.GetOpcode() == IR::Opcode::SetAttribute &&
+                    IR::IsMrt(inst.Arg(0).Attribute())) {
+                    const IR::Attribute attr{inst.Arg(0).Attribute()};
+                    const u32 mrt_index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
+                    const u32 num_components{ctx.frag_outputs.at(mrt_index).num_components};
+                    if (num_components > 1 && num_components <= 4) {
+                        std::array<Id, 4> values{};
+                        u32 component_mask{};
+                        auto scan_it = inst_it;
+                        u32 scanned{};
+                        for (; scanned < num_components && scan_it != instructions.end();
+                             ++scanned, ++scan_it) {
+                            const IR::Inst& candidate = *scan_it;
+                            if (candidate.GetOpcode() != IR::Opcode::SetAttribute ||
+                                candidate.Arg(0).Attribute() != attr) {
+                                break;
+                            }
+                            const u32 component{candidate.Arg(2).U32()};
+                            if (component >= num_components ||
+                                (component_mask & (1U << component)) != 0) {
+                                break;
+                            }
+                            component_mask |= 1U << component;
+                            values[component] = ctx.Def(candidate.Arg(1));
+                        }
+                        const u32 full_mask{(1U << num_components) - 1U};
+                        if (scanned == num_components && component_mask == full_mask) {
+                            EmitSetAttributeVector(
+                                ctx, attr,
+                                std::span<const Id>{values.data(), num_components});
+                            inst_it = scan_it;
+                            continue;
+                        }
+                    }
+                }
+
                 EmitInst(ctx, &inst);
+                ++inst_it;
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;
@@ -237,8 +367,6 @@ spv::ExecutionMode ExecutionMode(AmdGpu::TessellationPartitioning spacing) {
     case AmdGpu::TessellationPartitioning::FracEven:
         return spv::ExecutionMode::SpacingFractionalEven;
     case AmdGpu::TessellationPartitioning::Pow2:
-        // Pow2 rounds tessellation factors to the nearest power of 2, which has no
-        // direct Vulkan equivalent. SpacingEqual (integer) is the closest match.
         LOG_WARNING(Render_Vulkan, "Tessellation partitioning Pow2 has no Vulkan equivalent, "
                                    "falling back to SpacingEqual");
         return spv::ExecutionMode::SpacingEqual;
@@ -316,7 +444,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         if (info.loads.GetAny(IR::Attribute::RenderTargetIndex)) {
             ctx.AddCapability(spv::Capability::Geometry);
         }
-        if (info.stores.Get(IR::Attribute::StencilRef) && profile.supports_shader_stencil_export) {
+        if (info.stores.Get(IR::Attribute::StencilRef) &&
+            profile.supports_shader_stencil_export) {
             ctx.AddExtension("SPV_EXT_shader_stencil_export");
             ctx.AddCapability(spv::Capability::StencilExportEXT);
         }
@@ -421,191 +550,35 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
     ctx.AddEntryPoint(execution_model, main, "main", interfaces);
 }
 
-void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,
-                          Id main_func) {
-    const auto fp32_denorm_mode = runtime_info.fp_denorm_mode32;
-    if (fp32_denorm_mode == AmdGpu::FpDenormMode::InOutFlush) {
+void SetupFloatMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,
+                    Id main_func) {
+    if (profile.has_broken_spirv_float_controls) {
+        return;
+    }
+#ifdef __ANDROID__
+    if (std::getenv("EXECUTOR_BISECT_NO_FLOATCTRL") != nullptr) {
+        return;
+    }
+#endif
+    ctx.AddExtension("SPV_KHR_float_controls");
+    const auto fp_denorm_mode = runtime_info.fp_denorm_mode32;
+    if (fp_denorm_mode == AmdGpu::FpDenormMode::InOutFlush) {
         if (profile.support_fp32_denorm_flush) {
             ctx.AddCapability(spv::Capability::DenormFlushToZero);
             ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 32U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float32 denorm flushing is not supported by the GPU");
-            });
         }
     } else {
-        LOG_WARNING(Render_Vulkan, "Unknown FP denorm mode {}", u32(fp32_denorm_mode));
+        LOG_WARNING(Render_Vulkan, "Unknown FP denorm mode {}", u32(fp_denorm_mode));
     }
-
-    if (!ctx.info.uses_fp16 && !ctx.info.uses_fp64) {
-        return;
-    }
-
-    const auto fp16_64_denorm_mode = runtime_info.fp_denorm_mode16_64;
-    const auto same_denorm_mode = fp16_64_denorm_mode == fp32_denorm_mode;
-    if (!same_denorm_mode && !profile.supports_denorm_behavior_independence) {
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            LOG_WARNING(Render_Vulkan, "Float32 and Float16/64 denorm modes are different but the "
-                                       "GPU does not support that");
-        });
-        return;
-    }
-
-    if (fp16_64_denorm_mode == AmdGpu::FpDenormMode::InOutFlush) {
-        if (profile.support_fp16_denorm_flush) {
-            ctx.AddCapability(spv::Capability::DenormFlushToZero);
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 16U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float16 denorm flushing is not supported by the GPU");
-            });
-        }
-        if (profile.support_fp64_denorm_flush) {
-            ctx.AddCapability(spv::Capability::DenormFlushToZero);
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 64U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float64 denorm flushing is not supported by the GPU");
-            });
-        }
-    } else if (fp16_64_denorm_mode == AmdGpu::FpDenormMode::InOutAllow) {
-        if (profile.support_fp16_denorm_preserve) {
-            ctx.AddCapability(spv::Capability::DenormPreserve);
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float16 denorm preserving is not supported by the GPU");
-            });
-        }
-        if (profile.support_fp64_denorm_preserve) {
-            ctx.AddCapability(spv::Capability::DenormPreserve);
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float64 denorm preserving is not supported by the GPU");
-            });
-        }
-    } else {
-        LOG_WARNING(Render_Vulkan, "Unknown Float16/64 denorm mode {}", u32(fp16_64_denorm_mode));
-    }
-}
-
-void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,
-                       Id main_func) {
     const auto fp_round_mode = runtime_info.fp_round_mode32;
     if (fp_round_mode == AmdGpu::FpRoundMode::ToZero) {
         if (profile.support_fp32_round_to_zero) {
             ctx.AddCapability(spv::Capability::RoundingModeRTZ);
             ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTZ, 32U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float32 rounding to zero is not supported by the GPU");
-            });
         }
     } else if (fp_round_mode != AmdGpu::FpRoundMode::NearestEven) {
         LOG_WARNING(Render_Vulkan, "Unknown FP rounding mode {}", u32(fp_round_mode));
     }
-
-    if (ctx.info.uses_fp16 || ctx.info.uses_fp64) {
-        const auto fp16_64_round_mode = runtime_info.fp_round_mode16_64;
-        const auto same_round_mode = fp16_64_round_mode == fp_round_mode;
-        if (!same_round_mode && !profile.supports_rounding_mode_independence) {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float32 and Float16/64 rounding modes are different "
-                                           "but the GPU does not support that");
-            });
-            return;
-        }
-
-        if (fp16_64_round_mode == AmdGpu::FpRoundMode::ToZero) {
-            if (ctx.info.uses_fp16) {
-                if (profile.support_fp16_round_to_zero) {
-                    ctx.AddCapability(spv::Capability::RoundingModeRTZ);
-                    ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTZ, 16U);
-                } else {
-                    static std::once_flag logged;
-                    std::call_once(logged, [] {
-                        LOG_WARNING(Render_Vulkan,
-                                    "Float16 rounding to zero is not supported by the GPU");
-                    });
-                }
-            }
-            if (ctx.info.uses_fp64) {
-                if (profile.support_fp64_round_to_zero) {
-                    ctx.AddCapability(spv::Capability::RoundingModeRTZ);
-                    ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTZ, 64U);
-                } else {
-                    static std::once_flag logged;
-                    std::call_once(logged, [] {
-                        LOG_WARNING(Render_Vulkan,
-                                    "Float64 rounding to zero is not supported by the GPU");
-                    });
-                }
-            }
-        } else if (fp16_64_round_mode != AmdGpu::FpRoundMode::NearestEven) {
-            LOG_WARNING(Render_Vulkan, "Unknown Float16/64 rounding mode {}",
-                        u32(fp16_64_round_mode));
-        }
-    }
-}
-
-void SetupInfNanPreserveMode(EmitContext& ctx, const Profile& profile,
-                             const RuntimeInfo& runtime_info, Id main_func) {
-    if (profile.support_fp16_signed_zero_inf_nan_preserve ||
-        profile.support_fp32_signed_zero_inf_nan_preserve ||
-        profile.support_fp64_signed_zero_inf_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-    }
-
-    if (profile.support_fp32_signed_zero_inf_nan_preserve) {
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
-    } else {
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            LOG_WARNING(Render_Vulkan,
-                        "Float32 signed zero/inf/nan preserve mode is not supported by the GPU");
-        });
-    }
-    if (ctx.info.uses_fp16) {
-        if (profile.support_fp16_signed_zero_inf_nan_preserve) {
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(
-                    Render_Vulkan,
-                    "Float16 signed zero/inf/nan preserve mode is not supported by the GPU");
-            });
-        }
-    }
-    if (ctx.info.uses_fp64) {
-        if (profile.support_fp64_signed_zero_inf_nan_preserve) {
-            ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 64U);
-        } else {
-            static std::once_flag logged;
-            std::call_once(logged, [] {
-                LOG_WARNING(
-                    Render_Vulkan,
-                    "Float64 signed zero/inf/nan preserve mode is not supported by the GPU");
-            });
-        }
-    }
-}
-
-void SetupFloatMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,
-                    Id main_func) {
-    ctx.AddExtension("SPV_KHR_float_controls");
-    SetupDenormFlushMode(ctx, profile, runtime_info, main_func);
-    SetupRoundingMode(ctx, profile, runtime_info, main_func);
-    SetupInfNanPreserveMode(ctx, profile, runtime_info, main_func);
 }
 
 void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
@@ -627,7 +600,7 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
         return std::make_pair(arg, parent);
     });
 }
-} // Anonymous namespace
+}
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
@@ -648,7 +621,6 @@ Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {
     for (size_t index = 0; index < num_args; ++index) {
         blocks.push_back(inst->PhiBlock(index)->Definition<Id>());
     }
-    // The type of a phi instruction is stored in its flags
     const Id result_type{TypeId(ctx, inst->Flags<IR::Type>())};
     return ctx.DeferredOpPhi(result_type, std::span(blocks.data(), blocks.size()));
 }
@@ -727,4 +699,4 @@ void EmitSetM0(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
-} // namespace Shader::Backend::SPIRV
+}

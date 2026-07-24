@@ -35,49 +35,49 @@ using OrbisNgs2BufferAllocHandler =
 using OrbisNgs2BufferFreeHandler = s32 PS4_SYSV_ABI (*)(OrbisNgs2ContextBufferInfo* io_buffer_info);
 
 struct OrbisNgs2SystemInfo {
-    char name[ORBIS_NGS2_SYSTEM_NAME_LENGTH]; // 0
+    char name[ORBIS_NGS2_SYSTEM_NAME_LENGTH];
 
-    OrbisNgs2Handle systemHandle;          // 16
-    OrbisNgs2ContextBufferInfo bufferInfo; // 24
+    OrbisNgs2Handle systemHandle;
+    OrbisNgs2ContextBufferInfo bufferInfo;
 
-    u32 uid;             // 88
-    u32 minGrainSamples; // 92
-    u32 maxGrainSamples; // 96
+    u32 uid;
+    u32 minGrainSamples;
+    u32 maxGrainSamples;
 
-    u32 stateFlags;        // 100
-    u32 rackCount;         // 104
-    float lastRenderRatio; // 108
-    s64 lastRenderTick;    // 112
-    s64 renderCount;       // 120
-    u32 sampleRate;        // 128
-    u32 numGrainSamples;   // 132
+    u32 stateFlags;
+    u32 rackCount;
+    float lastRenderRatio;
+    s64 lastRenderTick;
+    s64 renderCount;
+    u32 sampleRate;
+    u32 numGrainSamples;
 };
 
 struct OrbisNgs2RackInfo {
-    char name[ORBIS_NGS2_RACK_NAME_LENGTH]; // 0
+    char name[ORBIS_NGS2_RACK_NAME_LENGTH];
 
-    OrbisNgs2Handle rackHandle;            // 16
-    OrbisNgs2ContextBufferInfo bufferInfo; // 24
+    OrbisNgs2Handle rackHandle;
+    OrbisNgs2ContextBufferInfo bufferInfo;
 
-    OrbisNgs2Handle ownerSystemHandle; // 88
+    OrbisNgs2Handle ownerSystemHandle;
 
-    u32 type;            // 96
-    u32 rackId;          // 100
-    u32 uid;             // 104
-    u32 minGrainSamples; // 108
-    u32 maxGrainSamples; // 112
-    u32 maxVoices;       // 116
-    u32 maxChannelWorks; // 120
-    u32 maxInputs;       // 124
-    u32 maxMatrices;     // 128
-    u32 maxPorts;        // 132
+    u32 type;
+    u32 rackId;
+    u32 uid;
+    u32 minGrainSamples;
+    u32 maxGrainSamples;
+    u32 maxVoices;
+    u32 maxChannelWorks;
+    u32 maxInputs;
+    u32 maxMatrices;
+    u32 maxPorts;
 
-    u32 stateFlags;             // 136
-    float lastProcessRatio;     // 140
-    u64 lastProcessTick;        // 144
-    u64 renderCount;            // 152
-    u32 activeVoiceCount;       // 160
-    u32 activeChannelWorkCount; // 164
+    u32 stateFlags;
+    float lastProcessRatio;
+    u64 lastProcessTick;
+    u64 renderCount;
+    u32 activeVoiceCount;
+    u32 activeChannelWorkCount;
 };
 
 struct StackBuffer {
@@ -93,18 +93,17 @@ struct StackBuffer {
 };
 
 struct SystemInternal {
-    // setup init
-    char name[ORBIS_NGS2_SYSTEM_NAME_LENGTH]; // 0
-    OrbisNgs2ContextBufferInfo bufferInfo;    // 16
-    OrbisNgs2BufferFreeHandler hostFree;      // 80
-    OrbisNgs2Handle systemHandle;             // 88
-    void* unknown1;                           // 96
-    void* unknown2;                           // 104
-    OrbisNgs2Handle rackHandle;               // 112
-    uintptr_t* userData;                      // 120
-    SystemInternal* systemList;               // 128
-    StackBuffer* stackBuffer;                 // 136
-    OrbisNgs2SystemInfo ownerSystemInfo;      // 144
+    char name[ORBIS_NGS2_SYSTEM_NAME_LENGTH];
+    OrbisNgs2ContextBufferInfo bufferInfo;
+    OrbisNgs2BufferFreeHandler hostFree;
+    OrbisNgs2Handle systemHandle;
+    void* unknown1;
+    void* unknown2;
+    OrbisNgs2Handle rackHandle;
+    uintptr_t* userData;
+    SystemInternal* systemList;
+    StackBuffer* stackBuffer;
+    OrbisNgs2SystemInfo ownerSystemInfo;
 
     struct rackList {
         void* prev;
@@ -112,56 +111,55 @@ struct SystemInternal {
         void* unknown;
     };
 
-    rackList rackListPreset; // 152
-    rackList rackListNormal; // 176
-    rackList rackListMaster; // 200
+    rackList rackListPreset;
+    rackList rackListNormal;
+    rackList rackListMaster;
 
-    void* unknown3;       // 208
-    void* systemListPrev; // 216
-    void* unknown4;       // 224
-    void* systemListNext; // 232
-    void* rackFunction;   // 240
+    void* unknown3;
+    void* systemListPrev;
+    void* unknown4;
+    void* systemListNext;
+    void* rackFunction;
 
-    Kernel::PthreadMutex processLock; // 248
-    u32 hasProcessMutex;              // 256
-    u32 unknown5;                     // 260
-    Kernel::PthreadMutex flushLock;   // 264
-    u32 hasFlushMutex;                // 272
-    u32 unknown6;                     // 276
+    Kernel::PthreadMutex processLock;
+    u32 hasProcessMutex;
+    u32 unknown5;
+    Kernel::PthreadMutex flushLock;
+    u32 hasFlushMutex;
+    u32 unknown6;
 
-    // info
-    u64 lastRenderTick;         // 280
-    u64 renderCount;            // 288
-    u32 isActive;               // 296
-    std::atomic<int> lockCount; // 300
-    u32 uid;                    // 304
-    u32 systemType;             // 308
+    u64 lastRenderTick;
+    u64 renderCount;
+    u32 isActive;
+    std::atomic<int> lockCount;
+    u32 uid;
+    u32 systemType;
 
     struct {
         u8 isBufferValid : 1;
         u8 isRendering : 1;
         u8 isSorted : 1;
         u8 isFlushReady : 1;
-    } flags; // 312
+    } flags;
 
-    u16 currentMaxGrainSamples; // 316
-    u16 minGrainSamples;        // 318
-    u16 maxGrainSamples;        // 320
-    u16 numGrainSamples;        // 322
-    u32 currentNumGrainSamples; // 324
-    u32 sampleRate;             // 328
-    u32 currentSampleRate;      // 332
-    u32 rackCount;              // 336
-    float lastRenderRatio;      // 340
-    float cpuLoad;              // 344
+    u16 currentMaxGrainSamples;
+    u16 minGrainSamples;
+    u16 maxGrainSamples;
+    u16 numGrainSamples;
+    u32 currentNumGrainSamples;
+    u32 sampleRate;
+    u32 currentSampleRate;
+    u32 rackCount;
+    float lastRenderRatio;
+    float cpuLoad;
 };
 
 struct HandleInternal {
-    HandleInternal* selfPtr;    // 0
-    SystemInternal* systemData; // 8
-    std::atomic<int> refCount;  // 16
-    u32 handleType;             // 24
-    u32 handleID;               // 28
+    HandleInternal* selfPtr;
+    SystemInternal* systemData;
+    std::atomic<int> refCount;
+    u32 handleType;
+    u32 handleID;
 };
 
 s32 StackBufferClose(StackBuffer* stackBuffer, size_t* outTotalSize);
@@ -176,4 +174,4 @@ s32 SystemCleanup(OrbisNgs2Handle systemHandle, OrbisNgs2ContextBufferInfo* outI
 s32 SystemSetup(const OrbisNgs2SystemOption* option, OrbisNgs2ContextBufferInfo* hostBufferInfo,
                 OrbisNgs2BufferFreeHandler hostFree, OrbisNgs2Handle* outHandle);
 
-} // namespace Libraries::Ngs2
+}

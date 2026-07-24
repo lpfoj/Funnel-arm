@@ -3,6 +3,9 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include <bit>
+
+#include "common/content_fingerprint.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -10,10 +13,52 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
+namespace {
+
+u64 DescriptorWritesSignature(const Pipeline::DescriptorWrites& writes) {
+    Common::ContentFingerprint64 fingerprint{Common::FingerprintDomain::DescriptorWrites};
+    const auto mix = [&fingerprint](const u64 value) {
+        fingerprint.UpdateLittleEndian(value);
+    };
+    mix(writes.size());
+    for (const auto& write : writes) {
+        mix(write.dstBinding);
+        mix(write.dstArrayElement);
+        mix(write.descriptorCount);
+        mix(static_cast<u32>(write.descriptorType));
+        for (u32 index = 0; index < write.descriptorCount; ++index) {
+            if (write.pBufferInfo != nullptr) {
+                const auto& info = write.pBufferInfo[index];
+                mix(std::bit_cast<u64>(static_cast<VkBuffer>(info.buffer)));
+                mix(info.offset);
+                mix(info.range);
+            } else if (write.pImageInfo != nullptr) {
+                const auto& info = write.pImageInfo[index];
+                mix(std::bit_cast<u64>(static_cast<VkSampler>(info.sampler)));
+                mix(std::bit_cast<u64>(static_cast<VkImageView>(info.imageView)));
+                mix(static_cast<u32>(info.imageLayout));
+            } else if (write.pTexelBufferView != nullptr) {
+                mix(std::bit_cast<u64>(
+                    static_cast<VkBufferView>(write.pTexelBufferView[index])));
+            }
+        }
+    }
+    return fingerprint.Finish();
+}
+
+struct DescriptorBindCache {
+    const Pipeline* pipeline{};
+    u64 cmdbuf{};
+    u64 recording_tick{};
+    u64 signature{};
+    bool valid{};
+};
+
+}
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
-                   bool is_compute_ /*= false*/)
+                   bool is_compute_)
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {}
 
@@ -38,13 +83,32 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
 
-    // Bind descriptor set.
     if (set_writes.empty()) {
+        return;
+    }
+
+    static thread_local std::array<DescriptorBindCache, 2> bind_caches{};
+    auto& bind_cache = bind_caches[IsCompute() ? 1u : 0u];
+    const u64 raw_cmdbuf =
+        std::bit_cast<u64>(static_cast<VkCommandBuffer>(cmdbuf));
+    const u64 recording_tick = scheduler.CurrentTick();
+    const u64 descriptor_signature = DescriptorWritesSignature(set_writes);
+    if (bind_cache.valid && bind_cache.pipeline == this &&
+        bind_cache.cmdbuf == raw_cmdbuf &&
+        bind_cache.recording_tick == recording_tick &&
+        bind_cache.signature == descriptor_signature) {
         return;
     }
 
     if (uses_push_descriptors) {
         cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        bind_cache = {
+            .pipeline = this,
+            .cmdbuf = raw_cmdbuf,
+            .recording_tick = recording_tick,
+            .signature = descriptor_signature,
+            .valid = true,
+        };
         return;
     }
 
@@ -54,6 +118,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    bind_cache = {
+        .pipeline = this,
+        .cmdbuf = raw_cmdbuf,
+        .recording_tick = recording_tick,
+        .signature = descriptor_signature,
+        .valid = true,
+    };
 }
 
 std::string Pipeline::GetDebugString() const {
@@ -71,4 +142,4 @@ std::string Pipeline::GetDebugString() const {
     return stage_desc;
 }
 
-} // namespace Vulkan
+}

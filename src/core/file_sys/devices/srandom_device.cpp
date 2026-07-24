@@ -53,8 +53,6 @@ s64 SRandomDevice::read(void* buf, u64 nbytes) {
 
 s32 SRandomDevice::fstat(Libraries::Kernel::OrbisKernelStat* sb) {
     LOG_ERROR(Kernel_Fs, "(STUBBED) called");
-    std::memset(sb, 0, sizeof(Libraries::Kernel::OrbisKernelStat));
-    sb->st_mode = 0000777u | 0020000u;
     return 0;
 }
 
@@ -78,4 +76,4 @@ s64 SRandomDevice::pwrite(const void* buf, u64 nbytes, s64 offset) {
     return 0;
 }
 
-} // namespace Core::Devices
+}

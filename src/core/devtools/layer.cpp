@@ -7,10 +7,10 @@
 #include <imgui.h>
 
 #include "SDL3/SDL_log.h"
+#include "common/config.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/debug_state.h"
-#include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "imgui/imgui_std.h"
 #include "imgui_internal.h"
@@ -49,11 +49,9 @@ static Widget::MemoryMapViewer memory_map;
 static Widget::ShaderList shader_list;
 static Widget::ModuleList module_list;
 
-// clang-format off
 static std::string help_text =
 #include "help.txt"
     ;
-// clang-format on
 
 void L::DrawMenuBar() {
     const auto& ctx = *GImGui;
@@ -110,11 +108,11 @@ void L::DrawMenuBar() {
                 EndDisabled();
 
                 if (Button("Save")) {
-                    EmulatorSettings.SetFsrEnabled(fsr.enable);
-                    EmulatorSettings.SetRcasEnabled(fsr.use_rcas);
-                    EmulatorSettings.SetRcasAttenuation(
-                        static_cast<int>(fsr.rcas_attenuation * 1000));
-                    EmulatorSettings.Save();
+                    Config::setFsrEnabled(fsr.enable);
+                    Config::setRcasEnabled(fsr.use_rcas);
+                    Config::setRcasAttenuation(static_cast<int>(fsr.rcas_attenuation * 1000));
+                    Config::save(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
+                                 "config.toml");
                     CloseCurrentPopup();
                 }
 
@@ -123,8 +121,12 @@ void L::DrawMenuBar() {
             ImGui::EndMenu();
         }
         if (BeginMenu("Debug")) {
-            MenuItem("Memory map", nullptr, &memory_map.open);
-            MenuItem("Module list", nullptr, &module_list.open);
+            if (MenuItem("Memory map")) {
+                memory_map.open = true;
+            }
+            if (MenuItem("Module list")) {
+                module_list.open = true;
+            }
             ImGui::EndMenu();
         }
 
@@ -274,11 +276,11 @@ void L::DrawAdvanced() {
 void L::DrawSimple() {
     const float frameRate = DebugState.Framerate;
     if (frameRate < 10) {
-        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.0f, 0.0f, 1.0f)); // Red
+        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
     } else if (frameRate >= 10 && frameRate < 20) {
-        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.0f, 1.0f)); // Orange
+        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.0f, 1.0f));
     } else {
-        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f)); // White
+        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
     }
     Text("%d FPS (%.1f ms)", static_cast<int>(std::round(frameRate)), 1000.0f / frameRate);
     PopStyleColor();
@@ -299,18 +301,6 @@ static void LoadSettings(const char* line) {
         frame_graph.is_open = i != 0;
         return;
     }
-    if (sscanf(line, "show_shader_list=%d", &i) == 1) {
-        shader_list.open = i != 0;
-        return;
-    }
-    if (sscanf(line, "show_memory_map=%d", &i) == 1) {
-        memory_map.open = i != 0;
-        return;
-    }
-    if (sscanf(line, "show_module_list=%d", &i) == 1) {
-        module_list.open = i != 0;
-        return;
-    }
     if (sscanf(line, "dump_frame_count=%d", &i) == 1) {
         dump_frame_count = i;
         return;
@@ -319,7 +309,7 @@ static void LoadSettings(const char* line) {
 
 void L::SetupSettings() {
     frame_graph.is_open = true;
-    show_simple_fps = EmulatorSettings.IsShowFpsCounter();
+    show_simple_fps = Config::getShowFpsCounter();
 
     using SettingLoader = void (*)(const char*);
 
@@ -352,9 +342,6 @@ void L::SetupSettings() {
         buf->appendf("fps_scale=%f\n", fps_scale);
         buf->appendf("show_advanced_debug=%d\n", DebugState.IsShowingDebugMenuBar());
         buf->appendf("show_frame_graph=%d\n", frame_graph.is_open);
-        buf->appendf("show_shader_list=%d\n", shader_list.open);
-        buf->appendf("show_memory_map=%d\n", memory_map.open);
-        buf->appendf("show_module_list=%d\n", module_list.open);
         buf->appendf("dump_frame_count=%d\n", dump_frame_count);
         buf->append("\n");
         buf->appendf("[%s][CmdList]\n", handler->TypeName);
@@ -407,7 +394,6 @@ void L::Draw() {
         if (Begin("Video Info", nullptr,
                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
-            // Set window position to top left if it was toggled on
             if (visibility_toggled) {
                 SetWindowPos("Video Info", {999999.0f, 0.0f}, ImGuiCond_Always);
                 visibility_toggled = false;
@@ -447,7 +433,7 @@ void L::Draw() {
                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
             SetWindowFontScale(1.5f);
-            Overlay::TextCentered("Are you sure you want to quit?");
+            TextCentered("Are you sure you want to quit?");
             NewLine();
             Text("Press Escape or Circle/B button to cancel");
             Text("Press Enter or Cross/A button to quit");
@@ -471,7 +457,6 @@ void L::Draw() {
     if (show_volume) {
         float current_time = ImGui::GetTime();
 
-        // Show volume for 3 seconds
         if (current_time - volume_start_time >= 3.0) {
             show_volume = false;
         } else {
@@ -483,7 +468,7 @@ void L::Draw() {
             if (ImGui::Begin("Volume Window", &show_volume,
                              ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
                                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
-                Text("Volume: %d", EmulatorSettings.GetVolumeSlider());
+                Text("Volume: %d", Config::getVolumeSlider());
             }
             End();
         }
@@ -492,16 +477,16 @@ void L::Draw() {
     PopID();
 }
 
-namespace Overlay {
-
-void TextCentered(const std::string& text) {
-    float window_width = GetContentRegionAvail().x;
+void L::TextCentered(const std::string& text) {
+    float window_width = GetWindowSize().x;
     float text_width = CalcTextSize(text.c_str()).x;
     float text_indentation = (window_width - text_width) * 0.5f;
 
-    SetCursorPosX(text_indentation);
+    SameLine(text_indentation);
     Text("%s", text.c_str());
 }
+
+namespace Overlay {
 
 void ToggleSimpleFps() {
     show_simple_fps = !show_simple_fps;
@@ -522,4 +507,4 @@ void ShowVolume() {
     show_volume = true;
 }
 
-} // namespace Overlay
+}

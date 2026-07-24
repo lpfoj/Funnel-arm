@@ -42,14 +42,7 @@ struct BufferResource {
     }
 
     bool IsStorage([[maybe_unused]] const AmdGpu::Buffer buffer) const noexcept {
-        // When using uniform buffers, a size is required at compilation time, so we need to
-        // either compile a lot of shader specializations to handle each size or just force it to
-        // the maximum possible size always. However, for some vendors the shader-supplied size is
-        // used for bounds checking uniform buffer accesses, so the latter would effectively turn
-        // off buffer robustness behavior. Instead, force storage buffers which are bounds checked
-        // using the actual buffer size. We are assuming the performance hit from this is
-        // acceptable.
-        return true; // buffer.GetSize() > profile.max_ubo_size || is_written;
+        return true;
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
@@ -57,7 +50,7 @@ struct BufferResource {
         if (inline_cbuf) {
             buffer = inline_cbuf;
             if (inline_cbuf.base_address != 1) {
-                buffer.base_address += info.pgm_base; // address fixup
+                buffer.base_address += info.pgm_base;
             }
         } else {
             buffer = info.template ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
@@ -162,4 +155,4 @@ struct PushData {
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 
-} // namespace Shader
+}

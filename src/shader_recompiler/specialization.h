@@ -52,7 +52,6 @@ struct ImageSpecialization {
     bool is_srgb = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
-    // FIXME any pipeline cache changes needed?
     u32 num_bindings = 0;
 
     bool operator==(const ImageSpecialization&) const = default;
@@ -72,12 +71,6 @@ struct SamplerSpecialization {
     bool operator==(const SamplerSpecialization&) const = default;
 };
 
-/**
- * Alongside runtime information, this structure also checks bound resources
- * for compatibility. Can be used as a key for storing shader permutations.
- * Is separate from runtime information, because resource layout can only be deduced
- * after the first compilation of a module.
- */
 struct StageSpecialization {
     static constexpr size_t MaxStageResources = 128;
 
@@ -94,11 +87,12 @@ struct StageSpecialization {
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+                        Backend::Bindings start_,
+                        const std::optional<Gcn::FetchShaderData>* parsed_fetch_shader = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        fetch_shader_data = Gcn::ParseFetchShader(info_);
+        fetch_shader_data =
+            parsed_fetch_shader ? *parsed_fetch_shader : Gcn::ParseFetchShader(info_);
         if (info_.stage == Stage::Vertex && fetch_shader_data) {
-            // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data->attributes,
                          [&profile_, this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                              using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
@@ -159,7 +153,6 @@ struct StageSpecialization {
                          spec.force_degamma = sharp.force_degamma;
                      });
 
-        // Initialize runtime_info fields that rely on analysis in tessellation passes
         if (info->l_stage == LogicalStage::TessellationControl ||
             info->l_stage == LogicalStage::TessellationEval) {
             TessellationDataConstantBuffer tess_constants{};
@@ -217,10 +210,6 @@ struct StageSpecialization {
             return false;
         }
 
-        // For VS which only generates geometry and doesn't have any inputs, its start
-        // bindings still may change as they depend on previously processed FS. The check below
-        // handles this case and prevents generation of redundant permutations. This is also safe
-        // for other types of shaders with no bindings.
         if (bitset.none() && other.bitset.none()) {
             return true;
         }
@@ -253,4 +242,4 @@ struct StageSpecialization {
     bool Deserialize(Serialization::Archive& ar);
 };
 
-} // namespace Shader
+}

@@ -19,7 +19,7 @@ namespace {
     UNREACHABLE_MSG("Invalid type = {}, functionName = {}, line = {}", u32(type), functionName,
                     lineNumber);
 }
-} // Anonymous namespace
+}
 
 U1 IREmitter::Imm1(bool value) const {
     return U1{Value{value}};
@@ -434,8 +434,8 @@ U32 IREmitter::ReadConst(const Value& base, const U32& offset) {
     return Inst<U32>(Opcode::ReadConst, base, offset);
 }
 
-U32 IREmitter::ReadConstBuffer(const Value& handle, const U32& index, BufferInstInfo info) {
-    return Inst<U32>(Opcode::ReadConstBuffer, Flags{info}, handle, index);
+U32 IREmitter::ReadConstBuffer(const Value& handle, const U32& index) {
+    return Inst<U32>(Opcode::ReadConstBuffer, handle, index);
 }
 
 U8 IREmitter::LoadBufferU8(const Value& handle, const Value& address, BufferInstInfo info) {
@@ -1393,29 +1393,35 @@ U1 IREmitter::FPUnordered(const F32F64& lhs, const F32F64& rhs) {
     return LogicalOr(FPIsNan(lhs), FPIsNan(rhs));
 }
 
-F32F64 IREmitter::FPMax(const F32F64& lhs, const F32F64& rhs) {
+F32F64 IREmitter::FPMax(const F32F64& lhs, const F32F64& rhs, bool is_legacy) {
     if (lhs.Type() != rhs.Type()) {
         UNREACHABLE_MSG("Mismatching types {} and {}", lhs.Type(), rhs.Type());
     }
 
     switch (lhs.Type()) {
     case Type::F32:
-        return Inst<F32>(Opcode::FPMax32, lhs, rhs);
+        return Inst<F32>(Opcode::FPMax32, lhs, rhs, is_legacy);
     case Type::F64:
+        if (is_legacy) {
+            UNREACHABLE_MSG("F64 cannot be used with LEGACY ops");
+        }
         return Inst<F64>(Opcode::FPMax64, lhs, rhs);
     default:
         ThrowInvalidType(lhs.Type());
     }
 }
 
-F32F64 IREmitter::FPMin(const F32F64& lhs, const F32F64& rhs) {
+F32F64 IREmitter::FPMin(const F32F64& lhs, const F32F64& rhs, bool is_legacy) {
     if (lhs.Type() != rhs.Type()) {
         UNREACHABLE_MSG("Mismatching types {} and {}", lhs.Type(), rhs.Type());
     }
     switch (lhs.Type()) {
     case Type::F32:
-        return Inst<F32>(Opcode::FPMin32, lhs, rhs);
+        return Inst<F32>(Opcode::FPMin32, lhs, rhs, is_legacy);
     case Type::F64:
+        if (is_legacy) {
+            UNREACHABLE_MSG("F64 cannot be used with LEGACY ops");
+        }
         return Inst<F64>(Opcode::FPMin64, lhs, rhs);
     default:
         ThrowInvalidType(lhs.Type());
@@ -2143,17 +2149,6 @@ void IREmitter::ImageWrite(const Value& handle, const Value& coords, const U32& 
     return Inst<F32>(Opcode::CubeFaceIndex, cube_coords);
 }
 
-// Debug print maps to SPIRV's NonSemantic DebugPrintf instruction
-// Renderdoc will hook in its own implementation of the SPIRV instruction
-// Renderdoc accepts format specifiers, e.g. %u, listed here:
-// https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/main/docs/debug_printf.md
-//
-// fmt must be a string literal (pointer is shallow copied into a Value)
-// Example usage:
-//         ir.DebugPrint("invocation xyz: (%u, %u, %u)",
-//                      {ir.GetVectorReg(IR::VectorReg::V0),
-//                       ir.GetVectorReg(IR::VectorReg::V1),
-//                       ir.GetVectorReg(IR::VectorReg::V2)});
 void IREmitter::DebugPrint(const char* fmt, boost::container::small_vector<Value, 5> format_args) {
     std::array<Value, DEBUGPRINT_NUM_FORMAT_ARGS> args;
 
@@ -2183,4 +2178,4 @@ void IREmitter::EmitPrimitive() {
     Inst(Opcode::EmitPrimitive);
 }
 
-} // namespace Shader::IR
+}

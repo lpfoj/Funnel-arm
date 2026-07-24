@@ -5,8 +5,6 @@
 
 namespace AmdGpu {
 
-// The following values are taken from fpPS4:
-// https://github.com/red-prig/fpPS4/blob/436b43064be4c78229500f3d3c054fc76639247d/chip/pm4_pfp.pas#L410
 static constexpr std::array REG_ARRAY_DEFAULT = {
     0x00000000u, 0x80000000u, 0x40004000u, 0xdeadbeefu, 0x00000000u, 0x40004000u, 0x00000000u,
     0x40004000u, 0x00000000u, 0x40004000u, 0x00000000u, 0x40004000u, 0xaa99aaaau, 0x00000000u,
@@ -29,7 +27,6 @@ void Regs::SetDefaults() {
     std::memcpy(&reg_array[ContextRegWordOffset + 0x80], REG_ARRAY_DEFAULT.data(),
                 REG_ARRAY_DEFAULT.size() * sizeof(u32));
 
-    // Individual context regs values
     reg_array[ContextRegWordOffset + 0x000d] = 0x40004000u;
     reg_array[ContextRegWordOffset + 0x01b6] = 0x00000002u;
     reg_array[ContextRegWordOffset + 0x0204] = 0x00090000u;
@@ -96,11 +93,7 @@ static_assert(GFX6_3D_REG_INDEX(vs_output_control) == 0xA207);
 static_assert(GFX6_3D_REG_INDEX(line_control) == 0xA282);
 static_assert(GFX6_3D_REG_INDEX(hs_clamp) == 0xA287);
 static_assert(GFX6_3D_REG_INDEX(vgt_gs_mode) == 0xA290);
-static_assert(GFX6_3D_REG_INDEX(vgt_gs_onchip_control) == 0xA291);
 static_assert(GFX6_3D_REG_INDEX(mode_control) == 0xA292);
-static_assert(GFX6_3D_REG_INDEX(vgt_gsvs_ring_offset_1) == 0xA298);
-static_assert(GFX6_3D_REG_INDEX(vgt_gsvs_ring_offset_2) == 0xA299);
-static_assert(GFX6_3D_REG_INDEX(vgt_gsvs_ring_offset_3) == 0xA29A);
 static_assert(GFX6_3D_REG_INDEX(vgt_gs_out_prim_type) == 0xA29B);
 static_assert(GFX6_3D_REG_INDEX(index_size) == 0xA29D);
 static_assert(GFX6_3D_REG_INDEX(index_buffer_type) == 0xA29F);
@@ -123,12 +116,10 @@ static_assert(GFX6_3D_REG_INDEX(color_buffers[0].pitch) == 0xA319);
 static_assert(GFX6_3D_REG_INDEX(color_buffers[0].slice) == 0xA31A);
 static_assert(GFX6_3D_REG_INDEX(color_buffers[7].base_address) == 0xA381);
 static_assert(GFX6_3D_REG_INDEX(cp_strmout_cntl) == 0xC03F);
-static_assert(GFX6_3D_REG_INDEX(vgt_esgs_ring_size) == 0xC240);
-static_assert(GFX6_3D_REG_INDEX(vgt_gsvs_ring_size) == 0xC241);
 static_assert(GFX6_3D_REG_INDEX(primitive_type) == 0xC242);
 static_assert(GFX6_3D_REG_INDEX(num_instances) == 0xC24D);
 static_assert(GFX6_3D_REG_INDEX(vgt_tf_memory_base) == 0xc250);
 
 #undef GFX6_3D_REG_INDEX
 
-} // namespace AmdGpu
+}

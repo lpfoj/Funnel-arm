@@ -43,4 +43,4 @@ private:
     std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS> tilers{};
 };
 
-} // namespace VideoCore
+}

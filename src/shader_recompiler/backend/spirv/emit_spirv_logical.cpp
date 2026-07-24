@@ -22,4 +22,4 @@ Id EmitLogicalNot(EmitContext& ctx, Id value) {
     return ctx.OpLogicalNot(ctx.U1[1], value);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

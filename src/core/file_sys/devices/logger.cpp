@@ -64,4 +64,4 @@ void Logger::log_flush() {
     buffer.clear();
 }
 
-} // namespace Core::Devices
+}

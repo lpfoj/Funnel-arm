@@ -1,7 +1,6 @@
 //  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-// Credits to https://github.com/psucien/tlg-emu-tools/
 
 #include <cinttypes>
 #include <string>
@@ -29,7 +28,7 @@ const char* GetContextRegName(u32 reg_offset);
 const char* GetShaderRegName(u32 reg_offset);
 const char* GetOpCodeName(u32 op);
 
-} // namespace Core::Devtools::Gcn
+}
 
 namespace Core::Devtools::Widget {
 
@@ -871,7 +870,6 @@ void CmdListViewer::OnNop(AmdGpu::PM4Type3Header const* header, u32 const* body)
     auto const* pkt = reinterpret_cast<AmdGpu::PM4CmdNop const*>(header);
     auto const* payload = &body[0];
 
-    // Dump payload
     for (unsigned i = 0; i < pkt->header.count + 1; ++i) {
         Text("%02X: %08X", i, payload[i]);
         if ((payload[i] & 0xffff0000) == 0x68750000) {
@@ -889,7 +887,6 @@ void CmdListViewer::OnSetBase(AmdGpu::PM4Type3Header const* header, u32 const* b
     Separator();
     BeginGroup();
 
-    // auto const* pkt = reinterpret_cast<AmdGpu::PM4CmdSetBase const*>(header);
     Text("BASE_INDEX: %08X", body[0]);
     Text("ADDRESS0  : %08X", body[1]);
     Text("ADDRESS1  : %08X", body[2]);
@@ -1036,7 +1033,6 @@ void CmdListViewer::OnSetContextReg(AmdGpu::PM4Type3Header const* header, u32 co
             break;
         }
 
-        //...
     }
 
     EndGroup();
@@ -1054,7 +1050,6 @@ void CmdListViewer::OnSetShReg(AmdGpu::PM4Type3Header const* header, u32 const* 
 
         Text("%08X", *((uint32_t*)header + 2 + i));
 
-        //...
     }
 
     EndGroup();
@@ -1071,7 +1066,6 @@ void CmdListViewer::OnDispatch(AmdGpu::PM4Type3Header const* header, u32 const* 
     Text("DIM_Z    : %d", pkt->dim_z);
     Text("INITIATOR: %X", pkt->dispatch_initiator);
     if (IsItemHovered() && BeginTooltip()) {
-        // TODO: dump_reg
         EndTooltip();
     }
 
@@ -1134,12 +1128,6 @@ CmdListViewer::CmdListViewer(DebugStateType::FrameDump* _frame_dump,
             }
 
             if (IsDrawCall(opcode)) {
-                // All these commands are terminated by NOP at the end, so
-                // it is safe to skip it to be even with CP
-                // next_pm4_hdr = get_next(next_pm4_hdr, 1);
-                // auto constexpr nop_len = 0x10;
-                // processed_len += nop_len;
-                // processed_size += nop_len;
 
                 events.emplace_back(BatchInfo{
                     .id = batch_id++,
@@ -1158,7 +1146,6 @@ CmdListViewer::CmdListViewer(DebugStateType::FrameDump* _frame_dump,
         pm4_hdr = next_pm4_hdr;
     }
 
-    // state batch (last)
     if (processed_size - prev_offset > 0) {
         events.emplace_back(BatchInfo{
             .id = batch_id++,
@@ -1286,7 +1273,6 @@ void CmdListViewer::Draw(bool only_batches_view, CmdListFilter& filter) {
 
                 auto& batch = std::get<BatchInfo>(event);
 
-                // filtering
                 {
                     bool remove = false;
 
@@ -1338,7 +1324,7 @@ void CmdListViewer::Draw(bool only_batches_view, CmdListFilter& filter) {
                              Gcn::GetOpCodeName(static_cast<u32>(batch.type)));
                 }
 
-                if (batch.id == batch_bp) { // highlight batch at breakpoint
+                if (batch.id == batch_bp) {
                     PushStyleColor(ImGuiCol_Header, ImVec4{1.0f, 0.5f, 0.5f, 0.5f});
                 }
                 if (batch.id == highlight_batch && !group_batches) {
@@ -1426,7 +1412,6 @@ void CmdListViewer::Draw(bool only_batches_view, CmdListFilter& filter) {
                             }
                             if (open_pm4) {
                                 if (IsItemToggledOpen()) {
-                                    // Editor
                                     cmdb_view.GotoAddrAndHighlight(
                                         reinterpret_cast<size_t>(pm4_hdr) - cmdb_addr,
                                         reinterpret_cast<size_t>(pm4_hdr) - cmdb_addr +
@@ -1515,4 +1500,4 @@ void CmdListViewer::Draw(bool only_batches_view, CmdListFilter& filter) {
     PopID();
 }
 
-} // namespace Core::Devtools::Widget
+}

@@ -704,7 +704,6 @@ int PS4_SYSV_ABI sceSslGetSubjectName() {
 
 int PS4_SYSV_ABI sceSslInit(std::size_t poolSize) {
     LOG_ERROR(Lib_Ssl, "(DUMMY) called poolSize = {}", poolSize);
-    // return a value >1
     static int id = 0;
     return ++id;
 }
@@ -1278,4 +1277,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("KPh5GncdOcc", "libSceSsl", 1, "libSceSsl", Func_28F8791A771D39C7);
 };
 
-} // namespace Libraries::Ssl
+}

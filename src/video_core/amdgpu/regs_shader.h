@@ -15,7 +15,7 @@ using UserData = std::array<u32, NUM_USER_DATA>;
 
 struct BinaryInfo {
     static constexpr std::array<u8, 7> signature_ref = {0x4f, 0x72, 0x62, 0x53,
-                                                        0x68, 0x64, 0x72}; // OrbShdr
+                                                        0x68, 0x64, 0x72};
 
     std::array<u8, sizeof(signature_ref)> signature;
     u8 version;
@@ -79,7 +79,6 @@ struct ShaderProgram {
     }
 
     [[nodiscard]] u32 NumVgprs() const {
-        // Each increment allocates 4 registers, where 0 = 4 registers.
         return (settings.num_vgprs + 1) * 4;
     }
 };
@@ -196,7 +195,6 @@ struct ComputeProgram {
     }
 
     u32 SharedMemSize() const noexcept {
-        // lds_dwords is in units of 128 dwords. We return bytes.
         return settings.lds_dwords * 128 * 4;
     }
 
@@ -238,4 +236,4 @@ static constexpr Shader::ShaderParams GetParams(const auto& sh) {
     };
 }
 
-} // namespace AmdGpu
+}

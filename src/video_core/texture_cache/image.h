@@ -18,7 +18,7 @@
 namespace Vulkan {
 class Instance;
 class Scheduler;
-} // namespace Vulkan
+}
 
 VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -27,13 +27,13 @@ namespace VideoCore {
 
 enum ImageFlagBits : u32 {
     Empty = 0,
-    MaybeCpuDirty = 1 << 0, ///< The page this image is in was touched before the image address
-    CpuDirty = 1 << 1,      ///< Contents have been modified from the CPU
-    GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
+    MaybeCpuDirty = 1 << 0,
+    CpuDirty = 1 << 1,
+    GpuDirty = 1 << 2,
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
-    GpuModified = 1 << 3, ///< Contents have been modified from the GPU
-    Registered = 1 << 6,  ///< True when the image is registered
-    Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
+    GpuModified = 1 << 3,
+    Registered = 1 << 6,
+    Picked = 1 << 7,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -60,8 +60,6 @@ struct UniqueImage {
 
     void Create(const vk::ImageCreateInfo& image_ci);
 
-    void Destroy();
-
     operator vk::Image() const {
         return image;
     }
@@ -77,6 +75,8 @@ public:
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
 };
+
+constexpr Common::SlotId NULL_IMAGE_ID{0};
 
 class BlitHelper;
 
@@ -156,7 +156,6 @@ public:
     ImageId depth_id{};
     u64 depth_uid{};
 
-    // Resource state tracking
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;
     struct State {
@@ -199,4 +198,4 @@ private:
     static Common::IncrementalIdProvider<u64> global_image_uid;
 };
 
-} // namespace VideoCore
+}

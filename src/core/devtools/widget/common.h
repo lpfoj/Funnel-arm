@@ -22,14 +22,11 @@
 #endif
 
 namespace Core::Devtools::Widget {
-/*
- * Generic PM4 header
- */
 union PM4Header {
     struct {
         u32 reserved : 16;
         u32 count : 14;
-        u32 type : 2; // PM4_TYPE
+        u32 type : 2;
     };
     u32 u32All;
 };
@@ -176,4 +173,4 @@ inline std::string RunDisassembler(const std::string& disassembler_cli, const T&
     return shader_dis;
 }
 
-} // namespace Core::Devtools::Widget
+}

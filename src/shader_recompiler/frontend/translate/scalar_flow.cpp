@@ -77,4 +77,4 @@ void Translator::S_SENDMSG(const GcnInst& inst) {
     }
 }
 
-} // namespace Shader::Gcn
+}

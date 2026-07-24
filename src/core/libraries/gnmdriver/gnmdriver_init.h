@@ -9,12 +9,9 @@ namespace Libraries::GnmDriver {
 
 constexpr auto HwInitPacketSize = 0x100u;
 
-// clang-format off
 constexpr std::array InitSequence{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,
@@ -57,10 +54,8 @@ constexpr std::array InitSequence{
 static_assert(InitSequence.size() == 0x73 + 2);
 
 constexpr std::array InitSequence175{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence 
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,
@@ -103,10 +98,8 @@ constexpr std::array InitSequence175{
 static_assert(InitSequence175.size() == 0x73 + 2);
 
 constexpr std::array InitSequence200{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence    
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,
@@ -150,10 +143,8 @@ constexpr std::array InitSequence200{
 static_assert(InitSequence200.size() == 0x76 + 2);
 
 constexpr std::array InitSequence200Neo{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x219u, 0xffffffffu,
@@ -201,10 +192,8 @@ constexpr std::array InitSequence200Neo{
 static_assert(InitSequence200Neo.size() == 0x83 + 2);
 
 constexpr std::array InitSequence200NeoCompat{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x219u, 0xffffffffu,
@@ -252,10 +241,8 @@ constexpr std::array InitSequence200NeoCompat{
 static_assert(InitSequence200NeoCompat.size() == 0x83 + 2);
 
 constexpr std::array InitSequence350{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence    
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,
@@ -301,10 +288,8 @@ constexpr std::array InitSequence350{
 static_assert(InitSequence350.size() == 0x7c + 2);
 
 constexpr std::array InitSequence350Neo{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x219u, 0xffffffffu,
@@ -353,10 +338,8 @@ constexpr std::array InitSequence350Neo{
 static_assert(InitSequence350Neo.size() == 0x86 + 2);
 
 constexpr std::array InitSequence350NeoCompat{
-    // A fake preamble to mimic context reset sent by FW
-    0xc0001200u, 0u, // IT_CLEAR_STATE
+    0xc0001200u, 0u,
 
-    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x219u, 0xffffffffu,
@@ -537,6 +520,4 @@ constexpr std::array CtxInitSequence400NeoCompat{
     0xc09a1000u,
 };
 static_assert(CtxInitSequence400Neo.size() == 0x65);
-// clang-format on
-
-} // namespace Libraries::GnmDriver
+}

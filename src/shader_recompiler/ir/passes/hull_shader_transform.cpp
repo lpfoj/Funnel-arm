@@ -16,129 +16,6 @@
 
 namespace Shader::Optimization {
 
-/**
- * Tessellation shaders pass outputs to the next shader using LDS.
- * The Hull shader stage receives input control points stored in LDS.
- *
- * These passes attempt to resolve LDS accesses to attribute accesses and correctly
- * write to the tessellation factor tables.
- *
- * The LDS layout is:
- * - TCS inputs for patch 0
- * - TCS inputs for patch 1
- * - TCS inputs for patch 2
- * - ...
- * - TCS outputs for patch 0
- * - TCS outputs for patch 1
- * - TCS outputs for patch 2
- * - ...
- * - PatchConst TCS outputs for patch 0
- * - PatchConst TCS outputs for patch 1
- * - PatchConst TCS outputs for patch 2
- *
- *
- * If the Hull stage does not write any new control points the driver will
- * optimize LDS layout so input and output control point spaces overlap.
- * (Passthrough)
- *
- * The gnm driver requires a V# holding special constants to be bound
- * for reads by the shader.
- * The Hull and Domain shaders read values from this buffer which
- * contain size and offset information required to address input, output,
- * or PatchConst attributes within the current patch.
- * See the TessellationDataConstantBuffer struct to see the layout of this V#.
- *
- * Tessellation factors are stored to a special tessellation factor V# that is automatically bound
- * by the driver. This is the input to the fixed function tessellator that actually subdivides the
- * domain. We translate these to writes to SPIR-V builtins for tessellation factors in the Hull
- * shader.
- * The offset into the tess factor buffer determines which factor the shader is writing.
- * Additionally, most hull shaders seem to redundantly write tess factors to PatchConst
- * attributes, even if dead in the domain shader. We just treat these as generic PatchConst writes.
- *
- * LDS reads in the Hull shader can be from input control points, and in the the Domain shader can
- * be hs output control points (output from the perspective of the Hull shader) and patchconst
- * values.
- * LDS stores in the Hull shader can either be output control point writes or per-patch
- * (PatchConst) data writes. The Domain shader exports attributes using EXP instructions, unless its
- * followed by the geometry stage (but we havent seen this yet), so nothing special there.
- * The address calculations can vary significantly and can't be easily pattern matched. We are at
- * the mercy of instruction selection the ps4 compiler wanted to use.
- * Generally though, they could look something like this:
- * Input control point:
- *     addr = PatchIdInVgt * input_cp_stride * #input_cp_per_patch + index * input_cp_stride
- *          + attr# * 16 + component
- * Output control point:
- *     addr = #patches * input_cp_stride * #input_cp_per_patch
- *          + PatchIdInVgt * output_patch_stride + InvocationID * output_cp_stride
-            + attr# * 16 + component
- * Per patch output:
- *     addr = #patches * input_cp_stride * #cp_per_input_patch
- *          + #patches * output_patch_stride
- *          + PatchIdInVgt * per_patch_output_stride + attr# * 16 + component
- *
- * output_patch_stride and output_cp_stride are usually compile time constants in the gcn
- *
- * Hull shaders can also read output control points corresponding to other threads.
- * In HLSL style, this should only be possible in the Patch Constant function.
- * TODO we may need to insert additional barriers if sync is free/more permissive
- * on AMD LDS HW
-
- * They should also be able to read output PatchConst values,
- * although not sure if this happens in practice.
- *
- * To determine which type of attribute (input, output, patchconst) we the check the users of
- * TessConstants V# reads to deduce which type of attribute a given load/store to LDS
- * is touching.
- *
- * In the Hull shader, both the PatchId within the VGT group (PatchIdInVgt) and the output control
- * point id (InvocationId) are packed in VGPR1 by the driver like
- * V1 = InvocationId << 8 | PatchIdInVgt
- * The shader typically uses V_BFE_(U|S)32 to extract them. We use the starting bit_pos to determine
- * which is which.
- *
- * This pass does not attempt to deduce the exact attribute referenced in a LDS load/store.
- * Instead, it feeds the address in the LDS load/store to the get/set Insts we use for TCS in/out's,
- * TES in's, and PatchConst in/out's.
- *
- * TCS/TES Input attributes:
- * We define input attributes using an array in the shader roughly like this:
- * // equivalent GLSL in TCS
- * layout (location = 0) in vec4 in_attrs[][NUM_INPUT_ATTRIBUTES];
- *
- * Here the NUM_INPUT_ATTRIBUTES is derived from the ls_stride member of the TessConstants V#.
- * We take ALIGN_UP(ls_stride, 16) / 16 to get the number of vec4 attributes.
- * For TES, NUM_INPUT_ATTRIBUTES is ALIGN_UP(hs_cp_stride, 16) / 16.
- * The first (outer) dimension is unsized but corresponds to the number of vertices in the hs input
- * patch (for Hull) or the hs output patch (for Domain).
- *
- * For input reads in TCS or TES, we emit SPIR-V like:
- * float value = in_attrs[addr / ls_stride][(addr % ls_stride) >> 4][(addr % ls_stride) >> 2];
- *
- * For output writes, we assume the control point index is InvocationId, since high level languages
- * impose that restriction (although maybe it's technically possible on hardware). So SPIR-V looks
- * like this:
- * layout (location = 0) in vec4 in_attrs[][NUM_OUTPUT_ATTRIBUTES];
- * out_attrs[InvocationId][(addr % hs_cp_stride) >> 4][(addr % hs_cp_stride) >> 2] = value;
- *
- * NUM_OUTPUT_ATTRIBUTES is derived by ALIGN_UP(hs_cp_stride, 16) / 16, so it matches
- * NUM_INPUT_ATTRIBUTES of the TES.
- *
- * Another challenge is the fact that the GCN shader needs to address attributes from LDS as a whole
- * which contains the attributes from many patches. On the other hand, higher level shading
- * languages restrict attribute access to the patch of the current thread, which is naturally a
- * restriction in SPIR-V also.
- * The addresses the ps4 compiler generates for loads/stores and the fact that LDS holds many
- * patches' attributes are just implementation details of the ps4 driver/compiler. To deal with
- * this, we can replace certain TessConstant V# reads with 0, which only contribute to the base
- * address of the current patch's attributes in LDS and not the indexes within the local patch.
- *
- * (A perfect implementation might need emulation of the VGTs in mesh/compute, loading/storing
- * attributes to buffers and not caring about whether they are hs input, hs output, or patchconst
- * attributes)
- *
- */
-
 namespace {
 
 using namespace Shader::Optimiation::PatternMatching;
@@ -182,22 +59,6 @@ std::optional<TessSharpLocation> FindTessConstantSharp(IR::Inst* read_const_buff
     return {};
 }
 
-// Walker that helps deduce what type of attribute a DS instruction is reading
-// or writing, which could be an input control point, output control point,
-// or per-patch constant (PatchConst).
-// For certain ReadConstBuffer instructions using the tess constants V#, we visit the users
-// recursively and increment a counter on the Load/WriteShared users.
-// Namely NumPatch (from m_hsNumPatch), HsOutputBase (m_hsOutputBase),
-// and PatchConstBase (m_patchConstBase).
-// In addr calculations, the term NumPatch * ls_stride * #input_cp_in_patch
-// is used as an addend to skip the region for input control points, and similarly
-// NumPatch * hs_cp_stride * #output_cp_in_patch is used to skip the region
-// for output control points.
-//
-// TODO: this will break if AMD compiler used distributive property like
-// TcsNumPatches * (ls_stride * #input_cp_in_patch + hs_cp_stride * #output_cp_in_patch)
-//
-// Assert if the region is ambiguous due to phi nodes in the addr calculation for a DS instruction,
 class TessConstantUseWalker {
 public:
     void WalkUsersOfTessConstant(IR::Inst* read_const_buffer, TessConstantAttribute attr) {
@@ -241,29 +102,21 @@ private:
                 inst->SetFlags<u32>(counter + inc);
                 ASSERT_MSG(!propagateError, "LDS instruction {} accesses ambiguous attribute type",
                            fmt::ptr(use.user));
-                // Stop here
                 return;
             }
         }
         case IR::Opcode::Phi: {
             auto it = phi_infos.find(use.user);
-            // the point of seq_num is to tell us if we've already traversed this
-            // phi on the current walk to handle phi cycles
             if (it == phi_infos.end()) {
-                // First time we've encountered this phi
-                // Mark the phi as having been traversed originally through this edge
                 phi_infos[inst] = {.seq_num = seq_num,
                                    .unique_edge = static_cast<u16>(use.operand)};
             } else if (it->second.seq_num < seq_num) {
                 it->second.seq_num = seq_num;
-                // For now, assume we are visiting this phi via the same edge
-                // as on other walks. If not, some dataflow analysis might be necessary
                 if (it->second.unique_edge != use.operand) {
                     propagateError = true;
                 }
             } else {
                 ASSERT(it->second.seq_num == seq_num);
-                // there's a cycle, and we've already been here on this walk
                 return;
             }
             break;
@@ -311,7 +164,6 @@ static bool IsDivisibleByStride(IR::Value term, u32 stride) {
     return false;
 }
 
-// Return true if we can eliminate any addends
 static bool TryOptimizeAddendInModulo(IR::Value addend, u32 stride, std::vector<IR::U32>& addends) {
     IR::Value a, b;
     if (M_IADD32(MatchValue(a), MatchValue(b)).Match(addend)) {
@@ -327,11 +179,6 @@ static bool TryOptimizeAddendInModulo(IR::Value addend, u32 stride, std::vector<
     }
 }
 
-// In calculation (a + b + ...) % stride
-// Use this fact
-// (a + b) mod N = (a mod N + b mod N) mod N
-// If any addend is divisible by stride, then we can replace it with 0 in the attribute
-// or component index calculation
 static IR::U32 TryOptimizeAddressModulo(IR::U32 addr, u32 stride, IR::IREmitter& ir) {
     std::vector<IR::U32> addends;
     if (TryOptimizeAddendInModulo(addr, stride, addends)) {
@@ -343,9 +190,7 @@ static IR::U32 TryOptimizeAddressModulo(IR::U32 addr, u32 stride, IR::IREmitter&
     return addr;
 }
 
-// TODO: can optimize div in control point index similarly to mod
 
-// Read a TCS input (InputCP region) or TES input (OutputCP region)
 static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR::IREmitter& ir,
                                              u32 off_dw, bool is_output_read_in_tcs) {
     if (off_dw > 0) {
@@ -364,7 +209,7 @@ static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR:
     }
 }
 
-} // namespace
+}
 
 void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) {
     const Info& info = program.info;
@@ -407,14 +252,6 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                 };
 
                 auto get_factor_attr = [&](u32 gcn_factor_idx) -> IR::Patch {
-                    // The hull outputs tess factors in different formats depending on the shader.
-                    // For triangle domains, it seems to pack the entries into 4 consecutive floats,
-                    // with the 3 edge factors followed by the 1 interior factor.
-                    // For quads, it does 4 edge factors then 2 interior.
-                    // There is a tess factor stride member of the GNMX hull constants struct in
-                    // a hull program shader binary archive, but this doesn't seem to be
-                    // communicated to the driver.
-                    // The layout seems to be implied by the type of the abstract domain.
                     switch (runtime_info.hs_info.tess_type) {
                     case AmdGpu::TessellationType::Isoline:
                         ASSERT(gcn_factor_idx < 2);
@@ -466,7 +303,6 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                             addr = ir.IAdd(addr, ir.Imm32(off_dw));
                         }
                         const u32 stride = runtime_info.hs_es_vs_info.hs_output_cp_stride;
-                        // Invocation ID array index is implicit, handled by SPIRV backend
                         const IR::U32 opt_addr = TryOptimizeAddressModulo(addr, stride, ir);
                         const IR::U32 offset = ir.IMod(opt_addr, ir.Imm32(stride));
                         const IR::U32 attr_index = ir.ShiftRightLogical(offset, ir.Imm32(4u));
@@ -530,8 +366,6 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
     }
 
     if (runtime_info.hs_info.IsPassthrough()) {
-        // Copy input attributes to output attributes, indexed by InvocationID
-        // Passthrough should imply that input and output patches have same number of vertices
         IR::Block* entry_block = *program.blocks.begin();
         auto it = std::ranges::find_if(entry_block->Instructions(), [](IR::Inst& inst) {
             return inst.GetOpcode() == IR::Opcode::Prologue;
@@ -540,10 +374,6 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
         ++it;
         ASSERT(it != entry_block->end());
         ++it;
-        // Prologue
-        // SetExec #true
-        // <- insert here
-        // ...
         IR::IREmitter ir{*entry_block, it};
 
         u32 num_attributes = Common::AlignUp(runtime_info.hs_info.ls_stride, 16) >> 4;
@@ -552,16 +382,9 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
             for (u32 comp = 0; comp < 4; comp++) {
                 IR::F32 attr_read =
                     ir.GetTessGenericAttribute(invocation_id, ir.Imm32(attr_no), ir.Imm32(comp));
-                // InvocationId is implicit index for output control point writes
                 ir.SetTcsGenericAttribute(attr_read, ir.Imm32(attr_no), ir.Imm32(comp));
             }
         }
-        // We could wrap the rest of the program in an if stmt
-        // CopyInputAttrsToOutputs(); // psuedocode
-        // if (InvocationId == 0) {
-        //     PatchConstFunction();
-        // }
-        // But as long as we treat invocation ID as 0 for all threads, shouldn't matter functionally
     }
 }
 
@@ -609,11 +432,9 @@ void DomainShaderTransform(const IR::Program& program, const RuntimeInfo& runtim
     }
 }
 
-// Run before either hull or domain transform
 void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
     TessellationDataConstantBuffer tess_constants;
     Shader::Info& info = program.info;
-    // Find the TessellationDataConstantBuffer V#
     for (IR::Block* block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             auto found_tess_consts_sharp = [&]() -> bool {
@@ -634,9 +455,6 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                         auto sharp_location = FindTessConstantSharp(read_const_buffer.value());
                         if (sharp_location) {
                             if (info.tess_consts_dword_offset >= 0) {
-                                // Its possible theres a readconstbuffer that contributes to an
-                                // LDS address and isnt a TessConstant V# read. Could improve on
-                                // this somehow
                                 ASSERT_MSG(static_cast<s32>(sharp_location->dword_off) ==
                                                    info.tess_consts_dword_offset &&
                                                sharp_location->ptr_base ==
@@ -673,7 +491,6 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                 auto sharp_location = FindTessConstantSharp(&inst);
                 if (sharp_location && sharp_location->ptr_base == info.tess_consts_ptr_base &&
                     sharp_location->dword_off == info.tess_consts_dword_offset) {
-                    // The shader is reading from the TessConstants V#
                     IR::Value index = inst.Arg(1);
 
                     ASSERT_MSG(index.IsImmediate(),
@@ -685,7 +502,6 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                     auto tess_const_attr = static_cast<TessConstantAttribute>(off_dw);
                     switch (tess_const_attr) {
                     case TessConstantAttribute::LsStride:
-                        // If not, we may need to make this runtime state for TES
                         ASSERT(info.l_stage == LogicalStage::TessellationControl);
                         inst.ReplaceUsesWithAndRemove(IR::Value(tess_constants.ls_stride));
                         break;
@@ -696,18 +512,12 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                     case TessConstantAttribute::HsOutputBase:
                     case TessConstantAttribute::PatchConstBase:
                         walker.WalkUsersOfTessConstant(&inst, tess_const_attr);
-                        // We should be able to safely set these to 0 so that indexing happens only
-                        // within the local patch in the recompiled Vulkan shader. This assumes
-                        // these values only contribute to address calculations for in/out
-                        // attributes in the original gcn shader.
-                        // See the explanation for why we set V2 to 0 when emitting the prologue.
                         inst.ReplaceUsesWithAndRemove(IR::Value(0u));
                         break;
                     case Shader::TessConstantAttribute::PatchConstSize:
                     case Shader::TessConstantAttribute::PatchOutputSize:
                     case Shader::TessConstantAttribute::OffChipTessellationFactorThreshold:
                     case Shader::TessConstantAttribute::FirstEdgeTessFactorIndex:
-                        // May need to replace PatchConstSize and PatchOutputSize with 0
                         break;
                     default:
                         UNREACHABLE_MSG("Read past end of TessConstantsBuffer");
@@ -717,11 +527,7 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
         }
     }
 
-    // These pattern matching are neccessary for now unless we support dynamic indexing of
-    // PatchConst attributes and tess factors. PatchConst should be easy, turn those into a single
-    // vec4 array like in/out attrs. Not sure about tess factors.
     if (info.l_stage == LogicalStage::TessellationControl) {
-        // Replace the BFEs on V1 (packed with patch id within VGT and output cp id)
         for (IR::Block* block : program.blocks) {
             for (auto it = block->Instructions().begin(); it != block->Instructions().end(); it++) {
                 IR::Inst& inst = *it;
@@ -731,8 +537,6 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                         MatchU32(0), MatchU32(8))
                         .Match(IR::Value{&inst})) {
                     IR::IREmitter emit(*block, it);
-                    // This is the patch id within the VGT, not the actual PrimitiveId
-                    // in the draw
                     IR::Value replacement(0u);
                     inst.ReplaceUsesWithAndRemove(replacement);
                 } else if (M_BITFIELDUEXTRACT(
@@ -744,8 +548,6 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
                     IR::IREmitter ir(*block, it);
                     IR::Value replacement;
                     if (runtime_info.hs_info.IsPassthrough()) {
-                        // Deal with annoying pattern in BB where InvocationID use makes no
-                        // sense (in addr calculation for patchconst or tess factor write)
                         replacement = ir.Imm32(0);
                     } else {
                         replacement = ir.GetAttributeU32(IR::Attribute::InvocationId);
@@ -759,4 +561,4 @@ void TessellationPreprocess(IR::Program& program, RuntimeInfo& runtime_info) {
     ConstantPropagationPass(program.post_order_blocks);
 }
 
-} // namespace Shader::Optimization
+}

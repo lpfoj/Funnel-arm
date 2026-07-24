@@ -140,36 +140,28 @@ public:
         parent = block;
     }
 
-    /// Get the number of uses this instruction has.
     [[nodiscard]] int UseCount() const noexcept {
         return uses.size();
     }
 
-    /// Determines whether this instruction has uses or not.
     [[nodiscard]] bool HasUses() const noexcept {
         return uses.size() > 0;
     }
 
-    /// Get the opcode this microinstruction represents.
     [[nodiscard]] IR::Opcode GetOpcode() const noexcept {
         return op;
     }
 
-    /// Determines whether or not this instruction may have side effects.
     [[nodiscard]] bool MayHaveSideEffects() const noexcept;
 
-    /// Determines if all arguments of this instruction are immediates.
     [[nodiscard]] bool AreAllArgsImmediates() const;
 
-    /// Get the type this instruction returns.
     [[nodiscard]] IR::Type Type() const;
 
-    /// Get the number of arguments this instruction has.
     [[nodiscard]] size_t NumArgs() const {
         return op == IR::Opcode::Phi ? phi_args.size() : NumArgsOf(op);
     }
 
-    /// Get the value of a given argument index.
     [[nodiscard]] Value Arg(size_t index) const noexcept {
         if (op == IR::Opcode::Phi) {
             return phi_args[index].second;
@@ -178,12 +170,9 @@ public:
         }
     }
 
-    /// Set the value of a given argument index.
     void SetArg(size_t index, Value value);
 
-    /// Get a pointer to the block of a phi argument.
     [[nodiscard]] Block* PhiBlock(size_t index) const;
-    /// Add phi operand to a phi instruction.
     void AddPhiOperand(Block* predecessor, const Value& value);
 
     void Invalidate();
@@ -200,7 +189,7 @@ public:
     void ReplaceOpcode(IR::Opcode opcode);
 
     template <typename FlagsType>
-        requires(sizeof(FlagsType) <= sizeof(u64) && std::is_trivially_copyable_v<FlagsType>)
+        requires(sizeof(FlagsType) <= sizeof(u32) && std::is_trivially_copyable_v<FlagsType>)
     [[nodiscard]] FlagsType Flags() const noexcept {
         FlagsType ret;
         std::memcpy(reinterpret_cast<char*>(&ret), &flags, sizeof(ret));
@@ -208,18 +197,16 @@ public:
     }
 
     template <typename FlagsType>
-        requires(sizeof(FlagsType) <= sizeof(u64) && std::is_trivially_copyable_v<FlagsType>)
+        requires(sizeof(FlagsType) <= sizeof(u32) && std::is_trivially_copyable_v<FlagsType>)
     void SetFlags(FlagsType value) noexcept {
         std::memcpy(&flags, &value, sizeof(value));
     }
 
-    /// Intrusively store the host definition of this instruction.
     template <typename DefinitionType>
     void SetDefinition(DefinitionType def) {
         definition = std::bit_cast<u32>(def);
     }
 
-    /// Return the intrusively stored host definition of this instruction.
     template <typename DefinitionType>
     [[nodiscard]] DefinitionType Definition() const noexcept {
         return std::bit_cast<DefinitionType>(definition);
@@ -239,8 +226,8 @@ private:
     void ReplaceUsesWith(Value replacement, bool preserve);
 
     IR::Opcode op{};
+    u32 flags{};
     u32 definition{};
-    u64 flags{};
     IR::Block* parent{};
     union {
         NonTriviallyDummy dummy{};
@@ -407,11 +394,11 @@ inline const char* Value::StringLiteral() const {
     return inst.GetOpcode() == Opcode::Phi;
 }
 
-} // namespace Shader::IR
+}
 
 namespace std {
 template <>
 struct hash<Shader::IR::Value> {
     std::size_t operator()(const Shader::IR::Value& v) const;
 };
-} // namespace std
+}

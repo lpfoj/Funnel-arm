@@ -3,9 +3,6 @@
 
 #pragma once
 
-// WARNING: All includes from this file must be relative to allow Dear_ImGui project to compile
-//          without having this project include paths.
-
 #include <cstdint>
 
 extern void assert_fail_debug_msg(const char* msg);

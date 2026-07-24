@@ -3,24 +3,17 @@
 
 #pragma once
 
+#include <algorithm>
+#include <memory>
 #include <mutex>
-#include <utility>
 #include <vector>
 
 #include <SDL3/SDL_gamepad.h>
-#include "SDL3/SDL_joystick.h"
-#include "common/assert.h"
-#include "common/ring_buffer_queue.h"
-#include "core/libraries/pad/pad.h"
-#include "core/libraries/system/userservice.h"
 
-struct SDL_Gamepad;
+#include "common/types.h"
+#include "core/libraries/pad/pad.h"
 
 namespace Input {
-
-enum class ControllerType {
-    Standard,
-};
 
 enum class Axis {
     LeftX = 0,
@@ -40,74 +33,88 @@ struct TouchpadEntry {
     u16 y{};
 };
 
-struct Colour {
-    u8 r, g, b;
-};
-static constexpr Input::Colour g_user_colours[4]{
-    {0, 0, 255},   // blue
-    {255, 0, 0},   // red
-    {0, 255, 0},   // green
-    {255, 0, 255}, // pink
-};
-
-struct State {
-private:
-    template <typename T>
-    using AxisArray = std::array<T, std::to_underlying(Axis::AxisMax)>;
-    static constexpr AxisArray<s32> axis_defaults{128, 128, 128, 128, 0, 0};
-    static constexpr u64 axis_smoothing_time{33000};
-    AxisArray<bool> axis_smoothing_flags{true};
-    AxisArray<u64> axis_smoothing_start_times{0};
-    AxisArray<int> axis_smoothing_start_values{axis_defaults};
-    AxisArray<int> axis_smoothing_end_values{axis_defaults};
-
+class State {
 public:
     void OnButton(Libraries::Pad::OrbisPadButtonDataOffset, bool);
-    void OnAxis(Axis, int, bool smooth = true);
+    void OnAxis(Axis, int);
     void OnTouchpad(int touchIndex, bool isDown, float x, float y);
     void OnGyro(const float[3]);
     void OnAccel(const float[3]);
-    void UpdateAxisSmoothing();
 
     Libraries::Pad::OrbisPadButtonDataOffset buttonsState{};
     u64 time = 0;
-    AxisArray<s32> axes{axis_defaults};
+    int axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
     TouchpadEntry touchpad[2] = {{false, 0, 0}, {false, 0, 0}};
-    Libraries::Pad::OrbisFVector3 acceleration = {0.0f, -9.81f, 0.0f};
+    Libraries::Pad::OrbisFVector3 acceleration = {0.0f, 0.0f, 0.0f};
     Libraries::Pad::OrbisFVector3 angularVelocity = {0.0f, 0.0f, 0.0f};
     Libraries::Pad::OrbisFQuaternion orientation = {0.0f, 0.0f, 0.0f, 1.0f};
 };
 
+class Engine {
+public:
+    virtual ~Engine() = default;
+    virtual void Init() = 0;
+    virtual void SetLightBarRGB(u8 r, u8 g, u8 b) = 0;
+    virtual void SetVibration(u8 smallMotor, u8 largeMotor) = 0;
+    virtual State ReadState() = 0;
+    virtual float GetAccelPollRate() const = 0;
+    virtual float GetGyroPollRate() const = 0;
+    SDL_Gamepad* m_gamepad;
+};
+
 inline int GetAxis(int min, int max, int value) {
-    int v = (255 * (value - min)) / (max - min);
-    return (v < 0 ? 0 : (v > 255 ? 255 : v));
+    return std::clamp((255 * (value - min)) / (max - min), 0, 255);
 }
 
-class GameController {
-    friend class GameControllers;
+template <class T>
+class RingBufferQueue {
+public:
+    RingBufferQueue(size_t size) : m_storage(size) {}
 
+    void Push(T item) {
+        const size_t index = (m_begin + m_size) % m_storage.size();
+        m_storage[index] = std::move(item);
+        if (m_size < m_storage.size()) {
+            m_size += 1;
+        } else {
+            m_begin = (m_begin + 1) % m_storage.size();
+        }
+    }
+
+    std::optional<T> Pop() {
+        if (m_size == 0) {
+            return {};
+        }
+        const size_t index = m_begin;
+        m_begin = (m_begin + 1) % m_storage.size();
+        m_size -= 1;
+        return std::move(m_storage[index]);
+    }
+
+private:
+    size_t m_begin = 0;
+    size_t m_size = 0;
+    std::vector<T> m_storage;
+};
+
+class GameController {
 public:
     GameController();
     virtual ~GameController() = default;
-    void ConnectController(SDL_Gamepad* pad);
-    void DisconnectController();
 
     void ReadState(State* state, bool* isConnected, int* connectedCount);
     int ReadStates(State* states, int states_num, bool* isConnected, int* connectedCount);
 
-    void Button(Libraries::Pad::OrbisPadButtonDataOffset button, bool isPressed);
-    void Axis(Input::Axis axis, int value, bool smooth = true);
-    void Gyro(int id);
-    void Acceleration(int id);
-    void UpdateGyro(const float gyro[3]);
-    void UpdateAcceleration(const float acceleration[3]);
-    void UpdateAxisSmoothing();
-    void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
-    void SetLightBarRGB(Colour const c);
-    Colour GetLightBarRGB();
-    void PollLightColour();
-    bool SetVibration(u8 smallMotor, u8 largeMotor);
+    void Button(int id, Libraries::Pad::OrbisPadButtonDataOffset button, bool isPressed);
+    void Axis(int id, Input::Axis axis, int value);
+    void Gyro(int id, const float gyro[3]);
+    void Acceleration(int id, const float acceleration[3]);
+    void SetLightBarRGB(u8 r, u8 g, u8 b);
+    void SetVibration(u8 smallMotor, u8 largeMotor);
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
+    void SetEngine(std::unique_ptr<Engine>);
+    Engine* GetEngine();
+    u32 Poll();
 
     u8 GetTouchCount();
     void SetTouchCount(u8 touchCount);
@@ -122,66 +129,39 @@ public:
     Libraries::Pad::OrbisFQuaternion GetLastOrientation();
     std::chrono::steady_clock::time_point GetLastUpdate();
     void SetLastUpdate(std::chrono::steady_clock::time_point lastUpdate);
-
-    float gyro_poll_rate;
-    float accel_poll_rate;
-    float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
-    s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;
-    SDL_Gamepad* m_sdl_gamepad = nullptr;
-    u64 last_touch_down_timestamp = 0;
+    static void CalculateOrientation(Libraries::Pad::OrbisFVector3& acceleration,
+                                     Libraries::Pad::OrbisFVector3& angularVelocity,
+                                     float deltaTime,
+                                     Libraries::Pad::OrbisFQuaternion& lastOrientation,
+                                     Libraries::Pad::OrbisFQuaternion& orientation);
 
 private:
     void PushState();
 
-    bool m_connected = false;
-    int m_connected_count = 0;
+    bool m_connected = true;
+    int m_connected_count = 1;
     u8 m_touch_count = 0;
     u8 m_secondary_touch_count = 0;
     u8 m_previous_touchnum = 0;
     bool m_was_secondary_reset = false;
     std::chrono::steady_clock::time_point m_last_update = {};
     Libraries::Pad::OrbisFQuaternion m_orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-    Colour colour;
-    std::optional<Colour> override_colour{};
 
     State m_state;
 
     std::mutex m_states_queue_mutex;
     RingBufferQueue<State> m_states_queue;
+
+    std::unique_ptr<Engine> m_engine = nullptr;
 };
 
-class GameControllers {
-    std::array<GameController*, 5> controllers;
+}
 
-public:
-    GameControllers()
-        : controllers({new GameController(), new GameController(), new GameController(),
-                       new GameController(), new GameController()}) {};
-    virtual ~GameControllers() = default;
-    GameController* operator[](const size_t& i) const {
-        if (i > 4) {
-            UNREACHABLE_MSG("Index {} is out of bounds for GameControllers!", i);
-        }
-        return controllers[i];
-    }
-    void TryOpenSDLControllers();
-    u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
-    static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
-    static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);
+namespace GamepadSelect {
 
-    static void CalculateOrientation(Libraries::Pad::OrbisFVector3& acceleration,
-                                     Libraries::Pad::OrbisFVector3& angularVelocity,
-                                     float deltaTime,
-                                     Libraries::Pad::OrbisFQuaternion& lastOrientation,
-                                     Libraries::Pad::OrbisFQuaternion& orientation);
-    void SetControllerCustomColor(s32 i, u8 r, u8 g, u8 b) {
-        // reset to ensure the next function always runs, even if there already was a preexisting
-        // override colour before
-        controllers[i]->override_colour = std::nullopt;
-        controllers[i]->SetLightBarRGB(r, g, b);
-        controllers[i]->override_colour = {r, g, b};
-    }
-    void ResetLightbarColors();
-};
+int GetIndexfromGUID(SDL_JoystickID* gamepadIDs, int gamepadCount, std::string GUID);
+std::string GetGUIDString(SDL_JoystickID* gamepadIDs, int index);
+std::string GetSelectedGamepad();
+void SetSelectedGamepad(std::string GUID);
 
-} // namespace Input
+}

@@ -21,11 +21,10 @@ using Hook =
     boost::intrusive::set_base_hook<boost::intrusive::link_mode<boost::intrusive::normal_link>>;
 
 enum class EndClass {
-    Branch, ///< Block ends with a (un)conditional branch.
-    Exit,   ///< Block ends with an exit instruction.
+    Branch,
+    Exit,
 };
 
-/// A block represents a linear range of instructions.
 struct Block : Hook {
     [[nodiscard]] bool Contains(u32 pc) const noexcept;
 
@@ -83,4 +82,4 @@ public:
     boost::intrusive::set<Block> blocks;
 };
 
-} // namespace Shader::Gcn
+}

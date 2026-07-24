@@ -5,6 +5,7 @@
 
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
+#include <vector>
 #include "common/types.h"
 
 namespace Serialization {
@@ -13,11 +14,21 @@ struct Archive;
 
 namespace Shader {
 
-using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
+using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32*, u32*);
+using PFN_SrtMemoryRead = bool (*)(VAddr, void*, u64);
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
+struct PortableSrtNode {
+    s32 parent;
+    u32 ptr_off_dw;
+};
+struct PortableSrtCopy {
+    u32 node;
+    u32 src_off_dw;
+    u32 dst_off_dw;
+};
+
 struct PersistentSrtInfo {
-    // Special case when fetch shader uses step rates.
     struct SrtSharpReservation {
         u32 sgpr_base;
         u32 dword_offset;
@@ -26,10 +37,23 @@ struct PersistentSrtInfo {
 
     PFN_SrtWalker walker_func{};
     size_t walker_func_size{};
-    u32 flattened_bufsize_dw = 16; // NumUserDataRegs
+    u32 flattened_bufsize_dw = 16;
+    std::vector<PortableSrtNode> portable_nodes;
+    std::vector<PortableSrtCopy> portable_copies;
 
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
 };
 
-} // namespace Shader
+struct SrtMemoryRange {
+    VAddr address{};
+    u64 size{};
+};
+using SrtMemoryRanges = boost::container::small_vector<SrtMemoryRange, 16>;
+
+void RunPortableSrtWalker(const u32* user_data, u32* flat, const PersistentSrtInfo& srt,
+                           u32 stage, u64 pgm_hash,
+                           SrtMemoryRanges* memory_ranges = nullptr,
+                           PFN_SrtMemoryRead memory_reader = nullptr);
+
+}

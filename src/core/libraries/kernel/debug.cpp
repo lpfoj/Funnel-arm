@@ -6,10 +6,22 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 namespace Libraries::Kernel {
 
 void PS4_SYSV_ABI sceKernelDebugOutText(void* unk, char* text) {
-    sceKernelWrite(1, text, strlen(text));
+#ifdef __ANDROID__
+    if (text != nullptr) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_DEBUG_OUT] %.*s", 512, text);
+    }
+#endif
+    if (text != nullptr) {
+        sceKernelWrite(1, text, strlen(text));
+    }
     return;
 }
 
@@ -17,4 +29,4 @@ void RegisterDebug(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("9JYNqN6jAKI", "libkernel", 1, "libkernel", sceKernelDebugOutText);
 }
 
-} // namespace Libraries::Kernel
+}

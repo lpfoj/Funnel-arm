@@ -165,4 +165,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("6fIC3XKt2k0", "libSceMsgDialog", 1, "libSceMsgDialog", sceMsgDialogUpdateStatus);
 };
 
-} // namespace Libraries::MsgDialog
+}

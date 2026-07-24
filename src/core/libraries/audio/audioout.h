@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include "common/bit_field.h"
 #include "core/libraries/kernel/threads.h"
@@ -15,18 +16,18 @@ namespace Libraries::AudioOut {
 
 class PortBackend;
 
-// Main up to 8 ports, BGM 1 port, voice up to 4 ports,
-// personal up to 4 ports, padspk up to 5 ports, aux 1 port
-constexpr s32 ORBIS_AUDIO_OUT_NUM_PORTS = 25;
-constexpr s32 ORBIS_AUDIO_OUT_VOLUME_0DB = 32768; // max volume value
+void SetHostOutputEnabled(bool enabled);
+bool IsHostOutputEnabled();
 
-constexpr s32 ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_DEFAULT = 11626; // default -9db
-constexpr s32 ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_0DB = 32768;     // max volume
+constexpr s32 ORBIS_AUDIO_OUT_NUM_PORTS = 25;
+constexpr s32 ORBIS_AUDIO_OUT_VOLUME_0DB = 32768;
+
+constexpr s32 ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_DEFAULT = 11626;
+constexpr s32 ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_0DB = 32768;
 
 constexpr s32 ORBIS_AUDIO_OUT_PARAM_ATTR_RESTRICTED = 0x00010000;
 constexpr s32 ORBIS_AUDIO_OUT_PARAM_ATTR_MIX_TO_MAIN = 0x00020000;
 
-// Volume flags
 constexpr u32 ORBIS_AUDIO_VOLUME_FLAG_L_CH = (1u << 0);
 constexpr u32 ORBIS_AUDIO_VOLUME_FLAG_R_CH = (1u << 1);
 constexpr u32 ORBIS_AUDIO_VOLUME_FLAG_C_CH = (1u << 2);
@@ -36,7 +37,6 @@ constexpr u32 ORBIS_AUDIO_VOLUME_FLAG_RS_CH = (1u << 5);
 constexpr u32 ORBIS_AUDIO_VOLUME_FLAG_LE_CH = (1u << 6);
 constexpr u32 ORBIS_AUDIO_VOLUME_FLAG_RE_CH = (1u << 7);
 
-// Port state constants
 constexpr u16 ORBIS_AUDIO_OUT_STATE_OUTPUT_UNKNOWN = 0x00;
 constexpr u16 ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_PRIMARY = 0x01;
 constexpr u16 ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_SECONDARY = 0x02;
@@ -107,8 +107,6 @@ struct AudioFormatInfo {
     bool is_float;
     u8 sample_size;
     u8 num_channels;
-    /// Layout array remapping channel indices, specified in this order:
-    /// FL, FR, FC, LFE, BL, BR, SL, SR
     std::array<int, 8> channel_layout;
     bool is_std;
 
@@ -124,7 +122,11 @@ struct PortOut {
     void* output_buffer = nullptr;
     std::condition_variable_any output_cv;
     bool output_ready = false;
+#ifdef __ANDROID__
+    std::jthread output_thread_host{};
+#else
     Kernel::Thread output_thread{};
+#endif
 
     OrbisAudioOutPort type;
     AudioFormatInfo format_info;
@@ -218,4 +220,4 @@ s32 PS4_SYSV_ABI sceAudioOutSetSystemDebugState();
 
 void AdjustVol();
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::AudioOut
+}

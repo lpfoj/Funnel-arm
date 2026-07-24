@@ -25,8 +25,6 @@ bool mouse_gyro_roll_mode = false;
 Uint32 mouse_polling_id = 0;
 MouseMode mouse_mode = MouseMode::Off;
 
-// Switches mouse to a set mode or turns mouse emulation off if it was already in that mode.
-// Returns whether the mode is turned on.
 bool ToggleMouseModeTo(MouseMode m) {
     if (mouse_mode == m) {
         mouse_mode = MouseMode::Off;
@@ -63,7 +61,7 @@ void EmulateJoystick(GameController* controller, u32 interval) {
         axis_y = Axis::RightY;
         break;
     default:
-        return; // no update needed
+        return;
     }
 
     float d_x = 0, d_y = 0;
@@ -77,11 +75,11 @@ void EmulateJoystick(GameController* controller, u32 interval) {
     float a_x = cos(angle) * output_speed, a_y = sin(angle) * output_speed;
 
     if (d_x != 0 || d_y != 0) {
-        controller->Axis(axis_x, GetAxis(-0x80, 0x7f, a_x), false);
-        controller->Axis(axis_y, GetAxis(-0x80, 0x7f, a_y), false);
+        controller->Axis(0, axis_x, GetAxis(-0x80, 0x7f, a_x));
+        controller->Axis(0, axis_y, GetAxis(-0x80, 0x7f, a_y));
     } else {
-        controller->Axis(axis_x, GetAxis(-0x80, 0x7f, 0), false);
-        controller->Axis(axis_y, GetAxis(-0x80, 0x7f, 0), false);
+        controller->Axis(0, axis_x, GetAxis(-0x80, 0x7f, 0));
+        controller->Axis(0, axis_y, GetAxis(-0x80, 0x7f, 0));
     }
 }
 
@@ -89,13 +87,13 @@ constexpr float constant_down_accel[3] = {0.0f, 9.81f, 0.0f};
 void EmulateGyro(GameController* controller, u32 interval) {
     float d_x = 0, d_y = 0;
     SDL_GetRelativeMouseState(&d_x, &d_y);
-    controller->UpdateAcceleration(constant_down_accel);
+    controller->Acceleration(1, constant_down_accel);
     float gyro_from_mouse[3] = {-d_y / 100, -d_x / 100, 0.0f};
     if (mouse_gyro_roll_mode) {
         gyro_from_mouse[1] = 0.0f;
         gyro_from_mouse[2] = -d_x / 100;
     }
-    controller->UpdateGyro(gyro_from_mouse);
+    controller->Gyro(1, gyro_from_mouse);
 }
 
 void EmulateTouchpad(GameController* controller, u32 interval) {
@@ -104,7 +102,7 @@ void EmulateTouchpad(GameController* controller, u32 interval) {
     controller->SetTouchpadState(0, (mouse_buttons & SDL_BUTTON_LMASK) != 0,
                                  std::clamp(x / g_window->GetWidth(), 0.0f, 1.0f),
                                  std::clamp(y / g_window->GetHeight(), 0.0f, 1.0f));
-    controller->Button(Libraries::Pad::OrbisPadButtonDataOffset::TouchPad,
+    controller->Button(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad,
                        (mouse_buttons & SDL_BUTTON_RMASK) != 0);
 }
 
@@ -142,4 +140,4 @@ Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
     return interval;
 }
 
-} // namespace Input
+}

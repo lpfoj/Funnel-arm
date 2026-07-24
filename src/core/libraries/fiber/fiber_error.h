@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// Fiber library
 constexpr int ORBIS_FIBER_ERROR_NULL = 0x80590001;
 constexpr int ORBIS_FIBER_ERROR_ALIGNMENT = 0x80590002;
 constexpr int ORBIS_FIBER_ERROR_RANGE = 0x80590003;

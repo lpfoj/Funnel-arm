@@ -18,13 +18,7 @@ class SymbolsResolver;
 
 namespace Libraries::Audio3d {
 
-using OrbisAudio3dPortId = u32;
-using OrbisAudio3dObjectId = u32;
-using OrbisAudio3dAmbisonics = u32;
-
 constexpr int ORBIS_AUDIO3D_OBJECT_INVALID = 0xFFFFFFFF;
-constexpr OrbisAudio3dPortId ORBIS_AUDIO3D_PORT_INVALID = 0xFFFFFFFFu;
-constexpr OrbisAudio3dPortId MaxPorts = 4;
 
 enum class OrbisAudio3dRate : u32 {
     ORBIS_AUDIO3D_RATE_48000 = 0,
@@ -43,7 +37,7 @@ struct OrbisAudio3dOpenParameters {
     u32 max_objects;
     u32 queue_depth;
     OrbisAudio3dBufferMode buffer_mode;
-    u32 _pad;
+    int : 32;
     u32 num_beds;
 };
 
@@ -83,6 +77,10 @@ enum class OrbisAudio3dAttributeId : u32 {
     ORBIS_AUDIO3D_ATTRIBUTE_OUTPUT_ROUTE = 11,
 };
 
+using OrbisAudio3dPortId = u32;
+using OrbisAudio3dObjectId = u32;
+using OrbisAudio3dAmbisonics = u32;
+
 struct OrbisAudio3dAttribute {
     OrbisAudio3dAttributeId attribute_id;
     int : 32;
@@ -93,45 +91,28 @@ struct OrbisAudio3dAttribute {
 struct AudioData {
     u8* sample_buffer;
     u32 num_samples;
-    u32 num_channels{1}; // channels in sample_buffer
+    u32 num_channels{1};
     OrbisAudio3dFormat format{
-        OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16}; // format of sample_buffer
+        OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16};
 };
 
 struct ObjectState {
     std::deque<AudioData> pcm_queue;
     std::unordered_map<u32, std::vector<u8>> persistent_attributes;
-    bool unreserved{false};
-};
-
-// An AudioOut port opened by the game through sceAudio3dAudioOutOpen
-struct AssociatedAudioOutPort {
-    s32 handle{-1};
-    u32 buffer_bytes{0};
-    u32 samples_per_buffer{0};
-    bool is_float{false};
-    std::deque<std::vector<u8>> pending;
 };
 
 struct Port {
     mutable std::recursive_mutex mutex;
     OrbisAudio3dOpenParameters parameters{};
-    // Opened lazily on the first sceAudio3dPortPush call.
     s32 audio_out_handle{-1};
-    // AudioOut ports explicitly opened by the game via sceAudio3dAudioOutOpen.
-    std::vector<AssociatedAudioOutPort> audioout_ports;
-    // Reserved objects and their state.
+    std::vector<s32> audioout_handles;
     std::unordered_map<OrbisAudio3dObjectId, ObjectState> objects;
-    // increasing counter for generating unique object IDs within this port.
     OrbisAudio3dObjectId next_object_id{0};
-    // Bed audio queue
     std::deque<AudioData> bed_queue;
-    // Mixed stereo frames ready to be consumed by sceAudio3dPortPush.
     std::deque<AudioData> mixed_queue;
 };
 
 struct Audio3dState {
-    std::mutex ports_mutex;
     std::unordered_map<OrbisAudio3dPortId, Port> ports;
 };
 
@@ -167,14 +148,11 @@ s32 PS4_SYSV_ABI sceAudio3dObjectUnreserve(OrbisAudio3dPortId port_id,
                                            OrbisAudio3dObjectId object_id);
 s32 PS4_SYSV_ABI sceAudio3dPortAdvance(OrbisAudio3dPortId port_id);
 s32 PS4_SYSV_ABI sceAudio3dPortClose(OrbisAudio3dPortId port_id);
-s32 PS4_SYSV_ABI sceAudio3dPortCreate(u32 granularity, u32 rate, s64 reserved,
-                                      OrbisAudio3dPortId* port_id);
+s32 PS4_SYSV_ABI sceAudio3dPortCreate();
 s32 PS4_SYSV_ABI sceAudio3dPortDestroy();
 s32 PS4_SYSV_ABI sceAudio3dPortFlush(OrbisAudio3dPortId port_id);
 s32 PS4_SYSV_ABI sceAudio3dPortFreeState();
-s32 PS4_SYSV_ABI sceAudio3dPortGetAttributesSupported(OrbisAudio3dPortId port_id,
-                                                      OrbisAudio3dAttributeId* capabilities,
-                                                      u32* num_capabilities);
+s32 PS4_SYSV_ABI sceAudio3dPortGetAttributesSupported();
 s32 PS4_SYSV_ABI sceAudio3dPortGetList();
 s32 PS4_SYSV_ABI sceAudio3dPortGetParameters();
 s32 PS4_SYSV_ABI sceAudio3dPortGetQueueLevel(OrbisAudio3dPortId port_id, u32* queue_level,
@@ -196,4 +174,4 @@ s32 PS4_SYSV_ABI sceAudio3dStrError();
 s32 PS4_SYSV_ABI sceAudio3dTerminate();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Audio3d
+}

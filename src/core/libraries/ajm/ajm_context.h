@@ -54,4 +54,4 @@ private:
     Common::MPSCQueue<std::shared_ptr<AjmBatch>> batch_queue;
 };
 
-} // namespace Libraries::Ajm
+}

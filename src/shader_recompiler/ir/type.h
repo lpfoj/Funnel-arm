@@ -44,7 +44,7 @@ DECLARE_ENUM_FLAG_OPERATORS(Type)
 
 [[nodiscard]] bool AreTypesCompatible(Type lhs, Type rhs) noexcept;
 
-} // namespace Shader::IR
+}
 
 template <>
 struct fmt::formatter<Shader::IR::Type> {

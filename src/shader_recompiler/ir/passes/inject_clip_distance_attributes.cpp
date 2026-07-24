@@ -26,9 +26,6 @@ void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_inf
 
     IR::IREmitter ir{*first_block, it};
 
-    // We don't know how many clip distances are exported by VS as it is not processed at this point
-    // yet. Here is an assumption that we will have not more than 4 of them (while max is 8) to save
-    // one attributes export slot.
     const auto attrib = IR::Attribute::Param0 + info.num_inputs;
     for (u32 comp = 0; comp < MaxEmulatedClipDistances; ++comp) {
         const auto attr_read = ir.GetAttribute(attrib, comp);
@@ -38,4 +35,4 @@ void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_inf
     ++info.num_inputs;
 }
 
-} // namespace Shader
+}

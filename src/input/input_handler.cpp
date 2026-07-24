@@ -18,233 +18,70 @@
 #include "SDL3/SDL_events.h"
 #include "SDL3/SDL_timer.h"
 
+#include "common/config.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
-#include "common/singleton.h"
 #include "core/devtools/layer.h"
-#include "core/emulator_settings.h"
 #include "core/emulator_state.h"
-#include "imgui/big_picture/settings_dialog_layer.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
 
 namespace Input {
-/*
-Project structure:
-n to m connection between inputs and outputs
-Keyup and keydown events update a dynamic list* of u32 'flags' (what is currently in the list is
-'pressed') On every event, after flag updates, we check for every input binding -> controller output
-pair if all their flags are 'on' If not, disable; if so, enable them. For axes, we gather their data
-into a struct cumulatively from all inputs, then after we checked all of those, we update them all
-at once. Wheel inputs generate a timer that doesn't turn off their outputs automatically, but push a
-userevent to do so.
-
-What structs are needed?
-InputBinding(key1, key2, key3)
-ControllerOutput(button, axis) - we only need a const array of these, and one of the attr-s is
-always 0 BindingConnection(inputBinding (member), controllerOutput (ref to the array element))
-*/
-
-constexpr std::string_view GetDefaultGlobalConfig() {
-    return R"(# Anything put here will be loaded for all games,
-# alongside the game's config or default.ini depending on your preference.
-)";
-}
-
-constexpr std::string_view GetDefaultInputConfig() {
-    return R"(#Feeling lost? Check out the Help section!
-
-# Keyboard bindings
-
-triangle = kp8
-circle = kp6
-cross = kp2
-square = kp4
-# Alternatives for users without a keypad
-triangle = c
-circle = b
-cross = n
-square = v
-
-l1 = q
-r1 = u
-l2 = e
-r2 = o
-l3 = x
-r3 = m
-
-options = enter
-touchpad_center = space
-
-pad_up = up
-pad_down = down
-pad_left = left
-pad_right = right
-
-axis_left_x_minus = a
-axis_left_x_plus = d
-axis_left_y_minus = w
-axis_left_y_plus = s
-
-axis_right_x_minus = j
-axis_right_x_plus = l
-axis_right_y_minus = i
-axis_right_y_plus = k
-
-# Controller bindings
-
-triangle = triangle
-cross = cross
-square = square
-circle = circle
-
-l1 = l1
-l2 = l2
-l3 = l3
-r1 = r1
-r2 = r2
-r3 = r3
-
-options = options
-touchpad_center = back
-
-pad_up = pad_up
-pad_down = pad_down
-pad_left = pad_left
-pad_right = pad_right
-
-axis_left_x = axis_left_x
-axis_left_y = axis_left_y
-axis_right_x = axis_right_x
-axis_right_y = axis_right_y
-
-# Range of deadzones: 1 (almost none) to 127 (max)
-analog_deadzone = leftjoystick, 5, 127
-analog_deadzone = rightjoystick, 5, 127
-
-override_controller_color = false, 0, 0, 255
-)";
-}
-std::filesystem::path GetInputConfigFile(const std::string& game_id) {
-    // Read configuration file of the game, and if it doesn't exist, generate it from default
-    // If that doesn't exist either, generate that from getDefaultConfig() and try again
-    // If even the folder is missing, we start with that.
-
-    const auto config_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "input_config";
-    const auto config_file = config_dir / (game_id + ".ini");
-    const auto default_config_file = config_dir / "default.ini";
-
-    // Ensure the config directory exists
-    if (!std::filesystem::exists(config_dir)) {
-        std::filesystem::create_directories(config_dir);
-    }
-
-    // Check if the default config exists
-    if (!std::filesystem::exists(default_config_file)) {
-        // If the default config is also missing, create it from getDefaultConfig()
-        const auto default_config = GetDefaultInputConfig();
-        std::ofstream default_config_stream(default_config_file);
-        if (default_config_stream) {
-            default_config_stream << default_config;
-        }
-    }
-
-    // if empty, we only need to execute the function up until this point
-    if (game_id.empty()) {
-        return default_config_file;
-    }
-
-    // Create global config if it doesn't exist yet
-    if (game_id == "global" && !std::filesystem::exists(config_file)) {
-        if (!std::filesystem::exists(config_file)) {
-            const auto global_config = GetDefaultGlobalConfig();
-            std::ofstream global_config_stream(config_file);
-            if (global_config_stream) {
-                global_config_stream << global_config;
-            }
-        }
-    }
-    if (game_id == "global") {
-        std::map<std::string, std::string> default_bindings_to_add = {
-            {"hotkey_capture_frame", "f12"},
-            {"hotkey_screenshot_with_overlays", "lalt, f12"},
-            {"hotkey_fullscreen", "f11"},
-            {"hotkey_show_fps", "f10"},
-            {"hotkey_pause", "f9"},
-            {"hotkey_reload_inputs", "f8"},
-            {"hotkey_toggle_mouse_to_joystick", "f7"},
-            {"hotkey_toggle_mouse_to_gyro", "f6"},
-            {"hotkey_add_virtual_user", "f5"},
-            {"hotkey_remove_virtual_user", "f4"},
-            {"hotkey_toggle_mouse_to_touchpad", "delete"},
-            {"hotkey_quit", "lctrl, lshift, end"},
-            {"hotkey_volume_up", "kpplus"},
-            {"hotkey_volume_down", "kpminus"},
-            {"hotkey_emulator_settings", "f3"},
-            {"hotkey_toggle_friends", "f2"},
-        };
-        std::string legacy_capture_binding;
-        bool legacy_capture_binding_found = false;
-        std::ifstream global_in(config_file);
-        std::string line;
-        while (std::getline(global_in, line)) {
-            line.erase(std::remove_if(line.begin(), line.end(),
-                                      [](unsigned char c) { return std::isspace(c); }),
-                       line.end());
-            std::size_t equal_pos = line.find('=');
-            if (equal_pos == std::string::npos) {
-                continue;
-            }
-            std::string output_string = line.substr(0, equal_pos);
-            if (output_string == "hotkey_renderdoc_capture") {
-                legacy_capture_binding = line.substr(equal_pos + 1);
-                legacy_capture_binding_found = true;
-            }
-            default_bindings_to_add.erase(output_string);
-        }
-        global_in.close();
-        if (legacy_capture_binding_found) {
-            if (auto it = default_bindings_to_add.find("hotkey_capture_frame");
-                it != default_bindings_to_add.end()) {
-                it->second = legacy_capture_binding;
-            }
-        }
-        std::ofstream global_out(config_file, std::ios::app);
-        for (auto const& b : default_bindings_to_add) {
-            global_out << b.first << " = " << b.second << "\n";
-        }
-    }
-
-    // If game-specific config doesn't exist, create it from the default config
-    if (!std::filesystem::exists(config_file)) {
-        std::filesystem::copy(default_config_file, config_file);
-    }
-    return config_file;
-}
-
 bool leftjoystick_halfmode = false, rightjoystick_halfmode = false;
-std::array<std::pair<int, int>, 4> leftjoystick_deadzone, rightjoystick_deadzone,
-    lefttrigger_deadzone, righttrigger_deadzone;
+std::pair<int, int> leftjoystick_deadzone, rightjoystick_deadzone, lefttrigger_deadzone,
+    righttrigger_deadzone;
 
 std::list<std::pair<InputEvent, bool>> pressed_keys;
 std::list<InputID> toggled_keys;
 static std::vector<BindingConnection> connections;
 
-GameControllers ControllerOutput::controllers =
-    *Common::Singleton<Input::GameControllers>::Instance();
+auto output_array = std::array{
+    ControllerOutput(LEFTJOYSTICK_HALFMODE),
+    ControllerOutput(RIGHTJOYSTICK_HALFMODE),
+    ControllerOutput(KEY_TOGGLE),
+    ControllerOutput(MOUSE_GYRO_ROLL_MODE),
 
-std::array<ControllerAllOutputs, 9> output_arrays = {
-    ControllerAllOutputs(0), ControllerAllOutputs(1), ControllerAllOutputs(2),
-    ControllerAllOutputs(3), ControllerAllOutputs(4), ControllerAllOutputs(5),
-    ControllerAllOutputs(6), ControllerAllOutputs(7), ControllerAllOutputs(8),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_NORTH),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_EAST),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_SOUTH),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_WEST),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_LEFT_STICK),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_RIGHT_STICK),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_START),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_UP),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_DOWN),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_LEFT),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_RIGHT),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTY),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTX),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHTY),
+
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFT_TRIGGER),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER),
+
+    ControllerOutput(HOTKEY_FULLSCREEN),
+    ControllerOutput(HOTKEY_PAUSE),
+    ControllerOutput(HOTKEY_SIMPLE_FPS),
+    ControllerOutput(HOTKEY_QUIT),
+    ControllerOutput(HOTKEY_RELOAD_INPUTS),
+    ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK),
+    ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_GYRO),
+    ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD),
+    ControllerOutput(HOTKEY_RENDERDOC),
+    ControllerOutput(HOTKEY_VOLUME_UP),
+    ControllerOutput(HOTKEY_VOLUME_DOWN),
+
+    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_INVALID),
 };
 
 void ControllerOutput::LinkJoystickAxes() {
-    // for (int i = 17; i < 23; i += 2) {
-    //     delete output_array[i].new_param;
-    //     output_array[i].new_param = output_array[i + 1].new_param;
-    // }
 }
 
 static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
@@ -281,8 +118,6 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
         return OPBDO::L1;
-    case SDL_GAMEPAD_BUTTON_MISC1: // Move
-        return OPBDO::L1;
     case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
         return OPBDO::R1;
     case SDL_GAMEPAD_BUTTON_LEFT_STICK:
@@ -313,12 +148,10 @@ Axis GetAxisFromSDLAxis(u8 sdl_axis) {
     }
 }
 
-// syntax: 'name, name,name' or 'name,name' or 'name'
 InputBinding GetBindingFromString(std::string& line) {
     std::array<InputID, 3> keys = {InputID(), InputID(), InputID()};
 
-    // Check and process tokens
-    for (const auto token : std::views::split(line, ',')) { // Split by comma
+    for (const auto token : std::views::split(line, ',')) {
         const std::string t(token.begin(), token.end());
         InputID input;
 
@@ -331,12 +164,10 @@ InputBinding GetBindingFromString(std::string& line) {
         } else if (string_to_hotkey_map.find(t) != string_to_hotkey_map.end()) {
             input = InputID(InputType::Controller, string_to_hotkey_map.at(t));
         } else {
-            // Invalid token found; return default binding
             LOG_DEBUG(Input, "Invalid token found: {}", t);
             return InputBinding();
         }
 
-        // Assign to the first available slot
         for (auto& key : keys) {
             if (!key.IsValid()) {
                 key = input;
@@ -348,35 +179,23 @@ InputBinding GetBindingFromString(std::string& line) {
     return InputBinding(keys[0], keys[1], keys[2]);
 }
 
-std::optional<int> parseInt(const std::string& s) {
-    try {
-        return std::stoi(s);
-    } catch (...) {
-        return std::nullopt;
-    }
-};
-
 void ParseInputConfig(const std::string game_id = "") {
-    std::string game_id_or_default =
-        EmulatorSettings.IsUseUnifiedInputConfig() ? "default" : game_id;
-    const auto config_file = GetInputConfigFile(game_id_or_default);
-    const auto global_config_file = GetInputConfigFile("global");
+    std::string game_id_or_default = Config::GetUseUnifiedInputConfig() ? "default" : game_id;
+    const auto config_file = Config::GetInputConfigFile(game_id_or_default);
+    const auto global_config_file = Config::GetInputConfigFile("global");
 
-    // we reset these here so in case the user fucks up or doesn't include some of these,
-    // we can fall back to default
     connections.clear();
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
 
-    // me when I'm in a type deduction tournament and my opponent is clang
-    constexpr std::array<std::pair<int, int>, 4> default_deadzone = {
-        std::pair{1, 127}, {1, 127}, {1, 127}, {1, 127}};
+    leftjoystick_deadzone = {1, 127};
+    rightjoystick_deadzone = {1, 127};
+    lefttrigger_deadzone = {1, 127};
+    righttrigger_deadzone = {1, 127};
 
-    leftjoystick_deadzone = default_deadzone;
-    rightjoystick_deadzone = default_deadzone;
-    lefttrigger_deadzone = default_deadzone;
-    righttrigger_deadzone = default_deadzone;
+    Config::SetOverrideControllerColor(false);
+    Config::SetControllerCustomColor(0, 0, 255);
 
     int lineCount = 0;
 
@@ -386,7 +205,6 @@ void ParseInputConfig(const std::string game_id = "") {
     auto ProcessLine = [&]() -> void {
         lineCount++;
 
-        // Strip the ; and whitespace
         line.erase(std::remove_if(line.begin(), line.end(),
                                   [](unsigned char c) { return std::isspace(c); }),
                    line.end());
@@ -394,7 +212,6 @@ void ParseInputConfig(const std::string game_id = "") {
             return;
         }
 
-        // Truncate lines starting at #
         std::size_t comment_pos = line.find('#');
         if (comment_pos != std::string::npos) {
             line = line.substr(0, comment_pos);
@@ -403,7 +220,6 @@ void ParseInputConfig(const std::string game_id = "") {
             return;
         }
 
-        // Split the line by '='
         std::size_t equal_pos = line.find('=');
         if (equal_pos == std::string::npos) {
             LOG_WARNING(Input, "Invalid format at line: {}, data: \"{}\", skipping line.",
@@ -413,37 +229,20 @@ void ParseInputConfig(const std::string game_id = "") {
 
         std::string output_string = line.substr(0, equal_pos);
         std::string input_string = line.substr(equal_pos + 1);
-        s8 input_gamepad_id = -1, output_gamepad_id = -1; // -1 means it's not specified
-
-        // input gamepad id is only for controllers, it's discarded otherwise
-        std::size_t input_colon_pos = input_string.find(':');
-        if (input_colon_pos != std::string::npos) {
-            auto temp = parseInt(input_string.substr(input_colon_pos + 1));
-            if (!temp) {
-                LOG_WARNING(Input, "Invalid gamepad ID value at line {}: \"{}\"", lineCount, line);
-            } else {
-                input_gamepad_id = *temp;
-            }
-            input_string = input_string.substr(0, input_colon_pos);
-        }
-
-        // if not provided, assume it's for all gamepads, if the input is a controller and that also
-        // doesn't have an ID, and for the first otherwise
-        std::size_t output_colon_pos = output_string.find(':');
-        if (output_colon_pos != std::string::npos) {
-            auto temp = parseInt(output_string.substr(output_colon_pos + 1));
-            if (!temp) {
-                LOG_WARNING(Input, "Invalid gamepad ID value at line {}: \"{}\"", lineCount, line);
-            } else {
-                output_gamepad_id = *temp;
-            }
-            output_string = output_string.substr(0, output_colon_pos);
+        if (!input_string.empty() && input_string[input_string.length() - 1] == ';' &&
+            input_string != ";") {
+            line = line.substr(0, line.length() - 1);
         }
 
         std::size_t comma_pos = input_string.find(',');
+        auto parseInt = [](const std::string& s) -> std::optional<int> {
+            try {
+                return std::stoi(s);
+            } catch (...) {
+                return std::nullopt;
+            }
+        };
 
-        // todo make override_controller_color and analog_deadzone be controller specific
-        // instead of global
         if (output_string == "mouse_to_joystick") {
             if (input_string == "left") {
                 SetMouseToJoystick(1);
@@ -456,7 +255,6 @@ void ParseInputConfig(const std::string game_id = "") {
             return;
         } else if (output_string == "key_toggle") {
             if (comma_pos != std::string::npos) {
-                // handle key-to-key toggling (separate list?)
                 InputBinding toggle_keys = GetBindingFromString(input_string);
                 if (toggle_keys.KeyCount() != 2) {
                     LOG_WARNING(Input,
@@ -466,7 +264,7 @@ void ParseInputConfig(const std::string game_id = "") {
                     return;
                 }
                 ControllerOutput* toggle_out =
-                    &*std::ranges::find(output_arrays[0].data, ControllerOutput(KEY_TOGGLE));
+                    &*std::ranges::find(output_array, ControllerOutput(KEY_TOGGLE));
                 BindingConnection toggle_connection = BindingConnection(
                     InputBinding(toggle_keys.keys[0]), toggle_out, 0, toggle_keys.keys[1]);
                 connections.insert(connections.end(), toggle_connection);
@@ -477,10 +275,9 @@ void ParseInputConfig(const std::string game_id = "") {
             return;
         } else if (output_string == "mouse_movement_params") {
             std::stringstream ss(input_string);
-            char comma; // To hold the comma separators between the floats
+            char comma;
             ss >> mouse_deadzone_offset >> comma >> mouse_speed >> comma >> mouse_speed_offset;
 
-            // Check for invalid input (in case there's an unexpected format)
             if (ss.fail()) {
                 LOG_WARNING(Input, "Failed to parse mouse movement parameters from line: {}", line);
                 return;
@@ -507,17 +304,15 @@ void ParseInputConfig(const std::string game_id = "") {
 
             std::pair<int, int> deadzone = {*inner_deadzone, *outer_deadzone};
 
-            static std::unordered_map<std::string, std::array<std::pair<int, int>, 4>&>
-                deadzone_map = {
-                    {"leftjoystick", leftjoystick_deadzone},
-                    {"rightjoystick", rightjoystick_deadzone},
-                    {"l2", lefttrigger_deadzone},
-                    {"r2", righttrigger_deadzone},
-                };
-            output_gamepad_id = output_gamepad_id == -1 ? 1 : output_gamepad_id;
+            static std::unordered_map<std::string, std::pair<int, int>&> deadzone_map = {
+                {"leftjoystick", leftjoystick_deadzone},
+                {"rightjoystick", rightjoystick_deadzone},
+                {"l2", lefttrigger_deadzone},
+                {"r2", righttrigger_deadzone},
+            };
 
             if (auto it = deadzone_map.find(device); it != deadzone_map.end()) {
-                it->second[output_gamepad_id - 1] = deadzone;
+                it->second = deadzone;
                 LOG_DEBUG(Input, "Parsed deadzone: {} {} {}", device, inner_deadzone_str,
                           outer_deadzone_str);
             } else {
@@ -543,17 +338,13 @@ void ParseInputConfig(const std::string game_id = "") {
                             lineCount, line);
                 return;
             }
-            output_gamepad_id = output_gamepad_id == -1 ? 1 : output_gamepad_id;
-            if (enable == "true") {
-                ControllerOutput::controllers.SetControllerCustomColor(output_gamepad_id - 1, *r,
-                                                                       *g, *b);
-            }
-            LOG_DEBUG(Input, "Parsed color settings: {} {} - {} {} {}",
-                      enable == "true" ? "override" : "no override", output_gamepad_id, *r, *b, *g);
+            Config::SetOverrideControllerColor(enable == "true");
+            Config::SetControllerCustomColor(*r, *g, *b);
+            LOG_DEBUG(Input, "Parsed color settings: {} {} {} {}",
+                      enable == "true" ? "override" : "no override", *r, *b, *g);
             return;
         }
 
-        // normal cases
         InputBinding binding = GetBindingFromString(input_string);
         if (binding.IsEmpty()) {
             LOG_WARNING(Input, "Invalid format at line: {}, data: \"{}\", skipping line.",
@@ -566,46 +357,31 @@ void ParseInputConfig(const std::string game_id = "") {
         auto axis_it = string_to_axis_map.find(output_string);
         if (button_it != string_to_cbutton_map.end()) {
             connection = BindingConnection(
-                binding,
-                &*std::ranges::find(output_arrays[std::clamp(output_gamepad_id - 1, 0, 3)].data,
-                                    ControllerOutput(button_it->second)));
+                binding, &*std::ranges::find(output_array, ControllerOutput(button_it->second)));
+            connections.insert(connections.end(), connection);
         } else if (hotkey_it != string_to_hotkey_map.end()) {
             connection = BindingConnection(
-                binding,
-                &*std::ranges::find(output_arrays[std::clamp(output_gamepad_id - 1, 0, 3)].data,
-                                    ControllerOutput(hotkey_it->second)));
+                binding, &*std::ranges::find(output_array, ControllerOutput(hotkey_it->second)));
+            connections.insert(connections.end(), connection);
         } else if (axis_it != string_to_axis_map.end()) {
             int value_to_set = binding.keys[2].type == InputType::Axis ? 0 : axis_it->second.value;
             connection = BindingConnection(
                 binding,
-                &*std::ranges::find(output_arrays[std::clamp(output_gamepad_id - 1, 0, 3)].data,
-                                    ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID,
-                                                     axis_it->second.axis,
-                                                     axis_it->second.value >= 0)),
+                &*std::ranges::find(output_array, ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID,
+                                                                   axis_it->second.axis,
+                                                                   axis_it->second.value >= 0)),
                 value_to_set);
+            connections.insert(connections.end(), connection);
         } else {
             LOG_WARNING(Input, "Invalid format at line: {}, data: \"{}\", skipping line.",
                         lineCount, line);
             return;
-        }
-        // if the input binding contains a controller input, and gamepad ID
-        // isn't specified for either inputs or output (both are -1), then multiply the binding and
-        // add it to all 4 controllers
-        if (connection.HasGamepadInput() && input_gamepad_id == -1 && output_gamepad_id == -1) {
-            for (int i = 0; i < output_arrays.size(); i++) {
-                BindingConnection copy = connection.CopyWithChangedGamepadId(i + 1);
-                copy.output = &*std::ranges::find(output_arrays[i].data, *connection.output);
-                connections.push_back(copy);
-            }
-        } else {
-            connections.push_back(connection);
         }
         LOG_DEBUG(Input, "Succesfully parsed line {}", lineCount);
     };
     while (std::getline(global_config_stream, line)) {
         ProcessLine();
     }
-    lineCount = 0;
     while (std::getline(config_stream, line)) {
         ProcessLine();
     }
@@ -615,16 +391,6 @@ void ParseInputConfig(const std::string game_id = "") {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
     }
     LOG_DEBUG(Input, "Done parsing the input config!");
-}
-
-BindingConnection BindingConnection::CopyWithChangedGamepadId(u8 gamepad) {
-    BindingConnection copy = *this;
-    for (auto& key : copy.binding.keys) {
-        if (key.type == InputType::Controller || key.type == InputType::Axis) {
-            key.gamepad_id = gamepad;
-        }
-    }
-    return copy;
 }
 
 u32 GetMouseWheelEvent(const SDL_Event& event) {
@@ -645,7 +411,6 @@ u32 GetMouseWheelEvent(const SDL_Event& event) {
 }
 
 InputEvent InputBinding::GetInputEventFromSDLEvent(const SDL_Event& e) {
-    u8 gamepad = 1;
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
@@ -660,15 +425,19 @@ InputEvent InputBinding::GetInputEventFromSDLEvent(const SDL_Event& e) {
                           e.type == SDL_EVENT_MOUSE_WHEEL, 0);
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        gamepad = ControllerOutput::controllers.GetGamepadIndexFromJoystickId(e.gbutton.which) + 1;
-        return InputEvent({InputType::Controller, (u32)e.gbutton.button, gamepad}, e.gbutton.down,
+        return InputEvent(InputType::Controller, static_cast<u32>(e.gbutton.button), e.gbutton.down,
                           0);
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-        gamepad = ControllerOutput::controllers.GetGamepadIndexFromJoystickId(e.gaxis.which) + 1;
-        return InputEvent({InputType::Axis, (u32)e.gaxis.axis, gamepad}, true, e.gaxis.value / 256);
+        return InputEvent(InputType::Axis, static_cast<u32>(e.gaxis.axis), true,
+                          e.gaxis.value / 256);
     default:
         return InputEvent();
     }
+}
+
+GameController* ControllerOutput::controller = nullptr;
+void ControllerOutput::SetControllerOutputController(GameController* c) {
+    ControllerOutput::controller = c;
 }
 
 void ToggleKeyInList(InputID input) {
@@ -689,7 +458,7 @@ void ToggleKeyInList(InputID input) {
 void ControllerOutput::ResetUpdate() {
     state_changed = false;
     new_button_state = false;
-    *new_param = 0; // bruh
+    *new_param = 0;
 }
 void ControllerOutput::AddUpdate(InputEvent event) {
     switch (button) {
@@ -716,8 +485,7 @@ void ControllerOutput::AddUpdate(InputEvent event) {
         *new_param = (event.active ? event.axis_value : 0) + *new_param;
     }
 }
-
-void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
+void ControllerOutput::FinalizeUpdate() {
     auto PushSDLEvent = [&](u32 event_type) {
         if (new_button_state) {
             SDL_Event e;
@@ -732,24 +500,20 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     }
     old_button_state = new_button_state;
     old_param = *new_param;
-    GameController* controller;
-    if (gamepad_index < 5)
-        controller = controllers[gamepad_index];
-    else
-        UNREACHABLE();
+    bool is_game_specific = EmulatorState::GetInstance()->IsGameSpecifigConfigUsed();
     if (button != SDL_GAMEPAD_BUTTON_INVALID) {
         switch (button) {
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT:
             controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            controller->Button(0, SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER:
             controller->SetTouchpadState(0, new_button_state, 0.50f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            controller->Button(0, SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
             controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            controller->Button(0, SDLGamepadToOrbisButton(button), new_button_state);
             break;
         case LEFTJOYSTICK_HALFMODE:
             leftjoystick_halfmode = new_button_state;
@@ -781,46 +545,29 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case HOTKEY_RENDERDOC:
             PushSDLEvent(SDL_EVENT_RDOC_CAPTURE);
             break;
-        case HOTKEY_SCREENSHOT_WITH_OVERLAYS:
-            PushSDLEvent(SDL_EVENT_SCREENSHOT_WITH_OVERLAYS);
-            break;
-        case HOTKEY_ADD_VIRTUAL_USER:
-            PushSDLEvent(SDL_EVENT_ADD_VIRTUAL_USER);
-            break;
-        case HOTKEY_REMOVE_VIRTUAL_USER:
-            PushSDLEvent(SDL_EVENT_REMOVE_VIRTUAL_USER);
-            break;
         case HOTKEY_VOLUME_UP:
-            EmulatorSettings.SetVolumeSlider(
-                std::clamp(EmulatorSettings.GetVolumeSlider() + 10, 0, 500));
+            Config::setVolumeSlider(std::clamp(Config::getVolumeSlider() + 10, 0, 500),
+                                    is_game_specific);
             Overlay::ShowVolume();
             break;
         case HOTKEY_VOLUME_DOWN:
-            EmulatorSettings.SetVolumeSlider(
-                std::clamp(EmulatorSettings.GetVolumeSlider() - 10, 0, 500));
+            Config::setVolumeSlider(std::clamp(Config::getVolumeSlider() - 10, 0, 500),
+                                    is_game_specific);
             Overlay::ShowVolume();
             break;
         case HOTKEY_QUIT:
             PushSDLEvent(SDL_EVENT_QUIT_DIALOG);
             break;
-        case HOTKEY_OPEN_EMULATOR_SETTINGS:
-            ImGuiEmuSettings::OpenInGameSettingsDialog();
-            break;
-        case HOTKEY_TOGGLE_FRIENDS:
-            PushSDLEvent(SDL_EVENT_TOGGLE_FRIENDS);
-            break;
         case KEY_TOGGLE:
-            // noop
             break;
         case MOUSE_GYRO_ROLL_MODE:
             SetMouseGyroRollMode(new_button_state);
             break;
-        default: // is a normal key (hopefully)
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+        default:
+            controller->Button(0, SDLGamepadToOrbisButton(button), new_button_state);
             break;
         }
     } else if (axis != SDL_GAMEPAD_AXIS_INVALID && positive_axis) {
-        // avoid double-updating axes, but don't skip directional button bindings
         auto ApplyDeadzone = [](s16* value, std::pair<int, int> deadzone) {
             if (std::abs(*value) <= deadzone.first || deadzone.first == deadzone.second) {
                 *value = 0;
@@ -836,50 +583,46 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         switch (c_axis) {
         case Axis::LeftX:
         case Axis::LeftY:
-            ApplyDeadzone(new_param, leftjoystick_deadzone[gamepad_index]);
+            ApplyDeadzone(new_param, leftjoystick_deadzone);
             multiplier = leftjoystick_halfmode ? 0.5 : 1.0;
             break;
         case Axis::RightX:
         case Axis::RightY:
-            ApplyDeadzone(new_param, rightjoystick_deadzone[gamepad_index]);
+            ApplyDeadzone(new_param, rightjoystick_deadzone);
             multiplier = rightjoystick_halfmode ? 0.5 : 1.0;
             break;
         case Axis::TriggerLeft:
-            ApplyDeadzone(new_param, lefttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
-            controller->Button(OrbisPadButtonDataOffset::L2, *new_param > 0x20);
+            ApplyDeadzone(new_param, lefttrigger_deadzone);
+            controller->Axis(0, c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Button(0, OrbisPadButtonDataOffset::L2, *new_param > 0x20);
             return;
         case Axis::TriggerRight:
-            ApplyDeadzone(new_param, righttrigger_deadzone[gamepad_index]);
-            controller->Axis(c_axis, GetAxis(0x0, 0x7f, *new_param));
-            controller->Button(OrbisPadButtonDataOffset::R2, *new_param > 0x20);
+            ApplyDeadzone(new_param, righttrigger_deadzone);
+            controller->Axis(0, c_axis, GetAxis(0x0, 0x7f, *new_param));
+            controller->Button(0, OrbisPadButtonDataOffset::R2, *new_param > 0x20);
             return;
         default:
             break;
         }
-        controller->Axis(c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier));
+        controller->Axis(0, c_axis, GetAxis(-0x80, 0x7f, *new_param * multiplier));
     }
 }
 
-// Updates the list of pressed keys with the given input.
-// Returns whether the list was updated or not.
 bool UpdatePressedKeys(InputEvent event) {
-    // Skip invalid inputs
     InputID input = event.input;
     if (input.sdl_id == SDL_UNMAPPED) {
         return false;
     }
     if (input.type == InputType::Axis) {
-        // analog input, it gets added when it first sends an event,
-        // and from there, it only changes the parameter
-        auto it = std::lower_bound(
-            pressed_keys.begin(), pressed_keys.end(), input,
-            [](const std::pair<InputEvent, bool>& e, InputID i) { return e.first.input < i; });
+        auto it = std::lower_bound(pressed_keys.begin(), pressed_keys.end(), input,
+                                   [](const std::pair<InputEvent, bool>& e, InputID i) {
+                                       return std::tie(e.first.input.type, e.first.input.sdl_id) <
+                                              std::tie(i.type, i.sdl_id);
+                                   });
         if (it == pressed_keys.end() || it->first.input != input) {
             pressed_keys.insert(it, {event, false});
             LOG_DEBUG(Input, "Added axis {} to the input list", event.input.sdl_id);
         } else {
-            // noise filter
             if (std::abs(it->first.axis_value - event.axis_value) <= 1) {
                 return false;
             }
@@ -887,20 +630,17 @@ bool UpdatePressedKeys(InputEvent event) {
         }
         return true;
     } else if (event.active) {
-        // Find the correct position for insertion to maintain order
         auto it = std::lower_bound(pressed_keys.begin(), pressed_keys.end(), input,
                                    [](const std::pair<InputEvent, bool>& e, InputID i) {
                                        return std::tie(e.first.input.type, e.first.input.sdl_id) <
                                               std::tie(i.type, i.sdl_id);
                                    });
 
-        // Insert only if 'value' is not already in the list
         if (it == pressed_keys.end() || it->first.input != input) {
             pressed_keys.insert(it, {event, false});
             return true;
         }
     } else {
-        // Remove 'value' from the list if it's not pressed
         auto it = std::find_if(
             pressed_keys.begin(), pressed_keys.end(),
             [input](const std::pair<InputEvent, bool>& e) { return e.first.input == input; });
@@ -912,33 +652,25 @@ bool UpdatePressedKeys(InputEvent event) {
     LOG_DEBUG(Input, "No change was made!");
     return false;
 }
-// Check if the binding's all keys are currently active.
-// It also extracts the analog inputs' parameters, and updates the input hierarchy flags.
 InputEvent BindingConnection::ProcessBinding() {
-    // the last key is always set (if the connection isn't empty),
-    // and the analog inputs are always the last one due to how they are sorted,
-    // so this signifies whether or not the input is analog
     InputEvent event = InputEvent(binding.keys[0]);
     if (pressed_keys.empty()) {
         return event;
     }
     if (event.input.type != InputType::Axis) {
-        // for button inputs
         event.axis_value = axis_param;
     }
-    // it's a bit scuffed, but if the output is a toggle, then we put the key here
     if (output->button == KEY_TOGGLE) {
         event.input = toggle;
     }
 
-    // Extract keys from InputBinding and ignore unused or toggled keys
     std::list<InputID> input_keys = {binding.keys[0], binding.keys[1], binding.keys[2]};
     input_keys.remove(InputID());
     for (auto key = input_keys.begin(); key != input_keys.end();) {
         if (std::find(toggled_keys.begin(), toggled_keys.end(), *key) != toggled_keys.end()) {
-            key = input_keys.erase(key); // Use the returned iterator
+            key = input_keys.erase(key);
         } else {
-            ++key; // Increment only if no erase happened
+            ++key;
         }
     }
     if (input_keys.empty()) {
@@ -947,13 +679,10 @@ InputEvent BindingConnection::ProcessBinding() {
         return event;
     }
 
-    // Iterator for pressed_keys, starting from the beginning
     auto pressed_it = pressed_keys.begin();
 
-    // Store pointers to flags in pressed_keys that need to be set if all keys are active
     std::list<bool*> flags_to_set;
 
-    // Check if all keys in input_keys are active
     for (InputID key : input_keys) {
         bool key_found = false;
 
@@ -979,42 +708,30 @@ InputEvent BindingConnection::ProcessBinding() {
     for (bool* flag : flags_to_set) {
         *flag = true;
     }
-    if (binding.keys[0].type != InputType::Axis) { // the axes spam inputs, making this unreadable
+    if (binding.keys[0].type != InputType::Axis) {
         LOG_DEBUG(Input, "Input found: {}", binding.ToString());
     }
     event.active = true;
-    return event; // All keys are active
+    return event;
 }
 
 void ActivateOutputsFromInputs() {
+    for (auto& it : pressed_keys) {
+        it.second = false;
+    }
+    for (auto& it : output_array) {
+        it.ResetUpdate();
+    }
 
-    // todo find a better solution
-    for (int i = 0; i < output_arrays.size(); i++) {
+    ApplyMouseInputBlockers();
 
-        // Reset values and flags
-        for (auto& it : pressed_keys) {
-            it.second = false;
-        }
-        for (auto& it : output_arrays[i].data) {
-            it.ResetUpdate();
-        }
+    for (auto& it : connections) {
+        it.output->AddUpdate(it.ProcessBinding());
+    }
 
-        // Check for input blockers
-        ApplyMouseInputBlockers();
-
-        // Iterate over all inputs, and update their respecive outputs accordingly
-        for (auto& it : connections) {
-            // only update this when it's the correct pass
-            if (it.output->gamepad_id == i) {
-                it.output->AddUpdate(it.ProcessBinding());
-            }
-        }
-
-        // Update all outputs
-        for (auto& it : output_arrays[i].data) {
-            it.FinalizeUpdate(i);
-        }
+    for (auto& it : output_array) {
+        it.FinalizeUpdate();
     }
 }
 
-} // namespace Input
+}

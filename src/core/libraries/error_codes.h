@@ -3,6 +3,5 @@
 
 #pragma once
 
-// Generic
 constexpr int ORBIS_OK = 0x00000000;
 constexpr int ORBIS_FAIL = 0xFFFFFFFF;

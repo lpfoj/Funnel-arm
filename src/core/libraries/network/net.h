@@ -11,7 +11,6 @@ namespace Core::Loader {
 class SymbolsResolver;
 }
 
-// Define our own htonll and ntohll because its not available in some systems/platforms
 #ifndef HTONLL
 #define HTONLL(x) (((uint64_t)htonl((x) & 0xFFFFFFFFUL)) << 32) | htonl((uint32_t)((x) >> 32))
 #endif
@@ -212,7 +211,7 @@ struct OrbisNetInAddr {
 
 struct OrbisNetSockaddrUn {
     u8 sun_len;
-    u8 sun_family; // AF_UNIX
+    u8 sun_family;
     char sun_path[104];
 };
 
@@ -492,4 +491,4 @@ int PS4_SYSV_ABI sceNetEmulationGet();
 int PS4_SYSV_ABI sceNetEmulationSet();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Net
+}

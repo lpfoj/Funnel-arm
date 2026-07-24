@@ -20,29 +20,29 @@ struct PlaygoHeader {
 
     u16 version_major;
     u16 version_minor;
-    u16 image_count;    // [0;1]
-    u16 chunk_count;    // [0;1000]
-    u16 mchunk_count;   // [0;8000]
-    u16 scenario_count; // [0;32]
+    u16 image_count;
+    u16 chunk_count;
+    u16 mchunk_count;
+    u16 scenario_count;
 
     u32 file_size;
     u16 default_scenario_id;
     u16 attrib;
     u32 sdk_version;
-    u16 disc_count; // [0;2] (if equals to 0 then disc count = 1)
+    u16 disc_count;
     u16 layer_bmp;
 
     u8 reserved[32];
     char content_id[128];
 
-    chunk_t chunk_attrs; // [0;32000]
+    chunk_t chunk_attrs;
     chunk_t chunk_mchunks;
-    chunk_t chunk_labels;   // [0;16000]
-    chunk_t mchunk_attrs;   // [0;12800]
-    chunk_t scenario_attrs; // [0;1024]
+    chunk_t chunk_labels;
+    chunk_t mchunk_attrs;
+    chunk_t scenario_attrs;
     chunk_t scenario_chunks;
     chunk_t scenario_labels;
-    chunk_t inner_mchunk_attrs; // [0;12800]
+    chunk_t inner_mchunk_attrs;
 } __attribute__((packed));
 
 struct playgo_scenario_attr_entry_t {
@@ -50,8 +50,8 @@ struct playgo_scenario_attr_entry_t {
     u8 _unk[19];
     u16 initial_chunk_count;
     u16 chunk_count;
-    u32 chunks_offset; //<-scenario_chunks
-    u32 label_offset;  //<-scenario_labels
+    u32 chunks_offset;
+    u32 label_offset;
 } __attribute__((packed));
 
 struct image_disc_layer_no_t {
@@ -67,8 +67,8 @@ struct playgo_chunk_attr_entry_t {
     u8 unk[11];
     u16 mchunk_count;
     u64 language_mask;
-    u32 mchunks_offset; //<-chunk_mchunks
-    u32 label_offset;   //<-chunk_labels
+    u32 mchunks_offset;
+    u32 label_offset;
 } __attribute__((packed));
 
 struct playgo_chunk_loc_t {

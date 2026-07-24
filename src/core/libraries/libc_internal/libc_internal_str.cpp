@@ -7,6 +7,12 @@
 #include "core/libraries/libs.h"
 #include "libc_internal_str.h"
 
+#ifdef __ANDROID__
+#include <cstdio>
+#include <cstring>
+#include <android/log.h>
+#endif
+
 namespace Libraries::LibcInternal {
 
 s32 PS4_SYSV_ABI internal_strcpy_s(char* dest, size_t dest_size, const char* src) {
@@ -14,7 +20,7 @@ s32 PS4_SYSV_ABI internal_strcpy_s(char* dest, size_t dest_size, const char* src
     return strcpy_s(dest, dest_size, src);
 #else
     std::strcpy(dest, src);
-    return 0; // ALL OK
+    return 0;
 #endif
 }
 
@@ -23,7 +29,7 @@ s32 PS4_SYSV_ABI internal_strcat_s(char* dest, size_t dest_size, const char* src
     return strcat_s(dest, dest_size, src);
 #else
     std::strcat(dest, src);
-    return 0; // ALL OK
+    return 0;
 #endif
 }
 
@@ -53,7 +59,24 @@ s32 PS4_SYSV_ABI internal_strncpy_s(char* dest, size_t destsz, const char* src, 
 }
 
 char* PS4_SYSV_ABI internal_strcat(char* dest, const char* src) {
+#ifdef __ANDROID__
+    char before[24] = {0};
+    char srcbuf[24] = {0};
+    if (dest != nullptr) {
+        std::snprintf(before, sizeof(before), "%.20s", dest);
+    }
+    if (src != nullptr) {
+        std::snprintf(srcbuf, sizeof(srcbuf), "%.20s", src);
+    }
+    char* result = std::strcat(dest, src);
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_INT_STRCAT] dest=%p src=%p before='%s' src='%s' after='%.20s'",
+                        static_cast<void*>(dest), static_cast<const void*>(src), before, srcbuf,
+                        dest != nullptr ? dest : "");
+    return result;
+#else
     return std::strcat(dest, src);
+#endif
 }
 
 const char* PS4_SYSV_ABI internal_strchr(const char* str, int c) {
@@ -72,4 +95,4 @@ void RegisterlibSceLibcInternalStr(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("ob5xAW4ln-0", "libSceLibcInternal", 1, "libSceLibcInternal", internal_strchr);
 }
 
-} // namespace Libraries::LibcInternal
+}

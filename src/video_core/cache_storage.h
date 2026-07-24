@@ -39,7 +39,7 @@ public:
     void Load(BlobType type, const std::string& name, std::vector<u8>& data);
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);
 
-    void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
+    void ForEachBlob(BlobType type, const std::function<bool(std::vector<u8>&& data)>& func);
 
 private:
     std::jthread io_worker{};
@@ -47,4 +47,4 @@ private:
     bool opened{};
 };
 
-} // namespace Storage
+}

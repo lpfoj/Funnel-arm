@@ -117,4 +117,4 @@ s32 PS4_SYSV_ABI sceFiberRename(OrbisFiber* fiber, const char* name);
 s32 PS4_SYSV_ABI sceFiberGetThreadFramePointerAddress(u64* addr_frame_pointer);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Fiber
+}

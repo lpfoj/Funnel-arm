@@ -23,7 +23,7 @@
 using Common::FS::IOFile;
 namespace fs = std::filesystem;
 
-constexpr std::string_view sce_sys = "sce_sys"; // system folder inside save
+constexpr std::string_view sce_sys = "sce_sys";
 constexpr std::string_view StandardDirnameSaveDataMemory = "sce_sdmemory";
 constexpr std::string_view FilenameSaveDataMemory = "memory.dat";
 constexpr std::string_view IconName = "icon0.png";
@@ -121,7 +121,7 @@ size_t SetupSaveMemory(Libraries::UserService::OrbisUserServiceUserId user_id, u
     }
 
     if (!data.sfo.Open(param_sfo_path) || fs::exists(save_dir / CorruptFileName)) {
-        if (!Backup::Restore(save_dir)) { // Could not restore the backup
+        if (!Backup::Restore(save_dir)) {
             return 0;
         }
     }
@@ -197,7 +197,7 @@ void ReadMemory(u32 slot_id, void* buf, size_t buf_size, int64_t offset) {
     std::lock_guard lk{g_slot_mtx};
     auto& data = g_attached_slots[slot_id];
     auto& memory = data.memory_cache;
-    if (memory.empty()) { // Load file
+    if (memory.empty()) {
         memory.resize(data.memory_cache_size);
         IOFile f{data.folder_path / FilenameSaveDataMemory, Common::FS::FileAccessMode::Read};
         if (f.IsOpen()) {
@@ -224,4 +224,4 @@ void WriteMemory(u32 slot_id, void* buf, size_t buf_size, int64_t offset) {
     Backup::NewRequest(data.user_id, data.game_serial, GetSaveDir(slot_id),
                        Backup::OrbisSaveDataEventType::__DO_NOT_SAVE);
 }
-} // namespace Libraries::SaveData::SaveMemory
+}

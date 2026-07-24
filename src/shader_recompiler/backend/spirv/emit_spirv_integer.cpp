@@ -7,53 +7,14 @@
 namespace Shader::Backend::SPIRV {
 namespace {
 void SetZeroFlag(EmitContext& ctx, IR::Inst* inst, Id result) {
-    // IR::Inst* const zero{inst->GetAssociatedPseudoOperation(IR::Opcode::GetZeroFromOp)};
-    // if (!zero) {
-    //     return;
-    // }
-    // zero->SetDefinition(ctx.OpIEqual(ctx.U1[1], result, ctx.u32_zero_value));
-    // zero->Invalidate();
 }
 
 void SetSignFlag(EmitContext& ctx, IR::Inst* inst, Id result) {
-    // IR::Inst* const sign{inst->GetAssociatedPseudoOperation(IR::Opcode::GetSignFromOp)};
-    // if (!sign) {
-    //     return;
-    // }
-    // sign->SetDefinition(ctx.OpSLessThan(ctx.U1[1], result, ctx.u32_zero_value));
-    // sign->Invalidate();
 }
-} // Anonymous namespace
+}
 
 Id EmitIAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
     return ctx.OpIAdd(ctx.U32[1], a, b);
-    // Id result{};
-    // if (IR::Inst* const carry{inst->GetAssociatedPseudoOperation(IR::Opcode::GetCarryFromOp)}) {
-    //     const Id carry_type{ctx.TypeStruct(ctx.U32[1], ctx.U32[1])};
-    //     const Id carry_result{ctx.OpIAddCarry(carry_type, a, b)};
-    //     result = ctx.OpCompositeExtract(ctx.U32[1], carry_result, 0U);
-
-    //    const Id carry_value{ctx.OpCompositeExtract(ctx.U32[1], carry_result, 1U)};
-    //    carry->SetDefinition(ctx.OpINotEqual(ctx.U1[1][1], carry_value, ctx.u32_zero_value));
-    //    carry->Invalidate();
-    //} else {
-    //    result = ctx.OpIAdd(ctx.U32[1], a, b);
-    //}
-    // SetZeroFlag(ctx, inst, result);
-    // SetSignFlag(ctx, inst, result);
-    // if (IR::Inst * overflow{inst->GetAssociatedPseudoOperation(IR::Opcode::GetOverflowFromOp)}) {
-    //    // https://stackoverflow.com/questions/55468823/how-to-detect-integer-overflow-in-c
-    //    constexpr u32 s32_max{static_cast<u32>(std::numeric_limits<s32>::max())};
-    //    const Id is_positive{ctx.OpSGreaterThanEqual(ctx.U1[1], a, ctx.u32_zero_value)};
-    //    const Id sub_a{ctx.OpISub(ctx.U32[1], ctx.Const(s32_max), a)};
-
-    //    const Id positive_test{ctx.OpSGreaterThan(ctx.U1[1], b, sub_a)};
-    //    const Id negative_test{ctx.OpSLessThan(ctx.U1[1], b, sub_a)};
-    //    const Id carry_flag{ctx.OpSelect(ctx.U1[1], is_positive, positive_test, negative_test)};
-    //    overflow->SetDefinition(carry_flag);
-    //    overflow->Invalidate();
-    //}
-    // return result;
 }
 
 Id EmitIAdd64(EmitContext& ctx, Id a, Id b) {
@@ -207,8 +168,6 @@ Id EmitBitCount32(EmitContext& ctx, Id value) {
 }
 
 Id EmitBitCount64(EmitContext& ctx, Id value) {
-    // Vulkan restricts some bitwise operations to 32-bit only, so decompose into
-    // two 32-bit values and add the result.
     const Id unpacked{ctx.OpBitcast(ctx.U32[2], value)};
     const Id lo{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 0U)};
     const Id hi{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 1U)};
@@ -230,8 +189,6 @@ Id EmitFindUMsb32(EmitContext& ctx, Id value) {
 }
 
 Id EmitFindUMsb64(EmitContext& ctx, Id value) {
-    // Vulkan restricts some bitwise operations to 32-bit only, so decompose into
-    // two 32-bit values and select the correct result.
     const Id unpacked{ctx.OpBitcast(ctx.U32[2], value)};
     const Id hi{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 1U)};
     const Id lo{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 0U)};
@@ -239,7 +196,6 @@ Id EmitFindUMsb64(EmitContext& ctx, Id value) {
     const Id lo_msb{ctx.OpFindUMsb(ctx.U32[1], lo)};
     const Id found_hi{ctx.OpINotEqual(ctx.U1[1], hi_msb, ctx.ConstU32(u32(-1)))};
     const Id shifted_hi{ctx.OpIAdd(ctx.U32[1], hi_msb, ctx.ConstU32(32u))};
-    // value == 0 case is checked in IREmitter
     return ctx.OpSelect(ctx.U32[1], found_hi, shifted_hi, lo_msb);
 }
 
@@ -248,8 +204,6 @@ Id EmitFindILsb32(EmitContext& ctx, Id value) {
 }
 
 Id EmitFindILsb64(EmitContext& ctx, Id value) {
-    // Vulkan restricts some bitwise operations to 32-bit only, so decompose into
-    // two 32-bit values and select the correct result.
     const Id unpacked{ctx.OpBitcast(ctx.U32[2], value)};
     const Id lo{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 0U)};
     const Id hi{ctx.OpCompositeExtract(ctx.U32[1], unpacked, 1U)};
@@ -427,4 +381,4 @@ Id EmitUGreaterThanEqual64(EmitContext& ctx, Id lhs, Id rhs) {
     return ctx.OpUGreaterThanEqual(ctx.U1[1], lhs, rhs);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

@@ -9,6 +9,11 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
+#include "core/memory.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #include "video_core/host_shaders/tiling_comp.h"
 
@@ -101,9 +106,20 @@ TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
 vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
     const u32 pl_id = u32(info.tile_mode) * NUM_BPPS + std::bit_width(info.num_bits) - 4;
     auto& tiling_pipelines = is_tiler ? tilers : detilers;
+#ifdef __ANDROID__
+    if (Libraries::GnmDriver::ExecutorReplayActive())
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
+                            "[EXECUTOR_DETILE_PL] pl_id=%u arraySize=%zu tile_mode=%u num_bits=%u",
+                            pl_id, tiling_pipelines.size(), (unsigned)info.tile_mode, info.num_bits);
+#endif
     if (auto pipeline = *tiling_pipelines[pl_id]; pipeline != VK_NULL_HANDLE) {
         return pipeline;
     }
+#ifdef __ANDROID__
+    if (Libraries::GnmDriver::ExecutorReplayActive())
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR", "[EXECUTOR_TILE] post_deref array_mode=%u",
+                            (unsigned)info.array_mode);
+#endif
 
     const auto device = instance.GetDevice();
     const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
@@ -114,9 +130,18 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
         fmt::format("MICRO_TILE_MODE={}", u32(micro_tile_mode)),
         fmt::format("MICRO_TILE_THICKNESS={}", AmdGpu::GetMicroTileThickness(info.array_mode)),
     };
+#ifdef __ANDROID__
+#define EXEC_TL_MARK(s) do { if (Libraries::GnmDriver::ExecutorReplayActive()) \
+    __android_log_print(ANDROID_LOG_INFO, "EXECUTOR", "[EXECUTOR_TILE] " s); } while(0)
+#else
+#define EXEC_TL_MARK(s) ((void)0)
+#endif
+    EXEC_TL_MARK("after_microtile");
     if (AmdGpu::IsMacroTiled(info.array_mode)) {
+        EXEC_TL_MARK("macro:before_calcmode");
         const auto macro_tile_mode =
             AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
+        EXEC_TL_MARK("macro:before_numbanks");
         const u32 num_banks = AmdGpu::GetNumBanks(macro_tile_mode);
         defines.emplace_back(
             fmt::format("PIPE_CONFIG={}", u32(AmdGpu::GetPipeConfig(info.tile_mode))));
@@ -134,15 +159,19 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
         defines.emplace_back(fmt::format("IS_TILER=1"));
     }
 
+    EXEC_TL_MARK("before_vkcompile");
     const auto& module = Vulkan::Compile(HostShaders::TILING_COMP,
                                          vk::ShaderStageFlagBits::eCompute, device, defines);
+    EXEC_TL_MARK("after_vkcompile");
     const auto module_name = fmt::format("{}_{} {}", magic_enum::enum_name(info.tile_mode),
                                          info.num_bits, is_tiler ? "tiler" : "detiler");
+    EXEC_TL_MARK("after_modulename");
     LOG_INFO(Render_Vulkan, "Compiling shader {}", module_name);
     for (const auto& def : defines) {
         LOG_INFO(Render_Vulkan, "#define {}", def);
     }
     Vulkan::SetObjectName(device, module, module_name);
+    EXEC_TL_MARK("after_setname before_createpipeline");
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
@@ -154,10 +183,17 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     };
     auto [result, pipeline] =
         device.createComputePipelineUnique(VK_NULL_HANDLE, compute_pipeline_ci);
+#ifdef __ANDROID__
+    if (Libraries::GnmDriver::ExecutorReplayActive())
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
+                            "[EXECUTOR_TILE] createpipeline result=%d handle=%p",
+                            (int)result, (void*)(VkPipeline)*pipeline);
+#endif
     ASSERT_MSG(result == vk::Result::eSuccess, "Detiler pipeline creation failed {}",
                vk::to_string(result));
     tiling_pipelines[pl_id] = std::move(pipeline);
     device.destroyShaderModule(module);
+    EXEC_TL_MARK("getpipeline_done");
     return *tiling_pipelines[pl_id];
 }
 
@@ -234,10 +270,36 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
             .pBufferInfo = &params_buffer_info,
         },
     }};
+    EXEC_TL_MARK("before_pushdesc");
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    EXEC_TL_MARK("after_pushdesc");
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+#ifdef __ANDROID__
+    if (Libraries::GnmDriver::ExecutorReplayActive()) {
+        Core::Memory::Instance()->VerifyReplayCanaries("before_detile_dispatch");
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
+                            "[EXECUTOR_TILE] before_dispatch dim_x=%u guest_size=%u num_bits=%u cmdbuf=%p",
+                            (unsigned)dim_x, info.guest_size, info.num_bits, (void*)(VkCommandBuffer)cmdbuf);
+    }
+#endif
     cmdbuf.dispatch(dim_x, 1, 1);
+    const vk::BufferMemoryBarrier2 detile_to_upload{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = out_buffer,
+        .offset = 0,
+        .size = info.guest_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &detile_to_upload,
+    });
+    EXEC_TL_MARK("after_dispatch");
     return {out_buffer, 0};
 }
 
@@ -278,6 +340,22 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     const auto cmdbuf = scheduler.CommandBuffer();
     in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
+
+    const vk::BufferMemoryBarrier2 download_to_tiler{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = temp_buffer,
+        .offset = 0,
+        .size = info.guest_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &download_to_tiler,
+    });
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
@@ -323,6 +401,22 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
+
+    const vk::BufferMemoryBarrier2 tiler_to_consumers{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = out_buffer,
+        .offset = out_offset,
+        .size = info.guest_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &tiler_to_consumers,
+    });
 }
 
-} // namespace VideoCore
+}

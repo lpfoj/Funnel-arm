@@ -4,14 +4,10 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 
 namespace Common {
 
-/**
- * SpinLock class
- * a lock similar to mutex that forces a thread to spin wait instead calling the
- * supervisor. Should be used on short sequences of code.
- */
 class SpinLock {
 public:
     SpinLock() = default;
@@ -30,4 +26,29 @@ private:
     std::atomic_flag lck = ATOMIC_FLAG_INIT;
 };
 
-} // namespace Common
+class ParkingMutex {
+public:
+    ParkingMutex() = default;
+
+    ParkingMutex(const ParkingMutex&) = delete;
+    ParkingMutex& operator=(const ParkingMutex&) = delete;
+    ParkingMutex(ParkingMutex&&) = delete;
+    ParkingMutex& operator=(ParkingMutex&&) = delete;
+
+    void lock() {
+        mutex.lock();
+    }
+
+    void unlock() {
+        mutex.unlock();
+    }
+
+    [[nodiscard]] bool try_lock() {
+        return mutex.try_lock();
+    }
+
+private:
+    std::mutex mutex;
+};
+
+}

@@ -27,7 +27,6 @@ const SymbolRecord* SymbolsResolver::FindSymbol(const SymbolResolver& s) const {
         }
     }
 
-    // LOG_INFO(Core_Linker, "Unresolved! {}", name);
     return nullptr;
 }
 
@@ -38,10 +37,11 @@ void SymbolsResolver::DebugDump(const std::filesystem::path& file_name) {
         const auto ids = Common::SplitString(symbol.name, '#');
         const auto aeronid = AeroLib::FindByNid(ids.at(0).c_str());
         const auto nid_name = aeronid ? aeronid->name : "UNK";
-        f.WriteString(fmt::format("0x{:<20x} {:<16} {:<60} {:<30} {:<2} {:<30} {:<10}\n",
-                                  symbol.virtual_address, ids.at(0), nid_name, ids.at(1), ids.at(2),
-                                  ids.at(3), ids.at(4)));
+        f.WriteString(
+            fmt::format("0x{:<20x} {:<16} {:<60} {:<30} {:<2} {:<30} {:<2} {:<2} {:<10}\n",
+                        symbol.virtual_address, ids.at(0), nid_name, ids.at(1), ids.at(2),
+                        ids.at(3), ids.at(4), ids.at(5), ids.at(6)));
     }
 }
 
-} // namespace Core::Loader
+}

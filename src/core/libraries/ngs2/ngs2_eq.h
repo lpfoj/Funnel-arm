@@ -38,4 +38,4 @@ struct OrbisNgs2EqVoiceState {
     u32 stateFlags;
 };
 
-} // namespace Libraries::Ngs2
+}

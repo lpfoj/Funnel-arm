@@ -19,7 +19,6 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
     }
     default:
         switch (inst.opcode) {
-            // SOP2
         case Opcode::S_ADD_U32:
             return S_ADD_U32(inst);
         case Opcode::S_SUB_U32:
@@ -93,7 +92,6 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
         case Opcode::S_ABSDIFF_I32:
             return S_ABSDIFF_I32(inst);
 
-            // SOP1
         case Opcode::S_MOV_B32:
             return S_MOV(inst);
         case Opcode::S_MOV_B64:
@@ -177,7 +175,6 @@ void Translator::EmitSOPC(const GcnInst& inst) {
 
 void Translator::EmitSOPK(const GcnInst& inst) {
     switch (inst.opcode) {
-        // SOPK
     case Opcode::S_MOVK_I32:
         return S_MOVK(inst, false);
     case Opcode::S_CMOVK_I32:
@@ -217,7 +214,6 @@ void Translator::EmitSOPK(const GcnInst& inst) {
     }
 }
 
-// SOP2
 
 void Translator::S_ADD_U32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
@@ -225,11 +221,6 @@ void Translator::S_ADD_U32(const GcnInst& inst) {
     const IR::U32 result{ir.IAdd(src0, src1)};
     SetDst(inst.dst[0], result);
 
-    // SCC = tmp >= 0x100000000ULL ? 1'1U : 1'0U;
-    // The above assumes tmp is a 64-bit value.
-    // It should be enough however to test that the truncated result is less than at least one
-    // of the operands. In unsigned addition the result is always bigger than both the operands,
-    // except in the case of overflow where the truncated result is less than both.
     ir.SetScc(ir.ILessThan(result, src0, false));
 }
 
@@ -238,7 +229,6 @@ void Translator::S_SUB_U32(const GcnInst& inst) {
     const IR::U32 src1{GetSrc(inst.src[1])};
     SetDst(inst.dst[0], ir.ISub(src0, src1));
 
-    // SCC = S1.u > S0.u ? 1'1U : 1'0U;
     ir.SetScc(ir.IGreaterThan(src1, src0, false));
 }
 
@@ -259,7 +249,6 @@ void Translator::S_ADD_I32(const GcnInst& inst) {
     const IR::U32 result{ir.IAdd(src0, src1)};
     SetDst(inst.dst[0], result);
 
-    // SCC = ((S0.u[31] == S1.u[31]) && (S0.u[31] != Result.u[31]));
     const IR::U32 shift{ir.Imm32(31)};
     const IR::U32 sign0{ir.ShiftRightLogical(src0, shift)};
     const IR::U32 sign1{ir.ShiftRightLogical(src1, shift)};
@@ -273,7 +262,6 @@ void Translator::S_SUB_I32(const GcnInst& inst) {
     const IR::U32 result{ir.ISub(src0, src1)};
     SetDst(inst.dst[0], result);
 
-    // SCC = ((S0.u[31] != S1.u[31]) && (S0.u[31] != tmp.u[31]));
     const IR::U32 shift{ir.Imm32(31)};
     const IR::U32 sign0{ir.ShiftRightLogical(src0, shift)};
     const IR::U32 sign1{ir.ShiftRightLogical(src1, shift)};
@@ -311,10 +299,33 @@ void Translator::S_CSELECT_B32(const GcnInst& inst) {
 }
 
 void Translator::S_CSELECT_B64(const GcnInst& inst) {
-    const IR::U1 src0{GetSrc1(inst.src[0])};
-    const IR::U1 src1{GetSrc1(inst.src[1])};
+    const auto get_src = [&](const InstOperand& operand) {
+        switch (operand.field) {
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(operand.code));
+        case OperandField::ConstZero:
+            return ir.Imm1(false);
+        default:
+            UNREACHABLE();
+        }
+    };
+    const IR::U1 src0{get_src(inst.src[0])};
+    const IR::U1 src1{get_src(inst.src[1])};
     const IR::U1 result{ir.Select(ir.GetScc(), src0, src1)};
-    SetDst1(inst.dst[0], result);
+    switch (inst.dst[0].field) {
+    case OperandField::VccLo:
+        ir.SetVcc(result);
+        break;
+    case OperandField::ScalarGPR:
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), result);
+        break;
+    default:
+        UNREACHABLE();
+    }
 }
 
 void Translator::S_AND_B32(NegateMode negate, const GcnInst& inst) {
@@ -332,8 +343,30 @@ void Translator::S_AND_B32(NegateMode negate, const GcnInst& inst) {
 }
 
 void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
-    const IR::U1 src0{GetSrc1(inst.src[0])};
-    IR::U1 src1{GetSrc1(inst.src[1])};
+    const auto get_src = [&](const InstOperand& operand) {
+        switch (operand.field) {
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(operand.code));
+        case OperandField::ConstZero:
+            return ir.Imm1(false);
+        case OperandField::SignedConstIntNeg:
+            ASSERT_MSG(-s32(operand.code) + SignedConstIntNegMin - 1 == -1,
+                       "SignedConstIntNeg must be -1");
+            return ir.Imm1(true);
+        case OperandField::LiteralConst:
+            ASSERT_MSG(operand.code == 0 || operand.code == std::numeric_limits<u32>::max(),
+                       "Unsupported literal {:#x}", operand.code);
+            return ir.Imm1(operand.code & 1);
+        default:
+            UNREACHABLE();
+        }
+    };
+    const IR::U1 src0{get_src(inst.src[0])};
+    IR::U1 src1{get_src(inst.src[1])};
     if (negate == NegateMode::Src1) {
         src1 = ir.LogicalNot(src1);
     }
@@ -342,7 +375,19 @@ void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
         result = ir.LogicalNot(result);
     }
     ir.SetScc(result);
-    SetDst1(inst.dst[0], result);
+    switch (inst.dst[0].field) {
+    case OperandField::VccLo:
+        ir.SetVcc(result);
+        break;
+    case OperandField::ScalarGPR:
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), result);
+        break;
+    case OperandField::ExecLo:
+        ir.SetExec(result);
+        break;
+    default:
+        UNREACHABLE();
+    }
 }
 
 void Translator::S_OR_B32(const GcnInst& inst) {
@@ -354,8 +399,21 @@ void Translator::S_OR_B32(const GcnInst& inst) {
 }
 
 void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
-    const IR::U1 src0{GetSrc1(inst.src[0])};
-    IR::U1 src1{GetSrc1(inst.src[1])};
+    const auto get_src = [&](const InstOperand& operand) {
+        switch (operand.field) {
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(operand.code));
+        default:
+            UNREACHABLE();
+        }
+    };
+
+    const IR::U1 src0{get_src(inst.src[0])};
+    IR::U1 src1{get_src(inst.src[1])};
     if (negate == NegateMode::Src1) {
         src1 = ir.LogicalNot(src1);
     }
@@ -364,7 +422,16 @@ void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
         result = ir.LogicalNot(result);
     }
     ir.SetScc(result);
-    SetDst1(inst.dst[0], result);
+    switch (inst.dst[0].field) {
+    case OperandField::VccLo:
+        ir.SetVcc(result);
+        break;
+    case OperandField::ScalarGPR:
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), result);
+        break;
+    default:
+        UNREACHABLE();
+    }
 }
 
 void Translator::S_XOR_B32(const GcnInst& inst) {
@@ -452,15 +519,12 @@ void Translator::S_ABSDIFF_I32(const GcnInst& inst) {
     ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
 }
 
-// SOPK
 
 void Translator::S_MOVK(const GcnInst& inst, bool is_conditional) {
     const s16 simm16 = inst.control.sopk.simm;
-    // do the sign extension
     const s32 simm32 = static_cast<s32>(simm16);
     IR::U32 val = ir.Imm32(simm32);
     if (is_conditional) {
-        // if !SCC its a NOP
         val = IR::U32{ir.Select(ir.GetScc(), val, GetSrc(inst.dst[0]))};
     }
     SetDst(inst.dst[0], val);
@@ -501,7 +565,6 @@ void Translator::S_MULK_I32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.IMul(GetSrc(inst.dst[0]), ir.Imm32(simm16)));
 }
 
-// SOP1
 
 void Translator::S_MOV(const GcnInst& inst) {
     if (inst.dst[0].field == OperandField::ScalarGPR) {
@@ -516,8 +579,6 @@ void Translator::S_MOV(const GcnInst& inst) {
 }
 
 void Translator::S_MOV_B64(const GcnInst& inst) {
-    // Moving SGPR to SGPR is used for thread masks, like most operations, but it can also be used
-    // for moving sharps.
     if (inst.dst[0].field == OperandField::ScalarGPR &&
         inst.src[0].field == OperandField::ScalarGPR) {
         ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code),
@@ -525,14 +586,66 @@ void Translator::S_MOV_B64(const GcnInst& inst) {
         ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code + 1),
                         ir.GetScalarReg(IR::ScalarReg(inst.src[0].code + 1)));
     }
-    SetDst1(inst.dst[0], GetSrc1(inst.src[0]));
+    const IR::U1 src = [&] {
+        switch (inst.src[0].field) {
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(inst.src[0].code));
+        case OperandField::ConstZero:
+            return ir.Imm1(false);
+        default:
+            UNREACHABLE();
+        }
+    }();
+    switch (inst.dst[0].field) {
+    case OperandField::ScalarGPR:
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), src);
+        break;
+    case OperandField::ExecLo:
+        ir.SetExec(src);
+        break;
+    case OperandField::VccLo:
+        ir.SetVcc(src);
+        break;
+    default:
+        UNREACHABLE();
+    }
 }
 
 void Translator::S_NOT_B64(const GcnInst& inst) {
-    const IR::U1 src0{GetSrc1(inst.src[0])};
+    const auto get_src = [&](const InstOperand& operand) {
+        switch (operand.field) {
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(operand.code));
+        case OperandField::ConstZero:
+            return ir.Imm1(false);
+        default:
+            UNREACHABLE();
+        }
+    };
+    const IR::U1 src0{get_src(inst.src[0])};
     const IR::U1 result = ir.LogicalNot(src0);
     ir.SetScc(result);
-    SetDst1(inst.dst[0], result);
+    switch (inst.dst[0].field) {
+    case OperandField::VccLo:
+        ir.SetVcc(result);
+        break;
+    case OperandField::ScalarGPR:
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), result);
+        break;
+    case OperandField::ExecLo:
+        ir.SetExec(result);
+        break;
+    default:
+        UNREACHABLE();
+    }
 }
 
 void Translator::S_BREV_B32(const GcnInst& inst) {
@@ -558,27 +671,35 @@ void Translator::S_FF1_I32_B32(const GcnInst& inst) {
 }
 
 void Translator::S_FF1_I32_B64(const GcnInst& inst) {
-    SetDst(inst.dst[0], ir.BallotFindLsb(ir.Ballot(GetSrc1(inst.src[0]))));
+    const auto src = [&] {
+        switch (inst.src[0].field) {
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(inst.src[0].code));
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        default:
+            UNREACHABLE_MSG("unhandled operand type {}", magic_enum::enum_name(inst.src[0].field));
+        }
+    }();
+    const IR::U32 result{ir.BallotFindLsb(ir.Ballot(src))};
+
+    SetDst(inst.dst[0], result);
 }
 
 void Translator::S_FLBIT_I32_B32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
-    // Gcn wants the MSB position counting from the left, but SPIR-V counts from the rightmost (LSB)
-    // position
     const IR::U32 msb_pos = ir.FindUMsb(src0);
     const IR::U32 pos_from_left = ir.ISub(ir.Imm32(31), msb_pos);
-    // Select 0xFFFFFFFF if src0 was 0
     const IR::U1 cond = ir.INotEqual(src0, ir.Imm32(0));
     SetDst(inst.dst[0], IR::U32{ir.Select(cond, pos_from_left, ir.Imm32(~0U))});
 }
 
 void Translator::S_FLBIT_I32_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    // Gcn wants the MSB position counting from the left, but SPIR-V counts from the rightmost (LSB)
-    // position
     const IR::U32 msb_pos = ir.FindUMsb(src0);
     const IR::U32 pos_from_left = ir.ISub(ir.Imm32(63), msb_pos);
-    // Select 0xFFFFFFFF if src0 was 0
     const IR::U1 cond = ir.INotEqual(src0, ir.Imm64(u64(0u)));
     SetDst(inst.dst[0], IR::U32{ir.Select(cond, pos_from_left, ir.Imm32(~0U))});
 }
@@ -591,14 +712,31 @@ void Translator::S_BITSET_B32(const GcnInst& inst, u32 bit_value) {
 }
 
 void Translator::S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& inst) {
-    // This instruction normally operates on 64-bit data (EXEC, VCC, SGPRs)
-    // However here we flatten it to 1-bit EXEC and 1-bit VCC. For the destination
-    // SGPR we have a special IR opcode for SPGRs that act as thread masks.
     IR::U1 exec{ir.GetExec()};
-    const IR::U1 src{GetSrc1(inst.src[0])};
-    SetDst1(inst.dst[0], exec);
+    const IR::U1 src = [&] {
+        switch (inst.src[0].field) {
+        case OperandField::VccLo:
+            return ir.GetVcc();
+        case OperandField::ScalarGPR:
+            return ir.GetThreadBitScalarReg(IR::ScalarReg(inst.src[0].code));
+        case OperandField::ExecLo:
+            return ir.GetExec();
+        default:
+            UNREACHABLE();
+        }
+    }();
 
-    // Update EXEC.
+    switch (inst.dst[0].field) {
+    case OperandField::ScalarGPR:
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), exec);
+        break;
+    case OperandField::VccLo:
+        ir.SetVcc(exec);
+        break;
+    default:
+        UNREACHABLE();
+    }
+
     if (negate == NegateMode::Src1) {
         exec = ir.LogicalNot(exec);
     }
@@ -616,7 +754,6 @@ void Translator::S_ABS_I32(const GcnInst& inst) {
     ir.SetScc(ir.INotEqual(result, ir.Imm32(0)));
 }
 
-// SOPC
 
 void Translator::S_CMP(ConditionOp cond, bool is_signed, const GcnInst& inst) {
     const IR::U32 lhs = GetSrc(inst.src[0]);
@@ -671,4 +808,4 @@ void Translator::S_BITCMP(bool compare_mode, u32 bits, const GcnInst& inst) {
     ir.SetScc(result);
 }
 
-} // namespace Shader::Gcn
+}

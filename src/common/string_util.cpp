@@ -83,4 +83,4 @@ std::wstring UTF8ToUTF16W(std::string_view input) {
 }
 #endif
 
-} // namespace Common
+}

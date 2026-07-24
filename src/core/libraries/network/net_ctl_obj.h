@@ -36,4 +36,4 @@ public:
     std::array<NetCtlCallback, 8> callbacks{};
     std::mutex m_mutex;
 };
-} // namespace Libraries::NetCtl
+}

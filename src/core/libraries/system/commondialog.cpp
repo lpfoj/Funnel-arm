@@ -215,4 +215,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  Func_F2AEE270605622B0);
 };
 
-} // namespace Libraries::CommonDialog
+}

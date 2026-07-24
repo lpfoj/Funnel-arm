@@ -112,4 +112,4 @@ void EmitDebugPrint(EmitContext& ctx, IR::Inst* inst, Id fmt, Id arg0, Id arg1, 
     ctx.OpDebugPrintf(fmt, fmt_args_span);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

@@ -13,9 +13,7 @@ constexpr size_t DEBUGPRINT_NUM_FORMAT_ARGS = NumArgsOf(IR::Opcode::DebugPrint) 
 
 union DebugPrintFlags {
     u32 raw;
-    // For now, only flag is the number of variadic format args actually used
-    // So bitfield not really needed
     BitField<0, 32, u32> num_args;
 };
 
-} // namespace Shader::IR
+}

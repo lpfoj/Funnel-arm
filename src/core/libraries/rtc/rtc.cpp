@@ -438,7 +438,6 @@ int PS4_SYSV_ABI sceRtcGetCurrentClockLocalTime(OrbisRtcDateTime* pTime) {
     if (returnValue >= 0) {
         Kernel::OrbisKernelTimespec clocktime;
 
-        // calculate total timezone offset for converting UTC to local time
         uint64_t tzOffset = -(timeZone.tz_minuteswest - (timeZone.tz_dsttime * 60));
 
         if (returnValue >= 0) {
@@ -752,10 +751,8 @@ int PS4_SYSV_ABI sceRtcParseDateTime(OrbisRtcTick* pTickUtc, const char* pszDate
     OrbisRtcDateTime dateTime;
 
     if (formatKey == 'Z' || formatKey == '-' || formatKey == '+' || formatKey == '.') {
-        // RFC3339
         sceRtcParseRFC3339(pTickUtc, pszDateTime);
     } else if (formatKey == ':') {
-        // RFC2822
         dateTime.day = std::stoi(dateTimeString.substr(5, 2));
         dateTime.month = GetMonthFromString(dateTimeString.substr(8, 3));
         dateTime.year = std::stoi(dateTimeString.substr(12, 4));
@@ -778,7 +775,6 @@ int PS4_SYSV_ABI sceRtcParseDateTime(OrbisRtcTick* pTickUtc, const char* pszDate
         }
 
     } else {
-        // asctime
         dateTime.month = GetMonthFromString(dateTimeString.substr(4, 3));
         dateTime.day = std::stoi(dateTimeString.substr(8, 2));
         dateTime.hour = std::stoi(dateTimeString.substr(11, 2));
@@ -1231,4 +1227,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("-5y2uJ62qS8", "libSceRtc", 1, "libSceRtc", sceRtcTickAddYears);
 };
 
-} // namespace Libraries::Rtc
+}

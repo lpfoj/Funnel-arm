@@ -42,7 +42,6 @@ public:
     bool SetLooping(bool is_looping);
 
 private:
-    // Event Replacement
     static void PS4_SYSV_ABI AutoPlayEventCallback(void* handle, AvPlayerEvents event_id,
                                                    s32 source_id, void* event_data);
 
@@ -94,4 +93,4 @@ private:
     AvPlayerQueue<AvPlayerEvent> m_event_queue{};
 };
 
-} // namespace Libraries::AvPlayer
+}

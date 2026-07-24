@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// AvPlayer library
 constexpr int ORBIS_AVPLAYER_ERROR_INVALID_PARAMS = 0x806A0001;
 constexpr int ORBIS_AVPLAYER_ERROR_OPERATION_FAILED = 0x806A0002;
 constexpr int ORBIS_AVPLAYER_ERROR_NO_MEMORY = 0x806A0003;

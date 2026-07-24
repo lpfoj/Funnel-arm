@@ -14,7 +14,7 @@
 namespace Frontend {
 enum class WindowSystemType : u8;
 class WindowSDL;
-} // namespace Frontend
+}
 
 namespace Vulkan {
 
@@ -71,4 +71,4 @@ static T Check(vk::ResultValue<T> r) {
     return std::move(r.value);
 }
 
-} // namespace Vulkan
+}

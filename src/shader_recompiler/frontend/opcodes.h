@@ -261,15 +261,8 @@ enum class OpcodeVOP2 : u32 {
     V_CVT_PKRTZ_F16_F32 = 47,
     V_CVT_PK_U16_U32 = 48,
     V_CVT_PK_I16_I32 = 49,
-    V_ADD_F16 = 50,
-    V_SUB_F16 = 51,
-    V_SUBREV_F16 = 52,
-    V_MUL_F16 = 53,
-    V_MAX_F16 = 57,
-    V_MIN_F16 = 58,
-    V_LDEXP_F16 = 59,
 
-    OP_RANGE_VOP2 = V_LDEXP_F16 + 1,
+    OP_RANGE_VOP2 = V_CVT_PK_I16_I32 + 1,
 };
 
 enum class OpcodeVOP3 : u32 {
@@ -420,12 +413,6 @@ enum class OpcodeVOP3 : u32 {
     V_CMP_TRU_I32 = 135,
     V_CMP_T_I32 = 135,
     V_CMP_CLASS_F32 = 136,
-    V_CMP_LT_I16 = 137,
-    V_CMP_EQ_I16 = 138,
-    V_CMP_LE_I16 = 139,
-    V_CMP_GT_I16 = 140,
-    V_CMP_NE_I16 = 141,
-    V_CMP_GE_I16 = 142,
     V_CMPX_F_I32 = 144,
     V_CMPX_LT_I32 = 145,
     V_CMPX_EQ_I32 = 146,
@@ -448,12 +435,6 @@ enum class OpcodeVOP3 : u32 {
     V_CMP_TRU_I64 = 167,
     V_CMP_T_I64 = 167,
     V_CMP_CLASS_F64 = 168,
-    V_CMP_LT_U16 = 169,
-    V_CMP_EQ_U16 = 170,
-    V_CMP_LE_U16 = 171,
-    V_CMP_GT_U16 = 172,
-    V_CMP_NE_U16 = 173,
-    V_CMP_GE_U16 = 174,
     V_CMPX_F_I64 = 176,
     V_CMPX_LT_I64 = 177,
     V_CMPX_EQ_I64 = 178,
@@ -475,14 +456,6 @@ enum class OpcodeVOP3 : u32 {
     V_CMP_GE_U32 = 198,
     V_CMP_TRU_U32 = 199,
     V_CMP_T_U32 = 199,
-    V_CMP_F_F16 = 200,
-    V_CMP_LT_F16 = 201,
-    V_CMP_EQ_F16 = 202,
-    V_CMP_LE_F16 = 203,
-    V_CMP_GT_F16 = 204,
-    V_CMP_LG_F16 = 205,
-    V_CMP_GE_F16 = 206,
-    V_CMP_O_F16 = 207,
     V_CMPX_F_U32 = 208,
     V_CMPX_LT_U32 = 209,
     V_CMPX_EQ_U32 = 210,
@@ -563,13 +536,6 @@ enum class OpcodeVOP3 : u32 {
     V_CVT_PKRTZ_F16_F32 = 303,
     V_CVT_PK_U16_U32 = 304,
     V_CVT_PK_I16_I32 = 305,
-    V_ADD_F16 = 306,
-    V_SUB_F16 = 307,
-    V_SUBREV_F16 = 308,
-    V_MUL_F16 = 309,
-    V_MAX_F16 = 313,
-    V_MIN_F16 = 314,
-    V_LDEXP_F16 = 315,
     V_MAD_LEGACY_F32 = 320,
     V_MAD_F32 = 321,
     V_MAD_I32_I24 = 322,
@@ -694,56 +660,8 @@ enum class OpcodeVOP3 : u32 {
     V_MOVRELSD_B32 = 452,
     V_LOG_LEGACY_F32 = 453,
     V_EXP_LEGACY_F32 = 454,
-    V_RCP_F16 = 468,
-    V_SQRT_F16 = 469,
 
-    V_ADD_NC_U16 = 771,
-    V_LSHRREV_B16 = 775,
-    V_ASHRREV_I16 = 776,
-    V_ADD_NC_I16 = 781,
-    V_SUB_NC_I16 = 782,
-    V_SUB_CO_U32 = 784,
-    V_LSHLREV_B16 = 788,
-    V_MAD_F16 = 833,
-    V_LSHL_ADD_U32 = 838,
-    V_ADD_LSHL_U32 = 839,
-    V_MIN3_F16 = 849,
-    V_MAX3_F16 = 852,
-    V_MED3_F16 = 855,
-    V_MAD_I16 = 862,
-    V_ADD3_U32 = 877,
-    V_LSHL_OR_B32 = 879,
-    V_AND_OR_B32 = 881,
-    V_OR3_B32 = 882,
-
-    OP_RANGE_VOP3 = 1024, // in neo mode, VOP3 gets an additional bit for OP so round up
-};
-
-enum class OpcodeVOP3P : u32 {
-    V_PK_MAD_I16 = 0,
-    V_PK_MUL_LO_U16 = 1,
-    V_PK_ADD_I16 = 2,
-    V_PK_SUB_I16 = 3,
-    V_PK_LSHLREV_B16 = 4,
-    V_PK_LSHRREV_B16 = 5,
-    V_PK_ASHRREV_I16 = 6,
-    V_PK_MAX_I16 = 7,
-    V_PK_MIN_I16 = 8,
-    V_PK_MAD_U16 = 9,
-    V_PK_ADD_U16 = 10,
-    V_PK_SUB_U16 = 11,
-    V_PK_MAX_U16 = 12,
-    V_PK_MIN_U16 = 13,
-    V_PK_FMA_F16 = 14,
-    V_PK_ADD_F16 = 15,
-    V_PK_MUL_F16 = 16,
-    V_PK_MIN_F16 = 17,
-    V_PK_MAX_F16 = 18,
-    V_MAD_MIX_F32 = 32,
-    V_MAD_MIXLO_F16 = 33,
-    V_MAD_MIXHI_F16 = 34,
-
-    OP_RANGE_VOP3P = V_MAD_MIXHI_F16 + 1,
+    OP_RANGE_VOP3 = V_EXP_LEGACY_F32 + 1,
 };
 
 enum class OpcodeVOP1 : u32 {
@@ -813,10 +731,8 @@ enum class OpcodeVOP1 : u32 {
     V_MOVRELSD_B32 = 68,
     V_LOG_LEGACY_F32 = 69,
     V_EXP_LEGACY_F32 = 70,
-    V_RCP_F16 = 84,
-    V_SQRT_F16 = 85,
 
-    OP_RANGE_VOP1 = V_SQRT_F16 + 1,
+    OP_RANGE_VOP1 = V_EXP_LEGACY_F32 + 1,
 };
 
 enum class OpcodeVOPC : u32 {
@@ -967,12 +883,6 @@ enum class OpcodeVOPC : u32 {
     V_CMP_TRU_I32 = 135,
     V_CMP_T_I32 = 135,
     V_CMP_CLASS_F32 = 136,
-    V_CMP_LT_I16 = 137,
-    V_CMP_EQ_I16 = 138,
-    V_CMP_LE_I16 = 139,
-    V_CMP_GT_I16 = 140,
-    V_CMP_NE_I16 = 141,
-    V_CMP_GE_I16 = 142,
     V_CMPX_F_I32 = 144,
     V_CMPX_LT_I32 = 145,
     V_CMPX_EQ_I32 = 146,
@@ -995,12 +905,6 @@ enum class OpcodeVOPC : u32 {
     V_CMP_TRU_I64 = 167,
     V_CMP_T_I64 = 167,
     V_CMP_CLASS_F64 = 168,
-    V_CMP_LT_U16 = 169,
-    V_CMP_EQ_U16 = 170,
-    V_CMP_LE_U16 = 171,
-    V_CMP_GT_U16 = 172,
-    V_CMP_NE_U16 = 173,
-    V_CMP_GE_U16 = 174,
     V_CMPX_F_I64 = 176,
     V_CMPX_LT_I64 = 177,
     V_CMPX_EQ_I64 = 178,
@@ -1022,14 +926,6 @@ enum class OpcodeVOPC : u32 {
     V_CMP_GE_U32 = 198,
     V_CMP_TRU_U32 = 199,
     V_CMP_T_U32 = 199,
-    V_CMP_F_F16 = 200,
-    V_CMP_LT_F16 = 201,
-    V_CMP_EQ_F16 = 202,
-    V_CMP_LE_F16 = 203,
-    V_CMP_GT_F16 = 204,
-    V_CMP_LG_F16 = 205,
-    V_CMP_GE_F16 = 206,
-    V_CMP_O_F16 = 207,
     V_CMPX_F_U32 = 208,
     V_CMPX_LT_U32 = 209,
     V_CMPX_EQ_U32 = 210,
@@ -1394,14 +1290,12 @@ enum class OpcodeEXP : u32 {
     OP_RANGE_EXP = EXP + 1,
 };
 
-// Use to map VOP3 opcodes into VOP1, VOP2, VOPC
 enum class OpMapVOP3VOPX : u32 {
     VOP3_TO_VOPC = 0,
     VOP3_TO_VOP2 = 256,
     VOP3_TO_VOP1 = 384,
 };
 
-// Use to map all opcodes into a single enum
 enum class OpcodeMap : u32 {
     OP_MAP_SOP2 = 0,
     OP_MAP_SOPK = OP_MAP_SOP2 + (u32)OpcodeSOP2::OP_RANGE_SOP2,
@@ -1419,11 +1313,9 @@ enum class OpcodeMap : u32 {
     OP_MAP_MTBUF = OP_MAP_MUBUF + (u32)OpcodeMUBUF::OP_RANGE_MUBUF,
     OP_MAP_MIMG = OP_MAP_MTBUF + (u32)OpcodeMTBUF::OP_RANGE_MTBUF,
     OP_MAP_EXP = OP_MAP_MIMG + (u32)OpcodeMIMG::OP_RANGE_MIMG,
-    OP_MAP_VOP3P = OP_MAP_EXP + (u32)OpcodeEXP::OP_RANGE_EXP,
 };
 
 enum class Opcode : u32 {
-    // SOP2
     S_ADD_U32 = 0 + (u32)OpcodeMap::OP_MAP_SOP2,
     S_SUB_U32 = 1 + (u32)OpcodeMap::OP_MAP_SOP2,
     S_ADD_I32 = 2 + (u32)OpcodeMap::OP_MAP_SOP2,
@@ -1467,7 +1359,6 @@ enum class Opcode : u32 {
     S_BFE_I64 = 42 + (u32)OpcodeMap::OP_MAP_SOP2,
     S_CBRANCH_G_FORK = 43 + (u32)OpcodeMap::OP_MAP_SOP2,
     S_ABSDIFF_I32 = 44 + (u32)OpcodeMap::OP_MAP_SOP2,
-    // SOPK
     S_MOVK_I32 = 0 + (u32)OpcodeMap::OP_MAP_SOPK,
     S_CMOVK_I32 = 2 + (u32)OpcodeMap::OP_MAP_SOPK,
     S_CMPK_EQ_I32 = 3 + (u32)OpcodeMap::OP_MAP_SOPK,
@@ -1489,7 +1380,6 @@ enum class Opcode : u32 {
     S_SETREG_B32 = 19 + (u32)OpcodeMap::OP_MAP_SOPK,
     S_GETREG_REGRD_B32 = 20 + (u32)OpcodeMap::OP_MAP_SOPK,
     S_SETREG_IMM32_B32 = 21 + (u32)OpcodeMap::OP_MAP_SOPK,
-    // SOP1
     S_MOV_B32 = 3 + (u32)OpcodeMap::OP_MAP_SOP1,
     S_MOV_B64 = 4 + (u32)OpcodeMap::OP_MAP_SOP1,
     S_CMOV_B32 = 5 + (u32)OpcodeMap::OP_MAP_SOP1,
@@ -1540,7 +1430,6 @@ enum class Opcode : u32 {
     S_MOV_REGRD_B32 = 51 + (u32)OpcodeMap::OP_MAP_SOP1,
     S_ABS_I32 = 52 + (u32)OpcodeMap::OP_MAP_SOP1,
     S_MOV_FED_B32 = 53 + (u32)OpcodeMap::OP_MAP_SOP1,
-    // SOPC
     S_CMP_EQ_I32 = 0 + (u32)OpcodeMap::OP_MAP_SOPC,
     S_CMP_LG_I32 = 1 + (u32)OpcodeMap::OP_MAP_SOPC,
     S_CMP_GT_I32 = 2 + (u32)OpcodeMap::OP_MAP_SOPC,
@@ -1558,7 +1447,6 @@ enum class Opcode : u32 {
     S_BITCMP0_B64 = 14 + (u32)OpcodeMap::OP_MAP_SOPC,
     S_BITCMP1_B64 = 15 + (u32)OpcodeMap::OP_MAP_SOPC,
     S_SETVSKIP = 16 + (u32)OpcodeMap::OP_MAP_SOPC,
-    // SOPP
     S_NOP = 0 + (u32)OpcodeMap::OP_MAP_SOPP,
     S_ENDPGM = 1 + (u32)OpcodeMap::OP_MAP_SOPP,
     S_BRANCH = 2 + (u32)OpcodeMap::OP_MAP_SOPP,
@@ -1585,7 +1473,6 @@ enum class Opcode : u32 {
     S_CBRANCH_CDBGUSER = 24 + (u32)OpcodeMap::OP_MAP_SOPP,
     S_CBRANCH_CDBGSYS_OR_USER = 25 + (u32)OpcodeMap::OP_MAP_SOPP,
     S_CBRANCH_CDBGSYS_AND_USER = 26 + (u32)OpcodeMap::OP_MAP_SOPP,
-    // VOPC
     V_CMP_F_F32 = 0 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_LT_F32 = 1 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_EQ_F32 = 2 + (u32)OpcodeMap::OP_MAP_VOPC,
@@ -1732,12 +1619,6 @@ enum class Opcode : u32 {
     V_CMP_TRU_I32 = 135 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_T_I32 = 135 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_CLASS_F32 = 136 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LT_I16 = 137 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_EQ_I16 = 138 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LE_I16 = 139 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_GT_I16 = 140 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_NE_I16 = 141 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_GE_I16 = 142 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_F_I32 = 144 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_LT_I32 = 145 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_EQ_I32 = 146 + (u32)OpcodeMap::OP_MAP_VOPC,
@@ -1760,12 +1641,6 @@ enum class Opcode : u32 {
     V_CMP_TRU_I64 = 167 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_T_I64 = 167 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_CLASS_F64 = 168 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LT_U16 = 169 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_EQ_U16 = 170 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LE_U16 = 171 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_GT_U16 = 172 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_NE_U16 = 173 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_GE_U16 = 174 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_F_I64 = 176 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_LT_I64 = 177 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_EQ_I64 = 178 + (u32)OpcodeMap::OP_MAP_VOPC,
@@ -1786,14 +1661,6 @@ enum class Opcode : u32 {
     V_CMP_GE_U32 = 198 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_TRU_U32 = 199 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMP_T_U32 = 199 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_F_F16 = 200 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LT_F16 = 201 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_EQ_F16 = 202 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LE_F16 = 203 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_GT_F16 = 204 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_LG_F16 = 205 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_GE_F16 = 206 + (u32)OpcodeMap::OP_MAP_VOPC,
-    V_CMP_O_F16 = 207 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_F_U32 = 208 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_LT_U32 = 209 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_EQ_U32 = 210 + (u32)OpcodeMap::OP_MAP_VOPC,
@@ -1823,7 +1690,6 @@ enum class Opcode : u32 {
     V_CMPX_GE_U64 = 246 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_TRU_U64 = 247 + (u32)OpcodeMap::OP_MAP_VOPC,
     V_CMPX_T_U64 = 247 + (u32)OpcodeMap::OP_MAP_VOPC,
-    // VOP2
     V_CNDMASK_B32 = 0 + (u32)OpcodeMap::OP_MAP_VOP2,
     V_READLANE_B32 = 1 + (u32)OpcodeMap::OP_MAP_VOP2,
     V_WRITELANE_B32 = 2 + (u32)OpcodeMap::OP_MAP_VOP2,
@@ -1874,14 +1740,6 @@ enum class Opcode : u32 {
     V_CVT_PKRTZ_F16_F32 = 47 + (u32)OpcodeMap::OP_MAP_VOP2,
     V_CVT_PK_U16_U32 = 48 + (u32)OpcodeMap::OP_MAP_VOP2,
     V_CVT_PK_I16_I32 = 49 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_ADD_F16 = 50 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_SUB_F16 = 51 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_SUBREV_F16 = 52 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_MUL_F16 = 53 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_MAX_F16 = 57 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_MIN_F16 = 58 + (u32)OpcodeMap::OP_MAP_VOP2,
-    V_LDEXP_F16 = 59 + (u32)OpcodeMap::OP_MAP_VOP2,
-    // VOP1
     V_NOP = 0 + (u32)OpcodeMap::OP_MAP_VOP1,
     V_MOV_B32 = 1 + (u32)OpcodeMap::OP_MAP_VOP1,
     V_READFIRSTLANE_B32 = 2 + (u32)OpcodeMap::OP_MAP_VOP1,
@@ -1948,9 +1806,6 @@ enum class Opcode : u32 {
     V_MOVRELSD_B32 = 68 + (u32)OpcodeMap::OP_MAP_VOP1,
     V_LOG_LEGACY_F32 = 69 + (u32)OpcodeMap::OP_MAP_VOP1,
     V_EXP_LEGACY_F32 = 70 + (u32)OpcodeMap::OP_MAP_VOP1,
-    V_RCP_F16 = 84 + (u32)OpcodeMap::OP_MAP_VOP1,
-    V_SQRT_F16 = 85 + (u32)OpcodeMap::OP_MAP_VOP1,
-    // VOP3
     V_MAD_LEGACY_F32 = 320 + (u32)OpcodeMap::OP_MAP_VOP3,
     V_MAD_F32 = 321 + (u32)OpcodeMap::OP_MAP_VOP3,
     V_MAD_I32_I24 = 322 + (u32)OpcodeMap::OP_MAP_VOP3,
@@ -2009,29 +1864,9 @@ enum class Opcode : u32 {
     V_MQSAD_U32_U8 = 373 + (u32)OpcodeMap::OP_MAP_VOP3,
     V_MAD_U64_U32 = 374 + (u32)OpcodeMap::OP_MAP_VOP3,
     V_MAD_I64_I32 = 375 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_ADD_NC_U16 = 771 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_LSHRREV_B16 = 775 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_ASHRREV_I16 = 776 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_ADD_NC_I16 = 781 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_SUB_NC_I16 = 782 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_SUB_CO_U32 = 784 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_LSHLREV_B16 = 788 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_MAD_F16 = 833 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_LSHL_ADD_U32 = 838 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_ADD_LSHL_U32 = 839 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_MIN3_F16 = 849 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_MAX3_F16 = 852 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_MED3_F16 = 855 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_MAD_I16 = 862 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_ADD3_U32 = 877 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_LSHL_OR_B32 = 879 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_AND_OR_B32 = 881 + (u32)OpcodeMap::OP_MAP_VOP3,
-    V_OR3_B32 = 882 + (u32)OpcodeMap::OP_MAP_VOP3,
-    // VINTRP
     V_INTERP_P1_F32 = 0 + (u32)OpcodeMap::OP_MAP_VINTRP,
     V_INTERP_P2_F32 = 1 + (u32)OpcodeMap::OP_MAP_VINTRP,
     V_INTERP_MOV_F32 = 2 + (u32)OpcodeMap::OP_MAP_VINTRP,
-    // SMRD
     S_LOAD_DWORD = 0 + (u32)OpcodeMap::OP_MAP_SMRD,
     S_LOAD_DWORDX2 = 1 + (u32)OpcodeMap::OP_MAP_SMRD,
     S_LOAD_DWORDX4 = 2 + (u32)OpcodeMap::OP_MAP_SMRD,
@@ -2044,7 +1879,6 @@ enum class Opcode : u32 {
     S_BUFFER_LOAD_DWORDX16 = 12 + (u32)OpcodeMap::OP_MAP_SMRD,
     S_MEMTIME = 30 + (u32)OpcodeMap::OP_MAP_SMRD,
     S_DCACHE_INV = 31 + (u32)OpcodeMap::OP_MAP_SMRD,
-    // DS
     DS_ADD_U32 = 0 + (u32)OpcodeMap::OP_MAP_DS,
     DS_SUB_U32 = 1 + (u32)OpcodeMap::OP_MAP_DS,
     DS_RSUB_U32 = 2 + (u32)OpcodeMap::OP_MAP_DS,
@@ -2185,7 +2019,6 @@ enum class Opcode : u32 {
     DS_CONDXCHG32_RTN_B128 = 253 + (u32)OpcodeMap::OP_MAP_DS,
     DS_READ_B96 = 254 + (u32)OpcodeMap::OP_MAP_DS,
     DS_READ_B128 = 255 + (u32)OpcodeMap::OP_MAP_DS,
-    // MUBUF
     BUFFER_LOAD_FORMAT_X = 0 + (u32)OpcodeMap::OP_MAP_MUBUF,
     BUFFER_LOAD_FORMAT_XY = 1 + (u32)OpcodeMap::OP_MAP_MUBUF,
     BUFFER_LOAD_FORMAT_XYZ = 2 + (u32)OpcodeMap::OP_MAP_MUBUF,
@@ -2242,7 +2075,6 @@ enum class Opcode : u32 {
     BUFFER_ATOMIC_FMAX_X2 = 96 + (u32)OpcodeMap::OP_MAP_MUBUF,
     BUFFER_WBINVL1_SC = 112 + (u32)OpcodeMap::OP_MAP_MUBUF,
     BUFFER_WBINVL1 = 113 + (u32)OpcodeMap::OP_MAP_MUBUF,
-    // MTBUF
     TBUFFER_LOAD_FORMAT_X = 0 + (u32)OpcodeMap::OP_MAP_MTBUF,
     TBUFFER_LOAD_FORMAT_XY = 1 + (u32)OpcodeMap::OP_MAP_MTBUF,
     TBUFFER_LOAD_FORMAT_XYZ = 2 + (u32)OpcodeMap::OP_MAP_MTBUF,
@@ -2251,7 +2083,6 @@ enum class Opcode : u32 {
     TBUFFER_STORE_FORMAT_XY = 5 + (u32)OpcodeMap::OP_MAP_MTBUF,
     TBUFFER_STORE_FORMAT_XYZ = 6 + (u32)OpcodeMap::OP_MAP_MTBUF,
     TBUFFER_STORE_FORMAT_XYZW = 7 + (u32)OpcodeMap::OP_MAP_MTBUF,
-    // MIMG
     IMAGE_LOAD = 0 + (u32)OpcodeMap::OP_MAP_MIMG,
     IMAGE_LOAD_MIP = 1 + (u32)OpcodeMap::OP_MAP_MIMG,
     IMAGE_LOAD_PCK = 2 + (u32)OpcodeMap::OP_MAP_MIMG,
@@ -2344,31 +2175,7 @@ enum class Opcode : u32 {
     IMAGE_SAMPLE_CD_CL_O = 109 + (u32)OpcodeMap::OP_MAP_MIMG,
     IMAGE_SAMPLE_C_CD_O = 110 + (u32)OpcodeMap::OP_MAP_MIMG,
     IMAGE_SAMPLE_C_CD_CL_O = 111 + (u32)OpcodeMap::OP_MAP_MIMG,
-    // EXP
     EXP = 0 + (u32)OpcodeMap::OP_MAP_EXP,
-    // VOP3P
-    V_PK_MAD_I16 = 0 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MUL_LO_U16 = 1 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_ADD_I16 = 2 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_SUB_I16 = 3 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_LSHLREV_B16 = 4 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_LSHRREV_B16 = 5 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_ASHRREV_I16 = 6 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MAX_I16 = 7 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MIN_I16 = 8 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MAD_U16 = 9 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_ADD_U16 = 10 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_SUB_U16 = 11 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MAX_U16 = 12 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MIN_U16 = 13 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_FMA_F16 = 14 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_ADD_F16 = 15 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MUL_F16 = 16 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MIN_F16 = 17 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_PK_MAX_F16 = 18 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_MAD_MIX_F32 = 32 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_MAD_MIXLO_F16 = 33 + (u32)OpcodeMap::OP_MAP_VOP3P,
-    V_MAD_MIXHI_F16 = 34 + (u32)OpcodeMap::OP_MAP_VOP3P,
 };
 
 enum class EncodingMask : u32 {
@@ -2382,46 +2189,21 @@ enum class EncodingMask : u32 {
 };
 
 enum class InstEncoding : u32 {
-    /// InstructionEncodingMask_9bit
-    /// bits [31:23] - (1 0 1 1 1 1 1 0 1)
     SOP1 = 0x0000017Du << 23,
-    /// bits [31:23] - (1 0 1 1 1 1 1 1 1)
     SOPP = 0x0000017Fu << 23,
-    /// bits [31:23] - (1 0 1 1 1 1 1 1 0)
     SOPC = 0x0000017Eu << 23,
-    /// InstructionEncodingMask_7bit
-    /// bits [31:25] - (0 1 1 1 1 1 1)
     VOP1 = 0x0000003Fu << 25,
-    /// bits [31:25] - (0 1 1 1 1 1 0)
     VOPC = 0x0000003Eu << 25,
-    /// InstructionEncodingMask_6bit
-    /// bits [31:26] - (1 1 0 1 0 0)
     VOP3 = 0x00000034u << 26,
-    /// bits [31:26] - (1 1 1 1 1 0)
     EXP = 0x0000003Eu << 26,
-    /// bits [31:26] - (1 1 0 0 1 1)
-    VOP3P = 0x00000033u << 26,
-    /// bits [31:26] - (1 1 0 0 1 0)
     VINTRP = 0x00000032u << 26,
-    /// bits [31:26] - (1 1 0 1 1 0)
     DS = 0x00000036u << 26,
-    /// bits [31:26] - (1 1 1 0 0 0)
     MUBUF = 0x00000038u << 26,
-    /// bits [31:26] - (1 1 1 0 1 0)
     MTBUF = 0x0000003Au << 26,
-    /// bits [31:26] - (1 1 1 1 0 0)
     MIMG = 0x0000003Cu << 26,
-    /// InstructionEncodingMask_5bit
-    /// bits [31:27] - (1 1 0 0 0)
     SMRD = 0x00000018u << 27,
-    /// InstructionEncodingMask_4bit
-    /// bits [31:28] - (1 0 1 1)
     SOPK = 0x0000000Bu << 28,
-    /// InstructionEncodingMask_2bit
-    /// bits [31:30] - (1 0)
     SOP2 = 0x00000002u << 30,
-    /// InstructionEncodingMask_1bit
-    /// bits [31:31] - (0)
     VOP2 = 0x00000000u << 31,
 
     ILLEGAL
@@ -2450,23 +2232,18 @@ enum class InstClass : u32 {
     VectorBitField32,
     VectorThreadMask,
     VectorBitField64,
-    VectorFpArith16,
     VectorFpArith32,
     VectorFpRound32,
     VectorFpField32,
-    VectorFpTran16,
     VectorFpTran32,
-    VectorFpCmp16,
     VectorFpCmp32,
     VectorFpArith64,
     VectorFpRound64,
     VectorFpField64,
     VectorFpTran64,
     VectorFpCmp64,
-    VectorIntArith16,
     VectorIntArith32,
     VectorIntArith64,
-    VectorIntCmp16,
     VectorIntCmp32,
     VectorIntCmp64,
     VectorConv,
@@ -2521,33 +2298,22 @@ enum class InstClass : u32 {
 
 enum class InstCategory : u32 {
     Undefined,
-    /// Scalar ALU Operation
     ScalarALU,
-    /// Scalar Instruction Memory
     ScalarMemory,
-    /// Vector ALU Operation
     VectorALU,
-    /// Vector Instruction Memory Read
     VectorMemory,
-    /// Scalar Program Flow Control and Special Operations
     FlowControl,
-    /// LDS and GDS
     DataShare,
-    /// Vector Interpolation Operations
     VectorInterpolation,
-    /// Export
     Export,
-    /// Debug and Profiling Operations
     DebugProfile,
 };
 
 enum class ScalarType : u32 {
     Undefined,
     Any,
-    Uint16,
     Uint32,
     Uint64,
-    Sint16,
     Sint32,
     Sint64,
     Float16,
@@ -2556,7 +2322,6 @@ enum class ScalarType : u32 {
     Bool,
 };
 
-/// Instruction's action when GPU thread is not active.
 enum class DivergentAction : u32 { Nop, ZeroScalar, Execute };
 
 enum class OperandField : u32 {
@@ -2577,9 +2342,6 @@ enum class OperandField : u32 {
     ConstFloatNeg_2_0,
     ConstFloatPos_4_0,
     ConstFloatNeg_4_0,
-    Inv2Pi,
-    Sdwa,
-    Dpp,
     VccZ = 251,
     ExecZ = 252,
     Scc = 253,
@@ -2646,14 +2408,14 @@ enum class InterpolationMode : u32 {
 };
 
 enum class MimgModifier : u32 {
-    Lod,              /// LOD is used instead of TA computed LOD.
-    LodBias,          /// Add this BIAS to the LOD TA computes.
-    LodClamp,         /// Clamp the LOD to be no larger than this value.
-    Derivative,       /// Send dx/dv, dx/dy, etc. slopes to TA for it to used in LOD computation.
-    CoarseDerivative, /// Send dx/dv, dx/dy, etc. slopes to TA for it to used in LOD computation.
-    Level0,           /// Force use of MIP level 0.
-    Pcf,              /// Percentage closer filtering.
-    Offset            /// Send X, Y, Z integer offsets (packed into 1 Dword) to offset XYZ address.
+    Lod,
+    LodBias,
+    LodClamp,
+    Derivative,
+    CoarseDerivative,
+    Level0,
+    Pcf,
+    Offset
 };
 using MimgModifierFlags = Common::Flags<MimgModifier>;
 
@@ -2699,10 +2461,10 @@ struct SendMsgSimm {
     GsOp op : 2;
 };
 
-} // namespace Shader::Gcn
+}
 
 template <>
 struct magic_enum::customize::enum_range<Shader::Gcn::Opcode> {
     static constexpr int min = static_cast<int>(Shader::Gcn::Opcode::S_ADD_U32);
-    static constexpr int max = static_cast<int>(Shader::Gcn::Opcode::V_MAD_MIXHI_F16);
+    static constexpr int max = static_cast<int>(Shader::Gcn::Opcode::EXP);
 };

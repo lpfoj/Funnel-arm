@@ -15,16 +15,14 @@ class PSF;
 
 namespace Libraries::SaveData {
 
-constexpr size_t OrbisSaveDataTitleMaxsize = 128;    // Maximum title name size
-constexpr size_t OrbisSaveDataSubtitleMaxsize = 128; // Maximum subtitle name size
-constexpr size_t OrbisSaveDataDetailMaxsize = 1024;  // Maximum detail name size
+constexpr size_t OrbisSaveDataTitleMaxsize = 128;
+constexpr size_t OrbisSaveDataSubtitleMaxsize = 128;
+constexpr size_t OrbisSaveDataDetailMaxsize = 1024;
 
 enum class Error : u32;
 enum class OrbisSaveDataParamType : u32;
 
-// Maximum size for a title ID (4 uppercase letters + 5 digits)
 constexpr int OrbisSaveDataTitleIdDataSize = 10;
-// Maximum save directory name size
 constexpr int OrbisSaveDataDirnameDataMaxsize = 32;
 
 struct OrbisSaveDataTitleId {
@@ -187,4 +185,4 @@ int PS4_SYSV_ABI sceSaveDataUpload();
 int PS4_SYSV_ABI Func_02E4C4D201716422();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::SaveData
+}

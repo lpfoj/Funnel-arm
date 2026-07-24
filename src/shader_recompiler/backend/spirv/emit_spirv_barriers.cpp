@@ -14,7 +14,7 @@ void MemoryBarrier(EmitContext& ctx, spv::Scope scope) {
     ctx.OpMemoryBarrier(ctx.ConstU32(static_cast<u32>(scope)),
                         ctx.ConstU32(static_cast<u32>(semantics)));
 }
-} // Anonymous namespace
+}
 
 void EmitBarrier(EmitContext& ctx) {
     const auto execution{spv::Scope::Workgroup};
@@ -41,4 +41,4 @@ void EmitDeviceMemoryBarrier(EmitContext& ctx) {
     MemoryBarrier(ctx, spv::Scope::Device);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

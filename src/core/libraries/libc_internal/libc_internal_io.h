@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <mutex>
 #include "common/types.h"
 #include "core/libraries/kernel/threads.h"
@@ -77,6 +78,15 @@ struct OrbisFILE {
     Orbis__mbstate_t _mbstate;
 };
 
+static_assert(sizeof(OrbisFILE) == 0x1c8, "Incorrect OrbisFILE size");
+static_assert(alignof(OrbisFILE) == 8, "Incorrect OrbisFILE alignment");
+static_assert(offsetof(OrbisFILE, _Handle) == 0x04, "Incorrect OrbisFILE::_Handle offset");
+static_assert(offsetof(OrbisFILE, _Buf) == 0x08, "Incorrect OrbisFILE::_Buf offset");
+static_assert(offsetof(OrbisFILE, _Mutex) == 0x80, "Incorrect OrbisFILE::_Mutex offset");
+static_assert(offsetof(OrbisFILE, _cookie) == 0xb8, "Incorrect OrbisFILE::_cookie offset");
+static_assert(offsetof(OrbisFILE, _offset) == 0x118, "Incorrect OrbisFILE::_offset offset");
+static_assert(offsetof(OrbisFILE, _mbstate) == 0x148, "Incorrect OrbisFILE::_mbstate offset");
+
 s32 PS4_SYSV_ABI internal_snprintf(char* s, u64 n, VA_ARGS);
 void PS4_SYSV_ABI internal__Lockfilelock(OrbisFILE* file);
 void PS4_SYSV_ABI internal__Unlockfilelock(OrbisFILE* file);
@@ -89,9 +99,18 @@ s64 PS4_SYSV_ABI internal__Nnl(OrbisFILE* file, u8* val1, u8* val2);
 s32 PS4_SYSV_ABI internal__Fspos(OrbisFILE* file, Orbisfpos_t* file_pos, s64 offset, s32 whence);
 s32 PS4_SYSV_ABI internal_fflush(OrbisFILE* file);
 s32 PS4_SYSV_ABI internal_fseek(OrbisFILE* file, s64 offset, s32 whence);
+s64 PS4_SYSV_ABI internal_ftell(OrbisFILE* file);
 s32 PS4_SYSV_ABI internal__Frprep(OrbisFILE* file);
 u64 PS4_SYSV_ABI internal_fread(char* ptr, u64 size, u64 nmemb, OrbisFILE* file);
+u64 PS4_SYSV_ABI internal_fwrite(const char* ptr, u64 size, u64 nmemb, OrbisFILE* file);
+s32 PS4_SYSV_ABI internal_fgetc(OrbisFILE* file);
+s32 PS4_SYSV_ABI internal_ungetc(s32 ch, OrbisFILE* file);
+s32 PS4_SYSV_ABI internal_feof(OrbisFILE* file);
+s32 PS4_SYSV_ABI internal_ferror(OrbisFILE* file);
+void PS4_SYSV_ABI internal_rewind(OrbisFILE* file);
+s32 PS4_SYSV_ABI internal_fopen_s(OrbisFILE** out_file, const char* path, const char* mode);
 s32 PS4_SYSV_ABI internal_fclose(OrbisFILE* file);
 
 void RegisterlibSceLibcInternalIo(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::LibcInternal
+void ForceRegisterlibSceLibcInternalIo(Core::Loader::SymbolsResolver* sym);
+}

@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
-#include <ranges>
 #include <span>
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -24,7 +22,6 @@ enum class Stage : u32 {
     Compute,
 };
 
-// Vertex intentionally comes after TCS/TES due to order of compilation
 enum class LogicalStage : u32 {
     Fragment,
     TessellationControl,
@@ -117,17 +114,10 @@ struct HullRuntimeInfo : protected CommonHsEsVsRuntimeInfo {
 
     bool operator==(const HullRuntimeInfo&) const = default;
 
-    // It might be possible for a non-passthrough TCS to have these conditions, in some dumb
-    // situation. In that case, it should be fine to assume passthrough and declare some extra
-    // output control points and attributes that shouldnt be read by the TES anyways
     bool IsPassthrough() const {
         return hs_output_base == 0 && ls_stride == hs_output_cp_stride && num_threads == 1;
     };
 
-    // regs.ls_hs_config.hs_output_control_points contains the number of threads, which
-    // isn't exactly the number of output control points.
-    // For passthrough shaders, the register field is set to 1, so use the number of
-    // input control points
     u32 NumOutputControlPoints() const {
         return IsPassthrough() ? num_input_control_points : num_threads;
     }
@@ -219,20 +209,13 @@ struct ComputeRuntimeInfo {
     }
 };
 
-/**
- * Stores information relevant to shader compilation sourced from liverpool registers.
- * It may potentially differ with the same shader module so must be checked.
- * It's also possible to store any other custom information that needs to be part of shader key.
- */
 struct RuntimeInfo {
     Stage stage;
     u32 num_user_data;
     u32 num_input_vgprs;
     u32 num_allocated_vgprs;
     AmdGpu::FpDenormMode fp_denorm_mode32;
-    AmdGpu::FpDenormMode fp_denorm_mode16_64;
     AmdGpu::FpRoundMode fp_round_mode32;
-    AmdGpu::FpRoundMode fp_round_mode16_64;
     union {
         LocalRuntimeInfo ls_info;
         ExportRuntimeInfo es_info;
@@ -241,8 +224,6 @@ struct RuntimeInfo {
         GeometryRuntimeInfo gs_info;
         FragmentRuntimeInfo fs_info;
         ComputeRuntimeInfo cs_info;
-        // Hs/Es/VsRuntimeInfo inherit from these so we can
-        // access common info with correct offsets
         CommonHsEsVsRuntimeInfo hs_es_vs_info;
         CommonEsVsRuntimeInfo es_vs_info;
     };
@@ -282,7 +263,7 @@ struct RuntimeInfo {
     }
 };
 
-} // namespace Shader
+}
 
 template <>
 struct fmt::formatter<Shader::Stage> {

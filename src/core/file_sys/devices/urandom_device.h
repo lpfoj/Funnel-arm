@@ -4,7 +4,6 @@
 #pragma once
 #include <memory>
 #include "core/file_sys/devices/base_device.h"
-#include "core/libraries/kernel/file_system.h"
 
 namespace Core::Devices {
 
@@ -31,4 +30,4 @@ public:
     s64 pwrite(const void* buf, u64 nbytes, s64 offset) override;
 };
 
-} // namespace Core::Devices
+}

@@ -14,8 +14,7 @@
 #include <wepoll.h>
 #endif
 
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-// ADD libepoll-shim if using freebsd!
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/epoll.h>
 #include <unistd.h>
 #endif
@@ -29,7 +28,7 @@ using epoll_handle = int;
 #endif
 
 struct Epoll {
-    std::vector<std::pair<u32 /*netId*/, OrbisNetEpollEvent>> events{};
+    std::vector<std::pair<u32, OrbisNetEpollEvent>> events{};
     std::string name;
     epoll_handle epoll_fd;
     std::deque<u32> async_resolutions{};
@@ -83,4 +82,4 @@ private:
     std::mutex m_mutex;
 };
 
-} // namespace Libraries::Net
+}

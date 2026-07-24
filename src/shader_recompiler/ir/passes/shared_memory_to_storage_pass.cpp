@@ -100,11 +100,6 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
         return;
     }
 
-    // Run this pass if:
-    // * There are shared memory instructions.
-    // * One of the following is true:
-    //   * Requested shared memory size is too large for the host shared memory.
-    //   * Workgroup explicit memory is not supported and multiple shared memory types are used.
     const u32 shared_memory_size = runtime_info.cs_info.shared_memory_size;
     const auto used_types = CalculateSharedMemoryTypes(program);
     if (used_types == IR::Type::Void || (shared_memory_size <= profile.max_shared_memory_size &&
@@ -113,7 +108,6 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
         return;
     }
 
-    // Add a buffer binding for shared memory storage buffer.
     const u32 binding = static_cast<u32>(program.info.buffers.size());
     program.info.buffers.push_back({
         .used_types = used_types,
@@ -209,4 +203,4 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
     }
 }
 
-} // namespace Shader::Optimization
+}

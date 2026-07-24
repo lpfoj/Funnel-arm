@@ -36,4 +36,4 @@ AjmInstanceStatistics& AjmInstanceStatistics::Getinstance() {
     return instance;
 }
 
-} // namespace Libraries::Ajm
+}

@@ -13,14 +13,14 @@
 namespace Shader {
 struct Info;
 struct Profile;
-} // namespace Shader
+}
 
 namespace Shader::Gcn {
 
 enum class ConditionOp : u32 {
     F,
     EQ,
-    LG, // NE
+    LG,
     GT,
     GE,
     LT,
@@ -54,9 +54,6 @@ enum class NegateMode : u32 {
     Result,
 };
 
-template <typename T>
-using pk_type = std::pair<T, T>;
-
 static constexpr size_t MaxInterpVgpr = 16;
 
 class Translator {
@@ -66,7 +63,6 @@ public:
     void Translate(IR::Block* block, u32 pc, std::span<const GcnInst> inst_list);
     void TranslateInstruction(const GcnInst& inst);
 
-    // Instruction categories
     void EmitPrologue(IR::Block* first_block);
     void EmitFetch(const GcnInst& inst);
     void EmitExport(const GcnInst& inst);
@@ -78,12 +74,9 @@ public:
     void EmitDataShare(const GcnInst& inst);
     void EmitVectorMemory(const GcnInst& inst);
 
-    // Instruction encodings
     void EmitSOPC(const GcnInst& inst);
     void EmitSOPK(const GcnInst& inst);
 
-    // Scalar ALU
-    // SOP2
     void S_ADD_U32(const GcnInst& inst);
     void S_SUB_U32(const GcnInst& inst);
     void S_SUBB_U32(const GcnInst& inst);
@@ -111,13 +104,11 @@ public:
     void S_ABSDIFF_I32(const GcnInst& inst);
     void S_NOT_B32(const GcnInst& inst);
 
-    // SOPK
     void S_MOVK(const GcnInst& inst, bool is_conditional);
     void S_CMPK(ConditionOp cond, bool is_signed, const GcnInst& inst);
     void S_ADDK_I32(const GcnInst& inst);
     void S_MULK_I32(const GcnInst& inst);
 
-    // SOP1
     void S_MOV(const GcnInst& inst);
     void S_MOV_B64(const GcnInst& inst);
     void S_NOT_B64(const GcnInst& inst);
@@ -133,21 +124,15 @@ public:
     void S_SAVEEXEC_B64(NegateMode negate, bool is_or, const GcnInst& inst);
     void S_ABS_I32(const GcnInst& inst);
 
-    // SOPC
     void S_CMP(ConditionOp cond, bool is_signed, const GcnInst& inst);
     void S_BITCMP(bool compare_mode, u32 bits, const GcnInst& inst);
 
-    // SOPP
     void S_BARRIER();
     void S_SENDMSG(const GcnInst& inst);
 
-    // Scalar Memory
-    // SMRD
     void S_LOAD_DWORD(int num_dwords, const GcnInst& inst);
     void S_BUFFER_LOAD_DWORD(int num_dwords, const GcnInst& inst);
 
-    // Vector ALU
-    // VOP2
     void V_CNDMASK_B32(const GcnInst& inst);
     void V_READLANE_B32(const GcnInst& inst);
     void V_WRITELANE_B32(const GcnInst& inst);
@@ -186,13 +171,7 @@ public:
     void V_CVT_PKNORM_U16_F32(const GcnInst& inst);
     void V_CVT_PKNORM_I16_F32(const GcnInst& inst);
     void V_CVT_PKRTZ_F16_F32(const GcnInst& inst);
-    void V_ADD_F16(const GcnInst& inst);
-    void V_SUB_F16(const GcnInst& inst);
-    void V_MUL_F16(const GcnInst& inst);
-    void V_MAX_F16(const GcnInst& inst);
-    void V_MIN_F16(const GcnInst& inst);
 
-    // VOP1
     void V_MOV(const GcnInst& inst);
     void V_READFIRSTLANE_B32(const GcnInst& inst);
     void V_CVT_I32_F64(const GcnInst& inst);
@@ -239,14 +218,12 @@ public:
     void V_MOVRELS_B32(const GcnInst& inst);
     void V_MOVRELSD_B32(const GcnInst& inst);
 
-    // VOPC
     void V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst);
     void V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst);
     void V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst);
     void V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst);
     void V_CMP_CLASS_F32(const GcnInst& inst);
 
-    // VOP3a
     void V_MAD_F32(const GcnInst& inst);
     void V_MAD_I32_I24(const GcnInst& inst, bool is_signed = true);
     void V_MAD_U32_U24(const GcnInst& inst);
@@ -278,47 +255,11 @@ public:
     void V_MUL_LO_U32(const GcnInst& inst);
     void V_MUL_HI_U32(bool is_signed, const GcnInst& inst);
     void V_MAD_U64_U32(const GcnInst& inst);
-    void V_LSHRREV_B16(const GcnInst& inst);
-    void V_ASHRREV_I16(const GcnInst& inst);
-    void V_LSHLREV_B16(const GcnInst& inst);
-    void V_LSHL_ADD_U32(const GcnInst& inst);
-    void V_ADD_LSHL_U32(const GcnInst& inst);
-    void V_MIN3_F16(const GcnInst& inst);
-    void V_MAX3_F16(const GcnInst& inst);
-    void V_MED3_F16(const GcnInst& inst);
-    void V_ADD3_U32(const GcnInst& inst);
-    void V_LSHL_OR_B32(const GcnInst& inst);
-    void V_AND_OR_B32(const GcnInst& inst);
-    void V_OR3_B32(const GcnInst& inst);
 
-    // VOP3P
-    void V_PK_MUL_LO_U16(const GcnInst& inst);
-    void V_PK_ADD_I16(const GcnInst& inst);
-    void V_PK_SUB_I16(const GcnInst& inst);
-    void V_PK_LSHLREV_B16(const GcnInst& inst);
-    void V_PK_LSHRREV_B16(const GcnInst& inst);
-    void V_PK_MAD_U16(const GcnInst& inst);
-    void V_PK_ADD_U16(const GcnInst& inst);
-    void V_PK_SUB_U16(const GcnInst& inst);
-    void V_PK_MAX_U16(const GcnInst& inst);
-    void V_PK_MIN_U16(const GcnInst& inst);
-    void V_PK_FMA_F16(const GcnInst& inst);
-    void V_PK_ADD_F16(const GcnInst& inst);
-    void V_PK_MUL_F16(const GcnInst& inst);
-    void V_PK_MIN_F16(const GcnInst& inst);
-    void V_PK_MAX_F16(const GcnInst& inst);
-    void V_MAD_MIX_F32(const GcnInst& inst);
-    void V_MAD_MIXLO_F16(const GcnInst& inst);
-    void V_MAD_MIXHI_F16(const GcnInst& inst);
-
-    // Vector interpolation
-    // VINTRP
     void V_INTERP_P1_F32(const GcnInst& inst);
     void V_INTERP_P2_F32(const GcnInst& inst);
     void V_INTERP_MOV_F32(const GcnInst& inst);
 
-    // Data share
-    // DS
     template <typename T = IR::U32>
     void DS_OP(const GcnInst& inst, AtomicOp op, bool rtn);
     void DS_WRITE(int bit_size, bool is_signed, bool is_pair, bool stride64, const GcnInst& inst);
@@ -327,8 +268,6 @@ public:
     void DS_APPEND(const GcnInst& inst);
     void DS_CONSUME(const GcnInst& inst);
 
-    // Buffer Memory
-    // MUBUF / MTBUF
     void BUFFER_LOAD(u32 num_dwords, bool is_inst_typed, bool is_buffer_typed, const GcnInst& inst,
                      u32 scalar_width = 32, bool is_signed = false);
     void BUFFER_STORE(u32 num_dwords, bool is_inst_typed, bool is_buffer_typed, const GcnInst& inst,
@@ -336,8 +275,6 @@ public:
     template <typename T = IR::U32>
     void BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst);
 
-    // Image Memory
-    // MIMG
     void IMAGE_LOAD(bool has_mip, const GcnInst& inst);
     void IMAGE_STORE(bool has_mip, const GcnInst& inst);
     void IMAGE_GET_RESINFO(const GcnInst& inst);
@@ -350,22 +287,12 @@ private:
     IR::U1 GetSrc1(const InstOperand& operand);
     template <typename T = IR::U32>
     [[nodiscard]] T GetSrc(const InstOperand& operand);
-    template <typename T = IR::U32, bool is_signed = false>
-    [[nodiscard]] T GetSrc16(const InstOperand& operand);
     template <typename T = IR::U64>
     [[nodiscard]] T GetSrc64(const InstOperand& operand);
-    [[nodiscard]] IR::F32 GetSrcMix(const InstOperand& operand);
-    template <typename T = IR::U32, bool is_signed = false>
-    [[nodiscard]] pk_type<T> GetSrcPk(const InstOperand& operand);
     void SetDst1(const InstOperand& operand, const IR::U1& value);
     void SetDst(const InstOperand& operand, const IR::U32F32& value);
-    template <bool is_signed = false>
-    void SetDst16(const InstOperand& operand, const IR::U32F32& value);
     void SetDst64(const InstOperand& operand, const IR::U64F64& value_raw);
-    template <typename T = IR::U32, bool is_signed = false>
-    void SetDstPk(const InstOperand& operand, const pk_type<T>& value);
 
-    // Vector ALU Helpers
     IR::U32 GetCarryIn(const GcnInst& inst);
     void SetCarryOut(const GcnInst& inst, const IR::U1& carry);
     IR::U32 VMovRelSHelper(u32 src_vgprno, const IR::U32 m0);
@@ -392,4 +319,4 @@ private:
     u32 pc{};
 };
 
-} // namespace Shader::Gcn
+}

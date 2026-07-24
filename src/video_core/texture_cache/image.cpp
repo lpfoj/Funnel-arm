@@ -30,15 +30,9 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
             if (instance->IsAttachmentFeedbackLoopLayoutSupported()) {
                 usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
             }
-            // Always create images with storage flag to avoid needing re-creation in case of e.g
-            // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
-            // flag is also used.
             usage |= vk::ImageUsageFlagBits::eStorage;
         }
     } else {
-        // Similarly to above, we specify storage usage. This is typically not supported by
-        // compressed formats, but may be used for uncompressed views. In order to satisfy this,
-        // we will also specify the extended usage bit.
         usage |= vk::ImageUsageFlagBits::eStorage;
     }
 
@@ -78,22 +72,12 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     if (usage_flags & vk::ImageUsageFlagBits::eDepthStencilAttachment) {
         feature_flags |= vk::FormatFeatureFlagBits2::eDepthStencilAttachment;
     }
-    // Note: StorageImage is intentionally ignored for now since it is always set, and can mess up
-    // compatibility checks.
     return feature_flags;
 }
 
 UniqueImage::~UniqueImage() {
     if (image) {
         vmaDestroyImage(allocator, image, allocation);
-    }
-}
-
-void UniqueImage::Destroy() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-        image = vk::Image{};
-        allocation = {};
     }
 }
 
@@ -128,8 +112,6 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     }
     image_uid = global_image_uid.Next();
     mip_hashes.resize(info.resources.levels);
-    // Here we force `eExtendedUsage` as don't know all image usage cases beforehand. In normal case
-    // the texture cache should re-create the resource with the usage requested
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
     if (info.props.is_volume) {
@@ -236,9 +218,6 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
         }
 
-        // In case of partial transition, we need to change the specified subresources only.
-        // Otherwise all subresources need to be set to the same state so we can use a full
-        // resource transition for the next time.
         const auto mips =
             needs_partial_transition
                 ? std::ranges::views::iota(subres_range->base.level,
@@ -252,8 +231,6 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 
         for (u32 mip : mips) {
             for (u32 layer : layers) {
-                // NOTE: these loops may produce a lot of small barriers.
-                // If this becomes a problem, we can optimize it by merging adjacent barriers.
                 const auto subres_idx = mip * info.resources.layers + layer;
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
@@ -291,7 +268,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
         if (!needs_partial_transition) {
             subresource_states.clear();
         }
-    } else { // Full resource transition
+    } else {
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
                                      vk::AccessFlagBits2::eShaderWrite |
                                      vk::AccessFlagBits2::eMemoryWrite;
@@ -328,8 +305,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 }
 
 void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
-    // Adjust pipeline stage
+                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf) {
     const vk::PipelineStageFlags2 dst_pl_stage =
         (dst_mask == vk::AccessFlagBits2::eTransferRead ||
          dst_mask == vk::AccessFlagBits2::eTransferWrite)
@@ -342,7 +318,6 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     }
 
     if (!cmdbuf) {
-        // When using external cmdbuf you are responsible for ending rp.
         scheduler->EndRendering();
         cmdbuf = scheduler->CommandBuffer();
     }
@@ -449,7 +424,6 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
     u32 src_layers = src_info.resources.layers;
     u32 dst_layers = dst_info.resources.layers;
 
-    // 3D images can only use 1 layer.
     if (vk_src_type == vk::ImageType::e3D && src_layers != 1) {
         LOG_WARNING(Render_Vulkan, "Coercing copy 3D source layers {} to 1.", src_layers);
         src_layers = 1;
@@ -459,7 +433,6 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
         dst_layers = 1;
     }
 
-    // If the image type is equal, layer count must match. Take the minimum of both.
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
             LOG_WARNING(Render_Vulkan,
@@ -468,7 +441,6 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
-        // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
             LOG_WARNING(Render_Vulkan,
@@ -493,7 +465,6 @@ void Image::CopyImage(Image& src_image) {
 
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
 
-    // Format mismatch warning (safe but useful)
     if (src_info.pixel_format != info.pixel_format) {
         LOG_DEBUG(Render_Vulkan,
                   "Copy between different formats: src={}, dst={}. "
@@ -506,7 +477,6 @@ void Image::CopyImage(Image& src_image) {
     const u32 base_depth =
         info.type == AmdGpu::ImageType::Color3D ? info.size.depth : src_info.size.depth;
 
-    // Match sample count before copying
     SetBackingSamples(info.num_samples, false);
     src_image.SetBackingSamples(src_info.num_samples);
 
@@ -545,26 +515,21 @@ void Image::CopyImage(Image& src_image) {
         region.dstSubresource.baseArrayLayer = 0;
 
         if (is_same_type) {
-            // 2D->2D OR 3D->3D
             if (src_is_3d) {
-                // 3D images must use layerCount=1
                 region.srcSubresource.layerCount = 1;
                 region.dstSubresource.layerCount = 1;
                 region.extent = vk::Extent3D(mip_w, mip_h, mip_d);
             } else {
-                // Array images
                 const u32 copy_layers = std::min(src_layers, dst_layers);
                 region.srcSubresource.layerCount = copy_layers;
                 region.dstSubresource.layerCount = copy_layers;
                 region.extent = vk::Extent3D(mip_w, mip_h, 1);
             }
         } else if (is_2d_to_3d) {
-            // 2D array -> 3D volume
             region.srcSubresource.layerCount = src_layers;
             region.dstSubresource.layerCount = 1;
             region.extent = vk::Extent3D(mip_w, mip_h, src_layers);
         } else if (is_3d_to_2d) {
-            // 3D volume -> 2D array
             region.srcSubresource.layerCount = 1;
             region.dstSubresource.layerCount = dst_layers;
             region.extent = vk::Extent3D(mip_w, mip_h, dst_layers);
@@ -814,12 +779,10 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         scheduler->EndRendering();
         ASSERT(info.resources.levels == 1 && info.resources.layers == 1);
 
-        // Transition current backing to shader read layout
         auto barriers =
             GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
                         vk::PipelineStageFlagBits2::eFragmentShader, std::nullopt);
 
-        // Transition dest backing to color attachment layout, not caring of previous contents
         constexpr auto dst_stage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
         constexpr auto dst_access = vk::AccessFlagBits2::eColorAttachmentWrite;
         constexpr auto dst_layout = vk::ImageLayout::eColorAttachmentOptimal;
@@ -847,12 +810,10 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
             .pImageMemoryBarriers = barriers.data(),
         });
 
-        // Copy between ms and non ms backing images
         blit_helper->CopyBetweenMsImages(
             info.size.width, info.size.height, new_backing->num_samples, info.pixel_format,
             backing->num_samples > 1, backing->image, new_backing->image);
 
-        // Update current layout in tracker to new backings layout
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
@@ -861,4 +822,4 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
     backing = new_backing;
 }
 
-} // namespace VideoCore
+}

@@ -23,4 +23,4 @@ struct OrbisSslCaCerts {
 };
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Ssl2
+}

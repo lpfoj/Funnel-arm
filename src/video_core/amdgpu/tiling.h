@@ -149,4 +149,4 @@ u32 CalculateTileSplit(TileMode tile_mode, ArrayMode array_mode, MicroTileMode m
 
 MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_samples);
 
-} // namespace AmdGpu
+}

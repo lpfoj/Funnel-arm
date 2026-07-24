@@ -20,7 +20,6 @@ layout(push_constant) uniform image_info {
     uint c1;
 } info;
 
-// Each LUT is 64 bytes, so should fit into K$ given tiled slices locality
 const uint lut_32bpp[][16] = {
     {
         0x05040100, 0x45444140,

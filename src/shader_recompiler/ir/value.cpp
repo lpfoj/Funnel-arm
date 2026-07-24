@@ -36,7 +36,6 @@ Value::Value(const char* value) noexcept : type{Type::StringLiteral}, string_lit
 
 IR::Type Value::Type() const noexcept {
     if (IsPhi()) {
-        // The type of a phi node is stored in its flags
         return inst->Flags<IR::Type>();
     }
     if (IsIdentity()) {
@@ -100,7 +99,7 @@ bool Value::operator!=(const Value& other) const {
     return !operator==(other);
 }
 
-} // namespace Shader::IR
+}
 
 namespace std {
 std::size_t hash<Shader::IR::Value>::operator()(const Shader::IR::Value& v) const {
@@ -149,4 +148,4 @@ std::size_t hash<Shader::IR::Value>::operator()(const Shader::IR::Value& v) cons
     }
     UNREACHABLE_MSG("Invalid type {}", v.type);
 }
-} // namespace std
+}

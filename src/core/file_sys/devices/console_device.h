@@ -30,4 +30,4 @@ public:
     s64 pwrite(const void* buf, u64 nbytes, s64 offset) override;
 };
 
-} // namespace Core::Devices
+}

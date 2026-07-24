@@ -66,7 +66,6 @@ struct OrbisHmdEyeOffset {
     u8 reserve[20];
 };
 
-// Reprojection
 s32 PS4_SYSV_ABI sceHmdReprojectionStartMultilayer();
 s32 PS4_SYSV_ABI sceHmdReprojectionAddDisplayBuffer();
 s32 PS4_SYSV_ABI sceHmdReprojectionClearUserEventEnd();
@@ -100,7 +99,6 @@ s32 PS4_SYSV_ABI sceHmdReprojectionStopLiveCapture();
 s32 PS4_SYSV_ABI sceHmdReprojectionUnsetCallback();
 s32 PS4_SYSV_ABI sceHmdReprojectionUnsetDisplayBuffers();
 
-// Distortion
 s32 PS4_SYSV_ABI sceHmdDistortionGet2dVrCommand();
 s32 PS4_SYSV_ABI sceHmdDistortionGetCompoundEyeCorrectionCommand();
 s32 PS4_SYSV_ABI sceHmdDistortionGetCorrectionCommand();
@@ -114,7 +112,6 @@ s32 PS4_SYSV_ABI sceHmdGetDistortionParams();
 s32 PS4_SYSV_ABI Func_B26430EA74FC3DC0();
 s32 PS4_SYSV_ABI Func_B614F290B67FB59B();
 
-// libSceHmd
 s32 PS4_SYSV_ABI sceHmdClose(s32 handle);
 s32 PS4_SYSV_ABI sceHmdGet2DEyeOffset(s32 handle, OrbisHmdEyeOffset* left_offset,
                                       OrbisHmdEyeOffset* right_offset);
@@ -130,7 +127,6 @@ s32 PS4_SYSV_ABI sceHmdOpen(Libraries::UserService::OrbisUserServiceUserId user_
                             s32 index, OrbisHmdOpenParam* param);
 s32 PS4_SYSV_ABI sceHmdTerminate();
 
-// Internal
 s32 PS4_SYSV_ABI sceHmdInternal3dAudioClose();
 s32 PS4_SYSV_ABI sceHmdInternal3dAudioOpen();
 s32 PS4_SYSV_ABI sceHmdInternal3dAudioSendData();
@@ -264,4 +260,4 @@ s32 PS4_SYSV_ABI Func_FF2E0E53015FE231();
 void RegisterDistortion(Core::Loader::SymbolsResolver* sym);
 void RegisterReprojection(Core::Loader::SymbolsResolver* sym);
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Hmd
+}

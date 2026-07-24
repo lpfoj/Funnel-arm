@@ -53,4 +53,4 @@ private:
     std::vector<Img> available_imgs;
 };
 
-} // namespace Vulkan::HostPasses
+}

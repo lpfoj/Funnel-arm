@@ -73,7 +73,6 @@ void RegView::DrawComputeRegs() {
     if (BeginTable("CREGS", 2, ImGuiTableFlags_Borders)) {
         TableNextRow();
 
-        // clang-format off
         DrawValueRowList(
             "DISPATCH_INITIATOR",     cs.dispatch_initiator,
             "DIM_X",                  cs.dim_x,
@@ -96,7 +95,6 @@ void RegView::DrawComputeRegs() {
             "SETTINGS.LDS_DWORDS",    cs.settings.lds_dwords,
             "RESOURCE_LIMITS",        cs.resource_limits
         );
-        // clang-format on
 
         EndTable();
     }
@@ -172,7 +170,6 @@ void RegView::DrawGraphicsRegs() {
 
         DrawRow("Primitive restart", "%X (IDX: %X)", regs.enable_primitive_restart & 1,
                 regs.primitive_restart_index);
-        // clang-format off
         DrawValueRowList(
             "Polygon mode", regs.polygon_control.PolyMode(),
             "Cull mode",    regs.polygon_control.CullingMode(),
@@ -180,7 +177,6 @@ void RegView::DrawGraphicsRegs() {
             "Front face",   regs.polygon_control.front_face,
             "Num Samples",  regs.aa_config.NumSamples()
         );
-        // clang-format on
 
         EndTable();
     }
@@ -225,7 +221,6 @@ void RegView::SetData(DebugStateType::RegDump _data, const std::string& base_tit
     this->data = std::move(_data);
     this->batch_id = batch_id;
     this->title = fmt::format("{}/Batch {}", base_title, batch_id);
-    // clear cache
     shader_decomp.clear();
     if (data.is_compute) {
         selected_shader = -2;
@@ -391,4 +386,4 @@ void RegView::Draw() {
     }
 }
 
-} // namespace Core::Devtools::Widget
+}

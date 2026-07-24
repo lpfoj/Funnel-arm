@@ -120,7 +120,7 @@ std::string DumpBlock(const Block& block, const std::map<const Block*, size_t>& 
         if (TypeOf(op) != Type::Void) {
             ret += fmt::format("%{:<5} = {}", InstIndex(inst_to_index, inst_index, &inst), op);
         } else {
-            ret += fmt::format("         {}", op); // '%00000 = ' -> 1 + 5 + 3 = 9 spaces
+            ret += fmt::format("         {}", op);
         }
 
         if (op == Opcode::ReadConst || op == Opcode::ImageSampleRaw) {
@@ -154,4 +154,4 @@ std::string DumpBlock(const Block& block, const std::map<const Block*, size_t>& 
     return ret;
 }
 
-} // namespace Shader::IR
+}

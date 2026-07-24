@@ -133,4 +133,4 @@ void MemoryMapViewer::Draw() {
     End();
 }
 
-} // namespace Core::Devtools::Widget
+}

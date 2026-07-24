@@ -22,7 +22,7 @@ s32 PS4_SYSV_ABI internal_memcpy_s(void* dest, size_t destsz, const void* src, s
     return memcpy_s(dest, destsz, src, count);
 #else
     std::memcpy(dest, src, count);
-    return 0; // ALL OK
+    return 0;
 #endif
 }
 
@@ -38,4 +38,4 @@ void RegisterlibSceLibcInternalMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("DfivPArhucg", "libSceLibcInternal", 1, "libSceLibcInternal", internal_memcmp);
 }
 
-} // namespace Libraries::LibcInternal
+}

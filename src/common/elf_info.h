@@ -6,9 +6,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
-#include <vector>
 
-#include <map>
 #include "assert.h"
 #include "bit_field.h"
 #include "singleton.h"
@@ -21,39 +19,22 @@ class Emulator;
 namespace Common {
 
 union PSFAttributes {
-    /// Supports initial user's logout
     BitField<0, 1, u32> support_initial_user_logout;
-    /// Enter button for the common dialog is cross.
     BitField<1, 1, u32> enter_button_cross;
-    /// Warning dialog for PS Move is displayed in the options menu.
     BitField<2, 1, u32> ps_move_warning;
-    /// Supports stereoscopic 3D.
     BitField<3, 1, u32> support_stereoscopic_3d;
-    /// Suspends when PS button is pressed.
     BitField<4, 1, u32> ps_button_suspend;
-    /// Enter button for the common dialog is assigned by the system software.
     BitField<5, 1, u32> enter_button_system;
-    /// Overrides share menu behavior.
     BitField<6, 1, u32> override_share_menu;
-    /// Suspends when PS button is pressed and special output resolution is set.
     BitField<8, 1, u32> special_res_ps_button_suspend;
-    /// Enable HDCP.
     BitField<9, 1, u32> enable_hdcp;
-    /// Disable HDCP for non-game.
     BitField<10, 1, u32> disable_hdcp_non_game;
-    /// Supports PS VR.
     BitField<14, 1, u32> support_ps_vr;
-    /// CPU mode (6 CPU)
     BitField<15, 1, u32> six_cpu_mode;
-    /// CPU mode (7 CPU)
     BitField<16, 1, u32> seven_cpu_mode;
-    /// Supports PS4 Pro (Neo) mode.
     BitField<23, 1, u32> support_neo_mode;
-    /// Requires PS VR.
     BitField<26, 1, u32> require_ps_vr;
-    /// Supports HDR.
     BitField<29, 1, u32> support_hdr;
-    /// Display location.
     BitField<31, 1, u32> display_location;
 
     u32 raw{};
@@ -75,33 +56,61 @@ class ElfInfo {
 
     std::filesystem::path splash_path{};
     std::filesystem::path game_folder{};
-    std::vector<std::string> npCommIds{};
-    std::map<s32, std::string> trophy_index_map{};
 
 public:
-    static constexpr u32 FW_100 = 0x1000000;
-    static constexpr u32 FW_150 = 0x1500000;
-    static constexpr u32 FW_160 = 0x1600000;
-    static constexpr u32 FW_170 = 0x1700000;
-    static constexpr u32 FW_200 = 0x2000000;
-    static constexpr u32 FW_250 = 0x2500000;
-    static constexpr u32 FW_300 = 0x3000000;
-    static constexpr u32 FW_350 = 0x3500000;
-    static constexpr u32 FW_400 = 0x4000000;
-    static constexpr u32 FW_450 = 0x4500000;
-    static constexpr u32 FW_500 = 0x5000000;
-    static constexpr u32 FW_550 = 0x5500000;
-    static constexpr u32 FW_600 = 0x6000000;
-    static constexpr u32 FW_700 = 0x7000000;
-    static constexpr u32 FW_750 = 0x7500000;
-    static constexpr u32 FW_800 = 0x8000000;
-    static constexpr u32 FW_900 = 0x9000000;
-    static constexpr u32 FW_1000 = 0x10000000;
-    static constexpr u32 FW_1150 = 0x11500000;
+    static constexpr u32 FW_10 = 0x1000000;
+    static constexpr u32 FW_15 = 0x1500000;
+    static constexpr u32 FW_16 = 0x1600000;
+    static constexpr u32 FW_17 = 0x1700000;
+    static constexpr u32 FW_20 = 0x2000000;
+    static constexpr u32 FW_25 = 0x2500000;
+    static constexpr u32 FW_30 = 0x3000000;
+    static constexpr u32 FW_35 = 0x3500000;
+    static constexpr u32 FW_40 = 0x4000000;
+    static constexpr u32 FW_45 = 0x4500000;
+    static constexpr u32 FW_50 = 0x5000000;
+    static constexpr u32 FW_55 = 0x5500000;
+    static constexpr u32 FW_60 = 0x6000000;
+    static constexpr u32 FW_70 = 0x7000000;
+    static constexpr u32 FW_75 = 0x7500000;
+    static constexpr u32 FW_80 = 0x8000000;
+    static constexpr u32 FW_115 = 0x11500000;
 
     static ElfInfo& Instance() {
         return *Singleton<ElfInfo>::Instance();
     }
+
+#if defined(__ANDROID__) && defined(EXECUTOR_ANDROID_NATIVE_CORE_PROBE_NO_DESKTOP_MEDIA_USB)
+    void InitializeForAndroidProbe(const std::filesystem::path& folder, u32 compiled_sdk_ver) {
+        initialized = true;
+        game_serial = "EXECANDROID";
+        title = "Executor Android native probe";
+        app_ver = "0.0";
+        firmware_ver = FW_45;
+        raw_firmware_ver = FW_45;
+        sdk_ver = compiled_sdk_ver != 0 ? compiled_sdk_ver : FW_45;
+        psf_attributes.raw = 0;
+        splash_path.clear();
+        game_folder = folder;
+    }
+
+    void InitializeForAndroidTitle(const std::filesystem::path& folder, std::string serial,
+                                   std::string title_name, std::string app_version,
+                                   u32 firmware, u32 raw_firmware, u32 compiled_sdk_ver,
+                                   PSFAttributes attributes,
+                                   std::filesystem::path splash = {}) {
+        initialized = true;
+        game_serial = std::move(serial);
+        title = std::move(title_name);
+        app_ver = std::move(app_version);
+        firmware_ver = firmware;
+        raw_firmware_ver = raw_firmware;
+        sdk_ver = compiled_sdk_ver != 0 ? compiled_sdk_ver : firmware;
+        psf_attributes = attributes;
+        splash_path = std::move(splash);
+        game_folder = folder;
+    }
+#endif
 
     [[nodiscard]] std::string_view GameSerial() const {
         ASSERT(initialized);
@@ -145,18 +154,6 @@ public:
     [[nodiscard]] const std::filesystem::path& GetGameFolder() const {
         return game_folder;
     }
-
-    [[nodiscard]] const std::map<s32, std::string>& GetTrophyIndexMap() const {
-        return trophy_index_map;
-    }
-
-    [[nodiscard]] const std::vector<std::string>& GetNpCommIds() const {
-        return npCommIds;
-    }
-
-    void SetNpCommIds(std::vector<std::string> ids) {
-        npCommIds = std::move(ids);
-    }
 };
 
-} // namespace Common
+}

@@ -207,4 +207,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceErrorDialogUpdateStatus);
 };
 
-} // namespace Libraries::ErrorDialog
+}

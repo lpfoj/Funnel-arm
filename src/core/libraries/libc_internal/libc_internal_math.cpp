@@ -143,4 +143,4 @@ void RegisterlibSceLibcInternalMath(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("lhpd6Wk6ccs", "libSceLibcInternal", 1, "libSceLibcInternal", internal_log10f);
 }
 
-} // namespace Libraries::LibcInternal
+}

@@ -31,4 +31,4 @@ struct Pools {
                                            Info& info, RuntimeInfo& runtime_info,
                                            const Profile& profile);
 
-} // namespace Shader
+}

@@ -15,4 +15,4 @@ struct Bindings {
     auto operator<=>(const Bindings&) const = default;
 };
 
-} // namespace Shader::Backend
+}

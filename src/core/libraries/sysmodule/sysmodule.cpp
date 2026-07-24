@@ -14,6 +14,10 @@
 #include "core/libraries/sysmodule/sysmodule_internal.h"
 #include "core/linker.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 namespace Libraries::SysModule {
 
 static std::mutex g_mutex{};
@@ -72,12 +76,21 @@ s32 PS4_SYSV_ABI sceSysmoduleIsLoadedInternal(OrbisSysModuleInternal id) {
 
 s32 PS4_SYSV_ABI sceSysmoduleLoadModule(OrbisSysModule id) {
     LOG_INFO(Lib_SysModule, "called, id = {:#x}", id);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SYSMODULE_LOAD] api=sceSysmoduleLoadModule id=0x%x",
+                        static_cast<u32>(id));
+#endif
     s32 result = validateModuleId(id);
     if (result < ORBIS_OK) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModule id=0x%x rc=0x%x",
+                            static_cast<u32>(id), static_cast<u32>(result));
+#endif
         return result;
     }
 
-    // Only locks for internal loadModule call.
     {
         std::scoped_lock lk{g_mutex};
         result = loadModule(id, 0, nullptr, nullptr);
@@ -86,15 +99,28 @@ s32 PS4_SYSV_ABI sceSysmoduleLoadModule(OrbisSysModule id) {
     if (result == ORBIS_KERNEL_ERROR_ESTART) {
         s32 sdk_ver = 0;
         result = Kernel::sceKernelGetCompiledSdkVersion(&sdk_ver);
-        if (sdk_ver < Common::ElfInfo::FW_1150 || result != ORBIS_OK) {
+        if (sdk_ver < Common::ElfInfo::FW_115 || result != ORBIS_OK) {
+#ifdef __ANDROID__
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModule id=0x%x rc=0x%x",
+                                static_cast<u32>(id), static_cast<u32>(ORBIS_KERNEL_ERROR_EINVAL));
+#endif
             return ORBIS_KERNEL_ERROR_EINVAL;
         } else {
+#ifdef __ANDROID__
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModule id=0x%x rc=0x%x",
+                                static_cast<u32>(id), static_cast<u32>(ORBIS_KERNEL_ERROR_ESTART));
+#endif
             return ORBIS_KERNEL_ERROR_ESTART;
         }
     }
 
-    // The real library has some weird workaround for CUSA01478 and CUSA01495 here.
-    // Unless this is proven necessary, I don't plan to handle this.
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModule id=0x%x rc=0x%x",
+                        static_cast<u32>(id), static_cast<u32>(result));
+#endif
     return result;
 }
 
@@ -105,33 +131,75 @@ s32 PS4_SYSV_ABI sceSysmoduleLoadModuleByNameInternal() {
 
 s32 PS4_SYSV_ABI sceSysmoduleLoadModuleInternal(OrbisSysModuleInternal id) {
     LOG_INFO(Lib_SysModule, "called, id = {:#x}", id);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SYSMODULE_LOAD] api=sceSysmoduleLoadModuleInternal id=0x%x",
+                        static_cast<u32>(id));
+#endif
     s32 result = validateModuleId(id);
     if (result < ORBIS_OK) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModuleInternal id=0x%x rc=0x%x",
+                            static_cast<u32>(id), static_cast<u32>(result));
+#endif
         return result;
     }
 
-    // This specific module ID is loaded unlocked.
     if (id == 0x80000039) {
-        return loadModule(id, 0, nullptr, nullptr);
+        result = loadModule(id, 0, nullptr, nullptr);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModuleInternal id=0x%x rc=0x%x",
+                            static_cast<u32>(id), static_cast<u32>(result));
+#endif
+        return result;
     }
     std::scoped_lock lk{g_mutex};
-    return loadModule(id, 0, nullptr, nullptr);
+    result = loadModule(id, 0, nullptr, nullptr);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModuleInternal id=0x%x rc=0x%x",
+                        static_cast<u32>(id), static_cast<u32>(result));
+#endif
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceSysmoduleLoadModuleInternalWithArg(OrbisSysModuleInternal id, s32 argc,
                                                        const void* argv, u64 unk, s32* res_out) {
     LOG_INFO(Lib_SysModule, "called, id = {:#x}", id);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SYSMODULE_LOAD] api=sceSysmoduleLoadModuleInternalWithArg id=0x%x argc=%d unk=0x%llx",
+                        static_cast<u32>(id), argc, static_cast<unsigned long long>(unk));
+#endif
     s32 result = validateModuleId(id);
     if (result < ORBIS_OK) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModuleInternalWithArg id=0x%x rc=0x%x",
+                            static_cast<u32>(id), static_cast<u32>(result));
+#endif
         return result;
     }
 
     if (unk != 0) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModuleInternalWithArg id=0x%x rc=0x%x",
+                            static_cast<u32>(id), static_cast<u32>(ORBIS_SYSMODULE_INVALID_ID));
+#endif
         return ORBIS_SYSMODULE_INVALID_ID;
     }
 
     std::scoped_lock lk{g_mutex};
-    return loadModule(id, argc, argv, res_out);
+    result = loadModule(id, argc, argv, res_out);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SYSMODULE_RESULT] api=sceSysmoduleLoadModuleInternalWithArg id=0x%x rc=0x%x",
+                        static_cast<u32>(id), static_cast<u32>(result));
+#endif
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceSysmoduleMapLibcForLibkernel() {
@@ -201,4 +269,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceSysmoduleUnloadModuleInternalWithArg);
 };
 
-} // namespace Libraries::SysModule
+}

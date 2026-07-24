@@ -8,7 +8,6 @@
 
 namespace Common {
 
-// From boost thread locking
 
 template <typename Iterator>
 struct RangeLockGuard {
@@ -98,4 +97,4 @@ void LockRange(Iterator begin, Iterator end) {
     }
 }
 
-} // namespace Common
+}

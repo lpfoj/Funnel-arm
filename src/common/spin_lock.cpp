@@ -29,7 +29,7 @@ void ThreadPause() {
 #endif
 }
 
-} // Anonymous namespace
+}
 
 namespace Common {
 
@@ -50,4 +50,4 @@ bool SpinLock::try_lock() {
     return true;
 }
 
-} // namespace Common
+}

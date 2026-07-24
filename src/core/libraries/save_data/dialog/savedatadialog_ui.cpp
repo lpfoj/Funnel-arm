@@ -18,7 +18,7 @@ using namespace ImGui;
 using namespace Libraries::CommonDialog;
 using Common::ElfInfo;
 
-constexpr u32 OrbisSaveDataBlockSize = 32768; // 32 KiB
+constexpr u32 OrbisSaveDataBlockSize = 32768;
 
 constexpr auto SAVE_ICON_SIZE = ImVec2{152.0f, 85.0f};
 constexpr auto SAVE_ICON_PADDING = ImVec2{8.0f, 2.0f};
@@ -32,11 +32,11 @@ static ::Core::FileSys::MntPoints* g_mnt =
 
 static std::string SpaceSizeToString(size_t size) {
     std::string size_str;
-    if (size > 1024 * 1024 * 1024) { // > 1GB
+    if (size > 1024 * 1024 * 1024) {
         size_str = fmt::format("{:.2f} GB", double(size / 1024 / 1024) / 1024.0f);
-    } else if (size > 1024 * 1024) { // > 1MB
+    } else if (size > 1024 * 1024) {
         size_str = fmt::format("{:.2f} MB", double(size / 1024) / 1024.0f);
-    } else if (size > 1024) { // > 1KB
+    } else if (size > 1024) {
         size_str = fmt::format("{:.2f} KB", double(size) / 1024.0f);
     } else {
         size_str = fmt::format("{} B", size);
@@ -412,7 +412,6 @@ void SaveDialogUi::Draw() {
         DrawPrettyBackground();
 
         Separator();
-        // Draw title bigger
         SetWindowFontScale(1.7f);
         switch (state->type) {
         case DialogType::SAVE:
@@ -503,7 +502,6 @@ void SaveDialogUi::DrawItem(int _id, const SaveDialogState::Item& item, bool cli
         auto texture = item.icon.GetTexture();
         window.DrawList->AddImage(texture.im_id, pos, pos + SAVE_ICON_SIZE);
     } else {
-        // placeholder
         window.DrawList->AddRectFilled(pos, pos + SAVE_ICON_SIZE, GetColorU32(ImVec4{0.7f}));
     }
 
@@ -580,14 +578,14 @@ void SaveDialogUi::DrawList() {
     for (const auto& item : state->save_list) {
         DrawItem(i++, item);
     }
-    if (first_render) { // Make the initial focus
+    if (first_render) {
         if (std::holds_alternative<FocusPos>(state->focus_pos)) {
             auto pos = std::get<FocusPos>(state->focus_pos);
             if (pos == FocusPos::LISTHEAD || pos == FocusPos::DATAHEAD) {
                 SetItemCurrentNavFocus(GetID(0));
             } else if (pos == FocusPos::LISTTAIL || pos == FocusPos::DATATAIL) {
                 SetItemCurrentNavFocus(GetID(std::max(i - 1, 0)));
-            } else { // Date
+            } else {
                 int idx = 0;
                 int max_idx = 0;
                 bool is_min = pos == FocusPos::DATAOLDEST;
@@ -672,7 +670,6 @@ void SaveDialogUi::DrawUser() {
         const char* end = &msg.back() + 1;
         if (user_state.msg_type == UserMessageType::ERROR) {
             PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
-            // Maybe make the text bold?
         }
         DrawCenteredText(begin, end, GetContentRegionAvail() - btn_space);
         if (user_state.msg_type == UserMessageType::ERROR) {
@@ -698,7 +695,7 @@ void SaveDialogUi::DrawUser() {
             }
             SameLine();
             if (Button("No", BUTTON_SIZE)) {
-                if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+                if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_45) {
                     Finish(ButtonId::INVALID, Result::USER_CANCELED);
                 } else {
                     Finish(ButtonId::NO);
@@ -710,7 +707,7 @@ void SaveDialogUi::DrawUser() {
         } else {
             if (Button("OK", BUTTON_SIZE)) {
                 if (btn_type == ButtonType::OK &&
-                    ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+                    ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_45) {
                     Finish(ButtonId::INVALID, Result::USER_CANCELED);
                 } else {
                     Finish(ButtonId::OK);
@@ -763,7 +760,7 @@ void SaveDialogUi::DrawSystemMessage() {
     });
     BeginGroup();
     if (Button(sys_state.show_no ? "Yes" : "OK", BUTTON_SIZE)) {
-        if (sys_state.return_cancel && ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+        if (sys_state.return_cancel && ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_45) {
             Finish(ButtonId::INVALID, Result::USER_CANCELED);
         } else {
             Finish(ButtonId::YES);
@@ -772,7 +769,7 @@ void SaveDialogUi::DrawSystemMessage() {
     SameLine();
     if (sys_state.show_no) {
         if (Button("No", BUTTON_SIZE)) {
-            if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+            if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_45) {
                 Finish(ButtonId::INVALID, Result::USER_CANCELED);
             } else {
                 Finish(ButtonId::NO);
@@ -811,7 +808,7 @@ void SaveDialogUi::DrawErrorCode() {
         ws.y - FOOTER_HEIGHT + 5.0f,
     });
     if (Button("OK", BUTTON_SIZE)) {
-        if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_450) {
+        if (ElfInfo::Instance().FirmwareVer() < ElfInfo::FW_45) {
             Finish(ButtonId::INVALID, Result::USER_CANCELED);
         } else {
             Finish(ButtonId::OK);
@@ -848,4 +845,4 @@ void SaveDialogUi::DrawProgressBar() {
     ProgressBar(static_cast<float>(bar_state.progress) / 100.0f,
                 {PROGRESS_BAR_WIDTH * ws.x, BUTTON_SIZE.y});
 }
-}; // namespace Libraries::SaveData::Dialog
+};

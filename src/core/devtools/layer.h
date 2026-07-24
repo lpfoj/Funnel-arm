@@ -12,18 +12,22 @@ class Layer final : public ImGui::Layer {
 public:
     static void SetupSettings();
 
+    bool CapturesGamepadInput() const override {
+        return false;
+    }
     void Draw() override;
 
-    // Must be inside a window
     static void DrawNullGpuNotice();
 
 private:
     static void DrawMenuBar();
     static void DrawAdvanced();
     static void DrawSimple();
+
+    static void TextCentered(const std::string& text);
 };
 
-} // namespace Core::Devtools
+}
 
 namespace Overlay {
 
@@ -32,6 +36,4 @@ void SetSimpleFps(bool enabled);
 void ToggleQuitWindow();
 void ShowVolume();
 
-void TextCentered(const std::string& text);
-
-} // namespace Overlay
+}

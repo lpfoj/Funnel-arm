@@ -173,4 +173,4 @@ bool AjmInstance::HasEnoughSpace(const SparseOutputBuffer& output) const {
     return output.Size() >= m_codec->GetNextFrameSize(m_gapless);
 }
 
-} // namespace Libraries::Ajm
+}

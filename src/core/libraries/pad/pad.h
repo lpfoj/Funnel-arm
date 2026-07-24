@@ -20,8 +20,6 @@ constexpr int ORBIS_PAD_PORT_TYPE_STANDARD = 0;
 constexpr int ORBIS_PAD_PORT_TYPE_SPECIAL = 2;
 constexpr int ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL = 16;
 
-constexpr int ORBIS_PAD_CONNECTION_TYPE_LOCAL = 0;
-
 enum class OrbisPadDeviceClass {
     Invalid = -1,
     Standard = 0,
@@ -149,6 +147,10 @@ enum class OrbisPadButtonDataOffset : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(OrbisPadButtonDataOffset)
 
+void ExecutorPadRecordHostButtonEvent(u32 button_mask, bool pressed);
+bool ExecutorConsumeUiLaunchRequest();
+u32 ExecutorConsumeUiNavButtons();
+
 struct OrbisFQuaternion {
     float x, y, z, w;
 };
@@ -167,7 +169,7 @@ struct OrbisPadTouch {
 struct OrbisPadTouchData {
     u8 touchNum;
     u8 reserve[3];
-    u32 time_since_touch_held_down;
+    u32 reserve1;
     OrbisPadTouch touch[ORBIS_PAD_MAX_TOUCH_NUM];
 };
 
@@ -255,18 +257,6 @@ struct OrbisPadVibrationParam {
     u8 smallMotor;
 };
 
-struct OrbisPadInfo {
-    u32 unk1;
-    u32 unk2;
-    u32 pad_handle;
-    u32 unk3;
-    u32 unk4;
-    u32 unk5;
-    u32 colour;
-    u32 unk6;
-    u32 unk[30];
-};
-
 int PS4_SYSV_ABI scePadClose(s32 handle);
 int PS4_SYSV_ABI scePadConnectPort();
 int PS4_SYSV_ABI scePadDeviceClassGetExtendedInformation(
@@ -294,7 +284,7 @@ int PS4_SYSV_ABI scePadGetFeatureReport();
 int PS4_SYSV_ABI scePadGetHandle(Libraries::UserService::OrbisUserServiceUserId userId, s32 type,
                                  s32 index);
 int PS4_SYSV_ABI scePadGetIdleCount();
-int PS4_SYSV_ABI scePadGetInfo(OrbisPadInfo* data);
+int PS4_SYSV_ABI scePadGetInfo();
 int PS4_SYSV_ABI scePadGetInfoByPortType();
 int PS4_SYSV_ABI scePadGetLicenseControllerInformation();
 int PS4_SYSV_ABI scePadGetMotionSensorPosition();
@@ -318,11 +308,11 @@ int PS4_SYSV_ABI scePadOpenExt2();
 int PS4_SYSV_ABI scePadOutputReport();
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num);
 int PS4_SYSV_ABI scePadReadBlasterForTracker();
-int PS4_SYSV_ABI scePadReadExt();
+int PS4_SYSV_ABI scePadReadExt(s32 handle, OrbisPadData* pData, s32 num);
 int PS4_SYSV_ABI scePadReadForTracker();
 int PS4_SYSV_ABI scePadReadHistory();
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData);
-int PS4_SYSV_ABI scePadReadStateExt();
+int PS4_SYSV_ABI scePadReadStateExt(s32 handle, OrbisPadData* pData);
 int PS4_SYSV_ABI scePadResetLightBar(s32 handle);
 int PS4_SYSV_ABI scePadResetLightBarAll();
 int PS4_SYSV_ABI scePadResetLightBarAllByPortType();
@@ -338,7 +328,7 @@ int PS4_SYSV_ABI scePadSetForceIntercepted();
 int PS4_SYSV_ABI scePadSetLightBar(s32 handle, const OrbisPadLightBarParam* pParam);
 int PS4_SYSV_ABI scePadSetLightBarBaseBrightness();
 int PS4_SYSV_ABI scePadSetLightBarBlinking();
-int PS4_SYSV_ABI scePadSetLightBarForTracker(s32 handle, const OrbisPadLightBarParam* pParam);
+int PS4_SYSV_ABI scePadSetLightBarForTracker();
 int PS4_SYSV_ABI scePadSetLoginUserNumber();
 int PS4_SYSV_ABI scePadSetMotionSensorState(s32 handle, bool bEnable);
 int PS4_SYSV_ABI scePadSetProcessFocus();
@@ -367,4 +357,4 @@ int PS4_SYSV_ABI Func_89C9237E393DA243();
 int PS4_SYSV_ABI Func_EF103E845B6F0420();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Pad
+}

@@ -9,7 +9,6 @@ namespace Shader::Gcn {
 
 void Translator::EmitDataShare(const GcnInst& inst) {
     switch (inst.opcode) {
-        // DS
     case Opcode::DS_ADD_U32:
         return DS_OP(inst, AtomicOp::Add, false);
     case Opcode::DS_ADD_U64:
@@ -87,7 +86,6 @@ void Translator::EmitDataShare(const GcnInst& inst) {
     }
 }
 
-// VOP2
 
 void Translator::V_READFIRSTLANE_B32(const GcnInst& inst) {
     const IR::U32 value{GetSrc(inst.src[0])};
@@ -105,8 +103,6 @@ void Translator::V_READLANE_B32(const GcnInst& inst) {
     const IR::U32 lane{GetSrc(inst.src[1])};
     SetDst(inst.dst[0], ir.ReadLane(value, lane));
 
-    // Restore a thread mask's per-lane bool spilled by V_WRITELANE_B32. Only the low (even) half
-    // of a 64-bit mask carries the view; SetDst1 routes it to the SGPR, VCC, or EXEC.
     if (lane.IsImmediate()) {
         ASSERT(lane.U32() < 64);
         const auto& dst = inst.dst[0];
@@ -126,8 +122,6 @@ void Translator::V_WRITELANE_B32(const GcnInst& inst) {
     const IR::U32 old_value{GetSrc(inst.dst[0])};
     ir.SetVectorReg(dst, ir.WriteLane(old_value, value, lane));
 
-    // A thread mask may be spilled from a scalar to a vector lane. Shadow the low (even) half's
-    // per-lane bool so V_READLANE_B32 can restore it; the high half and plain data store nothing.
     if (lane.IsImmediate()) {
         ASSERT(lane.U32() < 64);
         const auto& src = inst.src[0];
@@ -140,7 +134,6 @@ void Translator::V_WRITELANE_B32(const GcnInst& inst) {
     }
 }
 
-// DS
 
 template <typename T>
 void Translator::DS_OP(const GcnInst& inst, AtomicOp op, bool rtn) {
@@ -260,7 +253,6 @@ void Translator::DS_READ(int bit_size, bool is_signed, bool is_pair, bool stride
         return;
     }
     if (is_pair) {
-        // Pair loads are either 32 or 64-bit
         const u32 adj = (bit_size == 32 ? 4 : 8) * (stride64 ? 64 : 1);
         const IR::U32 addr0 = ir.IAdd(addr, ir.Imm32(u32(inst.control.ds.offset0 * adj)));
         const IR::Value data0 = ir.LoadShared(bit_size, is_signed, addr0, is_gds);
@@ -334,4 +326,4 @@ void Translator::DS_CONSUME(const GcnInst& inst) {
     SetDst(inst.dst[0], prev);
 }
 
-} // namespace Shader::Gcn
+}

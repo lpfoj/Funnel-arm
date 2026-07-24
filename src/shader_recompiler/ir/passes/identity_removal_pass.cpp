@@ -31,4 +31,4 @@ void IdentityRemovalPass(IR::BlockList& program) {
     }
 }
 
-} // namespace Shader::Optimization
+}

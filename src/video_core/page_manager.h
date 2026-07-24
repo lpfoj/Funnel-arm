@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <cstddef>
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
@@ -15,42 +14,47 @@ class Rasterizer;
 
 namespace VideoCore {
 
-class PageManager {
-    // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!
-    // Use the same page size as the tracker.
-    static constexpr size_t PM_PAGE_BITS = TRACKER_PAGE_BITS;
-    static constexpr size_t PM_PAGE_SIZE = TRACKER_BYTES_PER_PAGE;
+void BeginBulkGuestWrite(VAddr address, u64 size) noexcept;
+void EndBulkGuestWrite() noexcept;
 
-    // Keep the lock granularity the same as region granularity. (since each regions has
-    // itself a lock)
+class PageManager {
+    static constexpr size_t PAGE_BITS = TRACKER_PAGE_BITS;
+    static constexpr size_t PAGE_BYTES = TRACKER_BYTES_PER_PAGE;
+
     static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
 
 public:
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
     ~PageManager();
 
-    /// Register a range of mapped gpu memory.
+    static void PrepareBulkGuestRead(VAddr address, u64 size);
+    static void PrepareBulkGuestWrite(VAddr address, u64 size);
+    static void EnterBulkGuestWrite(VAddr address, u64 size);
+    static void LeaveBulkGuestWrite(VAddr address, u64 size);
+
     void OnGpuMap(VAddr address, size_t size);
 
-    /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);
 
-    /// Updates watches in the pages touching the specified region.
     template <bool track>
     void UpdatePageWatchers(VAddr addr, u64 size) const;
 
-    /// Updates watches in the pages touching the specified region using a mask.
+    void TrackPendingCompletionRead(VAddr addr, u64 size) const;
+    void UntrackPendingCompletionRead(VAddr addr, u64 size) const;
+
+    void TrackMemoryWaitWrite(VAddr addr, u64 size) const;
+    void UntrackMemoryWaitWrite(VAddr addr, u64 size) const;
+    [[nodiscard]] bool ConsumeMemoryWaitWriteFault(VAddr addr) const;
+
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
-    /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
-        return Common::AlignDown(addr, PM_PAGE_SIZE);
+        return Common::AlignDown(addr, PAGE_BYTES);
     }
 
-    /// Returns address of the next page.
     static constexpr VAddr GetNextPageAddr(VAddr addr) {
-        return Common::AlignUp(addr + 1, PM_PAGE_SIZE);
+        return Common::AlignUp(addr + 1, PAGE_BYTES);
     }
 
 private:
@@ -58,4 +62,4 @@ private:
     std::unique_ptr<Impl> impl;
 };
 
-} // namespace VideoCore
+}

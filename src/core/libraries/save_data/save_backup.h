@@ -25,7 +25,7 @@ enum class OrbisSaveDataEventType : u32 {
     BACKUP = 2,
     SAVE_DATA_MEMORY_SYNC = 3,
 
-    __DO_NOT_SAVE = 1000000, // This value is only for the backup thread
+    __DO_NOT_SAVE = 1000000,
 };
 
 struct BackupRequest {
@@ -39,7 +39,6 @@ struct BackupRequest {
     std::filesystem::path save_path{};
 };
 
-// No problem calling this function if the backup thread is already running
 void StartThread();
 
 void StopThread();
@@ -63,6 +62,6 @@ float GetProgress();
 
 void ClearProgress();
 
-} // namespace Backup
+}
 
-} // namespace Libraries::SaveData
+}

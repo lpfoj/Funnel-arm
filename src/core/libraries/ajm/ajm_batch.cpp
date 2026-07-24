@@ -144,7 +144,6 @@ AjmJob AjmStatisticsJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buf
             break;
         }
         case Identifier::AjmIdentReturnAddressBuf: {
-            // Ignore return address buffers.
             batch_buffer.Skip<AjmChunkBuffer>();
             break;
         }
@@ -158,7 +157,7 @@ AjmJob AjmStatisticsJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buf
             break;
         }
         default:
-            UNREACHABLE_MSG("Unknown chunk: {}", +header.ident);
+            UNREACHABLE_MSG("Unknown chunk: {}", header.ident);
         }
     }
 
@@ -206,7 +205,6 @@ AjmJob AjmJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buffer) {
     AjmJob job;
     job.instance_id = instance_id;
 
-    // Read parameters of a job
     while (!batch_buffer.IsEmpty()) {
         auto& header = batch_buffer.Peek<AjmChunkHeader>();
         switch (header.ident) {
@@ -235,7 +233,6 @@ AjmJob AjmJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buffer) {
             break;
         }
         case Identifier::AjmIdentReturnAddressBuf: {
-            // Ignore return address buffers.
             batch_buffer.Skip<AjmChunkBuffer>();
             break;
         }
@@ -257,14 +254,13 @@ AjmJob AjmJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buffer) {
             break;
         }
         default:
-            UNREACHABLE_MSG("Unknown chunk: {}", +header.ident);
+            UNREACHABLE_MSG("Unknown chunk: {}", header.ident);
         }
     }
 
     ASSERT(job_flags.has_value());
     job.flags = job_flags.value();
 
-    // Initialize sideband input parameters
     if (input_control_buffer.has_value()) {
         AjmBatchBuffer input_batch(input_control_buffer.value());
         const auto sideband_flags = job_flags->sideband_flags;
@@ -284,7 +280,6 @@ AjmJob AjmJobFromBatchBuffer(u32 instance_id, AjmBatchBuffer batch_buffer) {
         }
     }
 
-    // Initialize sideband output parameters
     if (output_control_buffer.has_value()) {
         AjmBatchBuffer output_batch(output_control_buffer.value());
         job.output.p_result = &output_batch.Consume<AjmSidebandResult>();
@@ -324,8 +319,6 @@ std::shared_ptr<AjmBatch> AjmBatch::FromBatchBuffer(std::span<u8> data) {
     while (!buffer.IsEmpty()) {
         auto& job_chunk = buffer.Consume<AjmChunkJob>();
         if (job_chunk.header.ident == AjmIdentInlineBuf) {
-            // Inline buffers are used to store sideband input data.
-            // We should just skip them as they do not require any special handling.
             buffer.Advance(job_chunk.size);
             continue;
         }
@@ -373,15 +366,6 @@ void* BatchJobControlBufferRa(void* p_buffer, u32 instance_id, u64 flags, void* 
     }
 
     {
-        // 0x0000'0000'C001'8007 (AJM_INSTANCE_STATISTICS):
-        // | sideband | reserved      | statistics        | command | codec    | revision |
-        // | 000      | 0000000000000 | 11000000000000011 | 0000    | 00000000 | 111      |
-        // statistics flags:
-        // STATISTICS_ENGINE | STATISTICS_ENGINE_PER_CODEC | ??STATISTICS_UNK?? | STATISTICS_MEMORY
-
-        // 0x0000'6000'0000'E7FF:
-        // | sideband | reserved                      | control | run | codec    | revision |
-        // | 011      | 00000000000000000000000000000 | 111     | 00  | 11111111 | 111      |
         const bool is_statistics = instance_id == AJM_INSTANCE_STATISTICS;
         flags &= is_statistics ? 0x0000'0000'C001'8007 : 0x0000'6000'0000'E7FF;
 
@@ -450,9 +434,6 @@ void* BatchJobRunBufferRa(void* p_buffer, u32 instance_id, u64 flags, void* p_da
     }
 
     {
-        // 0x0000'E000'0000'1FFF:
-        // | sideband | reserved                      | control | run | codec    | revision |
-        // | 111      | 00000000000000000000000000000 | 000     | 11  | 11111111 | 111      |
         flags &= 0x0000'E000'0000'1FFF;
 
         auto& chunk_flags = job_buffer.Consume<AjmChunkFlags>();
@@ -513,9 +494,6 @@ void* BatchJobRunSplitBufferRa(void* p_buffer, u32 instance_id, u64 flags,
     }
 
     {
-        // 0x0000'E000'0000'1FFF:
-        // | sideband | reserved                      | control | run | codec    | revision |
-        // | 111      | 00000000000000000000000000000 | 000     | 11  | 11111111 | 111      |
         flags &= 0x0000'E000'0000'1FFF;
 
         auto& chunk_flags = job_buffer.Consume<AjmChunkFlags>();
@@ -544,4 +522,4 @@ void* BatchJobRunSplitBufferRa(void* p_buffer, u32 instance_id, u64 flags,
     return job_buffer.GetCurrent();
 }
 
-} // namespace Libraries::Ajm
+}

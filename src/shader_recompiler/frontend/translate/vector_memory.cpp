@@ -7,9 +7,7 @@ namespace Shader::Gcn {
 
 void Translator::EmitVectorMemory(const GcnInst& inst) {
     switch (inst.opcode) {
-        // MUBUF / MTBUF
 
-        // Buffer load operations
     case Opcode::TBUFFER_LOAD_FORMAT_X:
         return BUFFER_LOAD(1, true, false, inst);
     case Opcode::TBUFFER_LOAD_FORMAT_XY:
@@ -46,7 +44,6 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
     case Opcode::BUFFER_LOAD_DWORDX4:
         return BUFFER_LOAD(4, false, false, inst);
 
-        // Buffer store operations
     case Opcode::BUFFER_STORE_FORMAT_X:
         return BUFFER_STORE(1, false, true, inst);
     case Opcode::BUFFER_STORE_FORMAT_XY:
@@ -79,7 +76,6 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
     case Opcode::BUFFER_STORE_DWORDX4:
         return BUFFER_STORE(4, false, false, inst);
 
-        // Buffer atomic operations
     case Opcode::BUFFER_ATOMIC_ADD:
         return BUFFER_ATOMIC(AtomicOp::Add, inst);
     case Opcode::BUFFER_ATOMIC_SWAP:
@@ -119,24 +115,19 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
     case Opcode::BUFFER_ATOMIC_FCMPSWAP:
         return BUFFER_ATOMIC<IR::F32>(AtomicOp::FCmpSwap, inst);
 
-        // MIMG
-        // Image load operations
     case Opcode::IMAGE_LOAD:
         return IMAGE_LOAD(false, inst);
     case Opcode::IMAGE_LOAD_MIP:
         return IMAGE_LOAD(true, inst);
 
-        // Buffer store operations
     case Opcode::IMAGE_STORE:
         return IMAGE_STORE(false, inst);
     case Opcode::IMAGE_STORE_MIP:
         return IMAGE_STORE(true, inst);
 
-        // Image misc operations
     case Opcode::IMAGE_GET_RESINFO:
         return IMAGE_GET_RESINFO(inst);
 
-        // Image atomic operations
     case Opcode::IMAGE_ATOMIC_SWAP:
         return IMAGE_ATOMIC(AtomicOp::Swap, inst);
     case Opcode::IMAGE_ATOMIC_CMPSWAP:
@@ -182,7 +173,6 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
     case Opcode::IMAGE_SAMPLE_CD:
         return IMAGE_SAMPLE(inst);
 
-        // Image gather operations
     case Opcode::IMAGE_GATHER4:
     case Opcode::IMAGE_GATHER4_L:
     case Opcode::IMAGE_GATHER4_LZ:
@@ -194,7 +184,6 @@ void Translator::EmitVectorMemory(const GcnInst& inst) {
     case Opcode::IMAGE_GATHER4_C_LZ_O:
         return IMAGE_GATHER(inst);
 
-        // Image misc operations
     case Opcode::IMAGE_GET_LOD:
         return IMAGE_GET_LOD(inst);
 
@@ -229,7 +218,6 @@ void Translator::BUFFER_LOAD(u32 num_dwords, bool is_inst_typed, bool is_buffer_
     } else {
         buffer_info.inst_data_fmt.Assign(AmdGpu::DataFormat::FormatInvalid);
     }
-    buffer_info.pc.Assign(pc);
 
     const IR::Value handle =
         ir.CompositeConstruct(ir.GetScalarReg(sharp), ir.GetScalarReg(sharp + 1),
@@ -297,7 +285,6 @@ void Translator::BUFFER_STORE(u32 num_dwords, bool is_inst_typed, bool is_buffer
     } else {
         buffer_info.inst_data_fmt.Assign(AmdGpu::DataFormat::FormatInvalid);
     }
-    buffer_info.pc.Assign(pc);
 
     const IR::Value handle =
         ir.CompositeConstruct(ir.GetScalarReg(sharp), ir.GetScalarReg(sharp + 1),
@@ -357,7 +344,6 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
     buffer_info.inst_offset.Assign(mubuf.offset);
     buffer_info.globally_coherent.Assign(mubuf.glc);
     buffer_info.system_coherent.Assign(mubuf.slc);
-    buffer_info.pc.Assign(pc);
 
     IR::Value vdata_val = [&] {
         if constexpr (std::is_same_v<T, IR::U32>) {
@@ -426,8 +412,6 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
     }
 }
 
-// Image Memory
-// MIMG
 
 void Translator::IMAGE_LOAD(bool has_mip, const GcnInst& inst) {
     const auto& mimg = inst.control.mimg;
@@ -593,16 +577,11 @@ IR::Value EmitImageSample(IR::IREmitter& ir, const GcnInst& inst, const IR::Scal
         info.has_derivatives.Assign(flags.test(MimgModifier::Derivative));
     }
 
-    // Load first dword of T# and the full S#. We will use them as the handle that will guide
-    // resource tracking pass where to read the sharps. This will later also get patched to the
-    // backend texture binding index.
     const IR::Value image_handle = ir.GetScalarReg(tsharp_reg);
     const IR::Value sampler_handle =
         ir.CompositeConstruct(ir.GetScalarReg(sampler_reg), ir.GetScalarReg(sampler_reg + 1),
                               ir.GetScalarReg(sampler_reg + 2), ir.GetScalarReg(sampler_reg + 3));
 
-    // Determine how many address registers need to be passed.
-    // The image type is unknown, so add all 4 possible base registers and resolve later.
     int num_addr_regs = 4;
     if (info.has_offset) {
         ++num_addr_regs;
@@ -614,12 +593,9 @@ IR::Value EmitImageSample(IR::IREmitter& ir, const GcnInst& inst, const IR::Scal
         ++num_addr_regs;
     }
     if (info.has_derivatives) {
-        // The image type is unknown, so add all 6 possible derivative registers and resolve later.
         num_addr_regs += 6;
     }
 
-    // Fetch all the address registers to pass in the IR instruction. There can be up to 13
-    // registers.
     const auto get_addr_reg = [&](int index) -> IR::F32 {
         if (index >= num_addr_regs) {
             return ir.Imm32(0.f);
@@ -634,11 +610,9 @@ IR::Value EmitImageSample(IR::IREmitter& ir, const GcnInst& inst, const IR::Scal
         ir.CompositeConstruct(get_addr_reg(8), get_addr_reg(9), get_addr_reg(10), get_addr_reg(11));
     const IR::Value address4 = get_addr_reg(12);
 
-    // Issue the placeholder IR instruction.
     IR::Value texel = ir.ImageSampleRaw(image_handle, sampler_handle, address1, address2, address3,
                                         address4, info);
     if (info.is_depth && !gather) {
-        // For non-gather depth sampling, only return a single value.
         texel = ir.CompositeExtract(texel, 0);
     }
     return texel;
@@ -675,10 +649,7 @@ void Translator::IMAGE_GATHER(const GcnInst& inst) {
     const IR::ScalarReg sampler_reg{inst.src[3].code * 4};
     const auto flags = MimgModifierFlags(mimg.mod);
 
-    // For gather4 instructions dmask selects which component to read and must have
-    // only one bit set to 1
     ASSERT_MSG(std::popcount(mimg.dmask) == 1, "Unexpected bits in gather dmask");
-    // should be always 1st (R) component for depth
     ASSERT(!flags.test(MimgModifier::Pcf) || mimg.dmask & 1);
 
     const IR::Value texel = EmitImageSample(ir, inst, tsharp_reg, sampler_reg, addr_reg, true, pc);
@@ -711,4 +682,4 @@ void Translator::IMAGE_GET_LOD(const GcnInst& inst) {
     }
 }
 
-} // namespace Shader::Gcn
+}

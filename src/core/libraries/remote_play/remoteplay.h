@@ -10,7 +10,6 @@ namespace Core::Loader {
 class SymbolsResolver;
 }
 
-// returning codes in sceRemoteplayGetConnectionStatus pstatus
 constexpr int ORBIS_REMOTEPLAY_CONNECTION_STATUS_DISCONNECT = 0;
 constexpr int ORBIS_REMOTEPLAY_CONNECTION_STATUS_CONNECT = 1;
 
@@ -61,4 +60,4 @@ int PS4_SYSV_ABI sceRemoteplayTerminate();
 int PS4_SYSV_ABI Func_1D5EE365ED5FADB3();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Remoteplay
+}

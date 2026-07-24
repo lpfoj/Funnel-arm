@@ -19,4 +19,4 @@ extern const char g_scm_date[];
 
 const std::string GetRemoteNameFromLink();
 
-} // namespace Common
+}

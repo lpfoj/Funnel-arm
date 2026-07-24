@@ -5,8 +5,8 @@
 #include <mutex>
 #include <stop_token>
 #include <unordered_map>
-#include <miniz.h>
 #include <queue>
+#include <zlib.h>
 
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -46,7 +46,6 @@ void ZlibTaskThread(const std::stop_token& stop) {
     while (!stop.stop_requested()) {
         InflateTask task;
         {
-            // Lock and pop from the task queue, unless stop has been requested.
             std::unique_lock lock(mutex);
             if (!task_queue_cv.wait(lock, stop, [&] { return !task_queue.empty(); })) {
                 break;
@@ -55,12 +54,11 @@ void ZlibTaskThread(const std::stop_token& stop) {
             task_queue.pop();
         }
 
-        mz_ulong decompressed_length = task.dst_length;
-        const auto ret = mz_uncompress(static_cast<u8*>(task.dst), &decompressed_length,
-                                       static_cast<const u8*>(task.src), task.src_length);
+        uLongf decompressed_length = task.dst_length;
+        const auto ret = uncompress(static_cast<Bytef*>(task.dst), &decompressed_length,
+                                    static_cast<const Bytef*>(task.src), task.src_length);
 
         {
-            // Lock, insert the new result, and push the finished request ID to the done queue.
             std::unique_lock lock(mutex);
             results[task.request_id] = InflateResult{
                 .length = static_cast<u32>(decompressed_length),
@@ -80,7 +78,6 @@ s32 PS4_SYSV_ABI sceZlibInitialize(const void* buffer, u32 length) {
         return ORBIS_ZLIB_ERROR_ALREADY_INITIALIZED;
     }
 
-    // Initialize with empty task data
     task_queue = std::queue<InflateTask>();
     done_queue = std::queue<u64>();
     results.clear();
@@ -92,7 +89,7 @@ s32 PS4_SYSV_ABI sceZlibInitialize(const void* buffer, u32 length) {
 
 s32 PS4_SYSV_ABI sceZlibInflate(const void* src, u32 src_len, void* dst, u32 dst_len,
                                 u64* request_id) {
-    LOG_DEBUG(Lib_Zlib, "called");
+    LOG_DEBUG(Lib_Zlib, "(STUBBED) called");
     if (!task_thread.Joinable()) {
         return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
     }
@@ -117,7 +114,7 @@ s32 PS4_SYSV_ABI sceZlibInflate(const void* src, u32 src_len, void* dst, u32 dst
 }
 
 s32 PS4_SYSV_ABI sceZlibWaitForDone(u64* request_id, const u32* timeout) {
-    LOG_DEBUG(Lib_Zlib, "called");
+    LOG_DEBUG(Lib_Zlib, "(STUBBED) called");
     if (!task_thread.Joinable()) {
         return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
     }
@@ -126,7 +123,6 @@ s32 PS4_SYSV_ABI sceZlibWaitForDone(u64* request_id, const u32* timeout) {
     }
 
     {
-        // Pop from the done queue, unless the timeout is reached.
         std::unique_lock lock(mutex);
         const auto pred = [] { return !done_queue.empty(); };
         if (timeout) {
@@ -143,7 +139,7 @@ s32 PS4_SYSV_ABI sceZlibWaitForDone(u64* request_id, const u32* timeout) {
 }
 
 s32 PS4_SYSV_ABI sceZlibGetResult(const u64 request_id, u32* dst_length, s32* status) {
-    LOG_DEBUG(Lib_Zlib, "called");
+    LOG_DEBUG(Lib_Zlib, "(STUBBED) called");
     if (!task_thread.Joinable()) {
         return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
     }
@@ -180,4 +176,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("2eDcGHC0YaM", "libSceZlib", 1, "libSceZlib", sceZlibGetResult);
 };
 
-} // namespace Libraries::Zlib
+}

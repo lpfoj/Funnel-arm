@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
-#include <ranges>
 #include <string_view>
 
 #include "assert.h"
@@ -14,13 +12,6 @@ namespace Common {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wtautological-undefined-compare"
 
-/**
- * @brief A null-terminated string with a fixed maximum length
- *        This class is not meant to be used as a general-purpose string class
- *        It is meant to be used as `char[N]` where memory layout is fixed
- * @tparam N Maximum length of the string
- * @tparam T Type of character
- */
 template <size_t N, typename T = char>
 class CString {
     T data[N]{};
@@ -159,7 +150,7 @@ public:
     };
 };
 
-static_assert(sizeof(CString<13>) == sizeof(char[13])); // Ensure size still matches a simple array
+static_assert(sizeof(CString<13>) == sizeof(char[13]));
 static_assert(std::weakly_incrementable<CString<13>::Iterator>);
 
 template <size_t N>
@@ -170,4 +161,4 @@ using CU16String = CString<N, char16_t>;
 
 #pragma clang diagnostic pop
 
-} // namespace Common
+}

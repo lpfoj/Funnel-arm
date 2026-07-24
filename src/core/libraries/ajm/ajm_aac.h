@@ -66,4 +66,4 @@ private:
     AAC_DECODER_INSTANCE* m_decoder = nullptr;
 };
 
-} // namespace Libraries::Ajm
+}

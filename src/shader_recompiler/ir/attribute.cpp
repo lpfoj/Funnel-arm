@@ -172,4 +172,4 @@ std::string NameOf(Attribute attribute) {
     return fmt::format("<reserved attribute {}>", static_cast<int>(attribute));
 }
 
-} // namespace Shader::IR
+}

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <iostream>
@@ -6,55 +6,52 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
-#include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "save_backup.h"
 #include "save_instance.h"
 
-constexpr auto OrbisSaveDataBlocksMin2 = 96;    // 3MiB
-constexpr auto OrbisSaveDataBlocksMax = 32768;  // 1 GiB
-constexpr std::string_view sce_sys = "sce_sys"; // system folder inside save
+constexpr auto OrbisSaveDataBlocksMin2 = 96;
+constexpr auto OrbisSaveDataBlocksMax = 32768;
+constexpr std::string_view sce_sys = "sce_sys";
 
 static Core::FileSys::MntPoints* g_mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
 
 namespace fs = std::filesystem;
 
-// clang-format off
 static const std::unordered_map<int, std::string> default_title = {
-    {0/*"ja_JP"*/, "セーブデータ"},
-    {1/*"en_US"*/, "Saved Data"},
-    {2/*"fr_FR"*/, "Données sauvegardées"},
-    {3/*"es_ES"*/, "Datos guardados"},
-    {4/*"de_DE"*/, "Gespeicherte Daten"},
-    {5/*"it_IT"*/, "Dati salvati"},
-    {6/*"nl_NL"*/, "Opgeslagen data"},
-    {7/*"pt_PT"*/, "Dados guardados"},
-    {8/*"ru_RU"*/, "Сохраненные данные"},
-    {9/*"ko_KR"*/, "저장 데이터"},
-    {10/*"zh_CN"*/, "保存数据"},
-    {12/*"fi_FI"*/, "Tallennetut tiedot"},
-    {13/*"sv_SE"*/, "Sparade data"},
-    {14/*"da_DK"*/, "Gemte data"},
-    {15/*"no_NO"*/, "Lagrede data"},
-    {16/*"pl_PL"*/, "Zapisane dane"},
-    {17/*"pt_BR"*/, "Dados salvos"},
-    {19/*"tr_TR"*/, "Kayıtlı Veriler"},
+    {0, "セーブデータ"},
+    {1, "Saved Data"},
+    {2, "Données sauvegardées"},
+    {3, "Datos guardados"},
+    {4, "Gespeicherte Daten"},
+    {5, "Dati salvati"},
+    {6, "Opgeslagen data"},
+    {7, "Dados guardados"},
+    {8, "Сохраненные данные"},
+    {9, "저장 데이터"},
+    {10, "保存数据"},
+    {12, "Tallennetut tiedot"},
+    {13, "Sparade data"},
+    {14, "Gemte data"},
+    {15, "Lagrede data"},
+    {16, "Zapisane dane"},
+    {17, "Dados salvos"},
+    {19, "Kayıtlı Veriler"},
 };
-// clang-format on
 
 namespace Libraries::SaveData {
 
 fs::path SaveInstance::MakeTitleSavePath(Libraries::UserService::OrbisUserServiceUserId user_id,
                                          std::string_view game_serial) {
-    return EmulatorSettings.GetHomeDir() / std::to_string(user_id) / "savedata" / game_serial;
+    return Config::GetSaveDataPath() / std::to_string(user_id) / game_serial;
 }
 
-fs::path SaveInstance::MakeDirSavePath(OrbisUserServiceUserId user_id, std::string_view game_serial,
-                                       std::string_view dir_name) {
-    return EmulatorSettings.GetHomeDir() / std::to_string(user_id) / "savedata" / game_serial /
-           dir_name;
+fs::path SaveInstance::MakeDirSavePath(Libraries::UserService::OrbisUserServiceUserId user_id,
+                                       std::string_view game_serial, std::string_view dir_name) {
+    return Config::GetSaveDataPath() / std::to_string(user_id) / game_serial / dir_name;
 }
 
 uint64_t SaveInstance::GetMaxBlockFromSFO(const PSF& psf) {
@@ -72,13 +69,12 @@ fs::path SaveInstance::GetParamSFOPath(const fs::path& dir_path) {
 
 void SaveInstance::SetupDefaultParamSFO(PSF& param_sfo, std::string dir_name,
                                         std::string game_serial) {
-    int locale = EmulatorSettings.GetConsoleLanguage();
+    int locale = Config::GetLanguage();
     if (!default_title.contains(locale)) {
-        locale = 1; // default to en_US if not found
+        locale = 1;
     }
 
 #define P(type, key, ...) param_sfo.Add##type(std::string{key}, __VA_ARGS__)
-    // TODO Link with user service
     P(Binary, SaveParams::ACCOUNT_ID, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
     P(String, SaveParams::MAINTITLE, default_title.at(locale));
     P(String, SaveParams::SUBTITLE, "");
@@ -147,7 +143,7 @@ void SaveInstance::SetupAndMount(bool read_only, bool copy_icon, bool ignore_cor
     if (mounted) {
         UNREACHABLE_MSG("Save instance is already mounted");
     }
-    this->exists = fs::exists(param_sfo_path); // check again just in case
+    this->exists = fs::exists(param_sfo_path);
     if (!exists) {
         CreateFiles();
         if (copy_icon) {
@@ -223,4 +219,4 @@ void SaveInstance::CreateFiles() {
     }
 }
 
-} // namespace Libraries::SaveData
+}

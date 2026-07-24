@@ -435,4 +435,4 @@ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
     ms_image_copy_pl.emplace_back(key, std::move(pipeline));
 }
 
-} // namespace VideoCore
+}

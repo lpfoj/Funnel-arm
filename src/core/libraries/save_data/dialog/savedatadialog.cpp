@@ -162,4 +162,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceSaveDataDialogUpdateStatus);
 };
 
-} // namespace Libraries::SaveData::Dialog
+}

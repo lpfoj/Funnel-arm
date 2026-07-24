@@ -34,46 +34,17 @@ static int ConvertReturnErrorCode(int retval) {
 #else
         switch (errno) {
 #endif
-#ifndef _WIN32 // These errorcodes don't exist in WinSock
+#ifndef _WIN32
             ERROR_CASE(EPERM)
             ERROR_CASE(ENOENT)
-            // ERROR_CASE(ESRCH)
-            // ERROR_CASE(EIO)
-            // ERROR_CASE(ENXIO)
-            // ERROR_CASE(E2BIG)
-            // ERROR_CASE(ENOEXEC)
-            // ERROR_CASE(EDEADLK)
             ERROR_CASE(ENOMEM)
-            // ERROR_CASE(ECHILD)
-            // ERROR_CASE(EBUSY)
             ERROR_CASE(EEXIST)
-            // ERROR_CASE(EXDEV)
             ERROR_CASE(ENODEV)
-            // ERROR_CASE(ENOTDIR)
-            // ERROR_CASE(EISDIR)
             ERROR_CASE(ENFILE)
-            // ERROR_CASE(ENOTTY)
-            // ERROR_CASE(ETXTBSY)
-            // ERROR_CASE(EFBIG)
             ERROR_CASE(ENOSPC)
-            // ERROR_CASE(ESPIPE)
-            // ERROR_CASE(EROFS)
-            // ERROR_CASE(EMLINK)
             ERROR_CASE(EPIPE)
-            // ERROR_CASE(EDOM)
-            // ERROR_CASE(ERANGE)
-            // ERROR_CASE(ENOLCK)
-            // ERROR_CASE(ENOSYS)
-            // ERROR_CASE(EIDRM)
-            // ERROR_CASE(EOVERFLOW)
-            // ERROR_CASE(EILSEQ)
-            // ERROR_CASE(ENOTSUP)
             ERROR_CASE(ECANCELED)
-            // ERROR_CASE(EBADMSG)
             ERROR_CASE(ENODATA)
-            // ERROR_CASE(ENOSR)
-            // ERROR_CASE(ENOSTR)
-            // ERROR_CASE(ETIME)
 #endif
             ERROR_CASE(EINTR)
             ERROR_CASE(EBADF)
@@ -114,7 +85,6 @@ static int ConvertReturnErrorCode(int retval) {
         *Libraries::Kernel::__Error() = ORBIS_NET_EINTERNAL;
         return -1;
     }
-    // if it is 0 or positive return it as it is
     return retval;
 }
 
@@ -193,7 +163,6 @@ static int convertOrbisFlagsToPosix(int sock_type, int sce_flags) {
     if (sce_flags & ORBIS_NET_MSG_DONTWAIT)
         posix_flags |= MSG_DONTWAIT;
 #endif
-    // MSG_WAITALL is only valid for stream sockets
     if ((sce_flags & ORBIS_NET_MSG_WAITALL) &&
         ((sock_type == ORBIS_NET_SOCK_STREAM) || (sock_type == ORBIS_NET_SOCK_STREAM_P2P)))
         posix_flags |= MSG_WAITALL;
@@ -201,8 +170,6 @@ static int convertOrbisFlagsToPosix(int sock_type, int sce_flags) {
     return posix_flags;
 }
 
-// On Windows, MSG_DONTWAIT is not handled natively by recv/send.
-// This function uses select() with zero timeout to simulate non-blocking behavior.
 static int socket_is_ready(int sock, bool is_read = true) {
     fd_set fds{};
     FD_ZERO(&fds);
@@ -227,7 +194,6 @@ int PosixSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
     bool waitAll = (flags & ORBIS_NET_MSG_WAITALL) != 0;
     bool dontWait = (flags & ORBIS_NET_MSG_DONTWAIT) != 0;
 
-    // stream socket with multiple buffers
     bool use_wsamsg =
         (socket_type == ORBIS_NET_SOCK_STREAM || socket_type == ORBIS_NET_SOCK_STREAM_P2P) &&
         msg->msg_iovlen > 1;
@@ -245,13 +211,11 @@ int PosixSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
 
             int sent = 0;
             if (use_wsamsg) {
-                // only call WSASendMsg if we have multiple buffers
                 LPFN_WSASENDMSG wsasendmsg = nullptr;
                 GUID guid = WSAID_WSASENDMSG;
                 DWORD bytes = 0;
                 if (WSAIoctl(sock, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid),
                              &wsasendmsg, sizeof(wsasendmsg), &bytes, nullptr, nullptr) != 0) {
-                    // fallback to send()
                     sent = ::send(sock, buf, remaining, 0);
                 } else {
                     DWORD bytesSent = 0;
@@ -316,7 +280,6 @@ int PosixSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
     bool waitAll = (flags & ORBIS_NET_MSG_WAITALL) != 0;
     bool dontWait = (flags & ORBIS_NET_MSG_DONTWAIT) != 0;
 
-    // stream socket with multiple buffers
     bool use_wsarecvmsg =
         (socket_type == ORBIS_NET_SOCK_STREAM || socket_type == ORBIS_NET_SOCK_STREAM_P2P) &&
         msg->msg_iovlen > 1;
@@ -326,22 +289,19 @@ int PosixSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
         size_t remaining = msg->msg_iov[i].iov_len;
 
         while (remaining > 0) {
-            // emulate DONTWAIT
             if (dontWait) {
                 int ready = socket_is_ready(sock, true);
                 if (ready <= 0)
-                    return ready; // returns ORBIS_NET_ERROR_EWOULDBLOCK or error
+                    return ready;
             }
 
             int received = 0;
             if (use_wsarecvmsg) {
-                // only call WSARecvMsg if multiple buffers + stream
                 LPFN_WSARECVMSG wsarecvmsg = nullptr;
                 GUID guid = WSAID_WSARECVMSG;
                 DWORD bytes = 0;
                 if (WSAIoctl(sock, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid),
                              &wsarecvmsg, sizeof(wsarecvmsg), &bytes, nullptr, nullptr) != 0) {
-                    // fallback to recv()
                     received = ::recv(sock, buf, remaining, 0);
                     if (received == SOCKET_ERROR)
                         return ConvertReturnErrorCode(WSAGetLastError());
@@ -354,7 +314,6 @@ int PosixSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
                     received = bytesReceived;
                 }
             } else {
-                // fallback to recv() for UDP or single-buffer
                 received = ::recv(sock, buf, remaining, 0);
                 if (received == SOCKET_ERROR)
                     return ConvertReturnErrorCode(WSAGetLastError());
@@ -364,7 +323,6 @@ int PosixSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
             remaining -= received;
             buf += received;
 
-            // stop after first receive if WAITALL is not set
             if (!waitAll)
                 break;
         }
@@ -431,8 +389,6 @@ int PosixSocket::Connect(const OrbisNetSockaddr* addr, u32 namelen) {
     convertOrbisNetSockaddrToPosix(addr, &addr2);
     int result = ::connect(sock, &addr2, sizeof(sockaddr_in));
 #ifdef _WIN32
-    // Winsock returns EWOULDBLOCK where real hardware returns EINPROGRESS
-    // Step in here on errors to address this.
     if (result == -1) {
         if (WSAGetLastError() == WSAEWOULDBLOCK) {
             WSASetLastError(WSAEINPROGRESS);
@@ -544,7 +500,7 @@ int PosixSocket::SetSocketOptions(int level, int optname, const void* optval, u3
 
         case ORBIS_NET_SO_NAME:
             *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
-            return -1; // don't support set for name
+            return -1;
         case ORBIS_NET_SO_NBIO: {
             if (optlen < sizeof(sockopt_so_nbio)) {
                 *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
@@ -560,13 +516,9 @@ int PosixSocket::SetSocketOptions(int level, int optname, const void* optval, u3
             return ConvertReturnErrorCode(ioctl(sock, FIONBIO, &sockopt_so_nbio));
 #endif
         }
-        case ORBIS_NET_SO_ACCEPTTIMEO:
-            LOG_ERROR(Lib_Net, "Unhandled option ORBIS_NET_SO_ACCEPTTIMEO");
-            return ORBIS_OK;
         }
     } else if (native_level == IPPROTO_IP) {
         switch (optname) {
-            // CASE_SETSOCKOPT(IP_HDRINCL);
             CASE_SETSOCKOPT(IP_TOS);
             CASE_SETSOCKOPT(IP_TTL);
             CASE_SETSOCKOPT(IP_MULTICAST_IF);
@@ -637,8 +589,7 @@ int PosixSocket::GetSocketOptions(int level, int optname, void* optval, u32* opt
             CASE_GETSOCKOPT_VALUE(ORBIS_NET_SO_ONESBCAST, sockopt_so_onesbcast);
             CASE_GETSOCKOPT_VALUE(ORBIS_NET_SO_USECRYPTO, sockopt_so_usecrypto);
             CASE_GETSOCKOPT_VALUE(ORBIS_NET_SO_USESIGNATURE, sockopt_so_usesignature);
-            CASE_GETSOCKOPT_VALUE(ORBIS_NET_SO_NAME,
-                                  (char)0); // writes an empty string to the output buffer
+            CASE_GETSOCKOPT_VALUE(ORBIS_NET_SO_NAME, (char)0);
         case ORBIS_NET_SO_ERROR_EX: {
             socklen_t optlen_temp = *optlen;
             auto retval = ConvertReturnErrorCode(
@@ -704,9 +655,8 @@ int PosixSocket::fstat(Libraries::Kernel::OrbisKernelStat* sb) {
     sb->st_size = st.st_size;
     sb->st_blocks = st.st_blocks;
     sb->st_blksize = st.st_blksize;
-    // sb->st_flags = st.st_flags;
     return ConvertReturnErrorCode(result);
 #endif
 }
 
-} // namespace Libraries::Net
+}

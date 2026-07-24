@@ -15,4 +15,4 @@ public:
     static AjmInstanceStatistics& Getinstance();
 };
 
-} // namespace Libraries::Ajm
+}

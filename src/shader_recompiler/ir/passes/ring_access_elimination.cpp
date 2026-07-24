@@ -172,4 +172,4 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
     }
 }
 
-} // namespace Shader::Optimization
+}

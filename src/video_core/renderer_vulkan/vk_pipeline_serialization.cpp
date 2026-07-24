@@ -1,8 +1,8 @@
-// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/config.h"
 #include "common/serdes.h"
-#include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
@@ -10,12 +10,18 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#include <chrono>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/resource.h>
+#endif
+
 namespace Serialization {
-/* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 2u;
-static constexpr u32 ShaderMetaVersion = 2u;
-static constexpr u32 PipelineKeyVersion = 2u;
-} // namespace Serialization
+static constexpr u32 ShaderBinaryVersion = 22u;
+static constexpr u32 ShaderMetaVersion = 1u;
+static constexpr u32 PipelineKeyVersion = 1u;
+}
 
 namespace Vulkan {
 
@@ -29,7 +35,7 @@ void RegisterPipelineData(const ComputePipelineKey& key,
     Serialization::Writer pldata{ar};
 
     pldata.Write(Serialization::PipelineKeyVersion);
-    pldata.Write(u32{1}); // compute
+    pldata.Write(u32{1});
 
     key.Serialize(ar);
     sdata.Serialize(ar);
@@ -48,7 +54,7 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
     Serialization::Writer pldata{ar};
 
     pldata.Write(Serialization::PipelineKeyVersion);
-    pldata.Write(u32{0}); // graphics
+    pldata.Write(u32{0});
 
     key.Serialize(ar);
     sdata.Serialize(ar);
@@ -131,17 +137,18 @@ bool ComputePipelineKey::Deserialize(Serialization::Archive& ar) {
 }
 
 void ComputePipeline::SerializationSupport::Serialize(Serialization::Archive& ar) const {
-    // Nothing here yet
     return;
 }
 
 bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
-    // Nothing here yet
     return true;
 }
 
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     compute_key.Deserialize(ar);
+    if (compute_pipelines.contains(compute_key)) {
+        return true;
+    }
 
     ComputePipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -210,6 +217,9 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     graphics_key.Deserialize(ar);
+    if (graphics_pipelines.contains(graphics_key)) {
+        return true;
+    }
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
@@ -265,8 +275,6 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
-    // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
-    // at the exact position rather than append
 
     vk::ShaderModule module{};
 
@@ -277,7 +285,6 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     } else {
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
-            // If the permutation is already preloaded, make sure it has the same permutation index
             const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
             ASSERT_MSG(perm_idx == idx, "Permutation {} is already inserted at {}! ({}_{:x})",
                        perm_idx, idx, program->info.stage, program->info.pgm_hash);
@@ -295,13 +302,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
-    if (!EmulatorSettings.IsPipelineCacheEnabled()) {
+    if (!Config::isPipelineCacheEnabled() || Config::patchShaders()) {
         return;
     }
 
     Storage::DataBase::Instance().Open();
 
-    // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     if (profile_data.empty()) {
@@ -317,7 +323,7 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render,
                     "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
                     profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
+        Storage::DataBase::Instance().FinishPreload();
         return;
     }
 
@@ -326,24 +332,38 @@ void PipelineCache::WarmUp() {
     if (cached_profile != profile) {
         LOG_WARNING(Render,
                     "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+        Storage::DataBase::Instance().FinishPreload();
         return;
     }
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+#ifdef __ANDROID__
+    constexpr u32 kWarmPipelineLimit = 24;
+    constexpr auto kWarmTimeBudget = std::chrono::milliseconds{1500};
+    const auto warm_start = std::chrono::steady_clock::now();
+    bool budget_reached = false;
+    std::vector<std::vector<u8>> deferred_pipeline_blobs;
+#endif
 
     Storage::DataBase::Instance().ForEachBlob(
-        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) -> bool {
             ++num_total_pipelines;
-
+#ifdef __ANDROID__
+            if (num_pipelines >= kWarmPipelineLimit ||
+                std::chrono::steady_clock::now() - warm_start >= kWarmTimeBudget) {
+                budget_reached = true;
+                deferred_pipeline_blobs.push_back(std::move(data));
+                return true;
+            }
+#endif
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
 
             u32 version{};
             pldata.Read(version);
             if (version != Serialization::PipelineKeyVersion) {
-                return;
+                return true;
             }
 
             u32 is_compute{};
@@ -359,22 +379,127 @@ void PipelineCache::WarmUp() {
             if (result) {
                 ++num_pipelines;
             }
+            return true;
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+#ifdef __ANDROID__
+    const auto warm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - warm_start)
+                             .count();
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_PIPELINE_WARMUP_BOUNDED] loaded=%u visited=%u limit=%u "
+                        "elapsedMs=%lld budgetReached=%d deferred=%zu",
+                        num_pipelines, num_total_pipelines, kWarmPipelineLimit,
+                        static_cast<long long>(warm_ms), budget_reached ? 1 : 0,
+                        deferred_pipeline_blobs.size());
+#endif
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
     }
 
     Storage::DataBase::Instance().FinishPreload();
+#ifdef __ANDROID__
+    if (!deferred_pipeline_blobs.empty()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_PIPELINE_WARMUP_DEFERRED] skipped=%zu reason=live_title_android",
+            deferred_pipeline_blobs.size());
+    }
+#endif
+}
+
+void PipelineCache::StartBackgroundWarmUp(
+    std::vector<std::vector<u8>>&& pipeline_blobs) {
+#ifdef __ANDROID__
+    StopBackgroundWarmUp();
+    background_warmup_active.store(false, std::memory_order_release);
+    background_warmup_worker = std::jthread{
+        [this, blobs = std::move(pipeline_blobs)](const std::stop_token stop_token) mutable {
+            (void)::setpriority(PRIO_PROCESS, 0, 8);
+            constexpr auto kFirstFrameGrace = std::chrono::seconds{60};
+            const auto grace_deadline = std::chrono::steady_clock::now() + kFirstFrameGrace;
+            while (!stop_token.stop_requested() &&
+                   std::chrono::steady_clock::now() < grace_deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            }
+            if (stop_token.stop_requested()) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_PIPELINE_WARMUP_BACKGROUND] loaded=0 attempted=0 total=%zu "
+                    "elapsedMs=0 stopped=1 graceMs=%lld",
+                    blobs.size(),
+                    static_cast<long long>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(kFirstFrameGrace)
+                            .count()));
+                return;
+            }
+            background_warmup_active.store(true, std::memory_order_release);
+            const auto started = std::chrono::steady_clock::now();
+            u32 attempted = 0;
+            u32 loaded = 0;
+            for (std::vector<u8>& data : blobs) {
+                if (stop_token.stop_requested()) {
+                    break;
+                }
+                while (background_warmup_foreground_waiters.load(
+                           std::memory_order_acquire) != 0 &&
+                       !stop_token.stop_requested()) {
+                    std::this_thread::yield();
+                }
+                if (stop_token.stop_requested()) {
+                    break;
+                }
+                std::unique_lock background_lock{background_warmup_mutex};
+                ++attempted;
+                Serialization::Archive ar{std::move(data)};
+                Serialization::Reader pldata{ar};
+                u32 version{};
+                pldata.Read(version);
+                if (version != Serialization::PipelineKeyVersion) {
+                    continue;
+                }
+                u32 is_compute{};
+                pldata.Read(is_compute);
+                const bool result = is_compute ? LoadComputePipeline(ar)
+                                               : LoadGraphicsPipeline(ar);
+                loaded += result ? 1u : 0u;
+            }
+            background_warmup_active.store(false, std::memory_order_release);
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - started)
+                                        .count();
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_PIPELINE_WARMUP_BACKGROUND] loaded=%u attempted=%u total=%zu "
+                "elapsedMs=%lld stopped=%d graceMs=%lld",
+                loaded, attempted, blobs.size(), static_cast<long long>(elapsed_ms),
+                stop_token.stop_requested() ? 1 : 0,
+                static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(kFirstFrameGrace)
+                        .count()));
+        }};
+#else
+    (void)pipeline_blobs;
+#endif
+}
+
+void PipelineCache::StopBackgroundWarmUp() {
+    if (!background_warmup_worker.joinable()) {
+        return;
+    }
+    background_warmup_worker.request_stop();
+    background_warmup_worker.join();
+    background_warmup_active.store(false, std::memory_order_release);
 }
 
 void PipelineCache::Sync() {
+    StopBackgroundWarmUp();
     Storage::DataBase::Instance().Close();
 }
 
-} // namespace Vulkan
+}
 
 namespace Shader {
 
@@ -419,21 +544,28 @@ bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
 void PersistentSrtInfo::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer srt{ar};
 
-    srt.Write(this, sizeof(*this));
+    srt.Write(walker_func_size);
+    srt.Write(flattened_bufsize_dw);
     if (walker_func_size) {
         srt.Write(reinterpret_cast<void*>(walker_func), walker_func_size);
     }
+    srt.Write(portable_nodes);
+    srt.Write(portable_copies);
 }
 
 bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader srt{ar};
 
-    srt.Read(this, sizeof(*this));
-
+    srt.Read(walker_func_size);
+    srt.Read(flattened_bufsize_dw);
     if (walker_func_size) {
         walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size);
         ar.Advance(walker_func_size);
     }
+    portable_nodes.clear();
+    portable_copies.clear();
+    srt.Read(portable_nodes);
+    srt.Read(portable_copies);
 
     return true;
 }
@@ -488,4 +620,4 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
     return true;
 }
 
-} // namespace Shader
+}

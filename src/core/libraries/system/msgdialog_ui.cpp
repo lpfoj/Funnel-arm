@@ -16,21 +16,26 @@ using namespace Libraries::MsgDialog;
 static constexpr ImVec2 BUTTON_SIZE{100.0f, 30.0f};
 static constexpr float PROGRESS_BAR_WIDTH{0.8f};
 
+static DialogResult utility_result{};
+static Status utility_status{Status::NONE};
+static MsgDialogUi utility_dialog;
+static MsgDialogState utility_state;
+
 struct {
     int count = 0;
     const char* text1;
     const char* text2;
 } static constexpr user_button_texts[] = {
-    {1, "OK"},             // 0 OK
-    {2, "Yes", "No"},      // 1 YESNO
-    {0},                   // 2 NONE
-    {2, "OK", "Cancel"},   // 3 OK_CANCEL
-    {},                    // 4 !!NOP
-    {1, "Wait"},           // 5 WAIT
-    {2, "Wait", "Cancel"}, // 6 WAIT_CANCEL
-    {2, "Yes", "No"},      // 7 YESNO_FOCUS_NO
-    {2, "OK", "Cancel"},   // 8 OK_CANCEL_FOCUS_CANCEL
-    {0xFF},                // 9 TWO_BUTTONS
+    {1, "OK"},
+    {2, "Yes", "No"},
+    {0},
+    {2, "OK", "Cancel"},
+    {},
+    {1, "Wait"},
+    {2, "Wait", "Cancel"},
+    {2, "Yes", "No"},
+    {2, "OK", "Cancel"},
+    {0xFF},
 };
 static_assert(std::size(user_button_texts) == static_cast<int>(ButtonType::TWO_BUTTONS) + 1);
 
@@ -97,7 +102,7 @@ void MsgDialogUi::DrawUser() {
     }
     ASSERT(button_type <= ButtonType::TWO_BUTTONS);
     auto [count, text1, text2] = user_button_texts[static_cast<u32>(button_type)];
-    if (count == 0xFF) { // TWO_BUTTONS -> User defined message
+    if (count == 0xFF) {
         count = 2;
         text1 = btn_param1.c_str();
         text2 = btn_param2.c_str();
@@ -109,7 +114,6 @@ void MsgDialogUi::DrawUser() {
     });
     BeginGroup();
     if (count > 0) {
-        // First button at the right, so we render the second button first
         if (count == 2) {
             PushID(2);
             if (Button(text2, BUTTON_SIZE)) {
@@ -174,18 +178,17 @@ void MsgDialogUi::DrawProgressBar() {
 struct {
     const char* text;
 } static constexpr system_message_texts[] = {
-    "No product available in the store.",            // TRC_EMPTY_STORE
-    "PSN chat restriction.",                         // TRC_PSN_CHAT_RESTRICTION
-    "User-generated Media restriction",              // TRC_PSN_UGC_RESTRICTION
-    nullptr,                                         // !!NOP
-    "Camera not connected.",                         // CAMERA_NOT_CONNECTED
-    "Warning: profile picture and name are not set", // WARNING_PROFILE_PICTURE_AND_NAME_NOT_SHARED
+    "No product available in the store.",
+    "PSN chat restriction.",
+    "User-generated Media restriction",
+    nullptr,
+    "Camera not connected.",
+    "Warning: profile picture and name are not set",
 };
 static_assert(std::size(system_message_texts) ==
               static_cast<int>(SystemMessageType::WARNING_PROFILE_PICTURE_AND_NAME_NOT_SHARED) + 1);
 
 void MsgDialogUi::DrawSystemMessage() {
-    // TODO: Implement go to settings & user profile
     const auto& [msg_type] = state->GetState<MsgDialogState::SystemState>();
     ASSERT(msg_type <= SystemMessageType::WARNING_PROFILE_PICTURE_AND_NAME_NOT_SHARED);
     auto [msg] = system_message_texts[static_cast<u32>(msg_type)];
@@ -283,18 +286,15 @@ void MsgDialogUi::Draw() {
 }
 
 DialogResult Libraries::MsgDialog::ShowMsgDialog(MsgDialogState p_state, bool block) {
-    static DialogResult result{};
-    static Status status;
-    static MsgDialogUi dialog;
-    static MsgDialogState state;
-    dialog = MsgDialogUi{};
-    status = Status::RUNNING;
-    state = std::move(p_state);
-    dialog = MsgDialogUi(&state, &status, &result);
+    utility_dialog = MsgDialogUi{};
+    utility_result = {};
+    utility_status = Status::RUNNING;
+    utility_state = std::move(p_state);
+    utility_dialog = MsgDialogUi(&utility_state, &utility_status, &utility_result);
     if (block) {
-        while (status == Status::RUNNING) {
+        while (utility_status == Status::RUNNING) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
-    return result;
+    return utility_result;
 }

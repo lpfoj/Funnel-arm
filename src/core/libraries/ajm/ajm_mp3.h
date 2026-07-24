@@ -28,7 +28,6 @@ enum AjmMp3CodecFlags : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(AjmMp3CodecFlags)
 
-// 11-bit syncword if MPEG 2.5 extensions are enabled
 static constexpr u8 SYNCWORDH = 0xff;
 static constexpr u8 SYNCWORDL = 0xe0;
 
@@ -101,4 +100,4 @@ private:
     u32 m_frame_samples = 0;
 };
 
-} // namespace Libraries::Ajm
+}

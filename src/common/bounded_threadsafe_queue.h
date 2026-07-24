@@ -14,7 +14,7 @@ namespace Common {
 
 namespace detail {
 constexpr std::size_t DefaultCapacity = 0x1000;
-} // namespace detail
+}
 
 template <typename T, std::size_t Capacity = detail::DefaultCapacity>
 class SPSCQueue {
@@ -74,12 +74,10 @@ private:
         const std::size_t write_index = m_write_index.load(std::memory_order::relaxed);
 
         if constexpr (Mode == PushMode::Try) {
-            // Check if we have free slots to write to.
             if ((write_index - m_read_index.load(std::memory_order::acquire)) == Capacity) {
                 return false;
             }
         } else if constexpr (Mode == PushMode::Wait) {
-            // Wait until we have free slots to write to.
             std::unique_lock lock{producer_cv_mutex};
             producer_cv.wait(lock, [this, write_index] {
                 return (write_index - m_read_index.load(std::memory_order::acquire)) < Capacity;
@@ -88,16 +86,12 @@ private:
             static_assert(Mode < PushMode::Count, "Invalid PushMode.");
         }
 
-        // Determine the position to write to.
         const std::size_t pos = write_index % Capacity;
 
-        // Emplace into the queue.
         new (std::addressof(m_data[pos])) T(std::forward<Args>(args)...);
 
-        // Increment the write index.
         ++m_write_index;
 
-        // Notify the consumer that we have pushed into the queue.
         std::scoped_lock lock{consumer_cv_mutex};
         consumer_cv.notify_one();
 
@@ -109,18 +103,15 @@ private:
         const std::size_t read_index = m_read_index.load(std::memory_order::relaxed);
 
         if constexpr (Mode == PopMode::Try) {
-            // Check if the queue is empty.
             if (read_index == m_write_index.load(std::memory_order::acquire)) {
                 return false;
             }
         } else if constexpr (Mode == PopMode::Wait) {
-            // Wait until the queue is not empty.
             std::unique_lock lock{consumer_cv_mutex};
             consumer_cv.wait(lock, [this, read_index] {
                 return read_index != m_write_index.load(std::memory_order::acquire);
             });
         } else if constexpr (Mode == PopMode::WaitWithStopToken) {
-            // Wait until the queue is not empty.
             std::unique_lock lock{consumer_cv_mutex};
             Common::CondvarWait(consumer_cv, lock, stop_token, [this, read_index] {
                 return read_index != m_write_index.load(std::memory_order::acquire);
@@ -132,16 +123,12 @@ private:
             static_assert(Mode < PopMode::Count, "Invalid PopMode.");
         }
 
-        // Determine the position to read from.
         const std::size_t pos = read_index % Capacity;
 
-        // Pop the data off the queue, moving it.
         t = std::move(m_data[pos]);
 
-        // Increment the read index.
         ++m_read_index;
 
-        // Notify the producer that we have popped off the queue.
         std::scoped_lock lock{producer_cv_mutex};
         producer_cv.notify_one();
 
@@ -245,4 +232,4 @@ private:
     std::mutex read_mutex;
 };
 
-} // namespace Common
+}

@@ -263,7 +263,7 @@ private:
     std::vector<u32> free_list;
 };
 
-} // namespace Common
+}
 
 template <>
 struct std::hash<Common::SlotId> {

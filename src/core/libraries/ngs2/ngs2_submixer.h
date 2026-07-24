@@ -123,4 +123,4 @@ struct OrbisNgs2SubmixerRackInfo {
     u32 maxInputs;
 };
 
-} // namespace Libraries::Ngs2
+}

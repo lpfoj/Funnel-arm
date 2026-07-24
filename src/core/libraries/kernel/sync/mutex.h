@@ -77,4 +77,4 @@ private:
 #endif
 };
 
-} // namespace Libraries::Kernel
+}

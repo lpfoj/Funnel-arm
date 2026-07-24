@@ -351,4 +351,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceGameLiveStreamingLaunchLiveViewer);
 };
 
-} // namespace Libraries::GameLiveStreaming
+}

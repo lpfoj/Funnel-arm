@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm> // std::max, std::min
+#include <algorithm>
 #include "core/libraries/avplayer/avplayer_file_streamer.h"
 
 extern "C" {
@@ -35,7 +35,6 @@ bool AvPlayerFileStreamer::Init(std::string_view path) {
         return false;
     }
     m_file_size = m_file_replacement.size(ptr);
-    // avio_buffer is deallocated in `avio_context_free`
     const auto avio_buffer = reinterpret_cast<u8*>(av_malloc(AVPLAYER_AVIO_BUFFER_SIZE));
     m_avio_context =
         avio_alloc_context(avio_buffer, AVPLAYER_AVIO_BUFFER_SIZE, 0, this,
@@ -71,14 +70,15 @@ s64 AvPlayerFileStreamer::Seek(void* opaque, s64 offset, int whence) {
         return self->m_file_size;
     }
 
-    if (whence == SEEK_CUR) {
+    const int origin = whence & ~AVSEEK_FORCE;
+    if (origin == SEEK_CUR) {
         self->m_position =
             std::min(u64(std::max(s64(0), s64(self->m_position) + offset)), self->m_file_size);
         return self->m_position;
-    } else if (whence == SEEK_SET) {
+    } else if (origin == SEEK_SET) {
         self->m_position = std::min(u64(std::max(s64(0), offset)), self->m_file_size);
         return self->m_position;
-    } else if (whence == SEEK_END) {
+    } else if (origin == SEEK_END) {
         self->m_position =
             std::min(u64(std::max(s64(0), s64(self->m_file_size) + offset)), self->m_file_size);
         return self->m_position;
@@ -87,4 +87,4 @@ s64 AvPlayerFileStreamer::Seek(void* opaque, s64 offset, int whence) {
     return -1;
 }
 
-} // namespace Libraries::AvPlayer
+}

@@ -9,7 +9,6 @@ namespace Shader::Gcn {
 
 void Translator::EmitVectorAlu(const GcnInst& inst) {
     switch (inst.opcode) {
-        // VOP2
     case Opcode::V_CNDMASK_B32:
         return V_CNDMASK_B32(inst);
     case Opcode::V_READLANE_B32:
@@ -100,18 +99,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_CVT_PKNORM_I16_F32(inst);
     case Opcode::V_CVT_PKRTZ_F16_F32:
         return V_CVT_PKRTZ_F16_F32(inst);
-    case Opcode::V_ADD_F16:
-        return V_ADD_F16(inst);
-    case Opcode::V_SUB_F16:
-        return V_SUB_F16(inst);
-    case Opcode::V_MUL_F16:
-        return V_MUL_F16(inst);
-    case Opcode::V_MAX_F16:
-        return V_MAX_F16(inst);
-    case Opcode::V_MIN_F16:
-        return V_MIN_F16(inst);
 
-        // VOP1
     case Opcode::V_MOV_B32:
         return V_MOV(inst);
     case Opcode::V_READFIRSTLANE_B32:
@@ -219,8 +207,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_MOVRELSD_B32:
         return V_MOVRELSD_B32(inst);
 
-        // VOPC
-        //     V_CMP_{OP16}_F32
     case Opcode::V_CMP_F_F32:
         return V_CMP_F32(ConditionOp::F, false, inst);
     case Opcode::V_CMP_LT_F32:
@@ -248,7 +234,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMP_NLT_F32:
         return V_CMP_F32(ConditionOp::GE, false, inst);
 
-        //     V_CMPX_{OP16}_F32
     case Opcode::V_CMPX_F_F32:
         return V_CMP_F32(ConditionOp::F, true, inst);
     case Opcode::V_CMPX_LT_F32:
@@ -278,7 +263,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMPX_TRU_F32:
         return V_CMP_F32(ConditionOp::TRU, true, inst);
 
-        //     V_CMP_{OP16}_F64
     case Opcode::V_CMP_F_F64:
         return V_CMP_F64(ConditionOp::F, false, inst);
     case Opcode::V_CMP_LT_F64:
@@ -306,7 +290,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMP_NLT_F64:
         return V_CMP_F64(ConditionOp::GE, false, inst);
 
-        //     V_CMP_{OP8}_I32
     case Opcode::V_CMP_LT_I32:
         return V_CMP_U32(ConditionOp::LT, true, false, inst);
     case Opcode::V_CMP_EQ_I32:
@@ -322,7 +305,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMPX_LE_I32:
         return V_CMP_U32(ConditionOp::LE, true, true, inst);
 
-        //     V_CMPX_{OP8}_I32
     case Opcode::V_CMPX_LT_I32:
         return V_CMP_U32(ConditionOp::LT, true, true, inst);
     case Opcode::V_CMPX_EQ_I32:
@@ -334,7 +316,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMPX_GE_I32:
         return V_CMP_U32(ConditionOp::GE, true, true, inst);
 
-        //     V_CMP_{OP8}_U32
     case Opcode::V_CMP_F_U32:
         return V_CMP_U32(ConditionOp::F, false, false, inst);
     case Opcode::V_CMP_LT_U32:
@@ -352,7 +333,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMP_TRU_U32:
         return V_CMP_U32(ConditionOp::TRU, false, false, inst);
 
-        //     V_CMPX_{OP8}_U32
     case Opcode::V_CMPX_F_U32:
         return V_CMP_U32(ConditionOp::F, false, true, inst);
     case Opcode::V_CMPX_LT_U32:
@@ -370,7 +350,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMPX_TRU_U32:
         return V_CMP_U32(ConditionOp::TRU, false, true, inst);
 
-        //     V_CMP_{OP8}_U64
     case Opcode::V_CMP_EQ_U64:
         return V_CMP_U64(ConditionOp::EQ, false, false, inst);
     case Opcode::V_CMP_NE_U64:
@@ -381,7 +360,6 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_CMP_CLASS_F32:
         return V_CMP_CLASS_F32(inst);
 
-        // VOP3a
     case Opcode::V_MAD_LEGACY_F32:
         return V_MAD_F32(inst);
     case Opcode::V_MAD_F32:
@@ -458,77 +436,13 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_MUL_HI_U32(true, inst);
     case Opcode::V_MAD_U64_U32:
         return V_MAD_U64_U32(inst);
-    case Opcode::V_LSHRREV_B16:
-        return V_LSHRREV_B16(inst);
-    case Opcode::V_ASHRREV_I16:
-        return V_ASHRREV_I16(inst);
-    case Opcode::V_LSHLREV_B16:
-        return V_LSHLREV_B16(inst);
-    case Opcode::V_ADD_LSHL_U32:
-        return V_ADD_LSHL_U32(inst);
-    case Opcode::V_LSHL_ADD_U32:
-        return V_LSHL_ADD_U32(inst);
-    case Opcode::V_MIN3_F16:
-        return V_MIN3_F16(inst);
-    case Opcode::V_MAX3_F16:
-        return V_MAX3_F16(inst);
-    case Opcode::V_MED3_F16:
-        return V_MED3_F16(inst);
-    case Opcode::V_ADD3_U32:
-        return V_ADD3_U32(inst);
-    case Opcode::V_LSHL_OR_B32:
-        return V_LSHL_OR_B32(inst);
-    case Opcode::V_AND_OR_B32:
-        return V_AND_OR_B32(inst);
-    case Opcode::V_OR3_B32:
-        return V_OR3_B32(inst);
     case Opcode::V_NOP:
         return;
-
-    // VOP3P
-    case Opcode::V_PK_MUL_LO_U16:
-        return V_PK_MUL_LO_U16(inst);
-    case Opcode::V_PK_ADD_I16:
-        return V_PK_ADD_I16(inst);
-    case Opcode::V_PK_SUB_I16:
-        return V_PK_SUB_I16(inst);
-    case Opcode::V_PK_LSHRREV_B16:
-        return V_PK_LSHRREV_B16(inst);
-    case Opcode::V_PK_LSHLREV_B16:
-        return V_PK_LSHLREV_B16(inst);
-    case Opcode::V_PK_MAD_U16:
-        return V_PK_MAD_U16(inst);
-    case Opcode::V_PK_ADD_U16:
-        return V_PK_ADD_U16(inst);
-    case Opcode::V_PK_SUB_U16:
-        return V_PK_SUB_U16(inst);
-    case Opcode::V_PK_MAX_U16:
-        return V_PK_MAX_U16(inst);
-    case Opcode::V_PK_MIN_U16:
-        return V_PK_MIN_U16(inst);
-    case Opcode::V_PK_FMA_F16:
-        return V_PK_FMA_F16(inst);
-    case Opcode::V_PK_ADD_F16:
-        return V_PK_ADD_F16(inst);
-    case Opcode::V_PK_MUL_F16:
-        return V_PK_MUL_F16(inst);
-    case Opcode::V_PK_MIN_F16:
-        return V_PK_MIN_F16(inst);
-    case Opcode::V_PK_MAX_F16:
-        return V_PK_MAX_F16(inst);
-    case Opcode::V_MAD_MIX_F32:
-        return V_MAD_MIX_F32(inst);
-    case Opcode::V_MAD_MIXLO_F16:
-        return V_MAD_MIXLO_F16(inst);
-    case Opcode::V_MAD_MIXHI_F16:
-        return V_MAD_MIXHI_F16(inst);
-
     default:
         LogMissingOpcode(inst);
     }
 }
 
-// VOP2
 
 void Translator::V_CNDMASK_B32(const GcnInst& inst) {
     const IR::ScalarReg flag_reg{inst.src[2].code};
@@ -569,9 +483,6 @@ void Translator::V_MUL_F32(const GcnInst& inst) {
 }
 
 void Translator::V_MUL_LEGACY_F32(const GcnInst& inst) {
-    // GCN V_MUL_LEGACY_F32: if either source is zero, the result is +0.0
-    // regardless of the other operand (even if NaN or Inf).
-    // Standard IEEE multiply would produce NaN for 0 * Inf.
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
     const IR::F32 zero{ir.Imm32(0.0f)};
@@ -680,9 +591,7 @@ void Translator::V_OR_B32(bool is_xor, const GcnInst& inst) {
 }
 
 void Translator::V_BFM_B32(const GcnInst& inst) {
-    // bitmask width
     const IR::U32 src0{ir.BitFieldExtract(GetSrc(inst.src[0]), ir.Imm32(0), ir.Imm32(4))};
-    // bitmask offset
     const IR::U32 src1{ir.BitFieldExtract(GetSrc(inst.src[1]), ir.Imm32(0), ir.Imm32(4))};
     const IR::U32 ones = ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1), src0), ir.Imm32(1));
     SetDst(inst.dst[0], ir.ShiftLeftLogical(ones, src1));
@@ -708,12 +617,10 @@ void Translator::V_BCNT_U32_B32(const GcnInst& inst) {
 
 void Translator::V_MBCNT_U32_B32(bool is_low, const GcnInst& inst) {
     if (!is_low) {
-        // v_mbcnt_hi_u32_b32 vX, -1, 0
         if (inst.src[0].field == OperandField::SignedConstIntNeg && inst.src[0].code == 193 &&
             inst.src[1].field == OperandField::ConstZero) {
             return;
         }
-        // v_mbcnt_hi_u32_b32 vX, exec_hi, 0/vZ
         if ((inst.src[0].field == OperandField::ExecHi ||
              inst.src[0].field == OperandField::VccHi ||
              inst.src[0].field == OperandField::ScalarGPR) &&
@@ -723,13 +630,9 @@ void Translator::V_MBCNT_U32_B32(bool is_low, const GcnInst& inst) {
         }
         UNREACHABLE();
     } else {
-        // v_mbcnt_lo_u32_b32 vY, -1, vX
-        // used combined with above to fetch lane id in non-compute stages
         if (inst.src[0].field == OperandField::SignedConstIntNeg && inst.src[0].code == 193) {
             return SetDst(inst.dst[0], ir.LaneId());
         }
-        // v_mbcnt_lo_u32_b32 vY, exec_lo, vX
-        // used combined with above for append buffer indexing.
         if (inst.src[0].field == OperandField::ExecLo || inst.src[0].field == OperandField::VccLo ||
             inst.src[0].field == OperandField::ScalarGPR) {
             return SetDst(inst.dst[0], GetSrc(inst.src[1]));
@@ -739,17 +642,14 @@ void Translator::V_MBCNT_U32_B32(bool is_low, const GcnInst& inst) {
 }
 
 void Translator::V_ADD_I32(const GcnInst& inst) {
-    // Signed or unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.IAdd(src0, src1)};
     SetDst(inst.dst[0], result);
 
-    // TODO: Carry-out with signed or unsigned components
 }
 
 void Translator::V_SUB_I32(const GcnInst& inst) {
-    // Unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.ISub(src0, src1)};
@@ -760,7 +660,6 @@ void Translator::V_SUB_I32(const GcnInst& inst) {
 }
 
 void Translator::V_SUBREV_I32(const GcnInst& inst) {
-    // Unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 result{ir.ISub(src1, src0)};
@@ -771,7 +670,6 @@ void Translator::V_SUBREV_I32(const GcnInst& inst) {
 }
 
 void Translator::V_ADDC_U32(const GcnInst& inst) {
-    // Unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
@@ -788,25 +686,21 @@ void Translator::V_ADDC_U32(const GcnInst& inst) {
 }
 
 void Translator::V_SUBB_U32(const GcnInst& inst) {
-    // Signed or unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
     const IR::U32 result{ir.ISub(ir.ISub(src0, src1), carry)};
     SetDst(inst.dst[0], result);
 
-    // TODO: Carry-out with signed or unsigned components
 }
 
 void Translator::V_SUBBREV_U32(const GcnInst& inst) {
-    // Signed or unsigned components
     const IR::U32 src0{GetSrc(inst.src[0])};
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 carry{GetCarryIn(inst)};
     const IR::U32 result{ir.ISub(ir.ISub(src1, src0), carry)};
     SetDst(inst.dst[0], result);
 
-    // TODO: Carry-out with signed or unsigned components
 }
 
 void Translator::V_LDEXP_F32(const GcnInst& inst) {
@@ -833,52 +727,6 @@ void Translator::V_CVT_PKRTZ_F16_F32(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.Pack2x16(AmdGpu::NumberFormat::Float, vec_f32));
 }
 
-void Translator::V_ADD_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-
-    const auto result = ir.FPAdd(src0, src1);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_SUB_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-
-    const auto result = ir.FPSub(src0, src1);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_MUL_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-
-    const auto result = ir.FPMul(src0, src1);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_MAX_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-
-    const auto result = ir.FPMax(src0, src1);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_MIN_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-
-    const auto result = ir.FPMin(src0, src1);
-
-    SetDst16(inst.dst[0], result);
-}
-
-// VOP1
 
 void Translator::V_MOV(const GcnInst& inst) {
     SetDst(inst.dst[0], GetSrc<IR::F32>(inst.src[0]));
@@ -1081,11 +929,8 @@ void Translator::V_BFREV_B32(const GcnInst& inst) {
 
 void Translator::V_FFBH_U32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
-    // Gcn wants the MSB position counting from the left, but SPIR-V counts from the rightmost (LSB)
-    // position
     const IR::U32 msb_pos = ir.FindUMsb(src0);
     const IR::U32 pos_from_left = ir.ISub(ir.Imm32(31), msb_pos);
-    // Select 0xFFFFFFFF if src0 was 0
     const IR::U1 cond = ir.INotEqual(src0, ir.Imm32(0));
     SetDst(inst.dst[0], IR::U32{ir.Select(cond, pos_from_left, ir.Imm32(~0U))});
 }
@@ -1097,11 +942,8 @@ void Translator::V_FFBL_B32(const GcnInst& inst) {
 
 void Translator::V_FFBH_I32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
-    // Gcn wants the MSB position counting from the left, but SPIR-V counts from the rightmost (LSB)
-    // position
     const IR::U32 msb_pos = ir.FindSMsb(src0);
     const IR::U32 pos_from_left = ir.ISub(ir.Imm32(31), msb_pos);
-    // Select 0xFFFFFFFF if src0 was 0 or -1
     const IR::U32 minusOne = ir.Imm32(~0U);
     const IR::U1 cond =
         ir.LogicalAnd(ir.INotEqual(src0, ir.Imm32(0)), ir.INotEqual(src0, minusOne));
@@ -1158,7 +1000,6 @@ void Translator::V_MOVRELSD_B32(const GcnInst& inst) {
     VMovRelDHelper(dst_vgprno, src_val, m0);
 }
 
-// VOPC
 
 void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
@@ -1186,8 +1027,6 @@ void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
         }
     }();
     if (set_exec) {
-        // V_CMPX evaluates on active lanes only; hardware writes exec & result to both EXEC
-        // and the VCC/SDST destination, zeroing inactive lanes' bits.
         const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
         ir.SetExec(masked);
         SetDst1(inst.dst[1], masked);
@@ -1222,7 +1061,6 @@ void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
         }
     }();
     if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
         const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
         ir.SetExec(masked);
         SetDst1(inst.dst[1], masked);
@@ -1257,7 +1095,6 @@ void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const 
         }
     }();
     if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
         const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
         ir.SetExec(masked);
         SetDst1(inst.dst[1], masked);
@@ -1289,7 +1126,7 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
         switch (op) {
         case ConditionOp::EQ:
             return is_zero ? ir.LogicalNot(src0) : src0;
-        case ConditionOp::LG: // NE
+        case ConditionOp::LG:
             return is_zero ? src0 : ir.LogicalNot(src0);
         case ConditionOp::GT:
             ASSERT(is_zero);
@@ -1305,7 +1142,15 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
     if (set_exec) {
         UNREACHABLE_MSG("Exec setting for V_CMP_U64 is not supported");
     }
-    SetDst1(inst.dst[1], result);
+
+    switch (inst.dst[1].field) {
+    case OperandField::VccLo:
+        return ir.SetVcc(result);
+    case OperandField::ScalarGPR:
+        return ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[1].code), result);
+    default:
+        UNREACHABLE();
+    }
 }
 
 void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
@@ -1324,13 +1169,19 @@ void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
             UNREACHABLE_MSG("Unsupported float class mask: {:#x}", static_cast<u32>(class_mask));
         }
     } else {
-        // We don't know the type yet, delay its resolution.
         value = ir.FPCmpClass32(src0, src1);
     }
-    SetDst1(inst.dst[1], value);
+
+    switch (inst.dst[1].field) {
+    case OperandField::VccLo:
+        return ir.SetVcc(value);
+    case OperandField::ScalarGPR:
+        return ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[1].code), value);
+    default:
+        UNREACHABLE();
+    }
 }
 
-// VOP3a
 
 void Translator::V_MAD_F32(const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
@@ -1624,324 +1475,17 @@ void Translator::V_MAD_U64_U32(const GcnInst& inst) {
     ir.SetVcc(did_overflow);
 }
 
-void Translator::V_LSHLREV_B16(const GcnInst& inst) {
-    const auto shift = GetSrc16<IR::U32>(inst.src[0]);
-    const auto src = GetSrc16<IR::U32>(inst.src[1]);
-
-    const auto result = ir.ShiftLeftLogical(src, ir.BitwiseAnd(shift, ir.Imm32(0xF)));
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_LSHRREV_B16(const GcnInst& inst) {
-    const auto shift = GetSrc16<IR::U32>(inst.src[0]);
-    const auto src = GetSrc16<IR::U32>(inst.src[1]);
-
-    const auto result = ir.ShiftRightLogical(src, ir.BitwiseAnd(shift, ir.Imm32(0xF)));
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_ASHRREV_I16(const GcnInst& inst) {
-    const auto shift = GetSrc16<IR::U32, true>(inst.src[0]);
-    const auto src = GetSrc16<IR::U32, true>(inst.src[1]);
-
-    const auto result = ir.ShiftRightArithmetic(src, ir.BitwiseAnd(shift, ir.Imm32(0xF)));
-
-    SetDst16<true>(inst.dst[0], result);
-}
-
-void Translator::V_ADD_LSHL_U32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrc<IR::U32>(inst.src[2]);
-
-    const auto shift = ir.BitwiseAnd(src2, ir.Imm32(0x1F));
-
-    const auto result = ir.ShiftLeftLogical(ir.IAdd(src0, src1), shift);
-
-    SetDst(inst.dst[0], result);
-}
-
-void Translator::V_LSHL_ADD_U32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrc<IR::U32>(inst.src[2]);
-
-    const auto shift = ir.BitwiseAnd(src1, ir.Imm32(0x1F));
-
-    const auto result = ir.IAdd(ir.ShiftLeftLogical(src0, shift), src2);
-
-    SetDst(inst.dst[0], result);
-}
-
-void Translator::V_MIN3_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-    const auto src2 = GetSrc16<IR::F32>(inst.src[2]);
-
-    const auto result = ir.FPMinTri(src0, src1, src2);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_MAX3_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-    const auto src2 = GetSrc16<IR::F32>(inst.src[2]);
-
-    const auto result = ir.FPMaxTri(src0, src1, src2);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_MED3_F16(const GcnInst& inst) {
-    const auto src0 = GetSrc16<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrc16<IR::F32>(inst.src[1]);
-    const auto src2 = GetSrc16<IR::F32>(inst.src[2]);
-
-    const auto result = ir.FPMedTri(src0, src1, src2);
-
-    SetDst16(inst.dst[0], result);
-}
-
-void Translator::V_ADD3_U32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrc<IR::U32>(inst.src[2]);
-
-    SetDst(inst.dst[0], ir.IAdd(src0, ir.IAdd(src1, src2)));
-}
-
-void Translator::V_PK_MUL_LO_U16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.IMul(src0.first, src1.first);
-    const auto result_hi = ir.IMul(src0.second, src1.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_ADD_I16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32, true>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32, true>(inst.src[1]);
-
-    const auto result_lo = ir.IAdd(src0.first, src1.first);
-    const auto result_hi = ir.IAdd(src0.second, src1.second);
-
-    SetDstPk<IR::U32, true>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_SUB_I16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32, true>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32, true>(inst.src[1]);
-
-    const auto result_lo = ir.ISub(src0.first, src1.first);
-    const auto result_hi = ir.ISub(src0.second, src1.second);
-
-    SetDstPk<IR::U32, true>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_LSHLREV_B16(const GcnInst& inst) {
-    const auto shift = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.ShiftLeftLogical(src.first, shift.first);
-    const auto result_hi = ir.ShiftLeftLogical(src.second, shift.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_LSHRREV_B16(const GcnInst& inst) {
-    const auto shift = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.ShiftRightLogical(src.first, shift.first);
-    const auto result_hi = ir.ShiftRightLogical(src.second, shift.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_MAD_U16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrcPk<IR::U32>(inst.src[2]);
-
-    const auto result_lo = ir.IAdd(ir.IMul(src0.first, src1.first), src2.first);
-    const auto result_hi = ir.IAdd(ir.IMul(src0.second, src1.second), src2.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_ADD_U16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.IAdd(src0.first, src1.first);
-    const auto result_hi = ir.IAdd(src0.second, src1.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_SUB_U16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.ISub(src0.first, src1.first);
-    const auto result_hi = ir.ISub(src0.second, src1.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_MAX_U16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.UMax(src0.first, src1.first);
-    const auto result_hi = ir.UMax(src0.second, src1.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_MIN_U16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::U32>(inst.src[1]);
-
-    const auto result_lo = ir.UMin(src0.first, src1.first);
-    const auto result_hi = ir.UMin(src0.second, src1.second);
-
-    SetDstPk<IR::U32, false>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_FMA_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::F32>(inst.src[1]);
-    const auto src2 = GetSrcPk<IR::F32>(inst.src[2]);
-
-    const auto result_lo = ir.FPFma(src0.first, src1.first, src2.first);
-    const auto result_hi = ir.FPFma(src0.second, src1.second, src2.second);
-
-    SetDstPk<IR::F32>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_ADD_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::F32>(inst.src[1]);
-
-    const auto result_lo = ir.FPAdd(src0.first, src1.first);
-    const auto result_hi = ir.FPAdd(src0.second, src1.second);
-
-    SetDstPk<IR::F32>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_MUL_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::F32>(inst.src[1]);
-
-    const auto result_lo = ir.FPMul(src0.first, src1.first);
-    const auto result_hi = ir.FPMul(src0.second, src1.second);
-
-    SetDstPk<IR::F32>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_MIN_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::F32>(inst.src[1]);
-
-    const auto result_lo = ir.FPMin(src0.first, src1.first);
-    const auto result_hi = ir.FPMin(src0.second, src1.second);
-
-    SetDstPk<IR::F32>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_PK_MAX_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcPk<IR::F32>(inst.src[0]);
-    const auto src1 = GetSrcPk<IR::F32>(inst.src[1]);
-
-    const auto result_lo = ir.FPMax(src0.first, src1.first);
-    const auto result_hi = ir.FPMax(src0.second, src1.second);
-
-    SetDstPk<IR::F32>(inst.dst[0], {result_lo, result_hi});
-}
-
-void Translator::V_LSHL_OR_B32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrc<IR::U32>(inst.src[2]);
-
-    const auto shift = ir.BitwiseAnd(src1, ir.Imm32(0x1F));
-
-    const auto result = ir.BitwiseOr(ir.ShiftLeftLogical(src0, shift), src2);
-
-    SetDst(inst.dst[0], result);
-}
-
-void Translator::V_AND_OR_B32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrc<IR::U32>(inst.src[2]);
-
-    const auto result = ir.BitwiseOr(ir.BitwiseAnd(src0, src1), src2);
-
-    SetDst(inst.dst[0], result);
-}
-
-void Translator::V_OR3_B32(const GcnInst& inst) {
-    const auto src0 = GetSrc<IR::U32>(inst.src[0]);
-    const auto src1 = GetSrc<IR::U32>(inst.src[1]);
-    const auto src2 = GetSrc<IR::U32>(inst.src[2]);
-
-    const auto result = ir.BitwiseOr(ir.BitwiseOr(src0, src1), src2);
-
-    SetDst(inst.dst[0], result);
-}
-
-void Translator::V_MAD_MIX_F32(const GcnInst& inst) {
-    const auto src0 = GetSrcMix(inst.src[0]);
-    const auto src1 = GetSrcMix(inst.src[1]);
-    const auto src2 = GetSrcMix(inst.src[2]);
-
-    const IR::F32 result = ir.FPFma(src0, src1, src2);
-
-    SetDst(inst.dst[0], result);
-}
-
-void Translator::V_MAD_MIXLO_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcMix(inst.src[0]);
-    const auto src1 = GetSrcMix(inst.src[1]);
-    const auto src2 = GetSrcMix(inst.src[2]);
-
-    const IR::F32 result = ir.FPFma(src0, src1, src2);
-    const IR::F16 result_f16 = ir.FPConvert(16, result);
-    const IR::U16 result_f16_u16 = ir.BitCast<IR::U16, IR::F16>(result_f16);
-
-    const IR::U32 old_value{GetSrc(inst.dst[0])};
-    const IR::U32 new_value{
-        ir.BitFieldInsert(old_value, ir.UConvert(32, result_f16_u16), ir.Imm32(0U), ir.Imm32(16U))};
-    SetDst(inst.dst[0], new_value);
-}
-
-void Translator::V_MAD_MIXHI_F16(const GcnInst& inst) {
-    const auto src0 = GetSrcMix(inst.src[0]);
-    const auto src1 = GetSrcMix(inst.src[1]);
-    const auto src2 = GetSrcMix(inst.src[2]);
-
-    const IR::F32 result = ir.FPFma(src0, src1, src2);
-    const IR::F16 result_f16 = ir.FPConvert(16, result);
-    const IR::U16 result_f16_u16 = ir.BitCast<IR::U16, IR::F16>(result_f16);
-
-    const IR::U32 old_value{GetSrc(inst.dst[0])};
-    const IR::U32 new_value{ir.BitFieldInsert(old_value, ir.UConvert(32, result_f16_u16),
-                                              ir.Imm32(16U), ir.Imm32(16U))};
-    SetDst(inst.dst[0], new_value);
-}
-
 IR::U32 Translator::GetCarryIn(const GcnInst& inst) {
     IR::U1 carry;
-    if (inst.src_count == 3) { // VOP3
-        carry = GetSrc1(inst.src[2]);
-    } else { // VOP2
+    if (inst.src_count == 3) {
+        if (inst.src[2].field == OperandField::VccLo) {
+            carry = ir.GetVcc();
+        } else if (inst.src[2].field == OperandField::ScalarGPR) {
+            carry = ir.GetThreadBitScalarReg(IR::ScalarReg(inst.src[2].code));
+        } else {
+            UNREACHABLE();
+        }
+    } else {
         carry = ir.GetVcc();
     }
 
@@ -1949,18 +1493,21 @@ IR::U32 Translator::GetCarryIn(const GcnInst& inst) {
 }
 
 void Translator::SetCarryOut(const GcnInst& inst, const IR::U1& carry) {
-    if (inst.dst_count == 2) { // VOP3
-        SetDst1(inst.dst[1], carry);
-    } else { // VOP2
+    if (inst.dst_count == 2) {
+        if (inst.dst[1].field == OperandField::VccLo) {
+            ir.SetVcc(carry);
+        } else if (inst.dst[1].field == OperandField::ScalarGPR) {
+            ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[1].code), carry);
+        } else {
+            UNREACHABLE();
+        }
+    } else {
         ir.SetVcc(carry);
     }
 }
 
-// TODO: add range analysis pass to hopefully put an upper bound on m0, and only select one of
-// [src_vgprno, src_vgprno + max_m0]. Same for dst regs we may write back to
 
 IR::U32 Translator::VMovRelSHelper(u32 src_vgprno, const IR::U32 m0) {
-    // Read from VGPR0 by default when src_vgprno + m0 > num_allocated_vgprs
     IR::U32 src_val = ir.GetVectorReg<IR::U32>(IR::VectorReg::V0);
     for (u32 i = src_vgprno; i < runtime_info.num_allocated_vgprs; i++) {
         const IR::U1 cond = ir.IEqual(m0, ir.Imm32(i - src_vgprno));
@@ -1979,4 +1526,4 @@ void Translator::VMovRelDHelper(u32 dst_vgprno, const IR::U32 src_val, const IR:
     }
 }
 
-} // namespace Shader::Gcn
+}

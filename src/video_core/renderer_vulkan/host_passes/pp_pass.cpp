@@ -1,10 +1,10 @@
-//  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 
 #include "common/assert.h"
-#include "core/emulator_settings.h"
+#include "common/config.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/post_process_frag.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -169,13 +169,11 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     };
 
     pipeline = Check<"create post process pipeline">(device.createGraphicsPipelineUnique(
-        /*pipeline_cache*/ {}, pipeline_info));
+        {}, pipeline_info));
 
-    // Once pipeline is compiled, we don't need the shader module anymore
     device.destroyShaderModule(vs_module);
     device.destroyShaderModule(fs_module);
 
-    // Create sampler resource
     const vk::SamplerCreateInfo sampler_ci{
         .magFilter = vk::Filter::eLinear,
         .minFilter = vk::Filter::eLinear,
@@ -188,7 +186,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings) {
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+    if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
         });
@@ -279,9 +277,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .pImageMemoryBarriers = &post_barrier,
     });
 
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+    if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 }
 
-} // namespace Vulkan::HostPasses
+}

@@ -5,7 +5,7 @@
 
 #include "ngs2.h"
 
-#include <stdarg.h> // va_list
+#include <stdarg.h>
 
 namespace Libraries::Ngs2 {
 
@@ -76,4 +76,4 @@ struct OrbisNgs2ReportVoiceWaveformData {
 s32 PS4_SYSV_ABI sceNgs2ReportRegisterHandler(u32 reportType, OrbisNgs2ReportHandler handler,
                                               uintptr_t userData, OrbisNgs2Handle* outHandle);
 
-} // namespace Libraries::Ngs2
+}

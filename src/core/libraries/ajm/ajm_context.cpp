@@ -74,7 +74,6 @@ void AjmContext::WorkerThread(std::stop_token stop) {
 }
 
 void AjmContext::ProcessBatch(u32 id, std::span<AjmJob> jobs) {
-    // Perform operation requested by control flags.
     for (auto& job : jobs) {
         LOG_TRACE(Lib_Ajm, "Processing job {} for instance {}. flags = {:#x}", id, job.instance_id,
                   job.flags.raw);
@@ -152,7 +151,6 @@ int AjmContext::BatchStartBuffer(u8* p_batch, u32 batch_size, const int priority
     if (!batch_info->jobs.empty()) {
         batch_queue.EmplaceWait(batch_info);
     } else {
-        // Empty batches are not submitted to the processor and are marked as finished
         batch_info->finished.release();
     }
 
@@ -191,4 +189,4 @@ s32 AjmContext::InstanceDestroy(u32 instance_id) {
     return ORBIS_OK;
 }
 
-} // namespace Libraries::Ajm
+}

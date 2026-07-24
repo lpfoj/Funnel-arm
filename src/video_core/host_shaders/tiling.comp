@@ -9,18 +9,6 @@
 
 layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// #define BITS_PER_PIXEL
-// #define NUM_SAMPLES
-// #define MICRO_TILE_MODE
-// #define ARRAY_MODE
-// #define MICRO_TILE_THICKNESS
-// #define PIPE_CONFIG
-// #define BANK_WIDTH
-// #define BANK_HEIGHT
-// #define NUM_BANKS
-// #define NUM_BANK_BITS
-// #define TILE_SPLIT_BYTES
-// #define MACRO_TILE_ASPECT
 
 #define BYTES_PER_PIXEL (BITS_PER_PIXEL / 8)
 
@@ -412,7 +400,7 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
 uint GetMipLevel(inout uint texel) {
     uint mip = 0;
     uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
-    while (texel >= mip_size && mip < info.num_mips) {
+    while (texel >= mip_size && mip + 1u < info.num_mips) {
         texel -= mip_size;
         ++mip;
         mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
@@ -420,11 +408,21 @@ uint GetMipLevel(inout uint texel) {
     return mip;
 }
 
-void main() {
-    uint texel = gl_GlobalInvocationID.x;
+bool GetTiledIndex(uint linear_index, out uint tiled_index) {
+    if (info.num_mips == 0u) {
+        return false;
+    }
+    uint texel = linear_index;
     uint mip = GetMipLevel(texel);
+    uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+    if (texel >= mip_size) {
+        return false;
+    }
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
+    if (pitch == 0u || height == 0u) {
+        return false;
+    }
     uint tiled_offset = info.mips[mip].offset;
     uint x = texel % pitch;
     uint y = (texel / pitch) % height;
@@ -436,9 +434,23 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
 #endif
 
+    tiled_index = tiled_offset / BYTES_PER_PIXEL;
+    return true;
+}
+
+void main() {
+    uint linear_index = gl_GlobalInvocationID.x;
+    if (linear_index >= linear_data.length()) {
+        return;
+    }
+    uint tiled_index;
+    if (!GetTiledIndex(linear_index, tiled_index) || tiled_index >= tiled_data.length()) {
+        return;
+    }
+
 #ifdef IS_TILER
-    tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+    tiled_data[tiled_index] = linear_data[linear_index];
 #else
-    linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+    linear_data[linear_index] = tiled_data[tiled_index];
 #endif
 }

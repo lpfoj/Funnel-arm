@@ -20,14 +20,11 @@ namespace {
 
 struct Statement;
 
-// Use normal_link because we are not guaranteed to destroy the tree in order
 using ListBaseHook =
     boost::intrusive::list_base_hook<boost::intrusive::link_mode<boost::intrusive::normal_link>>;
 
 using Tree = boost::intrusive::list<Statement,
-                                    // Allow using Statement without a definition
                                     boost::intrusive::base_hook<ListBaseHook>,
-                                    // Avoid linear complexity on splice, size is never called
                                     boost::intrusive::constant_time_size<false>>;
 using Node = Tree::iterator;
 
@@ -217,7 +214,7 @@ bool IsDirectlyRelated(Node goto_stmt, Node label_stmt) {
         max_level = goto_level;
         min = label_stmt;
         max = goto_stmt;
-    } else { // goto_level < label_level
+    } else {
         min_level = goto_level;
         max_level = label_level;
         min = goto_stmt;
@@ -275,12 +272,6 @@ bool NeedsLift(Node goto_stmt, Node label_stmt) noexcept {
     return AreOrdered(sibling, goto_stmt);
 }
 
-/**
- * The algorithm used here is from:
- * Taming Control Flow: A Structured Approach to Eliminating Goto Statements.
- * Ana M. Erosa and Laurie J. Hendren
- * http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.42.1485&rep=rep1&type=pdf
- */
 class GotoPass {
 public:
     explicit GotoPass(CFG& cfg, Common::ObjectPool<Statement>& stmt_pool) : pool{stmt_pool} {
@@ -297,51 +288,35 @@ public:
 
 private:
     void RemoveGoto(Node goto_stmt) {
-        // Force goto_stmt and label_stmt to be directly related
         const Node label_stmt{goto_stmt->label};
         if (IsIndirectlyRelated(goto_stmt, label_stmt)) {
-            // Move goto_stmt out using outward-movement transformation until it becomes
-            // directly related to label_stmt
             while (!IsDirectlyRelated(goto_stmt, label_stmt)) {
                 goto_stmt = MoveOutward(goto_stmt);
             }
         }
-        // Force goto_stmt and label_stmt to be siblings
         if (IsDirectlyRelated(goto_stmt, label_stmt)) {
             const size_t label_level{Level(label_stmt)};
             size_t goto_level{Level(goto_stmt)};
             if (goto_level > label_level) {
-                // Move goto_stmt out of its level using outward-movement transformations
                 while (goto_level > label_level) {
                     goto_stmt = MoveOutward(goto_stmt);
                     --goto_level;
                 }
-            } else { // Level(goto_stmt) < Level(label_stmt)
+            } else {
                 if (NeedsLift(goto_stmt, label_stmt)) {
-                    // Lift goto_stmt to above stmt containing label_stmt using goto-lifting
-                    // transformations
                     goto_stmt = Lift(goto_stmt);
                 }
-                // Move goto_stmt into label_stmt's level using inward-movement transformation
                 while (goto_level < label_level) {
                     goto_stmt = MoveInward(goto_stmt);
                     ++goto_level;
                 }
             }
         }
-        // Expensive operation:
-        // if (!AreSiblings(goto_stmt, label_stmt)) {
-        //    UNREACHABLE_MSG("Goto is not a sibling with the label");
-        //}
-        // goto_stmt and label_stmt are guaranteed to be siblings, eliminate
         if (std::next(goto_stmt) == label_stmt) {
-            // Simply eliminate the goto if the label is next to it
             goto_stmt->up->children.erase(goto_stmt);
         } else if (AreOrdered(goto_stmt, label_stmt)) {
-            // Eliminate goto_stmt with a conditional
             EliminateAsConditional(goto_stmt, label_stmt);
         } else {
-            // Eliminate goto_stmt with a loop
             EliminateAsLoop(goto_stmt, label_stmt);
         }
     }
@@ -368,10 +343,8 @@ private:
         }
         for (Block& block : cfg.blocks) {
             const Node label{local_labels.at(&block)};
-            // Insertion point
             const Node ip{std::next(label)};
 
-            // Reset goto variables before the first block and after its respective label
             const auto make_reset_variable{[&]() -> Statement& {
                 return *pool.Create(SetVariable{}, label->id, false_stmt, &root_stmt);
             }};
@@ -472,7 +445,6 @@ private:
 
         switch (label_nested_stmt->type) {
         case StatementType::If:
-            // Update nested if condition
             label_nested_stmt->cond =
                 pool.Create(Or{}, variable, label_nested_stmt->cond, &root_stmt);
             break;
@@ -621,7 +593,6 @@ private:
             Statement& stmt{child};
             switch (stmt.type) {
             case StatementType::Label:
-                // Labels can be ignored
                 break;
             case StatementType::Code: {
                 ensure_block();
@@ -644,14 +615,12 @@ private:
                 ensure_block();
                 IR::Block* const merge_block{MergeBlock(parent, stmt)};
 
-                // Implement if header block
                 IR::IREmitter ir{*current_block};
                 const IR::U1 cond{ir.ConditionRef(VisitExpr(ir, *stmt.cond))};
 
                 const size_t if_node_index{syntax_list.size()};
                 syntax_list.emplace_back();
 
-                // Visit children
                 const size_t then_block_index{syntax_list.size()};
                 Visit(stmt, break_block, merge_block);
 
@@ -690,11 +659,9 @@ private:
                 const size_t loop_node_index{syntax_list.size()};
                 syntax_list.emplace_back();
 
-                // Visit children
                 const size_t body_block_index{syntax_list.size()};
                 Visit(stmt, merge_block, continue_block);
 
-                // The continue block is located at the end of the loop
                 IR::IREmitter ir{*continue_block};
                 const IR::U1 cond{ir.ConditionRef(VisitExpr(ir, *stmt.cond))};
 
@@ -784,7 +751,6 @@ private:
     IR::Block* MergeBlock(Statement& parent, Statement& stmt) const {
         Statement* merge_stmt{TryFindForwardBlock(stmt)};
         if (!merge_stmt) {
-            // Create a merge block we can visit later
             merge_stmt = stmt_pool.Create(&dummy_flow_block, &parent);
             parent.children.insert(std::next(Tree::s_iterator_to(stmt)), *merge_stmt);
         }
@@ -801,7 +767,7 @@ private:
     const Profile& profile;
     Translator translator;
 };
-} // Anonymous namespace
+}
 
 IR::AbstractSyntaxList BuildASL(Common::ObjectPool<IR::Inst>& inst_pool,
                                 Common::ObjectPool<IR::Block>& block_pool, CFG& cfg, Info& info,
@@ -816,4 +782,4 @@ IR::AbstractSyntaxList BuildASL(Common::ObjectPool<IR::Inst>& inst_pool,
     return syntax_list;
 }
 
-} // namespace Shader::Gcn
+}

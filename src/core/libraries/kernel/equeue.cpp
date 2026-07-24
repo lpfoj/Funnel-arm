@@ -1,8 +1,14 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <thread>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <atomic>
+#endif
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -13,8 +19,12 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
+#include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#ifdef __ANDROID__
+#include "video_core/amdgpu/liverpool.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -23,6 +33,55 @@ extern void KernelSignalRequest();
 
 static std::unordered_map<s32, EqueueInternal*> kqueues;
 static constexpr auto HrTimerSpinlockThresholdNs = 1200000u;
+
+#ifdef __ANDROID__
+static bool ExecutorTraceHotEqueueWait() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EXECUTOR_TRACE_EQUEUE_WAIT");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ShouldTraceLiveEqueue() {
+    if (std::getenv("EXECUTOR_TRACE_LIVE_WIDE") == nullptr &&
+        std::getenv("EXECUTOR_TRACE_LIVE_SYNC") == nullptr &&
+        std::getenv("EXECUTOR_LIGHT_ORACLE") == nullptr) {
+        return false;
+    }
+    if (!g_curthread) {
+        return false;
+    }
+    const auto& name = g_curthread->name;
+    return name.find("Game:Main") != std::string::npos ||
+           name.find("mono") != std::string::npos ||
+           name.find("UnityPreload") != std::string::npos ||
+           name.find("UnityGfxDeviceWorker") != std::string::npos ||
+           name.find("UnityWorker") != std::string::npos ||
+           name.find("Submit Done Thread") != std::string::npos;
+}
+
+static const char* CurrentLiveThreadName() {
+    return g_curthread ? g_curthread->name.c_str() : "<no-gcurthread>";
+}
+
+static void TraceLiveEqueue(const char* op, OrbisKernelEqueue eq, u64 ident, s16 filter, u64 data,
+                            void* udata, s32 rc) {
+    if (!ShouldTraceLiveEqueue()) {
+        return;
+    }
+    static std::atomic_int budget{4096};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_EQUEUE] op=%s thread=%s eq=%ld ident=0x%llx "
+                        "filter=%d data=0x%llx udata=%p rc=0x%x",
+                        op, CurrentLiveThreadName(), eq,
+                        static_cast<unsigned long long>(ident), filter,
+                        static_cast<unsigned long long>(data), udata, static_cast<u32>(rc));
+}
+#endif
 
 EqueueInternal* GetEqueue(OrbisKernelEqueue eq) {
     if (!kqueues.contains(eq)) {
@@ -41,60 +100,44 @@ static void TimerCallback(OrbisKernelEqueue eq, const OrbisKernelEvent& kevent) 
     if (kqueues.contains(eq) && kqueues[eq]->EventExists(kevent.ident, kevent.filter)) {
         kqueues[eq]->TriggerEvent(kevent.ident, OrbisKernelEvent::Filter::Timer, kevent.udata);
         if (!(kevent.flags & OrbisKernelEvent::Flags::OneShot)) {
-            // Reschedule the event for its next period.
             kqueues[eq]->ScheduleEvent(kevent.ident, kevent.filter, TimerCallback);
         }
     }
 }
 
-// Events are uniquely identified by id and filter.
 bool EqueueInternal::AddEvent(EqueueEvent& event) {
-    // Save id and filter before event is moved into m_events.
     const u64 id = event.event.ident;
     const auto filter = event.event.filter;
-
     {
         std::scoped_lock lock{m_mutex};
 
-        // Calculate timer interval
         event.time_added = std::chrono::steady_clock::now();
         if (event.event.filter == OrbisKernelEvent::Filter::Timer) {
-            // Set timer interval, this is stored in milliseconds for timers.
             event.timer_interval = std::chrono::milliseconds(event.event.data);
         } else if (event.event.filter == OrbisKernelEvent::Filter::HrTimer) {
-            // Retrieve inputted time, this is stored in the bintime format.
             OrbisKernelBintime* time = reinterpret_cast<OrbisKernelBintime*>(event.event.data);
 
-            // Convert the bintime format to a timespec.
             OrbisKernelTimespec ts;
             ts.tv_sec = time->sec;
             ts.tv_nsec = (1000000000 * (time->frac >> 32)) >> 32;
 
-            // Then use the timespec to set the timer interval.
             event.timer_interval = std::chrono::nanoseconds(ts.tv_nsec + ts.tv_sec * 1000000000);
         }
 
-        // First, check if there's already an event with the same id and filter.
         const auto& find_it = std::ranges::find_if(m_events, [id, filter](auto& ev) {
             return ev.event.ident == id && ev.event.filter == filter;
         });
-        // If there is a duplicate event, we need to update that instead.
         if (find_it != m_events.cend()) {
-            // Specifically, update user data and timer_interval.
-            // Trigger status and event data should remain intact.
             auto& old_event = *find_it;
             old_event.timer_interval = event.timer_interval;
             old_event.event.udata = event.event.udata;
             return true;
         }
 
-        // Clear input data from event.
         event.event.data = 0;
 
-        // Remove add flag from event
         event.event.flags &= ~OrbisKernelEvent::Flags::Add;
 
-        // Clear flag is appended to most event types internally.
         if (event.event.filter != OrbisKernelEvent::Filter::User) {
             event.event.flags |= OrbisKernelEvent::Flags::Clear;
         }
@@ -107,10 +150,9 @@ bool EqueueInternal::AddEvent(EqueueEvent& event) {
         }
     }
 
-    // Schedule callbacks for timer events
-    if (filter == OrbisKernelEvent::Filter::Timer) {
+    if (filter == OrbisKernelEvent::Timer) {
         return this->ScheduleEvent(id, OrbisKernelEvent::Filter::Timer, TimerCallback);
-    } else if (filter == OrbisKernelEvent::Filter::HrTimer) {
+    } else if (filter == OrbisKernelEvent::HrTimer) {
         return this->ScheduleEvent(id, OrbisKernelEvent::Filter::HrTimer, HrTimerCallback);
     }
 
@@ -135,8 +177,6 @@ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
     if (!it->timer) {
         it->timer = std::make_unique<boost::asio::steady_timer>(io_context, event.timer_interval);
     } else {
-        // If the timer already exists we are scheduling a reoccurrence after the next period.
-        // Set the expiration time to the previous occurrence plus the period.
         it->timer->expires_at(it->timer->expiry() + event.timer_interval);
     }
 
@@ -146,7 +186,6 @@ bool EqueueInternal::ScheduleEvent(u64 id, s16 filter,
                 if (ec != boost::system::errc::operation_canceled) {
                     LOG_ERROR(Kernel_Event, "Timer callback error: {}", ec.message());
                 } else {
-                    // Timer was cancelled (removed) before it triggered
                     LOG_DEBUG(Kernel_Event, "Timer cancelled");
                 }
                 return;
@@ -174,18 +213,22 @@ bool EqueueInternal::RemoveEvent(u64 id, s16 filter) {
 
 int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo) {
     if (timo != nullptr && *timo == 0) {
-        // Effectively acts as a poll; only events that have already
-        // arrived at the time of this function call can be received
         return GetTriggeredEvents(ev, num);
     }
     const auto micros = timo ? *timo : 0u;
 
     if (HasSmallTimer()) {
-        // If a small timer is set, just wait for it to expire.
         return WaitForSmallTimer(ev, num, micros);
     }
 
     int count = 0;
+#ifdef __ANDROID__
+    const bool is_gfx_eop_queue = m_name.find("EOP") != std::string::npos;
+    if (is_gfx_eop_queue) {
+        AmdGpu::ExecutorEopTraceEqWait(true, m_handle, 0, 0,
+                                      OrbisKernelEvent::Filter::GraphicsCore);
+    }
+#endif
 
     const auto predicate = [&] {
         count = GetTriggeredEvents(ev, num);
@@ -193,15 +236,20 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     };
 
     if (micros == 0) {
-        // Wait indefinitely for events
         std::unique_lock lock{m_mutex};
         m_cond.wait(lock, predicate);
     } else {
-        // Wait up until the timeout value
         std::unique_lock lock{m_mutex};
         m_cond.wait_for(lock, std::chrono::microseconds(micros), predicate);
     }
 
+#ifdef __ANDROID__
+    if (is_gfx_eop_queue) {
+        const u64 event_id = count > 0 ? ev[0].ident : 0;
+        const s16 event_filter = count > 0 ? ev[0].filter : OrbisKernelEvent::Filter::None;
+        AmdGpu::ExecutorEopTraceEqWait(false, m_handle, count, event_id, event_filter);
+    }
+#endif
     return count;
 }
 
@@ -226,6 +274,10 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
         }
     }
     m_cond.notify_one();
+#ifdef __ANDROID__
+    TraceLiveEqueue(has_found ? "trigger" : "trigger_miss", m_handle, ident, filter,
+                    reinterpret_cast<u64>(trigger_data), trigger_data, has_found ? ORBIS_OK : -1);
+#endif
     return has_found;
 }
 
@@ -255,13 +307,11 @@ int EqueueInternal::GetTriggeredEvents(OrbisKernelEvent* ev, int num) {
 }
 
 bool EqueueInternal::AddSmallTimer(EqueueEvent& ev) {
-    // Retrieve inputted time, this is stored in the bintime format
     OrbisKernelBintime* time = reinterpret_cast<OrbisKernelBintime*>(ev.event.data);
     OrbisKernelTimespec ts;
     ts.tv_sec = time->sec;
     ts.tv_nsec = ((1000000000 * (time->frac >> 32)) >> 32);
 
-    // Create the small timer
     SmallTimer st;
     st.event = ev.event;
     st.added = std::chrono::steady_clock::now();
@@ -315,28 +365,21 @@ bool EqueueInternal::EventExists(u64 id, s16 filter) {
 }
 
 s32 PS4_SYSV_ABI posix_kqueue() {
-    // Reserve a file handle for the kqueue
     auto* handles = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     s32 kqueue_handle = handles->CreateHandle();
     auto* kqueue_file = handles->GetFile(kqueue_handle);
     kqueue_file->type = Core::FileSys::FileType::Equeue;
 
-    // Plenty of equeue logic uses names to identify queues.
-    // Create a unique name for the queue we create.
     char name[32];
     memset(name, 0, sizeof(name));
     snprintf(name, sizeof(name), "kqueue%i", kqueue_handle);
 
-    // Create the queue
     kqueues[kqueue_handle] = new EqueueInternal(kqueue_handle, name);
     LOG_INFO(Kernel_Event, "kqueue created with name {}", name);
 
-    // Return handle.
     return kqueue_handle;
 }
 
-// Helper method to detect supported filters.
-// We don't want to allow adding events we don't handle properly.
 bool SupportedEqueueFilter(OrbisKernelEvent::Filter filter) {
     return filter == OrbisKernelEvent::Filter::GraphicsCore ||
            filter == OrbisKernelEvent::Filter::HrTimer ||
@@ -350,14 +393,12 @@ s32 PS4_SYSV_ABI posix_kevent(s32 handle, OrbisKernelEvent* changelist, u64 ncha
     LOG_INFO(Kernel_Event, "called, eq = {}, nchanges = {}, nevents = {}", handle, nchanges,
              nevents);
 
-    // Get the equeue
     if (!kqueues.contains(handle)) {
         *__Error() = POSIX_EBADF;
         return ORBIS_FAIL;
     }
     auto equeue = kqueues[handle];
 
-    // First step is to apply all changes in changelist.
     for (u64 i = 0; i < nchanges; i++) {
         auto event = changelist[i];
         if (!SupportedEqueueFilter(event.filter)) {
@@ -366,42 +407,42 @@ s32 PS4_SYSV_ABI posix_kevent(s32 handle, OrbisKernelEvent* changelist, u64 ncha
             continue;
         }
 
-        // Check the event flags to determine the appropriate action
         if (event.flags & OrbisKernelEvent::Flags::Add) {
-            // The caller is requesting to add an event.
             EqueueEvent internal_event{};
             internal_event.event = event;
             if (!equeue->AddEvent(internal_event)) {
-                // Failed to add event, return error.
                 *__Error() = POSIX_ENOMEM;
                 return ORBIS_FAIL;
             }
+#ifdef __ANDROID__
+            TraceLiveEqueue("kevent_add", handle, event.ident, event.filter, event.data,
+                            event.udata, ORBIS_OK);
+#endif
         }
 
         if (event.flags & OrbisKernelEvent::Flags::Delete) {
-            // The caller is requesting to remove an event.
             if (!equeue->RemoveEvent(event.ident, event.filter)) {
-                // Failed to remove event, return error.
                 *__Error() = POSIX_ENOENT;
                 return ORBIS_FAIL;
             }
+#ifdef __ANDROID__
+            TraceLiveEqueue("kevent_delete", handle, event.ident, event.filter, event.data,
+                            event.udata, ORBIS_OK);
+#endif
         }
 
         if (event.filter == OrbisKernelEvent::Filter::User && event.fflags == 0x1000000) {
-            // For user events, this fflags value indicates we need to trigger the event.
             if (!equeue->TriggerEvent(event.ident, OrbisKernelEvent::Filter::User, event.udata)) {
                 *__Error() = POSIX_ENOENT;
                 return ORBIS_FAIL;
             }
         } else if (event.fflags != 0) {
-            // The title is using filter-specific flags. Right now, these are unhandled.
             LOG_ERROR(Kernel_Event, "Unhandled fflags {:#x} for event filter {}", event.fflags,
                       magic_enum::enum_name(event.filter));
             continue;
         }
     }
 
-    // Now we need to wait on the event list.
     s32 count = 0;
     if (nevents > 0) {
         if (timeout != nullptr) {
@@ -425,7 +466,6 @@ int PS4_SYSV_ABI sceKernelCreateEqueue(OrbisKernelEqueue* eq, const char* name) 
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    // Maximum is 32 including null terminator
     static constexpr u64 MaxEventQueueNameSize = 32;
     if (std::strlen(name) > MaxEventQueueNameSize) {
         LOG_ERROR(Kernel_Event, "Event queue name exceeds 32 bytes!");
@@ -434,15 +474,17 @@ int PS4_SYSV_ABI sceKernelCreateEqueue(OrbisKernelEqueue* eq, const char* name) 
 
     LOG_INFO(Kernel_Event, "name = {}", name);
 
-    // Reserve a file handle for the kqueue
     auto* handles = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     OrbisKernelEqueue kqueue_handle = handles->CreateHandle();
     auto* kqueue_file = handles->GetFile(kqueue_handle);
     kqueue_file->type = Core::FileSys::FileType::Equeue;
 
-    // Create the equeue
     kqueues[kqueue_handle] = new EqueueInternal(kqueue_handle, name);
     *eq = kqueue_handle;
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_EQUEUE_CREATE] eq=%ld name=%s", kqueue_handle, name);
+#endif
 
     return ORBIS_OK;
 }
@@ -454,7 +496,6 @@ int PS4_SYSV_ABI sceKernelDeleteEqueue(OrbisKernelEqueue eq) {
 
     auto* handles = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     handles->DeleteHandle(eq);
-    delete kqueues[eq];
     kqueues.erase(eq);
     return ORBIS_OK;
 }
@@ -462,6 +503,15 @@ int PS4_SYSV_ABI sceKernelDeleteEqueue(OrbisKernelEqueue eq) {
 int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev, int num, int* out,
                                      OrbisKernelUseconds* timo) {
     HLE_TRACE;
+#ifdef __ANDROID__
+    if (ExecutorTraceHotEqueueWait()) {
+        const long long timeout = timo ? static_cast<long long>(*timo) : -1;
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_EQUEUE_WAIT_ENTER] eq=%ld ev=%p num=%d out=%p timeout=%lld", eq,
+            ev, num, out, timeout);
+    }
+#endif
     if (!kqueues.contains(eq)) {
         return ORBIS_KERNEL_ERROR_EBADF;
     }
@@ -483,9 +533,25 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
     *out = equeue->WaitForEvents(ev, num, timo);
 
     if (*out == 0) {
+#ifdef __ANDROID__
+        if (ExecutorTraceHotEqueueWait()) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_EQUEUE_WAIT_EXIT] eq=%ld out=0 rc=0x%x", eq,
+                                static_cast<u32>(ORBIS_KERNEL_ERROR_ETIMEDOUT));
+        }
+#endif
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;
     }
 
+#ifdef __ANDROID__
+    if (ExecutorTraceHotEqueueWait()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_EQUEUE_WAIT_EXIT] eq=%ld out=%d ident=0x%llx filter=%d data=0x%llx rc=0",
+            eq, *out, static_cast<unsigned long long>(ev[0].ident), ev[0].filter,
+            static_cast<unsigned long long>(ev[0].data));
+    }
+#endif
     return ORBIS_OK;
 }
 
@@ -502,18 +568,10 @@ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKer
     event.event.filter = OrbisKernelEvent::Filter::HrTimer;
     event.event.flags = OrbisKernelEvent::Flags::Add | OrbisKernelEvent::Flags::OneShot;
     event.event.fflags = 0;
-    // Data is stored as the address of a OrbisKernelBintime struct.
     OrbisKernelBintime time{ts->tv_sec, ts->tv_nsec * 0x44b82fa09};
     event.event.data = reinterpret_cast<u64>(&time);
     event.event.udata = udata;
 
-    // HR timers cannot be implemented within the existing event queue architecture due to the
-    // slowness of the notification mechanism. For instance, a 100us timer will lose its precision
-    // as the trigger time drifts by +50-700%, depending on the host PC and workload. To address
-    // this issue, we use a spinlock for small waits (which can be adjusted using
-    // `HrTimerSpinlockThresholdUs`) and fall back to boost asio timers if the time to tick is
-    // large. Even for large delays, we truncate a small portion to complete the wait
-    // using the spinlock, prioritizing precision.
     auto& equeue = kqueues[eq];
     if (total_ns < HrTimerSpinlockThresholdNs) {
         return equeue->AddSmallTimer(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
@@ -522,6 +580,10 @@ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKer
     if (!equeue->AddEvent(event)) {
         return ORBIS_KERNEL_ERROR_ENOMEM;
     }
+#ifdef __ANDROID__
+    TraceLiveEqueue("add_hrtimer", eq, event.event.ident, event.event.filter, total_ns, udata,
+                    ORBIS_OK);
+#endif
     return ORBIS_OK;
 }
 
@@ -558,6 +620,10 @@ int PS4_SYSV_ABI sceKernelAddTimerEvent(OrbisKernelEqueue eq, int id, OrbisKerne
     if (!equeue->AddEvent(event)) {
         return ORBIS_KERNEL_ERROR_ENOMEM;
     }
+#ifdef __ANDROID__
+    TraceLiveEqueue("add_timer", eq, event.event.ident, event.event.filter, usec, udata,
+                    ORBIS_OK);
+#endif
     return ORBIS_OK;
 }
 
@@ -584,7 +650,12 @@ int PS4_SYSV_ABI sceKernelAddUserEvent(OrbisKernelEqueue eq, int id) {
     event.event.fflags = 0;
     event.event.data = 0;
 
-    return kqueues[eq]->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+    const int rc = kqueues[eq]->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+#ifdef __ANDROID__
+    TraceLiveEqueue("add_user", eq, event.event.ident, event.event.filter, event.event.data,
+                    event.event.udata, rc);
+#endif
+    return rc;
 }
 
 int PS4_SYSV_ABI sceKernelAddUserEventEdge(OrbisKernelEqueue eq, int id) {
@@ -600,7 +671,12 @@ int PS4_SYSV_ABI sceKernelAddUserEventEdge(OrbisKernelEqueue eq, int id) {
     event.event.fflags = 0;
     event.event.data = 0;
 
-    return kqueues[eq]->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+    const int rc = kqueues[eq]->AddEvent(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
+#ifdef __ANDROID__
+    TraceLiveEqueue("add_user_edge", eq, event.event.ident, event.event.filter,
+                    event.event.data, event.event.udata, rc);
+#endif
+    return rc;
 }
 
 void* PS4_SYSV_ABI sceKernelGetEventUserData(const OrbisKernelEvent* ev) {
@@ -618,8 +694,15 @@ int PS4_SYSV_ABI sceKernelTriggerUserEvent(OrbisKernelEqueue eq, int id, void* u
     }
 
     if (!kqueues[eq]->TriggerEvent(id, OrbisKernelEvent::Filter::User, udata)) {
+#ifdef __ANDROID__
+        TraceLiveEqueue("trigger_user_miss", eq, id, OrbisKernelEvent::Filter::User, 0, udata,
+                        ORBIS_KERNEL_ERROR_ENOENT);
+#endif
         return ORBIS_KERNEL_ERROR_ENOENT;
     }
+#ifdef __ANDROID__
+    TraceLiveEqueue("trigger_user", eq, id, OrbisKernelEvent::Filter::User, 0, udata, ORBIS_OK);
+#endif
     return ORBIS_OK;
 }
 
@@ -662,4 +745,4 @@ void RegisterEventQueue(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("kwGyyjohI50", "libkernel", 1, "libkernel", sceKernelGetEventData);
 }
 
-} // namespace Libraries::Kernel
+}

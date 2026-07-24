@@ -20,7 +20,6 @@ void RegPopup::DrawColorBuffer(const AmdGpu::ColorBuffer& buffer) {
     if (BeginTable("COLOR_BUFFER", 2, ImGuiTableFlags_Borders)) {
         TableNextRow();
 
-        // clang-format off
 
         DrawValueRowList(
             "BASE_ADDR",            buffer.base_address,
@@ -69,7 +68,6 @@ void RegPopup::DrawColorBuffer(const AmdGpu::ColorBuffer& buffer) {
             "NumFormat()",          buffer.GetNumberFmt()
         );
 
-        // clang-format on
 
         EndTable();
     }
@@ -82,7 +80,6 @@ void RegPopup::DrawDepthBuffer(const AmdGpu::DepthBuffer& buffer,
     if (BeginTable("DEPTH_BUFFER", 2, ImGuiTableFlags_Borders)) {
         TableNextRow();
 
-        // clang-format off
         DrawValueRowList(
             "Z_INFO.FORMAT",                  buffer.z_info.format,
             "Z_INFO.NUM_SAMPLES",             buffer.z_info.num_samples,
@@ -110,7 +107,6 @@ void RegPopup::DrawDepthBuffer(const AmdGpu::DepthBuffer& buffer,
             "NumBits()",                      buffer.NumBits(),
             "GetDepthSliceSize()",            buffer.GetDepthSliceSize()
         );
-        // clang-format on
 
         EndTable();
     }
@@ -118,7 +114,6 @@ void RegPopup::DrawDepthBuffer(const AmdGpu::DepthBuffer& buffer,
     if (BeginTable("DEPTH_CONTROL", 2, ImGuiTableFlags_Borders)) {
         TableNextRow();
 
-        // clang-format off
         DrawValueRowList(
             "STENCIL_ENABLE",                     control.stencil_enable,
             "DEPTH_ENABLE",                       control.depth_enable,
@@ -131,7 +126,6 @@ void RegPopup::DrawDepthBuffer(const AmdGpu::DepthBuffer& buffer,
             "ENABLE_COLOR_WRITES_ON_DEPTH_FAIL",  control.enable_color_writes_on_depth_fail,
             "DISABLE_COLOR_WRITES_ON_DEPTH_PASS", control.disable_color_writes_on_depth_pass
         );
-        // clang-format on
 
         EndTable();
     }
@@ -191,4 +185,4 @@ void RegPopup::Draw() {
     }
     End();
 }
-} // namespace Core::Devtools::Widget
+}

@@ -222,13 +222,16 @@ Id EmitPackSnorm2_10_10_10(EmitContext& ctx, Id value) {
     const auto snorm_mul{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(511.f), ctx.ConstF32(511.f),
                                                ctx.ConstF32(511.f), ctx.ConstF32(1.f))};
     const auto as_float{ctx.OpFMul(ctx.F32[4], clamped, snorm_mul)};
-    const auto as_sint{ctx.OpConvertFToS(ctx.U32[4], ctx.OpRoundEven(ctx.F32[4], as_float))};
+    const auto as_sint_signed{
+        ctx.OpConvertFToS(ctx.S32[4], ctx.OpRoundEven(ctx.F32[4], as_float))};
+    const auto as_sint{ctx.OpBitcast(ctx.U32[4], as_sint_signed)};
     return EmitPackSint2_10_10_10(ctx, ctx.OpBitcast(ctx.F32[4], as_sint));
 }
 
 Id EmitUnpackSnorm2_10_10_10(EmitContext& ctx, Id value) {
     const auto unpacked{ctx.OpBitcast(ctx.U32[4], EmitUnpackSint2_10_10_10(ctx, value))};
-    const auto as_float{ctx.OpConvertSToF(ctx.F32[4], unpacked)};
+    const auto as_sint{ctx.OpBitcast(ctx.S32[4], unpacked)};
+    const auto as_float{ctx.OpConvertSToF(ctx.F32[4], as_sint)};
     const auto snorm_div{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(511.f), ctx.ConstF32(511.f),
                                                ctx.ConstF32(511.f), ctx.ConstF32(1.f))};
     return ctx.OpFDiv(ctx.F32[4], as_float, snorm_div);
@@ -258,4 +261,4 @@ Id EmitUnpackSint2_10_10_10(EmitContext& ctx, Id value) {
     return ctx.OpBitcast(ctx.F32[4], unpacked);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

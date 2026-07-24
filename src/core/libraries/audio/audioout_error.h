@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// AudioOut library
 constexpr int ORBIS_AUDIO_OUT_ERROR_NOT_OPENED = 0x80260001;
 constexpr int ORBIS_AUDIO_OUT_ERROR_BUSY = 0x80260002;
 constexpr int ORBIS_AUDIO_OUT_ERROR_INVALID_PORT = 0x80260003;

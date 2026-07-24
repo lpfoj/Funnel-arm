@@ -71,4 +71,4 @@ struct VideoOutBuffer {
     uintptr_t address_right;
 };
 
-} // namespace Libraries::VideoOut
+}

@@ -61,4 +61,4 @@ bool GcnInst::IsCmpx() const {
     return false;
 }
 
-} // namespace Shader::Gcn
+}

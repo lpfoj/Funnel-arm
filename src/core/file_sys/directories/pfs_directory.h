@@ -46,4 +46,4 @@ private:
     };
 #pragma pack(pop)
 };
-} // namespace Core::Directories
+}

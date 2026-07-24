@@ -11,4 +11,4 @@ class SymbolsResolver;
 
 namespace Libraries::Ulobjmgr {
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Ulobjmgr
+}

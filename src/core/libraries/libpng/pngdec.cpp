@@ -196,16 +196,13 @@ s32 PS4_SYSV_ABI scePngDecParseHeader(const OrbisPngDecParseParam* param,
 
     u8 header[8];
     memcpy(header, param->png_mem_addr, 8);
-    // Check if the header indicates a valid PNG file
     if (png_sig_cmp(header, 0, 8)) {
         LOG_ERROR(Lib_Png, "Memory doesn't contain a valid png file");
         return ORBIS_PNG_DEC_ERROR_INVALID_DATA;
     }
-    // Create a libpng structure, also pass our custom error/warning functions
     auto png_ptr =
         png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, PngDecError, PngDecWarning);
 
-    // Create a libpng info structure
     auto info_ptr = png_create_info_struct(png_ptr);
 
     const auto pngdata = PngStruct{
@@ -220,8 +217,6 @@ s32 PS4_SYSV_ABI scePngDecParseHeader(const OrbisPngDecParseParam* param,
         pngdata->offset += len;
     });
 
-    // Now call png_read_info with our pngPtr as image handle, and infoPtr to receive the file
-    // info.
     png_read_info(png_ptr, info_ptr);
 
     imageInfo->image_width = png_get_image_width(png_ptr, info_ptr);
@@ -272,4 +267,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  scePngDecDecodeWithInputControl);
 };
 
-} // namespace Libraries::PngDec
+}

@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ctime>
+#include <cstdlib>
+#include <mutex>
 #include <thread>
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <atomic>
+#endif
 
 #include "common/assert.h"
 #include "common/native_clock.h"
@@ -10,6 +16,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
+#include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 
@@ -17,7 +24,7 @@
 #include <windows.h>
 #include "common/ntapi.h"
 #else
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#ifdef __APPLE__
 #include <date/tz.h>
 #endif
 #include <ctime>
@@ -26,31 +33,124 @@
 #include <unistd.h>
 #endif
 
+#ifdef __ANDROID__
+extern "C" void executor_live_mono_run_pending_signal_safe_point() __attribute__((weak));
+extern "C" int executor_live_get_current_hle_call_site(std::uint64_t* guest_return,
+                                                       std::uint64_t* return_off,
+                                                       std::uint64_t* arg0, char* symbol,
+                                                       std::size_t symbol_size, char* module,
+                                                       std::size_t module_size)
+    __attribute__((weak));
+#endif
+
 namespace Libraries::Kernel {
 
 static u64 initial_ptc;
 static std::unique_ptr<Common::NativeClock> clock;
+static std::mutex clock_mutex;
+#ifdef __ANDROID__
+static std::once_flag realtime_origin_once;
+static u64 realtime_origin_us;
+static u64 realtime_process_origin_us;
+static bool realtime_origin_valid;
+#endif
+
+#ifdef __ANDROID__
+static bool ShouldTraceLiveSleep() {
+    static const bool enabled =
+        std::getenv("EXECUTOR_TRACE_LIVE_WIDE") != nullptr ||
+        std::getenv("EXECUTOR_TRACE_LIVE_SYNC") != nullptr ||
+        std::getenv("EXECUTOR_LIGHT_ORACLE") != nullptr;
+    if (!enabled) {
+        return false;
+    }
+    if (!g_curthread) {
+        return false;
+    }
+    const auto& name = g_curthread->name;
+    return name.find("Game:Main") != std::string::npos ||
+           name.find("UnityPreload") != std::string::npos ||
+           name.find("mono") != std::string::npos ||
+           name.find("Mono") != std::string::npos ||
+           name.find("UnityGfxDeviceWorker") != std::string::npos ||
+           name.find("UnityWorker") != std::string::npos ||
+           name.find("Submit Done Thread") != std::string::npos;
+}
+
+static void TraceLiveSleep(const char* op, const OrbisKernelTimespec* rqtp, s32 ret) {
+    if (!ShouldTraceLiveSleep()) {
+        return;
+    }
+    static std::atomic_int budget{2048};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    const long long sec = rqtp ? static_cast<long long>(rqtp->tv_sec) : -1;
+    const long long nsec = rqtp ? static_cast<long long>(rqtp->tv_nsec) : -1;
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_SLEEP] op=%s thread=%s sec=%lld nsec=%lld ret=%d",
+                        op, g_curthread ? g_curthread->name.c_str() : "<no-gcurthread>", sec,
+                        nsec, ret);
+}
+#endif
+
+static void EnsureClockInitialized() {
+    if (clock) {
+        return;
+    }
+
+    std::lock_guard lock{clock_mutex};
+    if (!clock) {
+        clock = std::make_unique<Common::NativeClock>();
+        initial_ptc = clock->GetUptime();
+    }
+}
+
+#ifdef __ANDROID__
+static u64 GetRelaxedProcessTime() {
+    EnsureClockInitialized();
+    return clock->GetTimeUSRelaxed(initial_ptc);
+}
+#endif
 
 u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
+    EnsureClockInitialized();
     return clock->GetTscFrequency();
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
-    // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
+    EnsureClockInitialized();
     return clock->GetTimeUS(initial_ptc);
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
+    EnsureClockInitialized();
     return clock->GetUptime() - initial_ptc;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
+    EnsureClockInitialized();
     return clock->GetTscFrequency();
 }
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
+    EnsureClockInitialized();
     return clock->GetUptime();
 }
+
+#ifdef __ANDROID__
+static bool ShouldCapLongSleeps() {
+    static const bool cap = [] {
+        if (std::FILE* f = std::fopen(
+                "/data/data/app.lsx4.android/files/lsx4-home/run-fast-sleep", "r")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    return cap;
+}
+#endif
 
 static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,
                                 const bool interruptible) {
@@ -58,7 +158,41 @@ static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTime
         SetPosixErrno(EINVAL);
         return -1;
     }
-    const auto duration = std::chrono::nanoseconds(rqtp->tv_sec * 1'000'000'000 + rqtp->tv_nsec);
+    auto duration = std::chrono::nanoseconds(rqtp->tv_sec * 1'000'000'000 + rqtp->tv_nsec);
+#ifdef __ANDROID__
+    if (ShouldCapLongSleeps() && duration >= std::chrono::seconds(1)) {
+        duration = std::chrono::milliseconds(20);
+    }
+#endif
+#ifdef __ANDROID__
+    if (executor_live_mono_run_pending_signal_safe_point) {
+        executor_live_mono_run_pending_signal_safe_point();
+    }
+    static std::atomic_bool s_gm_poll_trace{
+        std::filesystem::exists(std::filesystem::path(
+            "/data/data/app.lsx4.android/files/lsx4-home/run-gamemain-poll-trace"))};
+    if (s_gm_poll_trace.load(std::memory_order_relaxed) &&
+        executor_live_get_current_hle_call_site && g_curthread &&
+        g_curthread->name.find("Game:Main") != std::string::npos &&
+        duration < std::chrono::milliseconds(1)) {
+        static std::atomic_int budget{4096};
+        if (budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            std::uint64_t g_ret = 0, g_off = 0, g_arg0 = 0;
+            char sym[128]{};
+            char mod[128]{};
+            const int rc = executor_live_get_current_hle_call_site(
+                &g_ret, &g_off, &g_arg0, sym, sizeof(sym), mod, sizeof(mod));
+            __android_log_print(
+                ANDROID_LOG_WARN, "LSX4Native",
+                "[EXECUTOR_GAMEMAIN_POLL] rc=%d guestRet=0x%llx off=0x%llx arg0=0x%llx "
+                "module=%s symbol=%s napNs=%lld",
+                rc, static_cast<unsigned long long>(g_ret),
+                static_cast<unsigned long long>(g_off),
+                static_cast<unsigned long long>(g_arg0), mod[0] ? mod : "<none>",
+                sym[0] ? sym : "<none>", static_cast<long long>(duration.count()));
+        }
+    }
+#endif
     std::chrono::nanoseconds remain;
     const auto uninterrupted = Common::AccurateSleep(duration, &remain, interruptible);
     if (rmtp) {
@@ -73,13 +207,23 @@ static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTime
 }
 
 s32 PS4_SYSV_ABI posix_nanosleep(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp) {
-    return posix_nanosleep_impl(rqtp, rmtp, true);
+    const s32 ret = posix_nanosleep_impl(rqtp, rmtp, true);
+#ifdef __ANDROID__
+    TraceLiveSleep("posix_nanosleep", rqtp, ret);
+#endif
+    return ret;
 }
 
 s32 PS4_SYSV_ABI sceKernelNanosleep(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp) {
     if (const auto ret = posix_nanosleep_impl(rqtp, rmtp, false); ret < 0) {
+#ifdef __ANDROID__
+        TraceLiveSleep("sceKernelNanosleep_fail", rqtp, ret);
+#endif
         return ErrnoToSceKernelError(*__Error());
     }
+#ifdef __ANDROID__
+    TraceLiveSleep("sceKernelNanosleep", rqtp, ORBIS_OK);
+#endif
     return ORBIS_OK;
 }
 
@@ -421,6 +565,28 @@ s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone*
     }
     return 0;
 #else
+#ifdef __ANDROID__
+    if (tp && !tz) {
+        std::call_once(realtime_origin_once, [] {
+            timeval origin{};
+            if (::gettimeofday(&origin, nullptr) == 0) {
+                realtime_origin_us =
+                    static_cast<u64>(origin.tv_sec) * 1'000'000 +
+                    static_cast<u64>(origin.tv_usec);
+                realtime_process_origin_us = GetRelaxedProcessTime();
+                realtime_origin_valid = true;
+            }
+        });
+        if (realtime_origin_valid) {
+            const u64 current_process_us = GetRelaxedProcessTime();
+            const u64 current_realtime_us =
+                realtime_origin_us + current_process_us - realtime_process_origin_us;
+            tp->tv_sec = static_cast<s64>(current_realtime_us / 1'000'000);
+            tp->tv_usec = static_cast<s64>(current_realtime_us % 1'000'000);
+            return 0;
+        }
+    }
+#endif
     struct timezone tzz;
     timeval tv;
     const auto ret = gettimeofday(&tv, &tzz);
@@ -474,14 +640,16 @@ s32 PS4_SYSV_ABI sceKernelConvertLocaltimeToUtc(time_t param_1, int64_t param_2,
 
 namespace Dev {
 u64& GetInitialPtc() {
+    EnsureClockInitialized();
     return initial_ptc;
 }
 
 Common::NativeClock* GetClock() {
+    EnsureClockInitialized();
     return clock.get();
 }
 
-} // namespace Dev
+}
 
 s32 PS4_SYSV_ABI sceKernelConvertUtcToLocaltime(time_t time, time_t* local_time,
                                                 struct OrbisTimesec* st, u64* dst_sec) {
@@ -501,12 +669,31 @@ s32 PS4_SYSV_ABI sceKernelConvertUtcToLocaltime(time_t time, time_t* local_time,
         *dst_sec = res == TIME_ZONE_ID_DAYLIGHT ? -_dstbias : 0;
     }
 #else
-#if defined(__APPLE__) || defined(__FreeBSD__)
-    // std::chrono::current_zone() not available yet.
+#ifdef __ANDROID__
+    OrbisKernelTimezone timezone{};
+    if (const auto ret = sceKernelGettimezone(&timezone); ret != ORBIS_OK) {
+        return ret;
+    }
+    const auto west_sec = static_cast<s64>(timezone.tz_minuteswest) * 60;
+    const auto dst_seconds = static_cast<s64>(timezone.tz_dsttime) * 60;
+
+    *local_time = time - west_sec + dst_seconds;
+
+    if (st != nullptr) {
+        st->t = time;
+        st->west_sec = -west_sec;
+        st->dst_sec = dst_seconds;
+    }
+
+    if (dst_sec != nullptr) {
+        *dst_sec = dst_seconds;
+    }
+#else
+#ifdef __APPLE__
     const auto* time_zone = date::current_zone();
 #else
     const auto* time_zone = std::chrono::current_zone();
-#endif // __APPLE__
+#endif
     auto info = time_zone->get_info(std::chrono::system_clock::now());
 
     *local_time = info.offset.count() + info.save.count() * 60 + time;
@@ -520,7 +707,8 @@ s32 PS4_SYSV_ABI sceKernelConvertUtcToLocaltime(time_t time, time_t* local_time,
     if (dst_sec != nullptr) {
         *dst_sec = info.save.count() * 60;
     }
-#endif // _WIN32
+#endif
+#endif
 
     return ORBIS_OK;
 }
@@ -544,10 +732,8 @@ s32 PS4_SYSV_ABI sceKernelSettimeofday(OrbisKernelTimeval* _tv, OrbisKernelTimez
 }
 
 void RegisterTime(Core::Loader::SymbolsResolver* sym) {
-    clock = std::make_unique<Common::NativeClock>();
-    initial_ptc = clock->GetUptime();
+    EnsureClockInitialized();
 
-    // POSIX
     LIB_FUNCTION("NhpspxdjEKU", "libkernel", 1, "libkernel", posix_nanosleep);
     LIB_FUNCTION("NhpspxdjEKU", "libScePosix", 1, "libkernel", posix_nanosleep);
     LIB_FUNCTION("yS8U2TGCe1A", "libkernel", 1, "libkernel", posix_nanosleep);
@@ -566,7 +752,6 @@ void RegisterTime(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("VdXIDAbJ3tQ", "libScePosix", 1, "libkernel", posix_settimeofday);
     LIB_FUNCTION("d7nUj1LOdDU", "libScePosix", 1, "libkernel", posix_clock_settime);
 
-    // Orbis
     LIB_FUNCTION("4J2sUJmuHZQ", "libkernel", 1, "libkernel", sceKernelGetProcessTime);
     LIB_FUNCTION("fgxnMeTNUtY", "libkernel", 1, "libkernel", sceKernelGetProcessTimeCounter);
     LIB_FUNCTION("BNowx2l588E", "libkernel", 1, "libkernel",
@@ -584,4 +769,4 @@ void RegisterTime(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("-o5uEDpN+oY", "libkernel", 1, "libkernel", sceKernelConvertUtcToLocaltime);
 }
 
-} // namespace Libraries::Kernel
+}

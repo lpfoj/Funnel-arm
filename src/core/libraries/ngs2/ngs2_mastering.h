@@ -78,4 +78,4 @@ struct OrbisNgs2MasteringRackInfo {
     u32 reserved;
 };
 
-} // namespace Libraries::Ngs2
+}

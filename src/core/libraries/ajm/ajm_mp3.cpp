@@ -18,7 +18,6 @@ extern "C" {
 
 namespace Libraries::Ajm {
 
-// Following tables have been reversed from AJM library
 static constexpr std::array<std::array<s32, 4>, 4> Mp3SampleRateTable = {
     std::array<s32, 4>{11025, 12000, 8000, 0},
     std::array<s32, 4>{0, 0, 0, 0},
@@ -141,7 +140,6 @@ void AjmMp3Decoder::GetInfo(void* out_info) const {
 }
 
 u32 AjmMp3Decoder::GetMinimumInputSize() const {
-    // 4 bytes is for mp3 header that contains frame_size
     return 4;
 }
 
@@ -173,14 +171,12 @@ DecoderResult AjmMp3Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
     in_buf = in_buf.subspan(ret);
 
     if (pkt->size) {
-        // Send the packet with the compressed data to the decoder
         pkt->pts = m_parser->pts;
         pkt->dts = m_parser->dts;
         pkt->flags = (m_parser->key_frame == 1) ? AV_PKT_FLAG_KEY : 0;
         ret = avcodec_send_packet(m_codec_context, pkt);
         ASSERT_MSG(ret >= 0, "Error submitting the packet to the decoder {}", ret);
 
-        // Read all the output frames (in general there may be any number of them
         while (ret >= 0) {
             AVFrame* frame = av_frame_alloc();
             ret = avcodec_receive_frame(m_codec_context, frame);
@@ -315,34 +311,16 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
 
     BitReader reader(p_current);
     if (header->protection_type == 0) {
-        // crc = reader.Read<u16>(16);
         reader.Skip(16);
     }
 
     if (header->version == Mp3AudioVersion::V1) {
-        // main_data_begin = reader.Read<u16>(9);
-        // if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
-        //     private_bits = reader.Read<u8>(5);
-        // } else {
-        //     private_bits = reader.Read<u8>(3);
-        // }
-        // for (u32 ch = 0; ch < frame->num_channels; ++ch) {
-        //     for (u8 band = 0; band < 4; ++band) {
-        //         scfsi[ch][band] = reader.Read<bool>(1);
-        //     }
-        // }
         if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
             reader.Skip(18);
         } else {
             reader.Skip(20);
         }
     } else {
-        // main_data_begin = reader.Read<u16>(8);
-        // if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
-        //     private_bits = reader.Read<u8>(1);
-        // } else {
-        //     private_bits = reader.Read<u8>(2);
-        // }
         if (header->channel_mode == Mp3ChannelMode::SingleChannel) {
             reader.Skip(9);
         } else {
@@ -351,41 +329,10 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
     }
 
     u32 part2_3_length = 0;
-    // Number of granules (18x32 sub-band samples)
     const u8 ngr = header->version == Mp3AudioVersion::V1 ? 2 : 1;
     for (u8 gr = 0; gr < ngr; ++gr) {
         for (u32 ch = 0; ch < frame->num_channels; ++ch) {
-            // part2_3_length[gr][ch] = reader.Read<u16>(12);
             part2_3_length += reader.Read<u16>(12);
-            // big_values[gr][ch] = reader.Read<u16>(9);
-            // global_main[gr][ch] = reader.Read<u8>(8);
-            // if (header->version == Mp3AudioVersion::V1) {
-            //     scalefac_compress[gr][ch] = reader.Read<u16>(4);
-            // } else {
-            //     scalefac_compress[gr][ch] = reader.Read<u16>(9);
-            // }
-            // window_switching_flag = reader.Read<bool>(1);
-            // if (window_switching_flag) {
-            //     block_type[gr][ch] = reader.Read<u8>(2);
-            //     mixed_block_flag[gr][ch] = reader.Read<bool>(1);
-            //     for (u8 region = 0; region < 2; ++region) {
-            //         table_select[gr][ch][region] = reader.Read<u8>(5);
-            //     }
-            //     for (u8 window = 0; window < 3; ++window) {
-            //         subblock_gain[gr][ch][window] = reader.Read<u8>(3);
-            //     }
-            // } else {
-            //     for (u8 region = 0; region < 3; ++region) {
-            //         table_select[gr][ch][region] = reader.Read<u8>(5);
-            //     }
-            //     region0_count[gr][ch] = reader.Read<u8>(4);
-            //     region1_count[gr][ch] = reader.Read<u8>(3);
-            // }
-            // if (header->version == Mp3AudioVersion::V1) {
-            //     preflag[gr][ch] = reader.Read<bool>(1);
-            // }
-            // scalefac_scale[gr][ch] = reader.Read<bool>(1);
-            // count1table_select[gr][ch] = reader.Read<bool>(1);
             if (header->version == Mp3AudioVersion::V1) {
                 reader.Skip(47);
             } else {
@@ -399,13 +346,10 @@ int AjmMp3Decoder::ParseMp3Header(const u8* p_begin, u32 stream_size, int parse_
 
     const auto* p_end = p_begin + frame->frame_size;
     if (memcmp(p_current, "Xing", 4) == 0 || memcmp(p_current, "Info", 4) == 0) {
-        // TODO: Parse Xing/Lame header
         LOG_ERROR(Lib_Ajm, "Xing/Lame header is not implemented.");
     } else if (memcmp(p_current, "VBRI", 4) == 0) {
-        // TODO: Parse VBRI header
         LOG_ERROR(Lib_Ajm, "VBRI header is not implemented.");
     } else {
-        // Parse FGH header
         constexpr auto fgh_indicator = 0xB4;
         while ((p_current + 9) < p_end && *p_current != fgh_indicator) {
             ++p_current;
@@ -446,4 +390,4 @@ AjmSidebandFormat AjmMp3Decoder::GetFormat() const {
     };
 };
 
-} // namespace Libraries::Ajm
+}

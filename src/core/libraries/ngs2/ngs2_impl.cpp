@@ -51,7 +51,7 @@ s32 StackBufferOpen(StackBuffer* stackBuffer, void* bufferStart, size_t bufferSi
     stackBuffer->currentOffset = (size_t)bufferStart;
     stackBuffer->usedSize = 0;
     stackBuffer->totalSize = bufferSize;
-    stackBuffer->alignment = 8; // this is a fixed value
+    stackBuffer->alignment = 8;
     stackBuffer->flags = flags;
 
     if (outBuffer != NULL) {
@@ -66,7 +66,6 @@ s32 SystemCleanup(OrbisNgs2Handle systemHandle, OrbisNgs2ContextBufferInfo* outI
         return ORBIS_NGS2_ERROR_INVALID_HANDLE;
     }
 
-    // TODO
 
     return ORBIS_OK;
 }
@@ -101,7 +100,6 @@ s32 SystemSetupCore(StackBuffer* stackBuffer, const OrbisNgs2SystemOption* optio
     }
 
     if (outSystem) {
-        // dummy handle
         outSystem->systemHandle = 1;
     }
 
@@ -125,7 +123,6 @@ s32 SystemSetup(const OrbisNgs2SystemOption* option, OrbisNgs2ContextBufferInfo*
         optionFlags = option->flags >> 31;
     }
 
-    // Init
     StackBufferOpen(&stackBuffer, NULL, 0, NULL, optionFlags);
     result = SystemSetupCore(&stackBuffer, option, 0);
 
@@ -135,7 +132,6 @@ s32 SystemSetup(const OrbisNgs2SystemOption* option, OrbisNgs2ContextBufferInfo*
 
     StackBufferClose(&stackBuffer, &requiredBufferSize);
 
-    // outHandle unprovided
     if (!outHandle) {
         hostBufferInfo->hostBuffer = NULL;
         hostBufferInfo->hostBufferSize = requiredBufferSize;
@@ -154,7 +150,6 @@ s32 SystemSetup(const OrbisNgs2SystemOption* option, OrbisNgs2ContextBufferInfo*
         return ORBIS_NGS2_ERROR_INVALID_BUFFER_SIZE;
     }
 
-    // Setup
     StackBufferOpen(&stackBuffer, hostBufferInfo->hostBuffer, hostBufferInfo->hostBufferSize,
                     &systemList, optionFlags);
     result = SystemSetupCore(&stackBuffer, option, &setupResult);
@@ -165,11 +160,8 @@ s32 SystemSetup(const OrbisNgs2SystemOption* option, OrbisNgs2ContextBufferInfo*
 
     StackBufferClose(&stackBuffer, &requiredBufferSize);
 
-    // Copy buffer results
     setupResult.bufferInfo = *hostBufferInfo;
     setupResult.hostFree = hostFree;
-    // TODO
-    // setupResult.systemList = systemList;
 
     OrbisNgs2Handle systemHandle = setupResult.systemHandle;
     if (hostBufferInfo->hostBufferSize >= requiredBufferSize) {
@@ -184,4 +176,4 @@ s32 SystemSetup(const OrbisNgs2SystemOption* option, OrbisNgs2ContextBufferInfo*
     return ORBIS_NGS2_ERROR_INVALID_BUFFER_SIZE;
 }
 
-} // namespace Libraries::Ngs2
+}

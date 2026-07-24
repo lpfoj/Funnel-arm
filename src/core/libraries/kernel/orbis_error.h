@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// Libkernel library
 constexpr int ORBIS_KERNEL_ERROR_UNKNOWN = 0x80020000;
 constexpr int ORBIS_KERNEL_ERROR_EPERM = 0x80020001;
 constexpr int ORBIS_KERNEL_ERROR_ENOENT = 0x80020002;

@@ -11,7 +11,7 @@
 namespace Vulkan {
 class Instance;
 class Scheduler;
-} // namespace Vulkan
+}
 
 namespace VideoCore {
 
@@ -62,4 +62,4 @@ private:
     std::vector<MsPipeline> ms_image_copy_pl;
 };
 
-} // namespace VideoCore
+}

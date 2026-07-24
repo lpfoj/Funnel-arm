@@ -62,12 +62,12 @@ struct OrbisKernelEvent {
         System = 0xf000u,
     };
 
-    u64 ident = 0;                /* identifier for this event */
-    Filter filter = Filter::None; /* filter for event */
+    u64 ident = 0;
+    Filter filter = Filter::None;
     u16 flags = 0;
     u32 fflags = 0;
     u64 data = 0;
-    void* udata = nullptr; /* opaque user data identifier */
+    void* udata = nullptr;
 };
 
 struct OrbisVideoOutEventHint {
@@ -194,4 +194,4 @@ u64 PS4_SYSV_ABI sceKernelGetEventData(const OrbisKernelEvent* ev);
 
 void RegisterEventQueue(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Kernel
+}

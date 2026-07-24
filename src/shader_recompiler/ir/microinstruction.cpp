@@ -82,7 +82,6 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::BufferAtomicXor32:
     case Opcode::BufferAtomicSwap32:
     case Opcode::BufferAtomicCmpSwap32:
-    case Opcode::BufferAtomicFCmpSwap32:
     case Opcode::DataAppend:
     case Opcode::DataConsume:
     case Opcode::WriteSharedU16:
@@ -169,7 +168,7 @@ Block* Inst::PhiBlock(size_t index) const {
         UNREACHABLE_MSG("{} is not a Phi instruction", op);
     }
     if (index >= phi_args.size()) {
-        UNREACHABLE_MSG("Out of bounds argument index {} in phi instruction", index);
+        UNREACHABLE_MSG("Out of bounds argument index {} in phi instruction");
     }
     return phi_args[index].first;
 }
@@ -203,15 +202,11 @@ void Inst::ClearArgs() {
                 UndoUse(value.Inst(), i);
             }
         }
-        // Reset arguments to null
-        // std::memset was measured to be faster on MSVC than std::ranges:fill
         std::memset(reinterpret_cast<char*>(&args), 0, sizeof(args));
     }
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-    // Copy since user->SetArg will mutate this->uses
-    // Could also do temp_uses = std::move(uses) but more readable
     const auto temp_uses = uses;
     for (const auto& [user, operand] : temp_uses) {
         DEBUG_ASSERT(user->Arg(operand).Inst() == this);
@@ -219,8 +214,6 @@ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
     }
     Invalidate();
     if (preserve) {
-        // Still useful to have Identity for indirection.
-        // SSA pass would be more complicated without it
         ReplaceOpcode(Opcode::Identity);
         SetArg(0, replacement);
     }
@@ -231,7 +224,6 @@ void Inst::ReplaceOpcode(IR::Opcode opcode) {
         UNREACHABLE_MSG("Cannot transition into Phi");
     }
     if (op == Opcode::Phi) {
-        // Transition out of phi arguments into non-phi
         std::destroy_at(&phi_args);
         std::construct_at(&args);
     }
@@ -249,4 +241,4 @@ void Inst::UndoUse(Inst* used, u32 operand) {
     used->uses.remove(use);
 }
 
-} // namespace Shader::IR
+}

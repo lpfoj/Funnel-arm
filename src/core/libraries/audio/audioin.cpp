@@ -17,9 +17,6 @@ std::mutex port_allocation_mutex;
 
 static std::unique_ptr<AudioInBackend> audio;
 
-/*
- * Helper functions
- **/
 static int GetPortId(s32 handle) {
     int port_id = handle & 0xFF;
 
@@ -41,7 +38,6 @@ static s32 GetPortType(s32 handle) {
 }
 
 static int AllocatePort(OrbisAudioInType type) {
-    // TODO implement port type ranges if needed
     for (int i = 0; i <= ORBIS_AUDIO_IN_NUM_PORTS; i++) {
         std::shared_lock read_lock{port_table_mutex};
         if (!port_table[i]) {
@@ -50,17 +46,12 @@ static int AllocatePort(OrbisAudioInType type) {
     }
     return -1;
 }
-/*
- * sceAudioIn implementation
- **/
 static bool initOnce = false;
 int PS4_SYSV_ABI sceAudioInOpen(Libraries::UserService::OrbisUserServiceUserId userId, u32 type,
                                 u32 index, u32 len, u32 freq, u32 param) {
     LOG_INFO(Lib_AudioIn, "called, userId={}, type={}, index={}, len={}, freq={}, param={}", userId,
              type, index, len, freq, param);
     if (!initOnce) {
-        // sceAudioInInit doesn't seem to be called by most apps before sceAudioInOpen so we init
-        // here
         audio = std::make_unique<SDLAudioIn>();
         initOnce = true;
     }
@@ -70,7 +61,6 @@ int PS4_SYSV_ABI sceAudioInOpen(Libraries::UserService::OrbisUserServiceUserId u
         return ORBIS_AUDIO_IN_ERROR_INVALID_SIZE;
     }
 
-    // Validate parameters
     OrbisAudioInType in_type = static_cast<OrbisAudioInType>(type);
     OrbisAudioInParamFormat format = static_cast<OrbisAudioInParamFormat>(param);
 
@@ -87,14 +77,12 @@ int PS4_SYSV_ABI sceAudioInOpen(Libraries::UserService::OrbisUserServiceUserId u
 
     std::unique_lock lock{port_allocation_mutex};
 
-    // Allocate port
     int port_id = AllocatePort(in_type);
     if (port_id < 0) {
         LOG_ERROR(Lib_AudioIn, "No free audio input ports available");
         return ORBIS_AUDIO_IN_ERROR_PORT_FULL;
     }
 
-    // Create port object
     std::shared_ptr<PortIn> port;
     try {
         port = std::make_shared<PortIn>();
@@ -104,7 +92,6 @@ int PS4_SYSV_ABI sceAudioInOpen(Libraries::UserService::OrbisUserServiceUserId u
         port->samples_num = len;
         port->freq = freq;
 
-        // Determine channel count and sample size based on format
         switch (format) {
         case OrbisAudioInParamFormat::S16Mono:
             port->channels_num = 1;
@@ -119,7 +106,6 @@ int PS4_SYSV_ABI sceAudioInOpen(Libraries::UserService::OrbisUserServiceUserId u
             return ORBIS_AUDIO_IN_ERROR_INVALID_PARAM;
         }
 
-        // Open backend
         port->impl = audio->Open(*port);
         if (!port->impl) {
             throw std::runtime_error("Failed to create audio backend");
@@ -133,13 +119,11 @@ int PS4_SYSV_ABI sceAudioInOpen(Libraries::UserService::OrbisUserServiceUserId u
         return ORBIS_AUDIO_IN_ERROR_NOT_OPENED;
     }
 
-    // Store the port pointer with write lock
     {
         std::unique_lock write_lock{port_table_mutex};
         port_table[port_id] = port;
     }
 
-    // Create handle
     s32 handle = (type << 16) | port_id | 0x30000000;
 
     LOG_INFO(Lib_AudioIn, "Opened audio input port {}: type={}, samples={}, freq={}, format={}",
@@ -170,7 +154,6 @@ int PS4_SYSV_ABI sceAudioInClose(s32 handle) {
     std::unique_lock lock{port_allocation_mutex};
     std::shared_ptr<PortIn> port;
 
-    // Get and clear the port pointer with write lock
     {
         std::unique_lock write_lock{port_table_mutex};
         port = std::move(port_table[port_id]);
@@ -181,7 +164,6 @@ int PS4_SYSV_ABI sceAudioInClose(s32 handle) {
         port_table[port_id].reset();
     }
 
-    // Free resources
     std::scoped_lock port_lock{port->mutex};
     port->impl.reset();
 
@@ -203,7 +185,6 @@ int PS4_SYSV_ABI sceAudioInInput(s32 handle, void* dest) {
         return ORBIS_AUDIO_IN_ERROR_INVALID_POINTER;
     }
 
-    // Get port with read lock
     std::shared_ptr<PortIn> port;
     {
         std::shared_lock read_lock{port_table_mutex};
@@ -230,7 +211,6 @@ int PS4_SYSV_ABI sceAudioInGetSilentState(s32 handle) {
         LOG_ERROR(Lib_AudioIn, "Invalid port id");
         return ORBIS_AUDIO_IN_ERROR_INVALID_HANDLE;
     }
-    // Get port with read lock
     std::shared_ptr<PortIn> port;
     {
         std::shared_lock read_lock{port_table_mutex};
@@ -248,15 +228,12 @@ int PS4_SYSV_ABI sceAudioInGetSilentState(s32 handle) {
 
     u32 silent_state = 0;
     std::scoped_lock lock{port->mutex};
-    if (!port->impl->IsAvailable()) { // if no mic exist or is not available
+    if (!port->impl->IsAvailable()) {
         silent_state |= ORBIS_AUDIO_IN_SILENT_STATE_DEVICE_NONE;
     }
     return silent_state;
 }
 
-/*
- * Stubbed functions
- **/
 int PS4_SYSV_ABI sceAudioInChangeAppModuleState() {
     LOG_ERROR(Lib_AudioIn, "(STUBBED) called");
     return ORBIS_OK;
@@ -490,4 +467,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("4kHw99LUG3A", "libSceAudioIn", 1, "libSceAudioIn", sceAudioInVmicWrite);
 };
 
-} // namespace Libraries::AudioIn
+}

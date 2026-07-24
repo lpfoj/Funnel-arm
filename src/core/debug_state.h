@@ -32,8 +32,8 @@ class Layer;
 namespace Widget {
 class FrameGraph;
 class ShaderList;
-} // namespace Widget
-} // namespace Core::Devtools
+}
+}
 
 namespace DebugStateType {
 
@@ -48,7 +48,7 @@ enum class QueueType {
 struct QueueDump {
     QueueType type;
     u32 submit_num;
-    u32 num2; // acb: queue_num; else: buffer_in_submit
+    u32 num2;
     std::vector<u32> data;
     uintptr_t base_addr;
 };
@@ -78,7 +78,7 @@ struct RegDump {
 struct FrameDump {
     u32 frame_id;
     std::vector<QueueDump> queues;
-    std::unordered_map<uintptr_t, RegDump> regs; // address -> reg dump
+    std::unordered_map<uintptr_t, RegDump> regs;
 };
 
 struct ShaderDump {
@@ -233,6 +233,6 @@ public:
 private:
     std::optional<RegDump*> GetRegDump(uintptr_t base_addr, uintptr_t header_addr);
 };
-} // namespace DebugStateType
+}
 
 extern DebugStateType::DebugStateImpl& DebugState;

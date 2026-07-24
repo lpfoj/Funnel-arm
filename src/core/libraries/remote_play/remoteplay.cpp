@@ -292,4 +292,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("HV7jZe1frbM", "libSceRemoteplay", 1, "libSceRemoteplay", Func_1D5EE365ED5FADB3);
 };
 
-} // namespace Libraries::Remoteplay
+}

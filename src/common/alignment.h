@@ -46,4 +46,4 @@ template <typename T>
     return (value & 0x1FFFFF) == 0;
 }
 
-} // namespace Common
+}

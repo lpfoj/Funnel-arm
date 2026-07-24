@@ -16,10 +16,6 @@ namespace Vulkan {
 class Instance;
 class MasterSemaphore;
 
-/**
- * Handles a pool of resources protected by fences. Manages resource overflow allocating more
- * resources.
- */
 class ResourcePool {
 public:
     explicit ResourcePool() = default;
@@ -35,18 +31,16 @@ public:
 protected:
     std::size_t CommitResource();
 
-    /// Called when a chunk of resources have to be allocated.
     virtual void Allocate(std::size_t begin, std::size_t end) = 0;
 
 private:
-    /// Manages pool overflow allocating new resources.
     std::size_t ManageOverflow();
 
 protected:
     MasterSemaphore* master_semaphore{nullptr};
-    std::size_t grow_step = 0;     ///< Number of new resources created after an overflow
-    std::size_t hint_iterator = 0; ///< Hint to where the next free resources is likely to be found
-    std::vector<u64> ticks;        ///< Ticks for each resource
+    std::size_t grow_step = 0;
+    std::size_t hint_iterator = 0;
+    std::vector<u64> ticks;
 };
 
 class CommandPool final : public ResourcePool {
@@ -89,4 +83,4 @@ private:
     tsl::robin_map<u64, DescSetBatch> descriptor_sets;
 };
 
-} // namespace Vulkan
+}

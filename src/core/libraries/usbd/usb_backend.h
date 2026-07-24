@@ -22,7 +22,6 @@ struct list_head {
     struct list_head *prev, *next;
 };
 
-// Forward declared libusb structs
 struct UsbDeviceHandle {
     usbi_mutex_t lock;
     unsigned long claimed_interfaces;
@@ -257,9 +256,6 @@ public:
     }
 
     s32 CheckConnected(libusb_device_handle* dev) override {
-        // There's no libusb version of this function.
-        // Simulate by querying data.
-
         int config;
         return libusb_get_configuration(dev, &config);
     }
@@ -330,7 +326,6 @@ public:
         return GetActiveConfigDescriptor(dev, config);
     }
     void FreeConfigDescriptor(libusb_config_descriptor* config) override {
-        // Member variable reference, don't free
     }
 
     u8 GetBusNumber(libusb_device* dev) override {
@@ -411,19 +406,16 @@ public:
     s32 SubmitTransfer(libusb_transfer* transfer) override {
         ASSERT(transfer->type == LIBUSB_TRANSFER_TYPE_INTERRUPT);
 
-        // if we have no other flying transfers, start the list with this one
         if (flight_list.empty()) {
             flight_list.push_front(transfer);
             return LIBUSB_SUCCESS;
         }
 
-        // if we have infinite timeout, append to end of list
         if (transfer->timeout == 0) {
             flight_list.push_back(transfer);
             return LIBUSB_SUCCESS;
         }
 
-        // otherwise, find appropriate place in list
         for (auto it = flight_list.begin(); it != flight_list.end(); ++it) {
             if ((*it)->timeout > transfer->timeout) {
                 flight_list.insert(it, transfer);
@@ -431,7 +423,6 @@ public:
             }
         }
 
-        // otherwise we need to be inserted at the end
         flight_list.push_back(transfer);
         return LIBUSB_SUCCESS;
     }
@@ -474,4 +465,4 @@ protected:
     std::list<libusb_transfer*> flight_list;
 };
 
-} // namespace Libraries::Usbd
+}

@@ -1,9 +1,11 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <forward_list>
 #include <list>
 #include <mutex>
@@ -69,6 +71,10 @@ struct PthreadMutex {
     u64 : 64;
     PthreadMutexFlags m_flags;
     TimedMutex m_lock;
+#ifdef __ANDROID__
+    long m_owner_host_tid;
+    std::atomic<u64> m_lock_generation{0};
+#endif
     std::string name;
 
     [[nodiscard]] PthreadMutexType Type() const noexcept {
@@ -79,7 +85,7 @@ struct PthreadMutex {
     int SelfLock(const OrbisKernelTimespec* abstime, u64 usec);
 
     int TryLock();
-    int Lock(const OrbisKernelTimespec* abstime, u64 usec = 0);
+    int Lock(const OrbisKernelTimespec* abstime, u64 usec = 0, void* guest_cell = nullptr);
 
     int CvLock(int recurse) {
         const int error = Lock(nullptr);
@@ -101,7 +107,6 @@ struct PthreadMutex {
 };
 using PthreadMutexT = PthreadMutex*;
 
-// libc and libSceLibcInternal modify the m_flags of a mutex, make sure it's in the right spot.
 static_assert(offsetof(PthreadMutex, m_flags) == 0x20, "Incorrect offset for mutex flags");
 
 struct PthreadMutexAttr {
@@ -153,6 +158,23 @@ struct PthreadCondAttr {
 };
 using PthreadCondAttrT = PthreadCondAttr*;
 
+constexpr s32 PthreadBarrierSerialThread = -1;
+
+struct PthreadBarrier {
+    s64 cycle;
+    int count;
+    int waiters;
+    int refcount;
+    bool destroying;
+    BinarySemaphore destroy_sema{0};
+};
+using PthreadBarrierT = PthreadBarrier*;
+
+struct PthreadBarrierAttr {
+    int pshared;
+};
+using PthreadBarrierAttrT = PthreadBarrierAttr*;
+
 using PthreadCleanupFunc = void PS4_SYSV_ABI (*)(void*);
 
 struct PthreadCleanup {
@@ -160,6 +182,8 @@ struct PthreadCleanup {
     void* routine_arg;
     int onheap;
 };
+
+void RunPthreadCleanupCallback(PthreadCleanupFunc routine, void* arg, const char* reason);
 
 enum class PthreadAttrFlags : u32 {
     ScopeProcess = 0,
@@ -224,6 +248,7 @@ struct PthreadSpecificElem {
 };
 
 using PthreadKeyDestructor = void PS4_SYSV_ABI (*)(const void*);
+void RunPthreadKeyDestructor(PthreadKeyDestructor destructor, const void* data, const char* reason);
 
 struct PthreadKey {
     std::atomic<int> allocated;
@@ -320,6 +345,10 @@ struct Pthread {
     bool has_user_waiters;
     int nwaiter_defer;
     BinarySemaphore* defer_waiters[MaxDeferWaiters];
+    std::atomic<std::uint64_t> spurious_cond_wakes{0};
+    std::atomic<std::uint64_t> wake_release_count{0};
+    const char* last_wake_site{""};
+    std::uint64_t mono_by_index[32]{};
 
     bool InCritical() const noexcept {
         return locklevel > 0 || critical_count > 0;
@@ -341,7 +370,6 @@ struct Pthread {
     }
 
     void ClearWake() {
-        // Try to acquire wake semaphore to reset it.
         void(wake_sema.try_acquire());
     }
 
@@ -365,9 +393,11 @@ struct Pthread {
 using PthreadT = Pthread*;
 
 extern thread_local Pthread* g_curthread;
+Pthread* CurrentOrFallbackPthread();
 
 void RegisterMutex(Core::Loader::SymbolsResolver* sym);
 void RegisterCond(Core::Loader::SymbolsResolver* sym);
+void RegisterBarrier(Core::Loader::SymbolsResolver* sym);
 void RegisterRwlock(Core::Loader::SymbolsResolver* sym);
 void RegisterSemaphore(Core::Loader::SymbolsResolver* sym);
 void RegisterSpec(Core::Loader::SymbolsResolver* sym);
@@ -377,4 +407,4 @@ void RegisterRtld(Core::Loader::SymbolsResolver* sym);
 void RegisterKernelEventFlag(Core::Loader::SymbolsResolver* sym);
 void RegisterPthreadClean(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Kernel
+}

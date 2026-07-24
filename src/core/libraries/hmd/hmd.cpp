@@ -60,8 +60,6 @@ s32 PS4_SYSV_ABI sceHmdOpen(Libraries::UserService::OrbisUserServiceUserId user_
         return ORBIS_HMD_ERROR_PARAMETER_INVALID;
     }
 
-    // Return positive value representing handle.
-    // Internal libSceVrTracker logic requires this handle to be different from other devices.
     g_user_id = user_id;
     g_internal_handle = 0xf000000;
     return g_internal_handle;
@@ -76,16 +74,13 @@ s32 PS4_SYSV_ABI sceHmdGet2DEyeOffset(s32 handle, OrbisHmdEyeOffset* left_offset
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
-        // Due to some faulty in-library checks, a missing headset results in this error
-        // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
+    if (g_firmware_version >= Common::ElfInfo::FW_45) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
     if (left_offset == nullptr || right_offset == nullptr) {
         return ORBIS_HMD_ERROR_PARAMETER_NULL;
     }
 
-    // Return default values
     left_offset->offset_x = -0.0315;
     left_offset->offset_y = 0;
     left_offset->offset_z = 0;
@@ -128,9 +123,7 @@ s32 PS4_SYSV_ABI sceHmdGetDeviceInformationByHandle(s32 handle, OrbisHmdDeviceIn
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
-        // Due to some faulty in-library checks, a missing headset results in this error
-        // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
+    if (g_firmware_version >= Common::ElfInfo::FW_45) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
     if (info == nullptr) {
@@ -154,23 +147,13 @@ s32 PS4_SYSV_ABI sceHmdGetFieldOfView(s32 handle, OrbisHmdFieldOfView* field_of_
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
-        // Due to some faulty in-library checks, a missing headset results in this error
-        // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
+    if (g_firmware_version >= Common::ElfInfo::FW_45) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
     if (!g_library_initialized) {
         return ORBIS_HMD_ERROR_NOT_INITIALIZED;
     }
 
-    // These values are a hardcoded return when a headset is connected.
-    // Leaving this here for future developers.
-    // field_of_view->tan_out = 1.20743;
-    // field_of_view->tan_in = 1.181346;
-    // field_of_view->tan_top = 1.262872;
-    // field_of_view->tan_bottom = 1.262872;
-
-    // Fails internally due to some internal library checks that break without a connected headset.
     return ORBIS_HMD_ERROR_HANDLE_INVALID;
 }
 
@@ -182,9 +165,7 @@ s32 PS4_SYSV_ABI sceHmdGetInertialSensorData(s32 handle, void* data, s32 unk) {
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
-        // Due to some faulty in-library checks, a missing headset results in this error
-        // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
+    if (g_firmware_version >= Common::ElfInfo::FW_45) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
 
@@ -420,7 +401,6 @@ s32 PS4_SYSV_ABI sceHmdInternalGetDeviceStatus(OrbisHmdDeviceStatus* status) {
     if (status == nullptr) {
         return ORBIS_HMD_ERROR_PARAMETER_NULL;
     }
-    // Internal function fails with error DEVICE_DISCONNECTED
     *status = OrbisHmdDeviceStatus::ORBIS_HMD_DEVICE_STATUS_NOT_DETECTED;
     return ORBIS_OK;
 }
@@ -567,7 +547,6 @@ s32 PS4_SYSV_ABI sceHmdInternalMmapGetSensorCalibrationData() {
 
 s32 PS4_SYSV_ABI sceHmdInternalMmapIsConnect() {
     LOG_DEBUG(Lib_Hmd, "called");
-    // Returns 0 when device is disconnected.
     return 0;
 }
 
@@ -799,9 +778,7 @@ s32 PS4_SYSV_ABI Func_69383B2B4E3AEABF(s32 handle, void* data, s32 unk) {
     if (handle != g_internal_handle) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
-    if (g_firmware_version >= Common::ElfInfo::FW_450) {
-        // Due to some faulty in-library checks, a missing headset results in this error
-        // instead of the expected ORBIS_HMD_ERROR_DEVICE_DISCONNECTED error.
+    if (g_firmware_version >= Common::ElfInfo::FW_45) {
         return ORBIS_HMD_ERROR_HANDLE_INVALID;
     }
 
@@ -824,12 +801,10 @@ s32 PS4_SYSV_ABI Func_9952277839236BA7() {
 }
 
 s32 PS4_SYSV_ABI Func_9A276E739E54EEAF() {
-    // Stubbed on real hardware.
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI Func_9E501994E289CBE7() {
-    // Stubbed on real hardware.
     return ORBIS_OK;
 }
 
@@ -844,7 +819,6 @@ s32 PS4_SYSV_ABI Func_A92D7C23AC364993() {
 }
 
 s32 PS4_SYSV_ABI Func_ADCCC25CB876FDBE() {
-    // Stubbed on real hardware.
     return ORBIS_OK;
 }
 
@@ -1026,4 +1000,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     RegisterReprojection(sym);
 };
 
-} // namespace Libraries::Hmd
+}

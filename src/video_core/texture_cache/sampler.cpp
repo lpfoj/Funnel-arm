@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include "core/libraries/gnmdriver/gnmdriver.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
@@ -43,6 +47,20 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         }
     }();
 
+    const bool exec_probe = Libraries::GnmDriver::ExecutorReplayActive();
+#ifdef __ANDROID__
+    if (exec_probe) {
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
+                            "[EXECUTOR_SAMPLER] clampX=%u clampY=%u clampZ=%u minF=%u magF=%u mip=%u "
+                            "minLod=%.2f maxLod=%.2f border=%u depthCmp=%u",
+                            (unsigned)sampler.clamp_x.Value(), (unsigned)sampler.clamp_y.Value(),
+                            (unsigned)sampler.clamp_z.Value(), (unsigned)sampler.xy_min_filter.Value(),
+                            (unsigned)sampler.xy_mag_filter.Value(), (unsigned)sampler.mip_filter.Value(),
+                            sampler.MinLod(), sampler.MaxLod(),
+                            (unsigned)sampler.border_color_type.Value(),
+                            (unsigned)sampler.depth_compare_func.Value());
+    }
+#endif
     const vk::SamplerCreateInfo sampler_ci = {
         .pNext = custom_color ? &*custom_color : nullptr,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
@@ -59,7 +77,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .minLod = sampler.MinLod(),
         .maxLod = sampler.MaxLod(),
         .borderColor = border_color,
-        .unnormalizedCoordinates = false, // Handled in shader due to Vulkan limitations.
+        .unnormalizedCoordinates = false,
     };
     auto [sampler_result, smplr] = instance.GetDevice().createSamplerUnique(sampler_ci);
     ASSERT_MSG(sampler_result == vk::Result::eSuccess, "Failed to create sampler: {}",
@@ -69,4 +87,4 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
 
 Sampler::~Sampler() = default;
 
-} // namespace VideoCore
+}

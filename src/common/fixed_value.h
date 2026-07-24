@@ -3,16 +3,6 @@
 
 #pragma once
 
-/**
- * @brief A template class that encapsulates a fixed, compile-time constant value.
- *
- * @tparam T The type of the value.
- * @tparam Value The fixed value of type T.
- *
- * This class provides a way to encapsulate a value that is constant and known at compile-time.
- * The value is stored as a private member and cannot be changed. Any attempt to assign a new
- * value to an object of this class will reset it to the fixed value.
- */
 template <typename T, T Value>
 class FixedValue {
     T m_value{Value};

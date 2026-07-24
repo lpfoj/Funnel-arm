@@ -63,4 +63,4 @@ public:
     }
 };
 
-} // namespace Core::Devices
+}

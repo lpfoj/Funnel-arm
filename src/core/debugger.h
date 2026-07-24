@@ -13,4 +13,4 @@ int GetCurrentPid();
 
 void WaitForPid(int pid);
 
-} // namespace Core::Debugger
+}

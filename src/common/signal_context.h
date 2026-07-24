@@ -15,4 +15,4 @@ void IncrementRip(void* ctx, u64 length);
 
 bool IsWriteError(void* ctx);
 
-} // namespace Common
+}

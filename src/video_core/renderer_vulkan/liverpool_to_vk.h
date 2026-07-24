@@ -19,6 +19,11 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op);
 
 vk::CompareOp CompareOp(AmdGpu::CompareFunc func);
 
+u32 StencilReference(AmdGpu::CompareFunc stencil_compare, bool depth_test_enabled,
+                     AmdGpu::CompareFunc depth_compare, AmdGpu::StencilFunc pass_op,
+                     AmdGpu::StencilFunc depth_fail_op,
+                     const AmdGpu::StencilRefMask& ref_mask);
+
 bool IsPrimitiveCulled(AmdGpu::PrimitiveType type);
 
 vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type);
@@ -80,11 +85,9 @@ vk::SampleCountFlagBits NumSamples(u32 num_samples, vk::SampleCountFlags support
 
 static inline bool IsFormatDepthCompatible(vk::Format fmt) {
     switch (fmt) {
-    // 32-bit float compatible
     case vk::Format::eD32Sfloat:
     case vk::Format::eR32Sfloat:
     case vk::Format::eR32Uint:
-    // 16-bit unorm compatible
     case vk::Format::eD16Unorm:
     case vk::Format::eR16Unorm:
         return true;
@@ -95,7 +98,6 @@ static inline bool IsFormatDepthCompatible(vk::Format fmt) {
 
 static inline bool IsFormatStencilCompatible(vk::Format fmt) {
     switch (fmt) {
-    // 8-bit uint compatible
     case vk::Format::eS8Uint:
     case vk::Format::eR8Uint:
     case vk::Format::eR8Unorm:
@@ -114,4 +116,4 @@ static inline vk::Format PromoteFormatToDepth(vk::Format fmt) {
     UNREACHABLE_MSG("Unexpected depth format {}", vk::to_string(fmt));
 }
 
-} // namespace Vulkan::LiverpoolToVK
+}

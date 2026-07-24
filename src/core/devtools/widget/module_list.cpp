@@ -52,4 +52,4 @@ void ModuleList::Draw() {
     End();
 }
 
-} // namespace Core::Devtools::Widget
+}

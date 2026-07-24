@@ -58,4 +58,4 @@ struct OrbisNgs2ReverbRackInfo {
     u32 reverbSize;
 };
 
-} // namespace Libraries::Ngs2
+}

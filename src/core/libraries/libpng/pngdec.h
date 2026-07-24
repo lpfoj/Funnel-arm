@@ -80,4 +80,4 @@ s32 PS4_SYSV_ABI scePngDecParseHeader(const OrbisPngDecParseParam* param,
 s32 PS4_SYSV_ABI scePngDecQueryMemorySize(const OrbisPngDecCreateParam* param);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::PngDec
+}

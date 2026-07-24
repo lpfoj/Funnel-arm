@@ -85,7 +85,7 @@ s32 PS4_SYSV_ABI scePlayGoGetEta(OrbisPlayGoHandle handle, const OrbisPlayGoChun
         return ORBIS_PLAYGO_ERROR_BAD_SIZE;
     }
 
-    *outEta = 0; // all is loaded
+    *outEta = 0;
     return ORBIS_OK;
 }
 
@@ -108,7 +108,7 @@ s32 PS4_SYSV_ABI scePlayGoGetInstallSpeed(OrbisPlayGoHandle handle,
     if (playgo->speed == OrbisPlayGoInstallSpeed::Suspended) {
         using namespace std::chrono;
         if ((duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count() -
-             playgo->speed_tick) > 30 * 1000) { // 30sec
+             playgo->speed_tick) > 30 * 1000) {
             playgo->speed = OrbisPlayGoInstallSpeed::Trickle;
         }
     }
@@ -224,7 +224,7 @@ s32 PS4_SYSV_ABI scePlayGoGetToDoList(OrbisPlayGoHandle handle, OrbisPlayGoToDo*
     if (!playgo) {
         return ORBIS_PLAYGO_ERROR_NOT_INITIALIZED;
     }
-    *outEntries = 0; // nothing to do
+    *outEntries = 0;
     return ORBIS_OK;
 }
 
@@ -405,4 +405,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("MPe0EeBGM-E", "libScePlayGo", 1, "libScePlayGo", scePlayGoTerminate);
 };
 
-} // namespace Libraries::PlayGo
+}

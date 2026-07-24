@@ -24,4 +24,4 @@ enum class Error : u32 {
     BACKUP_BUSY = 0x809F0013,
     BUSY_FOR_SAVING = 0x809F0016,
 };
-} // namespace Libraries::SaveData
+}

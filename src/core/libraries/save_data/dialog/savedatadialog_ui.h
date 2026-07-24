@@ -219,7 +219,7 @@ public:
     struct SystemState {
         std::string msg{};
         bool hide_ok{};
-        bool show_no{}; // Yes instead of OK
+        bool show_no{};
         bool show_cancel{};
 
         bool return_cancel{};
@@ -317,4 +317,4 @@ private:
     void DrawProgressBar();
 };
 
-}; // namespace Libraries::SaveData::Dialog
+};

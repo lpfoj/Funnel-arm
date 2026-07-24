@@ -7,6 +7,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef __ANDROID__
+#include <atomic>
+#include <android/log.h>
+#endif
+
 #include "common/object_pool.h"
 #include "common/types.h"
 
@@ -30,8 +35,13 @@ public:
 
     ~MultiLevelPageTable() noexcept = default;
 
+    static constexpr size_t NumL1Pages = 1ULL << FirstLevelBits;
+
     [[nodiscard]] Entry* find(size_t page) {
         const size_t l1_page = page >> SecondLevelBits;
+        if (l1_page >= NumL1Pages) {
+            return nullptr;
+        }
         const size_t l2_page = page & (NumEntriesPerL1Page - 1);
         if (!first_level_map[l1_page]) {
             return nullptr;
@@ -41,6 +51,9 @@ public:
 
     [[nodiscard]] const Entry* find(size_t page) const {
         const size_t l1_page = page >> SecondLevelBits;
+        if (l1_page >= NumL1Pages) {
+            return nullptr;
+        }
         const size_t l2_page = page & (NumEntriesPerL1Page - 1);
         if (!first_level_map[l1_page]) {
             return nullptr;
@@ -50,6 +63,9 @@ public:
 
     [[nodiscard]] const Entry& operator[](size_t page) const {
         const size_t l1_page = page >> SecondLevelBits;
+        if (l1_page >= NumL1Pages) {
+            return OutOfRangeEntry();
+        }
         const size_t l2_page = page & (NumEntriesPerL1Page - 1);
         if (!first_level_map[l1_page]) {
             first_level_map[l1_page] = page_alloc.Create();
@@ -59,6 +75,9 @@ public:
 
     [[nodiscard]] Entry& operator[](size_t page) {
         const size_t l1_page = page >> SecondLevelBits;
+        if (l1_page >= NumL1Pages) {
+            return OutOfRangeEntry();
+        }
         const size_t l2_page = page & (NumEntriesPerL1Page - 1);
         if (!first_level_map[l1_page]) {
             first_level_map[l1_page] = page_alloc.Create();
@@ -67,8 +86,22 @@ public:
     }
 
 private:
+    static Entry& OutOfRangeEntry() {
+#ifdef __ANDROID__
+        static std::atomic<unsigned> s_oob{0};
+        const unsigned n = s_oob.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32) {
+            __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                                "[EXECUTOR_PAGETABLE_OOB] n=%u (guest address >= GPU ceiling; "
+                                "bounded no-op instead of ~8MB wild write)",
+                                n);
+        }
+#endif
+        static Entry dummy{};
+        return dummy;
+    }
     std::vector<L1Page*> first_level_map{};
     Common::ObjectPool<L1Page> page_alloc;
 };
 
-} // namespace VideoCore
+}

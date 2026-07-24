@@ -14,11 +14,11 @@ namespace Libraries::CompanionUtil {
 constexpr u32 ORBIS_COMPANION_UTIL_OK = 0;
 
 struct sceCompanionUtilEvent {
-    std::uint8_t blob[0x104]{}; /// 0x104 bytes of data, dont know what it is exactly
+    std::uint8_t blob[0x104]{};
 };
 
 struct sceCompanionUtilContext {
-    std::uint8_t blob[0x27B]{}; /// 0x27B bytes of data, dont know what it is exactly
+    std::uint8_t blob[0x27B]{};
 };
 
 u32 PS4_SYSV_ABI getEvent(sceCompanionUtilContext* ctx, sceCompanionUtilEvent* outEvent,
@@ -30,4 +30,4 @@ s32 PS4_SYSV_ABI sceCompanionUtilOptParamInitialize();
 s32 PS4_SYSV_ABI sceCompanionUtilTerminate();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::CompanionUtil
+}

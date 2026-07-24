@@ -13,12 +13,12 @@ class SymbolsResolver;
 
 namespace Libraries::VideoOut {
 
-// SceVideoOutBusType
-constexpr int SCE_VIDEO_OUT_BUS_TYPE_MAIN = 0;                    // Main output
-constexpr int SCE_VIDEO_OUT_BUS_TYPE_AUX_SOCIAL_SCREEN = 5;       // Aux output for social
-constexpr int SCE_VIDEO_OUT_BUS_TYPE_AUX_GAME_LIVE_STREAMING = 6; // Aux output for screaming
+struct VideoOutPort;
 
-// SceVideoOutRefreshRate
+constexpr int SCE_VIDEO_OUT_BUS_TYPE_MAIN = 0;
+constexpr int SCE_VIDEO_OUT_BUS_TYPE_AUX_SOCIAL_SCREEN = 5;
+constexpr int SCE_VIDEO_OUT_BUS_TYPE_AUX_GAME_LIVE_STREAMING = 6;
+
 constexpr int SCE_VIDEO_OUT_REFRESH_RATE_UNKNOWN = 0;
 constexpr int SCE_VIDEO_OUT_REFRESH_RATE_23_98HZ = 1;
 constexpr int SCE_VIDEO_OUT_REFRESH_RATE_50HZ = 2;
@@ -124,6 +124,11 @@ s32 PS4_SYSV_ABI sceVideoOutAddVblankEvent(Kernel::OrbisKernelEqueue eq, s32 han
 s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* const* addresses,
                                             s32 bufferNum, const BufferAttribute* attribute);
 s32 PS4_SYSV_ABI sceVideoOutGetBufferLabelAddress(s32 handle, uintptr_t* label_addr);
+bool ExecutorRegisterVoLabelAlias(s32 handle, uintptr_t address, u32 buffer_index);
+bool ExecutorTryWriteVoLabelAlias(const void* address, const void* data, u32 size);
+bool ExecutorTryReadVoLabelAlias(const void* address, u32* value);
+bool ExecutorRetireVoLabel(VideoOutPort* expected_port, u32 buffer_index);
+bool ExecutorResolveVoBufferIndex(s32 handle, u32 requested, u32* effective);
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate);
 s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle);
 s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle);
@@ -138,9 +143,30 @@ s32 PS4_SYSV_ABI sceVideoOutGetEventData(const Kernel::OrbisKernelEvent* ev, s64
 s32 PS4_SYSV_ABI sceVideoOutColorSettingsSetGamma(SceVideoOutColorSettings* settings, float gamma);
 s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettings* settings);
 
-// Internal system functions
 s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk);
+
+void ReplayBufferRegistrationsToPresenter();
+
+struct ExecutorVideoOutBufferSnapshot {
+    bool valid{};
+    s32 requested_index{-1};
+    s32 effective_index{-1};
+    s32 exact_address_index{-1};
+    s32 overlapping_address_index{-1};
+    u32 registered_buffers{};
+    VAddr address{};
+    u64 size_bytes{};
+    u32 width{};
+    u32 height{};
+    u32 pitch_in_pixel{};
+    u32 pixel_format{};
+    u32 tiling_mode{};
+};
+
+[[nodiscard]] bool
+ExecutorGetVideoOutBufferSnapshot(VAddr candidate_address, u64 candidate_size,
+                                  ExecutorVideoOutBufferSnapshot* snapshot) noexcept;
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::VideoOut
+}

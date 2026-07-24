@@ -4,11 +4,14 @@
 #include <cstdarg>
 #include <cstdio>
 #include <map>
+#include <string_view>
 
 #include <common/va_ctx.h>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
+#include "core/file_sys/fs.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
@@ -18,7 +21,25 @@
 #include "core/libraries/libs.h"
 #include "printf.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <array>
+#include <atomic>
+#include <mutex>
+#include "core/aerolib/stubs.h"
+#endif
+
 namespace Libraries::LibcInternal {
+
+#ifdef __ANDROID__
+static constexpr std::size_t kFileLockStripes = 128;
+static std::array<std::recursive_mutex, kFileLockStripes> g_file_lock_stripes{};
+
+static std::recursive_mutex& FileLockFor(const OrbisFILE* file) {
+    const auto key = reinterpret_cast<std::uintptr_t>(file);
+    return g_file_lock_stripes[(key >> 4) % kFileLockStripes];
+}
+#endif
 
 s32 PS4_SYSV_ABI internal_snprintf(char* s, u64 n, VA_ARGS) {
     VA_CTX(ctx);
@@ -26,28 +47,71 @@ s32 PS4_SYSV_ABI internal_snprintf(char* s, u64 n, VA_ARGS) {
 }
 
 std::map<s32, OrbisFILE*> g_files{};
-// Constants for tracking accurate file indexes.
-// Since the file struct is exposed to the application, accuracy is important.
 static constexpr s32 g_initial_files = 5;
 static constexpr s32 g_max_files = 0x100;
+
+#ifdef __ANDROID__
+namespace {
+
+std::atomic<int> g_executor_libc_io_log_budget{1024};
+
+bool ExecutorTraceLibcIoPath(std::string_view path) {
+    return path.find("/mnt/sandbox/pfsmnt/NPXS39041-app0/assets/") != std::string_view::npos ||
+           path.find("/user/app/NPXS39041/storedata/") != std::string_view::npos ||
+           path.find("/user/appmeta/NPXS39041/") != std::string_view::npos ||
+           path.find("/user/appmeta/external/NPXS39041/") != std::string_view::npos;
+}
+
+const Core::FileSys::File* ExecutorLibcIoFile(const OrbisFILE* file) {
+    if (file == nullptr || file->_Handle < 0) {
+        return nullptr;
+    }
+    return Common::Singleton<Core::FileSys::HandleTable>::Instance()->GetFile(file->_Handle);
+}
+
+bool ExecutorTraceLibcIoFile(const OrbisFILE* file) {
+    const auto* fs_file = ExecutorLibcIoFile(file);
+    return fs_file != nullptr && ExecutorTraceLibcIoPath(fs_file->m_guest_name);
+}
+
+void ExecutorLibcIoLog(const char* format, ...) {
+    if (g_executor_libc_io_log_budget.fetch_sub(1, std::memory_order_relaxed) <= 0) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    va_list stderr_args;
+    va_copy(stderr_args, args);
+    __android_log_vprint(ANDROID_LOG_INFO, "LSX4Native", format, args);
+    std::vfprintf(stderr, format, stderr_args);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+    va_end(stderr_args);
+    va_end(args);
+}
+
+}
+#endif
 
 OrbisFILE* PS4_SYSV_ABI internal__Fofind() {
     u64 index = g_initial_files;
     while (index != g_max_files) {
         OrbisFILE* file = g_files[index];
-        // If file doesn't exist, create it.
         if (file == nullptr) {
+#ifdef __ANDROID__
+            file = reinterpret_cast<OrbisFILE*>(
+                Core::AeroLib::ExecutorLibcCalloc(1, sizeof(OrbisFILE)));
+#else
             file = new OrbisFILE();
+#endif
             if (file == nullptr) {
                 return nullptr;
             }
-            // Store new file in the array, initialize default values, and return it.
             g_files[index] = file;
             file->_Mode = 0x80;
             file->_Idx = index;
             return file;
         }
-        // Special case, files with mode 0 are returned?
         if (file->_Mode == 0) {
             file->_Mode = 0xff7f;
             return file;
@@ -58,39 +122,49 @@ OrbisFILE* PS4_SYSV_ABI internal__Fofind() {
 }
 
 void PS4_SYSV_ABI internal__Lockfilelock(OrbisFILE* file) {
+#ifdef __ANDROID__
+    if (file != nullptr) {
+        FileLockFor(file).lock();
+    }
+#else
     if (file != nullptr && file->_Mutex != nullptr) {
         internal__Mtxlock(&file->_Mutex);
     }
+#endif
 }
 
 void PS4_SYSV_ABI internal__Unlockfilelock(OrbisFILE* file) {
+#ifdef __ANDROID__
+    if (file != nullptr) {
+        FileLockFor(file).unlock();
+    }
+#else
     if (file != nullptr && file->_Mutex != nullptr) {
         internal__Mtxunlock(&file->_Mutex);
     }
+#endif
 }
 
 OrbisFILE* PS4_SYSV_ABI internal__Foprep(const char* path, const char* mode, OrbisFILE* file,
                                          s32 fd, s32 s_mode, s32 flag) {
     if (file == nullptr) {
         *Kernel::__Error() = POSIX_ENOMEM;
+#ifdef __ANDROID__
         return nullptr;
+#endif
     }
 
-    // Preserve mode and index
+#ifndef __ANDROID__
     Libraries::Kernel::PthreadMutexT mtx = file->_Mutex;
     Libraries::Kernel::PthreadMutexT* mtx_ptr = &file->_Mutex;
+#endif
     u8 file_index = file->_Idx;
     u16 file_mode = file->_Mode & 0x80;
 
-    // Real library does a memcpy using a static global FILE object.
-    // This stored file is just zeros, with the only exception being a handle of -1.
     memset(file, 0, sizeof(OrbisFILE));
     file->_Handle = -1;
 
-    // Not sure what this magic is for, but I'll replicate it.
     u8* ptr = &file->_Cbuf;
-    // Note: this field is supposed to be a pthread mutex.
-    // Since we don't export pthread HLEs for other functions, I'll avoid handling this for now.
     file->_Mutex = nullptr;
     file->_Idx = file_index;
     file->_Buf = ptr;
@@ -103,7 +177,6 @@ OrbisFILE* PS4_SYSV_ABI internal__Foprep(const char* path, const char* mode, Orb
     file->_Rback = ptr;
     file->_WRback = &file->unk1;
 
-    // Parse inputted mode string
     const char* mode_str = mode;
     u16 calc_mode = 0;
     u16 access_mode = 0;
@@ -114,14 +187,20 @@ OrbisFILE* PS4_SYSV_ABI internal__Foprep(const char* path, const char* mode, Orb
     } else if (mode_str[0] == 'a') {
         calc_mode = 0x16 | file_mode;
     } else {
-        // Closes the file and returns EINVAL.
         file->_Mode = file_mode;
+#ifdef __ANDROID__
+        file->_Mutex = nullptr;
+        if (flag != 0) {
+            internal__Unlockfilelock(file);
+        }
+#else
         if (flag == 0) {
             internal__Mtxinit(mtx_ptr, nullptr);
         } else {
             file->_Mutex = mtx;
             internal__Unlockfilelock(file);
         }
+#endif
         internal_fclose(file);
         *Kernel::__Error() = POSIX_EINVAL;
         return nullptr;
@@ -129,7 +208,6 @@ OrbisFILE* PS4_SYSV_ABI internal__Foprep(const char* path, const char* mode, Orb
     file->_Mode = calc_mode;
 
     do {
-        // This is all basically straight from decomp, need to cleanup at some point.
         if (mode_str[1] == '+') {
             file_mode = 3;
             if ((~calc_mode & 3) == 0) {
@@ -147,28 +225,35 @@ OrbisFILE* PS4_SYSV_ABI internal__Foprep(const char* path, const char* mode, Orb
     } while (true);
 
     if (path == nullptr && fd >= 0) {
-        // I guess this is for some internal behavior?
         file->_Handle = fd;
     } else {
         fd = internal__Fopen(path, calc_mode, s_mode == 0x55);
         file->_Handle = fd;
     }
 
-    // Error case
     if (fd < 0) {
-        // Closes the file, but ensures errno is unchanged.
+#ifdef __ANDROID__
+        file->_Mutex = nullptr;
+        if (flag != 0) {
+            internal__Unlockfilelock(file);
+        }
+#else
         if (flag == 0) {
             internal__Mtxinit(mtx_ptr, nullptr);
         } else {
             file->_Mutex = mtx;
             internal__Unlockfilelock(file);
         }
+#endif
         s32 old_errno = *Kernel::__Error();
         internal_fclose(file);
         *Kernel::__Error() = old_errno;
         return nullptr;
     }
 
+#ifdef __ANDROID__
+    file->_Mutex = nullptr;
+#else
     if (flag == 0) {
         char mtx_name[0x20];
         std::snprintf(mtx_name, 0x20, "FileFD:0x%08X", fd);
@@ -176,6 +261,7 @@ OrbisFILE* PS4_SYSV_ABI internal__Foprep(const char* path, const char* mode, Orb
     } else {
         file->_Mutex = mtx;
     }
+#endif
     return file;
 }
 
@@ -185,26 +271,48 @@ s32 PS4_SYSV_ABI internal__Fopen(const char* path, u16 mode, bool flag) {
     if (!flag) {
         open_mode = 0666;
     }
-    // Straight from decomp, should probably get cleaned up at some point.
     s32 creat_flag = large_mode << 5 & 0x200;
     s32 excl_flag = large_mode << 5 & 0x800;
     s32 misc_flags = (large_mode & 8) * 0x80 + (large_mode & 4) * 2;
-    // Real library has an array for this, where large_mode & 3 is used as an index.
-    // That array has values [0, 0, 1, 2], so this call should match the result.
     s32 access_flag = std::max<s32>((large_mode & 3) - 1, 0);
     s32 open_flags = creat_flag | misc_flags | excl_flag | access_flag;
-    return Libraries::Kernel::posix_open(path, open_flags, open_mode);
+#ifdef __ANDROID__
+    const bool trace = path != nullptr && ExecutorTraceLibcIoPath(path);
+    if (trace) {
+        ExecutorLibcIoLog(
+            "[EXECUTOR_LIBC_IO] _Fopen path=%s mode=0x%x flag=%d open_flags=0x%x open_mode=0%o",
+            path, mode, flag ? 1 : 0, open_flags, open_mode);
+    }
+#endif
+    const s32 fd = Libraries::Kernel::posix_open(path, open_flags, open_mode);
+#ifdef __ANDROID__
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] _Fopen_result path=%s fd=%d errno=%d", path, fd,
+                          *Kernel::__Error());
+    }
+#endif
+    return fd;
 }
 
 OrbisFILE* PS4_SYSV_ABI internal_fopen(const char* path, const char* mode) {
     std::scoped_lock lk{g_file_mtx};
     LOG_INFO(Lib_LibcInternal, "called, path {}, mode {}", path, mode);
-    OrbisFILE* file = internal__Fofind();
-    OrbisFILE* ret_file = internal__Foprep(path, mode, file, -1, 0, 0);
-    if (ret_file == nullptr) {
-        LOG_ERROR(Lib_LibcInternal, "failed to open file {}", path);
+#ifdef __ANDROID__
+    const bool trace = path != nullptr && ExecutorTraceLibcIoPath(path);
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fopen path=%s mode=%s", path,
+                          mode ? mode : "<null>");
     }
-    return ret_file;
+#endif
+    OrbisFILE* file = internal__Fofind();
+    OrbisFILE* result = internal__Foprep(path, mode, file, -1, 0, 0);
+#ifdef __ANDROID__
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fopen_result path=%s file=%p fd=%d errno=%d", path,
+                          result, result ? result->_Handle : -1, *Kernel::__Error());
+    }
+#endif
+    return result;
 }
 
 s32 PS4_SYSV_ABI internal_fflush(OrbisFILE* file) {
@@ -312,30 +420,105 @@ s32 PS4_SYSV_ABI internal_fseek(OrbisFILE* file, s64 offset, s32 whence) {
     internal__Lockfilelock(file);
     LOG_TRACE(Lib_LibcInternal, "called, file handle {:#x}, offset {:#x}, whence {:#x}",
               file->_Handle, offset, whence);
+#ifdef __ANDROID__
+    const auto* fs_file = ExecutorLibcIoFile(file);
+    const bool trace = fs_file != nullptr && ExecutorTraceLibcIoPath(fs_file->m_guest_name);
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fseek fd=%d guest=%s offset=%lld whence=%d",
+                          file->_Handle, fs_file->m_guest_name.c_str(),
+                          static_cast<long long>(offset), whence);
+    }
+#endif
     s32 result = internal__Fspos(file, nullptr, offset, whence);
+#ifdef __ANDROID__
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fseek_result fd=%d result=%d errno=%d",
+                          file->_Handle, result, *Kernel::__Error());
+    }
+#endif
+    internal__Unlockfilelock(file);
+    return result;
+}
+
+s64 PS4_SYSV_ABI internal_ftell(OrbisFILE* file) {
+    if (file == nullptr || file->_Handle < 0) {
+        *Kernel::__Error() = POSIX_EBADF;
+        return -1;
+    }
+    internal__Lockfilelock(file);
+    s64 result = Libraries::Kernel::posix_lseek(file->_Handle, 0, 1);
+    if (result >= 0 && (file->_Mode & 0x1000) != 0) {
+        u8* read_end = file->_Rsave != nullptr ? file->_Rsave : file->_Rend;
+        if (read_end > file->_Next) {
+            result -= read_end - file->_Next;
+        }
+        if ((file->_Mode & 0x4000) != 0 && file->_Rback < &file->_Cbuf) {
+            result -= &file->_Cbuf - file->_Rback;
+        }
+    }
+    LOG_TRACE(Lib_LibcInternal, "called, file handle {:#x}, result {:#x}", file->_Handle, result);
+#ifdef __ANDROID__
+    if (ExecutorTraceLibcIoFile(file)) {
+        const auto* fs_file = ExecutorLibcIoFile(file);
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] ftell fd=%d guest=%s result=%lld errno=%d",
+                          file->_Handle, fs_file ? fs_file->m_guest_name.c_str() : "<unknown>",
+                          static_cast<long long>(result), *Kernel::__Error());
+    }
+#endif
     internal__Unlockfilelock(file);
     return result;
 }
 
 s32 PS4_SYSV_ABI internal__Frprep(OrbisFILE* file) {
+#ifdef __ANDROID__
+    const auto* trace_file = ExecutorLibcIoFile(file);
+    const bool trace = trace_file != nullptr && ExecutorTraceLibcIoPath(trace_file->m_guest_name);
+    if (trace) {
+        ExecutorLibcIoLog(
+            "[EXECUTOR_LIBC_IO] frprep_enter fd=%d guest=%s mode=0x%x next=%p rend=%p buf=%p bend=%p",
+            file->_Handle, trace_file->m_guest_name.c_str(), file->_Mode, file->_Next,
+            file->_Rend, file->_Buf, file->_Bend);
+    }
+#endif
     if (file->_Rend > file->_Next) {
+#ifdef __ANDROID__
+        if (trace) {
+            ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] frprep_buffered fd=%d guest=%s available=%llu",
+                              file->_Handle, trace_file->m_guest_name.c_str(),
+                              static_cast<unsigned long long>(file->_Rend - file->_Next));
+        }
+#endif
         return 1;
     }
     if ((file->_Mode & 0x100) != 0) {
+#ifdef __ANDROID__
+        if (trace) {
+            ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] frprep_eof_or_error fd=%d guest=%s mode=0x%x",
+                              file->_Handle, trace_file->m_guest_name.c_str(), file->_Mode);
+        }
+#endif
         return 0;
     }
     u16 mode = file->_Mode;
     if ((mode & 0xa001) != 1) {
-        // Lot of magic here, might be valuable to figure out what this does.
         file->_Mode = (((mode ^ 0x8000) >> 0xf) << 0xe) | mode | 0x200;
+#ifdef __ANDROID__
+        if (trace) {
+            ExecutorLibcIoLog(
+                "[EXECUTOR_LIBC_IO] frprep_reject_mode fd=%d guest=%s old_mode=0x%x new_mode=0x%x",
+                file->_Handle, trace_file->m_guest_name.c_str(), mode, file->_Mode);
+        }
+#endif
         return -1;
     }
 
     u8* file_buf = file->_Buf;
     if ((mode & 0x800) == 0 && file_buf == &file->_Cbuf) {
-        // Allocate a new file buffer, for now, we'll use host malloc to create it.
-        // When we have an HLE for malloc, that should be used instead.
+#ifdef __ANDROID__
+        u8* new_buffer = reinterpret_cast<u8*>(Core::AeroLib::ExecutorLibcMalloc(0x10000));
+#else
         u8* new_buffer = std::bit_cast<u8*>(std::malloc(0x10000));
+#endif
         if (new_buffer == nullptr) {
             file->_Buf = file_buf;
             file->_Bend = file_buf + 1;
@@ -347,13 +530,37 @@ s32 PS4_SYSV_ABI internal__Frprep(OrbisFILE* file) {
             file->_WWend = new_buffer;
             file_buf = new_buffer;
         }
+#ifdef __ANDROID__
+        if (trace) {
+            ExecutorLibcIoLog(
+                "[EXECUTOR_LIBC_IO] frprep_buffer_alloc fd=%d guest=%s host_buffer=%p bend=%p ok=%d",
+                file->_Handle, trace_file->m_guest_name.c_str(), file->_Buf, file->_Bend,
+                new_buffer != nullptr ? 1 : 0);
+        }
+#endif
     }
     file->_Next = file_buf;
     file->_Rend = file_buf;
     file->_Wend = file_buf;
-    // Intentional shrinking here, library treats value as 32-bit.
+    const auto read_request = static_cast<u64>(file->_Bend - file_buf);
+#ifdef __ANDROID__
+    if (trace) {
+        ExecutorLibcIoLog(
+            "[EXECUTOR_LIBC_IO] frprep_read_request fd=%d guest=%s request=%llu buf=%p bend=%p",
+            file->_Handle, trace_file->m_guest_name.c_str(),
+            static_cast<unsigned long long>(read_request), file_buf, file->_Bend);
+    }
+#endif
     s32 read_result =
-        Libraries::Kernel::sceKernelRead(file->_Handle, file_buf, file->_Bend - file_buf);
+        Libraries::Kernel::sceKernelRead(file->_Handle, file_buf, read_request);
+#ifdef __ANDROID__
+    if (trace) {
+        ExecutorLibcIoLog(
+            "[EXECUTOR_LIBC_IO] frprep_read_result fd=%d guest=%s result=%d errno=%d mode=0x%x",
+            file->_Handle, trace_file->m_guest_name.c_str(), read_result, *Kernel::__Error(),
+            file->_Mode);
+    }
+#endif
     if (read_result < 0) {
         u8* off_mode = reinterpret_cast<u8*>(&file->_Mode) + 1;
         *off_mode = *off_mode | 0x42;
@@ -374,6 +581,16 @@ u64 PS4_SYSV_ABI internal_fread(char* ptr, u64 size, u64 nmemb, OrbisFILE* file)
     internal__Lockfilelock(file);
     LOG_TRACE(Lib_LibcInternal, "called, file handle {:#x}, size {:#x}, nmemb {:#x}", file->_Handle,
               size, nmemb);
+#ifdef __ANDROID__
+    const auto* fs_file = ExecutorLibcIoFile(file);
+    const bool trace = fs_file != nullptr && ExecutorTraceLibcIoPath(fs_file->m_guest_name);
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fread fd=%d guest=%s size=%llu nmemb=%llu ptr=%p",
+                          file->_Handle, fs_file->m_guest_name.c_str(),
+                          static_cast<unsigned long long>(size),
+                          static_cast<unsigned long long>(nmemb), ptr);
+    }
+#endif
     s64 total_size = size * nmemb;
     s64 remaining_size = total_size;
     if ((file->_Mode & 0x4000) != 0) {
@@ -402,7 +619,18 @@ u64 PS4_SYSV_ABI internal_fread(char* ptr, u64 size, u64 nmemb, OrbisFILE* file)
             s32 res = internal__Frprep(file);
             if (res < 1) {
                 internal__Unlockfilelock(file);
-                return (total_size - remaining_size) / size;
+                const u64 items = (total_size - remaining_size) / size;
+#ifdef __ANDROID__
+                if (trace) {
+                    ExecutorLibcIoLog(
+                        "[EXECUTOR_LIBC_IO] fread_result fd=%d guest=%s items=%llu bytes=%llu short=1 errno=%d",
+                        file->_Handle, fs_file->m_guest_name.c_str(),
+                        static_cast<unsigned long long>(items),
+                        static_cast<unsigned long long>(total_size - remaining_size),
+                        *Kernel::__Error());
+                }
+#endif
+                return items;
             }
             src = file->_Next;
             file_ptr = file->_Rend;
@@ -414,7 +642,105 @@ u64 PS4_SYSV_ABI internal_fread(char* ptr, u64 size, u64 nmemb, OrbisFILE* file)
         remaining_size -= copy_bytes;
     }
     internal__Unlockfilelock(file);
-    return (total_size - remaining_size) / size;
+    const u64 items = (total_size - remaining_size) / size;
+#ifdef __ANDROID__
+    if (trace) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fread_result fd=%d guest=%s items=%llu bytes=%llu errno=%d",
+                          file->_Handle, fs_file->m_guest_name.c_str(),
+                          static_cast<unsigned long long>(items),
+                          static_cast<unsigned long long>(total_size - remaining_size),
+                          *Kernel::__Error());
+    }
+#endif
+    return items;
+}
+
+u64 PS4_SYSV_ABI internal_fwrite(const char* ptr, u64 size, u64 nmemb, OrbisFILE* file) {
+    if (size == 0 || nmemb == 0) {
+        return 0;
+    }
+    if (file == nullptr || file->_Handle < 0) {
+        *Kernel::__Error() = POSIX_EBADF;
+        return 0;
+    }
+    internal__Lockfilelock(file);
+    const u64 total_size = size * nmemb;
+    u64 written = 0;
+    while (written < total_size) {
+        const auto chunk = total_size - written;
+        const s64 result =
+            Libraries::Kernel::sceKernelWrite(file->_Handle, ptr + written, chunk);
+        if (result <= 0) {
+            break;
+        }
+        written += static_cast<u64>(result);
+    }
+    internal__Unlockfilelock(file);
+    return written / size;
+}
+
+s32 PS4_SYSV_ABI internal_fgetc(OrbisFILE* file) {
+    unsigned char ch = 0;
+    const s32 result = internal_fread(reinterpret_cast<char*>(&ch), 1, 1, file) == 1 ? ch : -1;
+#ifdef __ANDROID__
+    if (ExecutorTraceLibcIoFile(file)) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fgetc fd=%d result=%d", file ? file->_Handle : -1,
+                          result);
+    }
+#endif
+    return result;
+}
+
+s32 PS4_SYSV_ABI internal_ungetc(s32 ch, OrbisFILE* file) {
+    if (file == nullptr || ch == -1) {
+        return -1;
+    }
+    internal__Lockfilelock(file);
+    if (file->_Rback <= file->_Back) {
+        internal__Unlockfilelock(file);
+        return -1;
+    }
+    --file->_Rback;
+    *file->_Rback = static_cast<u8>(ch);
+    file->_Mode |= 0x4000;
+    internal__Unlockfilelock(file);
+    return static_cast<u8>(ch);
+}
+
+s32 PS4_SYSV_ABI internal_feof(OrbisFILE* file) {
+    if (file == nullptr) {
+        return 0;
+    }
+    return (file->_Mode & 0x0100) != 0 ? 1 : 0;
+}
+
+s32 PS4_SYSV_ABI internal_ferror(OrbisFILE* file) {
+    if (file == nullptr) {
+        return 0;
+    }
+    return (file->_Mode & 0x0200) != 0 ? 1 : 0;
+}
+
+void PS4_SYSV_ABI internal_rewind(OrbisFILE* file) {
+    if (file == nullptr) {
+        return;
+    }
+#ifdef __ANDROID__
+    if (ExecutorTraceLibcIoFile(file)) {
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] rewind fd=%d", file->_Handle);
+    }
+#endif
+    internal_fseek(file, 0, 0);
+    file->_Mode &= static_cast<u16>(~0x0300u);
+}
+
+s32 PS4_SYSV_ABI internal_fopen_s(OrbisFILE** out_file, const char* path, const char* mode) {
+    if (out_file == nullptr) {
+        *Kernel::__Error() = POSIX_EFAULT;
+        return POSIX_EFAULT;
+    }
+    *out_file = internal_fopen(path, mode);
+    return *out_file != nullptr ? 0 : *Kernel::__Error();
 }
 
 void PS4_SYSV_ABI internal__Fofree(OrbisFILE* file) {
@@ -431,11 +757,17 @@ void PS4_SYSV_ABI internal__Fofree(OrbisFILE* file) {
     file->_WWend = cbuf_ptr;
     file->_Rback = cbuf_ptr;
     file->_WRback = &file->unk1;
+#ifdef __ANDROID__
+    file->_Mutex = nullptr;
+#endif
     if (trunc_mode < 0) {
-        // Remove file from vector
         g_files.erase(file->_Idx);
+#ifdef __ANDROID__
+        Core::AeroLib::ExecutorLibcFree(reinterpret_cast<u64>(file));
+#else
         internal__Mtxdst(&file->_Mutex);
         free(file);
+#endif
     }
 }
 
@@ -445,6 +777,13 @@ s32 PS4_SYSV_ABI internal_fclose(OrbisFILE* file) {
     }
 
     LOG_INFO(Lib_LibcInternal, "called, file handle {:#x}", file->_Handle);
+#ifdef __ANDROID__
+    if (ExecutorTraceLibcIoFile(file)) {
+        const auto* fs_file = ExecutorLibcIoFile(file);
+        ExecutorLibcIoLog("[EXECUTOR_LIBC_IO] fclose fd=%d guest=%s", file->_Handle,
+                          fs_file ? fs_file->m_guest_name.c_str() : "<unknown>");
+    }
+#endif
     if ((file->_Mode & 3) == 0 || file->_Handle < 0) {
         std::scoped_lock lk{g_file_mtx};
         internal__Fofree(file);
@@ -453,12 +792,15 @@ s32 PS4_SYSV_ABI internal_fclose(OrbisFILE* file) {
         s32 fflush_result = internal_fflush(file);
         std::scoped_lock lk{g_file_mtx};
         if ((file->_Mode & 0x40) != 0) {
+#ifdef __ANDROID__
+            Core::AeroLib::ExecutorLibcFree(reinterpret_cast<u64>(file->_Buf));
+#else
             std::free(file->_Buf);
+#endif
         }
         file->_Buf = nullptr;
         s32 close_result = Libraries::Kernel::posix_close(file->_Handle);
         internal__Fofree(file);
-        // Need to figure out what exactly this means.
         return ~-(close_result == 0) | fflush_result;
     }
     return 0;
@@ -466,6 +808,7 @@ s32 PS4_SYSV_ABI internal_fclose(OrbisFILE* file) {
 
 void RegisterlibSceLibcInternalIo(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("eLdDw6l0-bU", "libSceLibcInternal", 1, "libSceLibcInternal", internal_snprintf);
+    LIB_FUNCTION("MUjC4lbHrK4", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fflush);
     LIB_FUNCTION("xGT4Mc55ViQ", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Fofind);
     LIB_FUNCTION("dREVnZkAKRE", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Foprep);
     LIB_FUNCTION("sQL8D-jio7U", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Fopen);
@@ -477,12 +820,26 @@ void RegisterlibSceLibcInternalIo(Core::Loader::SymbolsResolver* sym) {
                  internal__Lockfilelock);
     LIB_FUNCTION("0x7rx8TKy2Y", "libSceLibcInternal", 1, "libSceLibcInternal",
                  internal__Unlockfilelock);
+}
 
+void ForceRegisterlibSceLibcInternalIo(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("xeYO4u7uyJ0", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fopen);
     LIB_FUNCTION("rQFVBXp-Cxg", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fseek);
+    LIB_FUNCTION("Qazy8LmXTvw", "libSceLibcInternal", 1, "libSceLibcInternal", internal_ftell);
+    LIB_FUNCTION("5qP1iVQkdck", "libSceLibcInternal", 1, "libSceLibcInternal", internal_ftell);
+    LIB_FUNCTION("pkYiKw09PRA", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fseek);
     LIB_FUNCTION("lbB+UlZqVG0", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fread);
-    LIB_FUNCTION("MUjC4lbHrK4", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fflush);
+    LIB_FUNCTION("MpxhMh8QFro", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fwrite);
+    LIB_FUNCTION("AEuF3F2f8TA", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fgetc);
+    LIB_FUNCTION("8Q60JLJ6Rv4", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fgetc);
+    LIB_FUNCTION("-LFO7jhD5CE", "libSceLibcInternal", 1, "libSceLibcInternal", internal_ungetc);
+    LIB_FUNCTION("LxcEU+ICu8U", "libSceLibcInternal", 1, "libSceLibcInternal", internal_feof);
+    LIB_FUNCTION("NuydofHcR1w", "libSceLibcInternal", 1, "libSceLibcInternal", internal_feof);
+    LIB_FUNCTION("AHxyhN96dy4", "libSceLibcInternal", 1, "libSceLibcInternal", internal_ferror);
+    LIB_FUNCTION("yxbGzBQC5xA", "libSceLibcInternal", 1, "libSceLibcInternal", internal_ferror);
+    LIB_FUNCTION("3QIPIh-GDjw", "libSceLibcInternal", 1, "libSceLibcInternal", internal_rewind);
+    LIB_FUNCTION("NL836gOLANs", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fopen_s);
     LIB_FUNCTION("uodLYyUip20", "libSceLibcInternal", 1, "libSceLibcInternal", internal_fclose);
 }
 
-} // namespace Libraries::LibcInternal
+}

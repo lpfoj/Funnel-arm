@@ -4,33 +4,12 @@
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 namespace Shader::Gcn {
-
-/**
- * s_load_dwordx4 s[8:11], s[2:3], 0x00
- * s_load_dwordx4 s[12:15], s[2:3], 0x04
- * s_load_dwordx4 s[16:19], s[2:3], 0x08
- * s_waitcnt     lgkmcnt(0)
- * buffer_load_format_xyzw v[4:7], v0, s[8:11], 0 idxen
- * buffer_load_format_xyz v[8:10], v0, s[12:15], 0 idxen
- * buffer_load_format_xy v[12:13], v0, s[16:19], 0 idxen
- * s_waitcnt     0
- * s_setpc_b64   s[0:1]
-
- * s_load_dwordx4  s[4:7], s[2:3], 0x0
- * s_waitcnt       lgkmcnt(0)
- * buffer_load_format_xyzw v[4:7], v0, s[4:7], 0 idxen
- * s_load_dwordx4  s[4:7], s[2:3], 0x8
- * s_waitcnt       lgkmcnt(0)
- * buffer_load_format_xyzw v[8:11], v0, s[4:7], 0 idxen
- * s_waitcnt       vmcnt(0) & expcnt(0) & lgkmcnt(0)
- * s_setpc_b64     s[0:1]
-
- * A normal fetch shader looks like the above, the instructions are generated
- * using input semantics on cpu side. Load instructions can either be separate or interleaved
- * We take the reverse way, extract the original input semantics from these instructions.
- **/
 
 static bool IsTypedBufferLoad(const Gcn::GcnInst& inst) {
     return inst.opcode == Opcode::TBUFFER_LOAD_FORMAT_X ||
@@ -42,6 +21,15 @@ static bool IsTypedBufferLoad(const Gcn::GcnInst& inst) {
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     const u32* code;
     std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
+#if defined(__ANDROID__)
+    if (Libraries::GnmDriver::ExecutorReplayActive()) {
+        const u64 ptr = reinterpret_cast<u64>(code);
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
+                            "[EXECUTOR_FETCH_PTR] sgpr_base=%u ptr=0x%llx relocated=%d",
+                            sgpr_base, (unsigned long long)ptr,
+                            Libraries::GnmDriver::ExecutorReplayIsRelocated(ptr) ? 1 : 0);
+    }
+#endif
     return code;
 }
 
@@ -79,10 +67,10 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
             const auto vgpr = inst.dst[0].code;
             const auto sgpr = s8(inst.src[0].code);
             switch (vgpr) {
-            case 0: // V0 is always the vertex offset
+            case 0:
                 data.vertex_offset_sgpr = sgpr;
                 break;
-            case 3: // V3 is always the instance offset
+            case 3:
                 data.instance_offset_sgpr = sgpr;
                 break;
             default:
@@ -91,7 +79,6 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         }
 
         if (inst.inst_class == InstClass::VectorMemBufFmt) {
-            // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
             const u32 base_sgpr = inst.src[2].code * 4;
             auto& attrib = data.attributes.emplace_back();
             attrib.semantic = semantic_index++;
@@ -111,4 +98,4 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     return data;
 }
 
-} // namespace Shader::Gcn
+}

@@ -13,6 +13,8 @@ class SymbolsResolver;
 
 namespace Libraries::Np::NpTrophy {
 
+extern std::string game_serial;
+
 constexpr int ORBIS_NP_TROPHY_FLAG_SETSIZE = 128;
 constexpr int ORBIS_NP_TROPHY_FLAG_BITS_SHIFT = 5;
 
@@ -226,4 +228,4 @@ int PS4_SYSV_ABI Func_F8EF6F5350A91990();
 int PS4_SYSV_ABI Func_FA7A2DD770447552();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Np::NpTrophy
+}

@@ -17,4 +17,4 @@ struct BorderColorBuffer {
     }
 };
 
-} // namespace AmdGpu
+}

@@ -22,4 +22,4 @@ struct OrbisNgs2PanWork {
     u32 numSpeakers;
 };
 
-} // namespace Libraries::Ngs2
+}

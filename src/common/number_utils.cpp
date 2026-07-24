@@ -152,4 +152,4 @@ float S16ToSnorm(s16 val) {
     return float(val * c);
 }
 
-} // namespace NumberUtils
+}

@@ -27,8 +27,6 @@ s32 PS4_SYSV_ABI sceMoveOpen(Libraries::UserService::OrbisUserServiceUserId user
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
     }
-    // Even when no controllers are connected, this returns a proper handle.
-    // Internal libSceVrTracker logic requires this handle to be different from other devices.
     static s32 handle = 0x30b0000;
     return handle += 0x100;
 }
@@ -99,7 +97,6 @@ s32 PS4_SYSV_ABI sceMoveResetLightSphere(s32 handle) {
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
     }
-    // Returns success, even if no controllers are connected.
     return ORBIS_OK;
 }
 
@@ -134,4 +131,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("tsZi60H4ypY", "libSceMove", 1, "libSceMove", sceMoveTerm);
 };
 
-} // namespace Libraries::Move
+}

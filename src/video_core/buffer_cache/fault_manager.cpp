@@ -80,7 +80,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
         scheduler.Wait(wait_tick);
-        scheduler.PopPendingOperations();
+        scheduler.PopPendingOperations(true, true);
     }
 
     const u32 offset = current_area * PageFaultAreaSize;
@@ -143,7 +143,6 @@ void FaultManager::ProcessFaultBuffer() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
-    // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = caching_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
     cmdbuf.dispatch(num_workgroups, 1, 1);
@@ -174,4 +173,4 @@ void FaultManager::ProcessFaultBuffer() {
     current_area %= MaxPendingFaults;
 }
 
-} // namespace VideoCore
+}

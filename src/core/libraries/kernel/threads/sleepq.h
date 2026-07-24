@@ -34,4 +34,4 @@ bool SleepqRemove(SleepQueue* sq, Pthread* td);
 
 void SleepqDrop(SleepQueue* sq, void (*callback)(Pthread*, void*), void* arg);
 
-} // namespace Libraries::Kernel
+}

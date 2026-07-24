@@ -44,4 +44,4 @@ struct OrbisMoveData {
 };
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Move
+}

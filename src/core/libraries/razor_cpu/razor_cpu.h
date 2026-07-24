@@ -14,4 +14,4 @@ class SymbolsResolver;
 
 namespace Libraries::RazorCpu {
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::RazorCpu
+}

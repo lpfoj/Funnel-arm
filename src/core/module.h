@@ -1,12 +1,13 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
+#include "common/config.h"
 #include "common/types.h"
-#include "core/emulator_settings.h"
 #include "core/loader/elf.h"
 #include "core/loader/symbols_resolver.h"
 
@@ -141,6 +142,12 @@ class MemoryManager;
 
 class Module {
 public:
+    enum class LifecycleState : u8 {
+        Loaded,
+        Starting,
+        Started,
+    };
+
     explicit Module(Core::MemoryManager* memory, const std::filesystem::path& file,
                     u32& max_tls_index);
     ~Module();
@@ -166,7 +173,7 @@ public:
     }
 
     bool IsSystemLib() {
-        auto system_path = EmulatorSettings.GetSysModulesDir();
+        auto system_path = Config::getSysModulesPath();
         if (file.string().starts_with(system_path.string().c_str())) {
             return true;
         }
@@ -207,6 +214,10 @@ public:
         rela_bits[index >> 3] |= (1 << (index & 7));
     }
 
+    void ClearRelaBit(u32 index) {
+        rela_bits[index >> 3] &= ~(1 << (index & 7));
+    }
+
     bool TestRelaBit(u32 index) const {
         return (rela_bits[index >> 3] >> (index & 7)) & 1;
     }
@@ -240,8 +251,9 @@ public:
     Loader::SymbolsResolver export_sym;
     Loader::SymbolsResolver import_sym;
     ThreadLocalImage tls{};
+    std::atomic<LifecycleState> lifecycle_state{LifecycleState::Loaded};
     OrbisKernelModuleInfo info{};
     std::vector<u8> rela_bits;
 };
 
-} // namespace Core
+}

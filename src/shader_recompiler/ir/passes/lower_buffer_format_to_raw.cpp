@@ -89,7 +89,6 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
         UNREACHABLE_MSG("Unsupported buffer data format: {}", format_info.data_format);
     }
 
-    // Pad to 4 components and apply additional modifications.
     boost::container::static_vector<IR::Value, 4> components;
     for (u32 i = 0; i < 4; i++) {
         if (i < format_info.num_components) {
@@ -109,7 +108,6 @@ static IR::Value LoadBufferFormat(IR::IREmitter& ir, const IR::Value handle, con
 static void StoreBufferFormat(IR::IREmitter& ir, const IR::Value handle, const IR::U32 address,
                               const IR::Value& value, const IR::BufferInstInfo info,
                               const FormatInfo& format_info) {
-    // Extract actual number of components and apply additional modifications.
     const auto swizzled = ApplySwizzle(ir, value, format_info.swizzle.Inverse());
     boost::container::static_vector<IR::Value, 4> components;
     for (u32 i = 0; i < format_info.num_components; i++) {
@@ -233,4 +231,4 @@ void LowerBufferFormatToRaw(IR::Program& program) {
     }
 }
 
-} // namespace Shader::Optimization
+}

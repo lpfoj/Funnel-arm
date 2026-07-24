@@ -25,4 +25,4 @@ float S10ToSnorm(s16 val);
 float U16ToUnorm(u16 val);
 float S16ToSnorm(s16 val);
 
-} // namespace NumberUtils
+}

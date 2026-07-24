@@ -84,10 +84,10 @@ struct Address {
 
 union ShaderStageEnable {
     enum VgtStages : u32 {
-        Vs = 0u, // always enabled
+        Vs = 0u,
         EsGs = 0xB0u,
         LsHs = 0x45u,
-        LsHsEsGs = 0xAD,
+        LsHsEsGs = 0xADu,
     };
 
     VgtStages raw;
@@ -135,17 +135,6 @@ enum class GsOutputPrimitiveType : u32 {
     PointList = 0,
     LineStrip = 1,
     TriangleStrip = 2,
-};
-
-union RingOffset {
-    u32 raw;
-    struct {
-        u32 offset : 15;
-    };
-
-    u32 GetOffset() const {
-        return offset;
-    }
 };
 
 union GsOutPrimitiveType {
@@ -282,4 +271,4 @@ struct TessFactorClamp {
     float hs_min_tess;
 };
 
-} // namespace AmdGpu
+}

@@ -18,6 +18,7 @@ public:
 
     u64 GetTimeNS(u64 base_ptc = 0) const;
     u64 GetTimeUS(u64 base_ptc = 0) const;
+    u64 GetTimeUSRelaxed(u64 base_ptc = 0) const;
     u64 GetTimeMS(u64 base_ptc = 0) const;
     u64 GetUptime() const;
 
@@ -28,4 +29,4 @@ private:
     u64 ms_rdtsc_factor;
 };
 
-} // namespace Common
+}

@@ -22,17 +22,25 @@ public:
     explicit Swapchain(const Instance& instance, const Frontend::WindowSDL& window);
     ~Swapchain();
 
-    /// Creates (or recreates) the swapchain with a given size.
     void Create(u32 width, u32 height);
 
-    /// Recreates the swapchain with a given size and current surface.
     void Recreate(u32 width, u32 height);
 
-    /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
 
-    /// Presents the current image and move to the next one
     bool Present();
+
+    [[nodiscard]] bool NeedsRecreation() const noexcept {
+        return needs_recreation;
+    }
+
+    [[nodiscard]] bool IsTerminal() const noexcept {
+        return terminal;
+    }
+
+    [[nodiscard]] vk::Result TerminalResult() const noexcept {
+        return terminal_result;
+    }
 
     vk::SurfaceKHR GetSurface() const {
         return surface;
@@ -93,22 +101,16 @@ public:
     }
 
 private:
-    /// Selects the best available swapchain image format
     void FindPresentFormat();
 
-    /// Selects the best available present mode
     void FindPresentMode();
 
-    /// Sets the surface properties according to device capabilities
-    void SetSurfaceProperties();
+    bool SetSurfaceProperties();
 
-    /// Destroys current swapchain resources
     void Destroy();
 
-    /// Performs creation of image views and framebuffers from the swapchain images
     void SetupImages();
 
-    /// Creates the image acquired and present ready semaphores
     void RefreshSemaphores();
 
 private:
@@ -120,6 +122,7 @@ private:
     vk::Format view_format;
     vk::PresentModeKHR present_mode;
     vk::Extent2D extent;
+    vk::SurfaceTransformFlagBitsKHR surface_current_transform;
     vk::SurfaceTransformFlagBitsKHR transform;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;
     std::vector<vk::Image> images;
@@ -132,8 +135,11 @@ private:
     u32 image_index = 0;
     u32 frame_index = 0;
     bool needs_recreation = true;
-    bool needs_hdr = false;    // The game requested HDR swapchain
-    bool supports_hdr = false; // SC supports HDR output
+    bool terminal = false;
+    vk::Result terminal_result{vk::Result::eSuccess};
+    u32 consecutive_acquire_timeouts = 0;
+    bool needs_hdr = false;
+    bool supports_hdr = false;
 };
 
-} // namespace Vulkan
+}

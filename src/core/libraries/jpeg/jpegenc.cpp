@@ -43,7 +43,6 @@ static s32 ValidateJpegEncMemory(const void* memory, const u32 memory_size) {
 
 static s32 ValidateJpegEncEncodeParam(const OrbisJpegEncEncodeParam* param) {
 
-    // Validate addresses
     if (!param) {
         return ORBIS_JPEG_ENC_ERROR_INVALID_ADDR;
     }
@@ -55,12 +54,10 @@ static s32 ValidateJpegEncEncodeParam(const OrbisJpegEncEncodeParam* param) {
         return ORBIS_JPEG_ENC_ERROR_INVALID_ADDR;
     }
 
-    // Validate sizes
     if (param->image_size == 0 || param->jpeg_size == 0) {
         return ORBIS_JPEG_ENC_ERROR_INVALID_SIZE;
     }
 
-    // Validate parameters
     if (param->image_width > ORBIS_JPEG_ENC_MAX_IMAGE_DIMENSION ||
         param->image_height > ORBIS_JPEG_ENC_MAX_IMAGE_DIMENSION) {
         return ORBIS_JPEG_ENC_ERROR_INVALID_PARAM;
@@ -204,4 +201,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("o6ZgXfFdWXQ", "libSceJpegEnc", 1, "libSceJpegEnc", sceJpegEncQueryMemorySize);
 };
 
-} // namespace Libraries::JpegEnc
+}

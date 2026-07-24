@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-// generated using ps4_names2stubs.py
 
 STUB("++-URPJNZ18", _ZN9Inspector17ScriptDebugServer23removeBreakpointActionsEm)
 STUB("++67uYkhqBU", _ZN7WebCore28InspectorFrontendClientLocal8Settings11getPropertyERKN3WTF6StringE)

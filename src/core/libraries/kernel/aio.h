@@ -40,4 +40,4 @@ struct OrbisKernelAioRWRequest {
 };
 
 void RegisterAio(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Kernel
+}

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <random>
 #include <thread>
 #include <boost/asio/io_context.hpp>
 
@@ -13,7 +15,6 @@
 #include "common/va_ctx.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/error_codes.h"
-#include "core/libraries/kernel/coredump/coredump.h"
 #include "core/libraries/kernel/debug.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/file_system.h"
@@ -31,20 +32,100 @@
 
 #ifdef _WIN64
 #include <Rpc.h>
-#else
+#elif !defined(__ANDROID__)
 #include <uuid/uuid.h>
 #endif
 #include <common/singleton.h>
 #include <core/libraries/network/net_error.h>
 #include <core/libraries/network/sockets.h>
 #include <core/linker.h>
+#include <cstring>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <atomic>
+#include <sys/mman.h>
+#endif
 #include "aio.h"
 
 namespace Libraries::Kernel {
 
-static u64 g_stack_chk_guard = 0xDEADBEEF54321ABC; // dummy return
-static std::vector<char*> g_environ{};
-static const char* g_progname = "eboot.bin";
+#ifdef __ANDROID__
+static u64 g_stack_chk_guard = 0;
+#else
+static u64 g_stack_chk_guard = 0xDEADBEEF54321ABC;
+#endif
+
+#ifdef __ANDROID__
+u64* GetStackChkGuardExportStorage() {
+    static u64* guard_storage = []() -> u64* {
+        void* page = mmap(nullptr, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) {
+            __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                                "[EXECUTOR_STACK_GUARD_EXPORT] mmap failed, using native bss ptr=%p",
+                                &g_stack_chk_guard);
+            return &g_stack_chk_guard;
+        }
+        auto* guard = static_cast<u64*>(page);
+        *guard = g_stack_chk_guard;
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_STACK_GUARD_EXPORT] storage=%p value=0x%llx mode=zero_model",
+                            guard, static_cast<unsigned long long>(*guard));
+        return guard;
+    }();
+    return guard_storage;
+}
+
+extern "C" int executor_live_get_current_hle_call_site(std::uint64_t* guest_return,
+                                                       std::uint64_t* return_off,
+                                                       std::uint64_t* arg0,
+                                                       char* symbol,
+                                                       std::size_t symbol_size,
+                                                       char* module,
+                                                       std::size_t module_size)
+    __attribute__((weak));
+extern "C" int executor_lsx4_android_get_current_guest_regs(void* out, std::size_t out_size)
+    __attribute__((weak));
+extern "C" int executor_lsx4_android_symbolize_guest_pc(
+    std::uint64_t pc, char* module_name, std::size_t module_name_size, std::uint64_t* module_base,
+    std::uint64_t* module_offset, char* symbol_name, std::size_t symbol_name_size,
+    std::uint64_t* symbol_offset, std::uint64_t* symbol_delta) __attribute__((weak));
+
+struct ExecutorStackChkGuestRegs {
+    std::uint64_t regs[16];
+    std::uint64_t rip;
+    std::uint64_t old_ip;
+    std::uint64_t fsbase;
+    std::uint64_t gsbase;
+    int quit;
+    int exit;
+    int error;
+};
+
+static void LogStackChkSymbol(const char* tag, std::uint64_t pc) {
+    if (pc == 0 || executor_lsx4_android_symbolize_guest_pc == nullptr) {
+        return;
+    }
+    char pc_module[192]{};
+    char pc_symbol[128]{};
+    std::uint64_t pc_base = 0;
+    std::uint64_t pc_off = 0;
+    std::uint64_t sym_off = 0;
+    std::uint64_t sym_delta = 0;
+    const int rc = executor_lsx4_android_symbolize_guest_pc(
+        pc, pc_module, sizeof(pc_module), &pc_base, &pc_off, pc_symbol, sizeof(pc_symbol),
+        &sym_off, &sym_delta);
+    __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                        "[EXECUTOR_STACK_CHK_SYMBOL] tag=%s pc=%p rc=%d module=%s "
+                        "base=%p off=0x%llx symbol=%s symOff=0x%llx delta=0x%llx",
+                        tag, reinterpret_cast<void*>(pc), rc,
+                        pc_module[0] ? pc_module : "<unknown>", reinterpret_cast<void*>(pc_base),
+                        static_cast<unsigned long long>(pc_off),
+                        pc_symbol[0] ? pc_symbol : "<unknown>",
+                        static_cast<unsigned long long>(sym_off),
+                        static_cast<unsigned long long>(sym_delta));
+}
+#endif
 
 boost::asio::io_context io_context;
 static std::mutex m_asio_req;
@@ -80,8 +161,95 @@ static void KernelServiceThread(std::stop_token stoken) {
     }
 }
 
-static PS4_SYSV_ABI void stack_chk_fail() {
-    UNREACHABLE();
+[[noreturn]] static PS4_SYSV_ABI void stack_chk_fail() {
+#ifdef __ANDROID__
+    std::uint64_t guest_return = 0;
+    std::uint64_t return_off = 0;
+    std::uint64_t arg0 = 0;
+    char symbol[128]{};
+    char module[192]{};
+    const int site_rc = executor_live_get_current_hle_call_site
+                            ? executor_live_get_current_hle_call_site(
+                                  &guest_return, &return_off, &arg0, symbol, sizeof(symbol),
+                                  module, sizeof(module))
+                            : -1;
+    __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                        "[EXECUTOR_STACK_CHK_FAIL] guest __stack_chk_fail reached site_rc=%d "
+                        "guest_return=%p returnOff=0x%llx symbol=%s module=%s arg0=%p",
+                        site_rc, reinterpret_cast<void*>(guest_return),
+                        static_cast<unsigned long long>(return_off),
+                        symbol[0] ? symbol : "<unknown>",
+                        module[0] ? module : "<unknown>", reinterpret_cast<void*>(arg0));
+    ExecutorStackChkGuestRegs regs{};
+    const int regs_rc = executor_lsx4_android_get_current_guest_regs
+                            ? executor_lsx4_android_get_current_guest_regs(&regs, sizeof(regs))
+                            : -1;
+    std::uint64_t stack_ret = 0;
+    std::uint64_t thunk_guest_rsp = 0;
+    std::uint64_t thunk_guest_ret = 0;
+    if (regs_rc == 0 && regs.regs[4] >= 0x10000) {
+        std::memcpy(&stack_ret, reinterpret_cast<const void*>(regs.regs[4]), sizeof(stack_ret));
+    }
+    if (regs_rc == 0 && regs.regs[7] >= 0x10000) {
+        std::memcpy(&thunk_guest_rsp, reinterpret_cast<const void*>(regs.regs[7] + 0x40),
+                    sizeof(thunk_guest_rsp));
+        if (thunk_guest_rsp >= 0x10000) {
+            std::memcpy(&thunk_guest_ret, reinterpret_cast<const void*>(thunk_guest_rsp),
+                        sizeof(thunk_guest_ret));
+        }
+    }
+    std::uint64_t canary_m08 = 0;
+    std::uint64_t canary_m10 = 0;
+    std::uint64_t canary_m18 = 0;
+    std::uint64_t canary_m20 = 0;
+    std::uint64_t canary_m28 = 0;
+    std::uint64_t canary_m30 = 0;
+    std::uint64_t guard_value = 0;
+    auto read_rbp_slot = [&](std::uint64_t offset, std::uint64_t& out) {
+        if (regs_rc == 0 && regs.regs[5] >= offset + 0x10000) {
+            std::memcpy(&out, reinterpret_cast<const void*>(regs.regs[5] - offset), sizeof(out));
+        }
+    };
+    read_rbp_slot(0x08, canary_m08);
+    read_rbp_slot(0x10, canary_m10);
+    read_rbp_slot(0x18, canary_m18);
+    read_rbp_slot(0x20, canary_m20);
+    read_rbp_slot(0x28, canary_m28);
+    read_rbp_slot(0x30, canary_m30);
+    const auto* guard = GetStackChkGuardExportStorage();
+    if (guard != nullptr) {
+        std::memcpy(&guard_value, guard, sizeof(guard_value));
+    }
+    __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                        "[EXECUTOR_STACK_CHK_REGS] regs_rc=%d rip=%p old_ip=%p rsp=%p rbp=%p "
+                        "rax=%p rdi=%p rsi=%p rdx=%p rcx=%p stackRet=%p fsbase=%p gsbase=%p",
+                        regs_rc, reinterpret_cast<void*>(regs.rip),
+                        reinterpret_cast<void*>(regs.old_ip), reinterpret_cast<void*>(regs.regs[4]),
+                        reinterpret_cast<void*>(regs.regs[5]), reinterpret_cast<void*>(regs.regs[0]),
+                        reinterpret_cast<void*>(regs.regs[7]), reinterpret_cast<void*>(regs.regs[6]),
+                        reinterpret_cast<void*>(regs.regs[2]), reinterpret_cast<void*>(regs.regs[1]),
+                        reinterpret_cast<void*>(stack_ret), reinterpret_cast<void*>(regs.fsbase),
+                        reinterpret_cast<void*>(regs.gsbase));
+    __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                        "[EXECUTOR_STACK_CHK_DETAIL] thunkGuestRsp=%p thunkGuestRet=%p "
+                        "guardPtr=%p guard=0x%llx rbp_m08=0x%llx rbp_m10=0x%llx "
+                        "rbp_m18=0x%llx rbp_m20=0x%llx rbp_m28=0x%llx rbp_m30=0x%llx",
+                        reinterpret_cast<void*>(thunk_guest_rsp),
+                        reinterpret_cast<void*>(thunk_guest_ret), guard,
+                        static_cast<unsigned long long>(guard_value),
+                        static_cast<unsigned long long>(canary_m08),
+                        static_cast<unsigned long long>(canary_m10),
+                        static_cast<unsigned long long>(canary_m18),
+                        static_cast<unsigned long long>(canary_m20),
+                        static_cast<unsigned long long>(canary_m28),
+                        static_cast<unsigned long long>(canary_m30));
+    LogStackChkSymbol("rip", regs.rip);
+    LogStackChkSymbol("old_ip", regs.old_ip);
+    LogStackChkSymbol("stack_ret", stack_ret);
+    LogStackChkSymbol("thunk_guest_ret", thunk_guest_ret);
+#endif
+    std::abort();
+    __builtin_unreachable();
 }
 
 static thread_local s32 g_posix_errno = 0;
@@ -106,7 +274,6 @@ s32 PS4_SYSV_ABI sceKernelError(s32 posix_error) {
 }
 
 void SetPosixErrno(s32 e) {
-    // Some error numbers are different between supported OSes
     switch (e) {
     case EPERM:
         g_posix_errno = POSIX_EPERM;
@@ -183,12 +350,21 @@ s32 PS4_SYSV_ABI sceKernelUuidCreate(OrbisKernelUuid* orbisUuid) {
     if (UuidCreate(&uuid) != RPC_S_OK) {
         return ORBIS_KERNEL_ERROR_EFAULT;
     }
+#elif defined(__ANDROID__)
+    std::random_device rd;
+    auto* uuid = reinterpret_cast<u8*>(orbisUuid);
+    for (size_t i = 0; i < sizeof(OrbisKernelUuid); i++) {
+        uuid[i] = static_cast<u8>(rd());
+    }
+    orbisUuid->timeHiAndVersion = (orbisUuid->timeHiAndVersion & 0x0fff) | 0x4000;
+    orbisUuid->clockSeqHiAndReserved = (orbisUuid->clockSeqHiAndReserved & 0x3f) | 0x80;
+    return ORBIS_OK;
 #else
     uuid_t uuid;
     uuid_generate(uuid);
-#endif
     std::memcpy(orbisUuid, &uuid, sizeof(OrbisKernelUuid));
     return ORBIS_OK;
+#endif
 }
 
 s32 PS4_SYSV_ABI kernel_ioctl(s32 fd, u64 cmd, VA_ARGS) {
@@ -215,25 +391,123 @@ s32 PS4_SYSV_ABI kernel_ioctl(s32 fd, u64 cmd, VA_ARGS) {
 }
 
 const char* PS4_SYSV_ABI sceKernelGetFsSandboxRandomWord() {
-    const char* path = "sys";
+    const char* path = "executor";
     return path;
 }
 
-s32 PS4_SYSV_ABI _sigprocmask() {
+#if !defined(_WIN32)
+static void OrbisSigsetToNative(const Sigset* in, sigset_t* out) {
+    sigemptyset(out);
+    if (!in) {
+        return;
+    }
+    for (s32 sig = 1; sig < 128; ++sig) {
+        const u64 mask = 1ULL << (sig & 63);
+        if ((in->bits[sig >> 6] & mask) == 0) {
+            continue;
+        }
+        if (sig == POSIX_SIGKILL || sig == POSIX_SIGSTOP || sig == POSIX_SIGTHR ||
+            sig == POSIX_SIGLIBRT) {
+            continue;
+        }
+        const s32 native = OrbisToNativeSignal(sig);
+        if (native > 0 && native < NSIG) {
+            sigaddset(out, native);
+        }
+    }
+}
+
+static void NativeSigsetToOrbis(const sigset_t* in, Sigset* out) {
+    if (!out) {
+        return;
+    }
+    out->bits[0] = 0;
+    out->bits[1] = 0;
+    if (!in) {
+        return;
+    }
+    for (s32 native = 1; native < NSIG; ++native) {
+        if (sigismember(in, native) != 1) {
+            continue;
+        }
+        const s32 orbis = NativeToOrbisSignal(native);
+        if (orbis > 0 && orbis < 128) {
+            out->bits[orbis >> 6] |= 1ULL << (orbis & 63);
+        }
+    }
+}
+#endif
+
+s32 PS4_SYSV_ABI _sigprocmask(s32 how, const Sigset* set, Sigset* oldset) {
+#ifdef _WIN32
+    if (oldset) {
+        oldset->bits[0] = 0;
+        oldset->bits[1] = 0;
+    }
     return ORBIS_OK;
+#else
+    sigset_t native_set{};
+    sigset_t native_old{};
+    sigset_t* set_ptr = nullptr;
+    if (set) {
+        OrbisSigsetToNative(set, &native_set);
+        set_ptr = &native_set;
+    }
+
+    int native_how = SIG_SETMASK;
+    switch (how) {
+    case 1:
+        native_how = SIG_BLOCK;
+        break;
+    case 2:
+        native_how = SIG_UNBLOCK;
+        break;
+    case 3:
+        native_how = SIG_SETMASK;
+        break;
+    default:
+        native_how = how;
+        break;
+    }
+
+    errno = 0;
+    const int rc = pthread_sigmask(native_how, set_ptr, oldset ? &native_old : nullptr);
+    if (oldset) {
+        NativeSigsetToOrbis(&native_old, oldset);
+    }
+#ifdef __ANDROID__
+    static const bool trace_sigmask = std::getenv("EXECUTOR_TRACE_SIGMASK") != nullptr;
+    static std::atomic_int budget{128};
+    if (trace_sigmask && budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_SIGMASK] thread=%s how=%d nativeHow=%d set=%p "
+                            "old=%p rc=%d errno=%d set0=0x%llx set1=0x%llx old0=0x%llx "
+                            "old1=0x%llx",
+                            g_curthread ? g_curthread->name.c_str() : "<no-gcurthread>", how,
+                            native_how, set, oldset, rc, errno,
+                            static_cast<unsigned long long>(set ? set->bits[0] : 0),
+                            static_cast<unsigned long long>(set ? set->bits[1] : 0),
+                            static_cast<unsigned long long>(oldset ? oldset->bits[0] : 0),
+                            static_cast<unsigned long long>(oldset ? oldset->bits[1] : 0));
+    }
+#endif
+    if (rc != 0) {
+        *__Error() = rc;
+        return ORBIS_FAIL;
+    }
+    return ORBIS_OK;
+#endif
 }
 
 s32 PS4_SYSV_ABI posix_getpagesize() {
     return 16_KB;
 }
 
-// stubbed on non-devkit consoles
 s32 PS4_SYSV_ABI sceKernelGetGPI() {
     LOG_DEBUG(Kernel, "called");
     return ORBIS_OK;
 }
 
-// stubbed on non-devkit consoles
 s32 PS4_SYSV_ABI sceKernelSetGPO() {
     LOG_DEBUG(Kernel, "called");
     return ORBIS_OK;
@@ -243,7 +517,6 @@ s32 PS4_SYSV_ABI sceKernelGetAllowedSdkVersionOnSystem(s32* ver) {
     if (ver == nullptr) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    // Returns the highest game SDK version this PS4 allows.
     *ver = CURRENT_FIRMWARE_VERSION | 0xfff;
     LOG_INFO(Lib_Kernel, "called, returned sw version: {}", *ver);
     return ORBIS_OK;
@@ -301,159 +574,8 @@ s32 PS4_SYSV_ABI sceKernelGetAppInfo(s32 pid, OrbisKernelAppInfo* app_info) {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceKernelTitleWorkaroundIsEnabled(OrbisKernelTitleWorkaround* tw, s32 bit,
-                                                   s32* result) {
-    LOG_ERROR(Lib_Kernel, "(STUBBED) called, bit {:#x}", bit);
-    if (!tw || !result) {
-        return ORBIS_KERNEL_ERROR_EFAULT;
-    }
-
-    // Maximum bit value is known to change with new firmwares.
-    if (bit >= 0x3a) {
-        return ORBIS_KERNEL_ERROR_EINVAL;
-    }
-
-    // Straight from decompilation, most uses rely on workaround data from sceKernelGetAppInfo.
-    *result = ((tw->ids[bit >> 6] >> (bit & 0x3f)) & 1);
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceKernelGetProcessType(s32 pid) {
-    LOG_ERROR(Lib_Kernel, "(STUBBED) called, pid: {}", pid);
-    if (pid != GLOBAL_PID) {
-        return ORBIS_KERNEL_ERROR_ENOSYS;
-    }
-    return 0;
-}
-
-s32 PS4_SYSV_ABI __sys_regmgr_call(u32 op, u32 key, void* result, void* value, u64 len) {
-    LOG_ERROR(Lib_Kernel, "(STUBBED) called, op: {:#x}, key: {}, len: {}", op, key, len);
-    return ORBIS_OK;
-}
-
-// Nominally: long sysconf(int name);
-u64 PS4_SYSV_ABI posix_sysconf(s32 name) {
-    switch (name) {
-    case 0:
-        return 0x20000;
-    case POSIX_SC_ARG_MAX:
-        return 0x588bc000;
-    case POSIX_SC_CHILD_MAX:
-        return 0x64;
-    case POSIX_SC_CLK_TCK:
-        return 0x20;
-    case POSIX_SC_NGROUPS_MAX:
-        return 0x644;
-    case POSIX_SC_OPEN_MAX:
-        return -0x1;
-    case POSIX_SC_JOB_CONTROL:
-        return 0x6;
-    case POSIX_SC_SAVED_IDS:
-        return 0x1;
-    case POSIX_SC_VERSION:
-        return 0x1;
-    case POSIX_SC_BC_BASE_MAX:
-        return 0x31069;
-    case POSIX_SC_BC_DIM_MAX:
-        return -0x1;
-    case POSIX_SC_BC_SCALE_MAX:
-        return 0x31069;
-    case POSIX_SC_BC_STRING_MAX:
-        return 0x31069;
-    case POSIX_SC_COLL_WEIGHTS_MAX:
-        return -0x1;
-    case POSIX_SC_EXPR_NEST_MAX:
-        return -0x1;
-    case POSIX_SC_LINE_MAX:
-        return 0x31069;
-    case POSIX_SC_RE_DUP_MAX:
-        return 0x31069;
-    case POSIX_SC_2_VERSION:
-        return 0x31069;
-    case POSIX_SC_2_C_BIND:
-        return 0x31069;
-    case POSIX_SC_2_C_DEV:
-        return 0x31069;
-    case POSIX_SC_2_CHAR_TERM:
-        return 0x31069;
-    case POSIX_SC_2_FORT_DEV:
-        return 0x31069;
-    case POSIX_SC_2_FORT_RUN:
-        return 0x31069;
-    case POSIX_SC_2_LOCALEDEF:
-        return -0x1;
-    case POSIX_SC_2_SW_DEV:
-        return -0x1;
-    case POSIX_SC_2_UPE:
-        return 0x0;
-    case POSIX_SC_STREAM_MAX:
-        return 0x7fffffff;
-    case POSIX_SC_TZNAME_MAX:
-        return -0x1;
-    case POSIX_SC_ASYNCHRONOUS_IO:
-        return 0x8000;
-    case POSIX_SC_MAPPED_FILES:
-        return 0x31069;
-    case POSIX_SC_MEMLOCK:
-        return 0x4000;
-    case POSIX_SC_MEMLOCK_RANGE:
-        return 0x1e;
-    case POSIX_SC_MEMORY_PROTECTION:
-        return 0x100;
-    case POSIX_SC_MESSAGE_PASSING:
-        return 0x7fffffff;
-    case POSIX_SC_PRIORITIZED_IO:
-        return -0x1;
-    case POSIX_SC_PRIORITY_SCHEDULING:
-        return -0x1;
-    case POSIX_SC_REALTIME_SIGNALS:
-        return 0x63;
-    case POSIX_SC_SEMAPHORES:
-        return 0x800;
-    case POSIX_SC_FSYNC:
-        return 0x63;
-    case POSIX_SC_SHARED_MEMORY_OBJECTS:
-        return 0x3e8;
-    case POSIX_SC_SYNCHRONIZED_IO:
-        return 0x2;
-    case POSIX_SC_THREAD_ATTR_STACKSIZE:
-        return 0x1;
-    case POSIX_SC_THREAD_CPUTIME:
-        return 0x1;
-    case POSIX_SC_THREAD_DESTRUCTOR_ITERATIONS:
-        return 0x48000;
-    case POSIX_SC_THREAD_KEYS_MAX:
-        return 0x1a078630b2dd7;
-    case POSIX_SC_THREAD_PRIO_INHERIT:
-        return -0x1;
-    case POSIX_SC_THREAD_PRIO_PROTECT:
-        return -0x1;
-    case POSIX_SC_THREAD_PRIORITY_SCHEDULING:
-        return 0x2bc;
-    case POSIX_SC_THREAD_PROCESS_SHARED:
-        return 0x2bc;
-    case POSIX_SC_THREAD_SAFE_FUNCTIONS:
-        return 0x1;
-    case POSIX_SC_THREAD_SPORADIC_SERVER:
-        return -0x1;
-    case POSIX_SC_THREAD_STACK_MIN:
-        return 0x1;
-    case POSIX_SC_THREAD_THREADS_MAX:
-        return 0x1;
-    case POSIX_SC_TIMEOUTS:
-        return -0x1;
-    // Manually specified
-    case POSIX_SC_PAGESIZE:
-        return posix_getpagesize();
-    default:
-        LOG_ERROR(Lib_Kernel, "unhandled {}", name);
-        return 0;
-    }
-}
-
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     service_thread = std::jthread{KernelServiceThread};
-    g_environ.emplace_back(nullptr);
 
     Libraries::Kernel::RegisterFileSystem(sym);
     Libraries::Kernel::RegisterTime(sym);
@@ -465,18 +587,17 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     Libraries::Kernel::RegisterException(sym);
     Libraries::Kernel::RegisterAio(sym);
     Libraries::Kernel::RegisterDebug(sym);
-    Libraries::Kernel::RegisterCoredump(sym);
 
+#ifdef __ANDROID__
+    LIB_OBJ("f7uOxY9mM1U", "libkernel", 1, "libkernel", GetStackChkGuardExportStorage());
+#else
     LIB_OBJ("f7uOxY9mM1U", "libkernel", 1, "libkernel", &g_stack_chk_guard);
-    LIB_OBJ("+2thxYZ4syk", "libkernel", 1, "libkernel", &g_environ);
-    LIB_OBJ("djxxOmW6-aw", "libkernel", 1, "libkernel", &g_progname);
+#endif
     LIB_FUNCTION("D4yla3vx4tY", "libkernel", 1, "libkernel", sceKernelError);
     LIB_FUNCTION("YeU23Szo3BM", "libkernel", 1, "libkernel", sceKernelGetAllowedSdkVersionOnSystem);
     LIB_FUNCTION("Mv1zUObHvXI", "libkernel", 1, "libkernel", sceKernelGetSystemSwVersion);
     LIB_FUNCTION("igMefp4SAv0", "libkernel", 1, "libkernel", get_authinfo);
     LIB_FUNCTION("G-MYv5erXaU", "libkernel", 1, "libkernel", sceKernelGetAppInfo);
-    LIB_FUNCTION("1yca4VvfcNA", "libkernel", 1, "libkernel", sceKernelTitleWorkaroundIsEnabled);
-    LIB_FUNCTION("+g+UP8Pyfmo", "libkernel", 1, "libkernel", sceKernelGetProcessType);
     LIB_FUNCTION("PfccT7qURYE", "libkernel", 1, "libkernel", kernel_ioctl);
     LIB_FUNCTION("wW+k21cmbwQ", "libkernel", 1, "libkernel", kernel_ioctl);
     LIB_FUNCTION("JGfTMBOdUJo", "libkernel", 1, "libkernel", sceKernelGetFsSandboxRandomWord);
@@ -486,15 +607,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("9BcDykPmo1I", "libkernel", 1, "libkernel", __Error);
     LIB_FUNCTION("k+AXqu2-eBc", "libkernel", 1, "libkernel", posix_getpagesize);
     LIB_FUNCTION("k+AXqu2-eBc", "libScePosix", 1, "libkernel", posix_getpagesize);
-    LIB_FUNCTION("7NwggrWJ5cA", "libkernel", 1, "libkernel", __sys_regmgr_call);
-
-    LIB_FUNCTION("mkawd0NA9ts", "libkernel", 1, "libkernel", posix_sysconf);
-    LIB_FUNCTION("mkawd0NA9ts", "libScePosix", 1, "libkernel", posix_sysconf);
-
     LIB_FUNCTION("NWtTN10cJzE", "libSceLibcInternalExt", 1, "libSceLibcInternal",
                  sceLibcHeapGetTraceInfo);
 
-    // network
     LIB_FUNCTION("XVL8So3QJUk", "libkernel", 1, "libkernel", Libraries::Net::sys_connect);
     LIB_FUNCTION("pG70GT5yRo4", "libkernel", 1, "libkernel", Libraries::Net::sys_socketex);
     LIB_FUNCTION("KuOmgKoqCdY", "libkernel", 1, "libkernel", Libraries::Net::sys_bind);
@@ -525,9 +640,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("RenI1lL1WFk", "libScePosix", 1, "libkernel", Libraries::Net::sys_getsockname);
     LIB_FUNCTION("KuOmgKoqCdY", "libScePosix", 1, "libkernel", Libraries::Net::sys_bind);
     LIB_FUNCTION("5jRCs2axtr4", "libScePosix", 1, "libkernel",
-                 Libraries::Net::sceNetInetNtop); // TODO fix it to sys_ ...
+                 Libraries::Net::sceNetInetNtop);
     LIB_FUNCTION("4n51s0zEf0c", "libScePosix", 1, "libkernel",
-                 Libraries::Net::sceNetInetPton); // TODO fix it to sys_ ...
+                 Libraries::Net::sceNetInetPton);
     LIB_FUNCTION("XVL8So3QJUk", "libScePosix", 1, "libkernel", Libraries::Net::sys_connect);
     LIB_FUNCTION("3e+4Iv7IJ8U", "libScePosix", 1, "libkernel", Libraries::Net::sys_accept);
     LIB_FUNCTION("aNeavPDNKzA", "libScePosix", 1, "libkernel", Libraries::Net::sys_sendmsg);
@@ -539,4 +654,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("FJmglmTMdr4", "libkernel", 1, "libkernel", getargv);
 }
 
-} // namespace Libraries::Kernel
+}

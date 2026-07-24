@@ -6,11 +6,10 @@
 #include "ajm_result.h"
 
 #include <aacdecoder_lib.h>
-// using this internal header to manually configure the decoder in RAW mode
 #include "externals/aacdec/fdk-aac/libAACdec/src/aacdecoder.h"
 
-#include <algorithm> // std::transform
-#include <iterator>  // std::back_inserter
+#include <algorithm>
+#include <iterator>
 #include <limits>
 
 namespace Libraries::Ajm {
@@ -68,8 +67,6 @@ void AjmAacDecoder::Reset() {
 
     m_decoder = aacDecoder_Open(TransportTypeFromConfigType(m_init_params.config_type), 1);
     if (m_init_params.config_type == ConfigType::RAW) {
-        // Manually configure the decoder
-        // Things may be incorrect due to limited documentation
         CSAudioSpecificConfig asc{};
         asc.m_aot = AOT_AAC_LC;
         asc.m_samplingFrequency = g_freq[m_init_params.sampling_freq_type];
@@ -92,7 +89,7 @@ void AjmAacDecoder::Reset() {
             asc.m_channelConfiguration = 11;
             break;
         case 8:
-            asc.m_channelConfiguration = 12; // 7, 12 or 14 ?
+            asc.m_channelConfiguration = 12;
             break;
         default:
             UNREACHABLE();
@@ -149,7 +146,6 @@ DecoderResult AjmAacDecoder::ProcessData(std::span<u8>& input, SparseOutputBuffe
                                          AjmInstanceGapless& gapless) {
     DecoderResult result{};
 
-    // Discard the previous contents of the internal buffer and replace them with new ones
     aacDecoder_SetParam(m_decoder, AAC_TPDEC_CLEAR_BUFFER, 1);
     UCHAR* buffers[] = {input.data()};
     const UINT sizes[] = {static_cast<UINT>(input.size())};
@@ -215,4 +211,4 @@ DecoderResult AjmAacDecoder::ProcessData(std::span<u8>& input, SparseOutputBuffe
     return result;
 }
 
-} // namespace Libraries::Ajm
+}

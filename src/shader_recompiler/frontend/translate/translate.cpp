@@ -1,10 +1,9 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/config.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
-#include "core/emulator_settings.h"
-#include "core/libraries/kernel/process.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/translate/translate.h"
@@ -15,8 +14,18 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/resource.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define EXEC_FF_MARK(...) \
+    do { if (Libraries::GnmDriver::ExecutorReplayActive()) \
+        __android_log_print(ANDROID_LOG_INFO, "EXECUTOR", __VA_ARGS__); } while (0)
+#else
+#define EXEC_FF_MARK(...) do {} while (0)
+#endif
 
-#include <numbers>
+#define MAGIC_ENUM_RANGE_MIN 0
+#define MAGIC_ENUM_RANGE_MAX 1515
 #include <magic_enum/magic_enum.hpp>
 
 namespace Shader::Gcn {
@@ -27,33 +36,33 @@ static IR::VectorReg IterateBarycentrics(const RuntimeInfo& runtime_info, auto&&
     }
     u32 dst_vreg{};
     if (runtime_info.fs_info.addr_flags.persp_sample_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothSample, 0); // I
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothSample, 1); // J
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothSample, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothSample, 1);
     }
     if (runtime_info.fs_info.addr_flags.persp_center_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmooth, 0); // I
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmooth, 1); // J
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmooth, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmooth, 1);
     }
     if (runtime_info.fs_info.addr_flags.persp_centroid_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothCentroid, 0); // I
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothCentroid, 1); // J
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothCentroid, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordSmoothCentroid, 1);
     }
     if (runtime_info.fs_info.addr_flags.persp_pull_model_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordPullModel, 0); // I/W
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordPullModel, 1); // J/W
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordPullModel, 2); // 1/W
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordPullModel, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordPullModel, 1);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordPullModel, 2);
     }
     if (runtime_info.fs_info.addr_flags.linear_sample_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspSample, 0); // I
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspSample, 1); // J
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspSample, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspSample, 1);
     }
     if (runtime_info.fs_info.addr_flags.linear_center_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPersp, 0); // I
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPersp, 1); // J
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPersp, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPersp, 1);
     }
     if (runtime_info.fs_info.addr_flags.linear_centroid_ena) {
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspCentroid, 0); // I
-        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspCentroid, 1); // J
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspCentroid, 0);
+        set_attribute(dst_vreg++, IR::Attribute::BaryCoordNoPerspCentroid, 1);
     }
     if (runtime_info.fs_info.addr_flags.line_stipple_tex_ena) {
         ++dst_vreg;
@@ -75,7 +84,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
     ir.Prologue();
     ir.SetExec(ir.Imm1(true));
 
-    // Initialize user data.
     IR::ScalarReg dst_sreg = IR::ScalarReg::S0;
     for (u32 i = 0; i < runtime_info.num_user_data; i++) {
         ir.SetScalarReg(dst_sreg, ir.GetUserData(dst_sreg));
@@ -85,23 +93,18 @@ void Translator::EmitPrologue(IR::Block* first_block) {
     IR::VectorReg dst_vreg = IR::VectorReg::V0;
     switch (info.l_stage) {
     case LogicalStage::Vertex:
-        // v0: vertex ID, always present
         ir.SetVectorReg(dst_vreg++, ir.GetAttributeU32(IR::Attribute::VertexId));
         if (info.stage == Stage::Local) {
-            // v1: rel patch ID
             if (runtime_info.num_input_vgprs > 0) {
                 ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
             }
-            // v2: unknown
             if (runtime_info.num_input_vgprs > 1) {
                 ++dst_vreg;
             }
-            // v3: instance ID, plain
             if (runtime_info.num_input_vgprs > 2) {
                 ir.SetVectorReg(dst_vreg++, ir.GetAttributeU32(IR::Attribute::InstanceId));
             }
         } else {
-            // v1: instance ID, step rate 0
             if (runtime_info.num_input_vgprs > 0) {
                 if (runtime_info.vs_info.step_rate_0 != 0) {
                     ir.SetVectorReg(dst_vreg++,
@@ -111,7 +114,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
             }
-            // v2: instance ID, step rate 1
             if (runtime_info.num_input_vgprs > 1) {
                 if (runtime_info.vs_info.step_rate_1 != 0) {
                     ir.SetVectorReg(dst_vreg++,
@@ -121,7 +123,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
             }
-            // v3: instance ID, plain
             if (runtime_info.num_input_vgprs > 2) {
                 ir.SetVectorReg(dst_vreg++, ir.GetAttributeU32(IR::Attribute::InstanceId));
             }
@@ -181,15 +182,10 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         break;
     case LogicalStage::TessellationControl: {
         ir.SetVectorReg(IR::VectorReg::V0, ir.GetAttributeU32(IR::Attribute::PrimitiveId));
-        // Should be laid out like:
-        // [0:8]: patch id within VGT
-        // [8:12]: output control point id
         ir.SetVectorReg(IR::VectorReg::V1,
                         ir.GetAttributeU32(IR::Attribute::PackedHullInvocationInfo));
 
         if (runtime_info.hs_info.offchip_lds_enable) {
-            // No off-chip tessellation has been observed yet. If this survives dead code elim,
-            // revisit
             ir.SetScalarReg(dst_sreg++, ir.GetAttributeU32(IR::Attribute::OffChipLdsBase));
         }
         ir.SetScalarReg(dst_sreg++, ir.GetAttributeU32(IR::Attribute::TessFactorsBufferBase));
@@ -201,13 +197,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                         ir.GetAttribute(IR::Attribute::TessellationEvaluationPointU));
         ir.SetVectorReg(IR::VectorReg::V1,
                         ir.GetAttribute(IR::Attribute::TessellationEvaluationPointV));
-        // V2 is similar to PrimitiveID but not the same. It seems to only be used in
-        // compiler-generated address calculations. Its probably the patch id within the
-        // patches running locally on a given VGT (or CU, whichever is the granularity of LDS
-        // memory)
-        // Set to 0. See explanation in comment describing hull/domain passes
         ir.SetVectorReg(IR::VectorReg::V2, ir.Imm32(0u));
-        // V3 is the actual PrimitiveID as intended by the shader author.
         ir.SetVectorReg(IR::VectorReg::V3, ir.GetAttributeU32(IR::Attribute::PrimitiveId));
         break;
     case LogicalStage::Compute:
@@ -226,30 +216,27 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         }
         break;
     case LogicalStage::Geometry:
-        // The GS wave receives one ES vertex offset per input primitive vertex in V0-V6, with
-        // the primitive id in V2. The offset count is a property of the input primitive type;
-        // adjacency primitives carry up to 6 vertices.
         switch (runtime_info.gs_info.in_primitive) {
         case AmdGpu::PrimitiveType::AdjTriangleList:
         case AmdGpu::PrimitiveType::AdjTriangleStrip:
-            ir.SetVectorReg(IR::VectorReg::V6, ir.Imm32(5u)); // vertex 5
-            ir.SetVectorReg(IR::VectorReg::V5, ir.Imm32(4u)); // vertex 4
+            ir.SetVectorReg(IR::VectorReg::V6, ir.Imm32(5u));
+            ir.SetVectorReg(IR::VectorReg::V5, ir.Imm32(4u));
             [[fallthrough]];
         case AmdGpu::PrimitiveType::AdjLineList:
         case AmdGpu::PrimitiveType::AdjLineStrip:
-            ir.SetVectorReg(IR::VectorReg::V4, ir.Imm32(3u)); // vertex 3
+            ir.SetVectorReg(IR::VectorReg::V4, ir.Imm32(3u));
             [[fallthrough]];
         case AmdGpu::PrimitiveType::TriangleList:
         case AmdGpu::PrimitiveType::TriangleStrip:
         case AmdGpu::PrimitiveType::RectList:
-            ir.SetVectorReg(IR::VectorReg::V3, ir.Imm32(2u)); // vertex 2
+            ir.SetVectorReg(IR::VectorReg::V3, ir.Imm32(2u));
             [[fallthrough]];
         case AmdGpu::PrimitiveType::LineList:
         case AmdGpu::PrimitiveType::LineStrip:
-            ir.SetVectorReg(IR::VectorReg::V1, ir.Imm32(1u)); // vertex 1
+            ir.SetVectorReg(IR::VectorReg::V1, ir.Imm32(1u));
             [[fallthrough]];
         default:
-            ir.SetVectorReg(IR::VectorReg::V0, ir.Imm32(0u)); // vertex 0
+            ir.SetVectorReg(IR::VectorReg::V0, ir.Imm32(0u));
             break;
         }
         ir.SetVectorReg(IR::VectorReg::V2, ir.GetAttributeU32(IR::Attribute::PrimitiveId));
@@ -258,7 +245,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         UNREACHABLE_MSG("Unknown shader stage");
     }
 
-    // Clear any scratch vgpr mappings for next shader.
     vgpr_map.clear();
 }
 
@@ -351,13 +337,6 @@ T Translator::GetSrc(const InstOperand& operand) {
     case OperandField::ConstFloatNeg_4_0:
         value = get_imm(-4.0f);
         break;
-    case OperandField::Inv2Pi:
-        value = get_imm(static_cast<float>(1.0f / (2.0f * std::numbers::pi)));
-        break;
-    case OperandField::Sdwa:
-        UNREACHABLE_MSG("unhandled SDWA");
-    case OperandField::Dpp:
-        UNREACHABLE_MSG("unhandled DPP");
     case OperandField::VccLo:
         if constexpr (is_float) {
             value = ir.BitCast<IR::F32>(ir.GetVccLo());
@@ -387,7 +366,7 @@ T Translator::GetSrc(const InstOperand& operand) {
         }
         break;
     default:
-        UNREACHABLE_MSG("unexpected operand: {}", std::to_underlying(operand.field));
+        UNREACHABLE();
     }
 
     if constexpr (is_float) {
@@ -410,265 +389,6 @@ T Translator::GetSrc(const InstOperand& operand) {
 
 template IR::U32 Translator::GetSrc<IR::U32>(const InstOperand&);
 template IR::F32 Translator::GetSrc<IR::F32>(const InstOperand&);
-
-template <typename T, bool is_signed>
-T Translator::GetSrc16(const InstOperand& operand) {
-    constexpr bool is_float = std::is_same_v<T, IR::F32>;
-
-    const auto get_imm = [&](auto value) -> T {
-        if constexpr (is_float) {
-            return ir.Imm32(std::bit_cast<float>(value));
-        } else {
-            return ir.Imm32(std::bit_cast<u32>(value));
-        }
-    };
-
-    const auto number_format = []() -> AmdGpu::NumberFormat {
-        if constexpr (is_float) {
-            return AmdGpu::NumberFormat::Float;
-        } else {
-            return AmdGpu::NumberFormat::Uint;
-        }
-    }();
-
-    const auto bitcast_to_u = [&](auto value) -> IR::U32 {
-        if constexpr (is_float) {
-            return ir.BitCast<IR::U32>(value);
-        } else {
-            return value;
-        }
-    };
-
-    const auto cast = [&](auto value) -> T {
-        if constexpr (is_float) {
-            return value;
-        } else {
-            return ir.BitFieldExtract(ir.BitCast<IR::U32>(value), ir.Imm32(0), ir.Imm32(16),
-                                      is_signed);
-        }
-    };
-
-    const auto op_sel = operand.op_sel.op_sel;
-
-    T value{};
-    switch (operand.field) {
-    case OperandField::ScalarGPR: {
-        const auto f = ir.GetScalarReg<T>(IR::ScalarReg(operand.code));
-        value = cast(IR::F32{
-            ir.CompositeExtract(ir.Unpack2x16(number_format, bitcast_to_u(f)), op_sel ? 1 : 0)});
-        break;
-    }
-    case OperandField::VectorGPR: {
-        const auto v = ir.GetVectorReg<T>(IR::VectorReg(operand.code));
-        value = cast(IR::F32{
-            ir.CompositeExtract(ir.Unpack2x16(number_format, bitcast_to_u(v)), op_sel ? 1 : 0)});
-        break;
-    }
-    case OperandField::ConstZero:
-        value = get_imm(0U);
-        break;
-    case OperandField::SignedConstIntPos:
-        value = get_imm(operand.code - SignedConstIntPosMin + 1);
-        break;
-    case OperandField::SignedConstIntNeg:
-        value = get_imm(-s32(operand.code) + SignedConstIntNegMin - 1);
-        break;
-    case OperandField::LiteralConst:
-        value = get_imm(operand.code);
-        break;
-    case OperandField::ConstFloatPos_1_0:
-        value = get_imm(1.f);
-        break;
-    case OperandField::ConstFloatPos_0_5:
-        value = get_imm(0.5f);
-        break;
-    case OperandField::ConstFloatPos_2_0:
-        value = get_imm(2.0f);
-        break;
-    case OperandField::ConstFloatPos_4_0:
-        value = get_imm(4.0f);
-        break;
-    case OperandField::ConstFloatNeg_0_5:
-        value = get_imm(-0.5f);
-        break;
-    case OperandField::ConstFloatNeg_1_0:
-        value = get_imm(-1.0f);
-        break;
-    case OperandField::ConstFloatNeg_2_0:
-        value = get_imm(-2.0f);
-        break;
-    case OperandField::ConstFloatNeg_4_0:
-        value = get_imm(-4.0f);
-        break;
-    case OperandField::Inv2Pi:
-        value = get_imm(static_cast<float>(1.0f / (2.0f * std::numbers::pi)));
-        break;
-    case OperandField::Sdwa:
-        LOG_ERROR(Render_Recompiler, "unhandled SDWA");
-        value = get_imm(0U);
-        break;
-    case OperandField::Dpp:
-        LOG_ERROR(Render_Recompiler, "unhandled DPP");
-        value = get_imm(0U);
-        break;
-    case OperandField::VccLo:
-        if constexpr (is_float) {
-            value = IR::F32{
-                ir.CompositeExtract(ir.Unpack2x16(number_format, ir.GetVccLo()), op_sel ? 1 : 0)};
-        } else {
-            value = cast(IR::F32{ir.CompositeExtract(
-                ir.Unpack2x16(number_format, bitcast_to_u(ir.GetVccLo())), op_sel ? 1 : 0)});
-        }
-        break;
-    case OperandField::VccHi:
-        UNREACHABLE();
-        break;
-    case OperandField::M0:
-        UNREACHABLE();
-        break;
-    case OperandField::Scc:
-        UNREACHABLE();
-        break;
-    default:
-        UNREACHABLE_MSG("unexpected operand: {}", std::to_underlying(operand.field));
-    }
-
-    if constexpr (is_float) {
-        if (operand.input_modifier.abs) {
-            value = ir.FPAbs(value);
-        }
-        if (operand.input_modifier.neg) {
-            value = ir.FPNeg(value);
-        }
-    } else {
-        if (operand.input_modifier.abs) {
-            value = ir.BitwiseAnd(value, ir.Imm32(0x7FFFFFFFu));
-        }
-        if (operand.input_modifier.neg) {
-            value = ir.BitwiseXor(value, ir.Imm32(0x80000000u));
-        }
-    }
-    return value;
-}
-
-template IR::U32 Translator::GetSrc16<IR::U32, false>(const InstOperand&);
-template IR::U32 Translator::GetSrc16<IR::U32, true>(const InstOperand&);
-template IR::F32 Translator::GetSrc16<IR::F32, false>(const InstOperand&);
-
-IR::F32 Translator::GetSrcMix(const InstOperand& operand) {
-    const auto get_imm = [&](auto value) -> IR::F32 {
-        return ir.Imm32(std::bit_cast<float>(value));
-    };
-
-    const auto extract = [&](auto value) -> IR::F32 {
-        const auto getter_u = [&]() {
-            if constexpr (std::same_as<decltype(value), IR::ScalarReg>) {
-                return ir.GetScalarReg<IR::U32>(value);
-            } else {
-                return ir.GetVectorReg<IR::U32>(value);
-            }
-        }();
-        if (!operand.op_sel.op_sel_hi) {
-            if constexpr (std::same_as<decltype(value), IR::ScalarReg>) {
-                return ir.GetScalarReg<IR::F32>(value);
-            } else {
-                return ir.GetVectorReg<IR::F32>(value);
-            }
-        } else if (operand.op_sel.op_sel) {
-            return IR::F32{
-                ir.CompositeExtract(ir.Unpack2x16(AmdGpu::NumberFormat::Float, getter_u), 1)};
-        } else {
-            return IR::F32{
-                ir.CompositeExtract(ir.Unpack2x16(AmdGpu::NumberFormat::Float, getter_u), 0)};
-        }
-    };
-
-    IR::F32 value{};
-    switch (operand.field) {
-    case OperandField::ScalarGPR:
-        value = extract(IR::ScalarReg(operand.code));
-        break;
-    case OperandField::VectorGPR:
-        value = extract(IR::VectorReg(operand.code));
-        break;
-    case OperandField::ConstZero:
-        value = get_imm(0U);
-        break;
-    case OperandField::SignedConstIntPos:
-        value = get_imm(operand.code - SignedConstIntPosMin + 1);
-        break;
-    case OperandField::SignedConstIntNeg:
-        value = get_imm(-s32(operand.code) + SignedConstIntNegMin - 1);
-        break;
-    case OperandField::LiteralConst:
-        value = get_imm(operand.code);
-        break;
-    case OperandField::ConstFloatPos_1_0:
-        value = get_imm(1.f);
-        break;
-    case OperandField::ConstFloatPos_0_5:
-        value = get_imm(0.5f);
-        break;
-    case OperandField::ConstFloatPos_2_0:
-        value = get_imm(2.0f);
-        break;
-    case OperandField::ConstFloatPos_4_0:
-        value = get_imm(4.0f);
-        break;
-    case OperandField::ConstFloatNeg_0_5:
-        value = get_imm(-0.5f);
-        break;
-    case OperandField::ConstFloatNeg_1_0:
-        value = get_imm(-1.0f);
-        break;
-    case OperandField::ConstFloatNeg_2_0:
-        value = get_imm(-2.0f);
-        break;
-    case OperandField::ConstFloatNeg_4_0:
-        value = get_imm(-4.0f);
-        break;
-    case OperandField::VccLo: {
-        if (!operand.op_sel.op_sel_hi) {
-            value = ir.BitCast<IR::F32>(ir.GetVccLo());
-        } else if (operand.op_sel.op_sel) {
-            value = IR::F32{
-                ir.CompositeExtract(ir.Unpack2x16(AmdGpu::NumberFormat::Float, ir.GetVccLo()), 1)};
-        } else {
-            value = IR::F32{
-                ir.CompositeExtract(ir.Unpack2x16(AmdGpu::NumberFormat::Float, ir.GetVccLo()), 0)};
-        }
-        break;
-    }
-    case OperandField::VccHi:
-        UNREACHABLE();
-        break;
-    case OperandField::M0:
-        UNREACHABLE();
-        break;
-    case OperandField::Scc:
-        UNREACHABLE();
-        break;
-    case OperandField::Inv2Pi:
-        value = get_imm(static_cast<float>(1.0f / (2.0f * std::numbers::pi)));
-        break;
-    case OperandField::Sdwa:
-        UNREACHABLE_MSG("unhandled SDWA");
-        break;
-    case OperandField::Dpp:
-        UNREACHABLE_MSG("unhandled DPP");
-        break;
-    default:
-        UNREACHABLE_MSG("unexpected operand: {}", std::to_underlying(operand.field));
-    }
-
-    if (operand.input_modifier.neg_hi) {
-        value = ir.FPAbs(value);
-    }
-    if (operand.input_modifier.neg) {
-        value = ir.FPNeg(value);
-    }
-    return value;
-}
 
 template <typename T>
 T Translator::GetSrc64(const InstOperand& operand) {
@@ -760,8 +480,6 @@ T Translator::GetSrc64(const InstOperand& operand) {
             value = ir.FPNeg(value);
         }
     } else {
-        // GCN VOP3 abs/neg modifier bits operate on the sign bit (bit 63 for
-        // 64-bit values). Unpack, modify the high dword's bit 31, repack.
         if (operand.input_modifier.abs) {
             const auto unpacked = ir.UnpackUint2x32(value);
             const auto lo = IR::U32{ir.CompositeExtract(unpacked, 0)};
@@ -782,136 +500,6 @@ T Translator::GetSrc64(const InstOperand& operand) {
 
 template IR::U64 Translator::GetSrc64<IR::U64>(const InstOperand&);
 template IR::F64 Translator::GetSrc64<IR::F64>(const InstOperand&);
-
-template <typename T, bool is_signed>
-pk_type<T> Translator::GetSrcPk(const InstOperand& operand) {
-    constexpr bool is_float = std::is_same_v<T, IR::F32>;
-
-    const auto get_imm = [&](auto value) -> pk_type<T> {
-        if constexpr (is_float) {
-            auto imm = ir.Imm32(std::bit_cast<float>(value));
-            return {operand.op_sel.op_sel ? ir.Imm32(0.f) : imm,
-                    operand.op_sel.op_sel_hi ? ir.Imm32(0.f) : imm};
-        } else {
-            auto imm = ir.Imm32(std::bit_cast<u32>(value));
-            return {operand.op_sel.op_sel ? ir.Imm32(0U) : imm,
-                    operand.op_sel.op_sel_hi ? ir.Imm32(0U) : imm};
-        }
-    };
-
-    constexpr auto number_format = [&]() {
-        if constexpr (is_float) {
-            return AmdGpu::NumberFormat::Float;
-        } else {
-            return AmdGpu::NumberFormat::Uint;
-        }
-    }();
-
-    const auto cast = [&](auto value) -> T {
-        if constexpr (is_float) {
-            return value;
-        } else {
-            return ir.BitFieldExtract(ir.BitCast<IR::U32>(value), ir.Imm32(0), ir.Imm32(16),
-                                      is_signed);
-        }
-    };
-
-    const auto extract = [&](auto value) -> pk_type<T> {
-        auto v_unpacked = ir.Unpack2x16(number_format, value);
-        return {cast(IR::F32{ir.CompositeExtract(v_unpacked, operand.op_sel.op_sel)}),
-                cast(IR::F32{ir.CompositeExtract(v_unpacked, operand.op_sel.op_sel_hi)})};
-    };
-
-    pk_type<T> value{};
-    switch (operand.field) {
-    case OperandField::ScalarGPR: {
-        value = extract(ir.GetScalarReg<IR::U32>(IR::ScalarReg(operand.code)));
-        break;
-    }
-    case OperandField::VectorGPR: {
-        value = extract(ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code)));
-        break;
-    }
-    case OperandField::ConstZero: {
-        value = get_imm(0U);
-        break;
-    }
-    case OperandField::SignedConstIntPos: {
-        value = get_imm(operand.code - SignedConstIntPosMin + 1);
-        break;
-    }
-    case OperandField::SignedConstIntNeg: {
-        value = get_imm(-s32(operand.code) + SignedConstIntNegMin - 1);
-        break;
-    }
-    case OperandField::LiteralConst: {
-        value = get_imm(operand.code);
-        break;
-    }
-    case OperandField::ConstFloatPos_1_0: {
-        value = get_imm(1.f);
-        break;
-    }
-    case OperandField::ConstFloatPos_0_5: {
-        value = get_imm(0.5f);
-        break;
-    }
-    case OperandField::ConstFloatPos_2_0: {
-        value = get_imm(2.0f);
-        break;
-    }
-    case OperandField::ConstFloatPos_4_0: {
-        value = get_imm(4.0f);
-        break;
-    }
-    case OperandField::ConstFloatNeg_0_5: {
-        value = get_imm(-0.5f);
-        break;
-    }
-    case OperandField::ConstFloatNeg_1_0: {
-        value = get_imm(-1.0f);
-        break;
-    }
-    case OperandField::ConstFloatNeg_2_0: {
-        value = get_imm(-2.0f);
-        break;
-    }
-    case OperandField::ConstFloatNeg_4_0: {
-        value = get_imm(-4.0f);
-        break;
-    }
-    case OperandField::Inv2Pi: {
-        value = get_imm(1.0f / (2.0f * std::numbers::pi_v<float>));
-        break;
-    }
-    case OperandField::VccLo:
-        value = extract(ir.GetVccLo());
-        break;
-    default:
-        UNREACHABLE_MSG("unexpected operand: {}", std::to_underlying(operand.field));
-    }
-
-    if constexpr (is_float) {
-        if (operand.input_modifier.neg) {
-            value.first = ir.FPNeg(value.first);
-        }
-        if (operand.input_modifier.neg_hi) {
-            value.second = ir.FPNeg(value.second);
-        }
-    } else {
-        if (operand.input_modifier.neg) {
-            value.first = ir.INeg(value.first);
-        }
-        if (operand.input_modifier.neg_hi) {
-            value.second = ir.INeg(value.second);
-        }
-    }
-    return value;
-}
-
-template pk_type<IR::U32> Translator::GetSrcPk<IR::U32, true>(const InstOperand&);
-template pk_type<IR::U32> Translator::GetSrcPk<IR::U32, false>(const InstOperand&);
-template pk_type<IR::F32> Translator::GetSrcPk<IR::F32, false>(const InstOperand&);
 
 void Translator::SetDst1(const InstOperand& operand, const IR::U1& value) {
     switch (operand.field) {
@@ -952,70 +540,9 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
     case OperandField::M0:
         return ir.SetM0(result);
     default:
-        UNREACHABLE_MSG("Unknown field {}", u32(operand.field));
-    }
-}
-
-template <bool is_signed>
-void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
-    IR::U32F32 result = value;
-    if (value.Type() == IR::Type::F32) {
-        if (operand.output_modifier.multiplier != 0.f) {
-            result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
-        }
-        if (operand.output_modifier.clamp) {
-            result = ir.FPSaturate(result);
-        }
-    } else {
-        if (operand.output_modifier.clamp) {
-            if constexpr (is_signed) {
-                result = ir.SClamp(result, ir.Imm32(-32768), ir.Imm32(32767));
-            } else {
-                result = ir.UMin(result, ir.Imm32(0xFFFF));
-            }
-        }
-    }
-
-    const auto cast = [&](auto value) -> IR::U32 {
-        if (value.Type() == IR::Type::F32) {
-            return ir.UConvert(32, ir.BitCast<IR::U16>(IR::F16{ir.FPConvert(16, value)}));
-        } else if (value.Type() == IR::Type::U32) {
-            return value;
-        } else {
-            UNREACHABLE();
-        }
-    };
-
-    const auto op_sel = operand.op_sel.op_sel;
-
-    switch (operand.field) {
-    case OperandField::ScalarGPR: {
-        const auto prev_dst = ir.GetScalarReg<IR::U32>(IR::ScalarReg(operand.code));
-        const auto result_16 = cast(result);
-        const auto new_dst =
-            ir.BitFieldInsert(prev_dst, result_16, ir.Imm32(op_sel ? 16 : 0), ir.Imm32(16));
-        return ir.SetScalarReg(IR::ScalarReg(operand.code), new_dst);
-    }
-    case OperandField::VectorGPR: {
-        const auto prev_dst = ir.GetVectorReg<IR::U32>(IR::VectorReg(operand.code));
-        const auto result_16 = cast(result);
-        const auto new_dst =
-            ir.BitFieldInsert(prev_dst, result_16, ir.Imm32(op_sel ? 16 : 0), ir.Imm32(16));
-        return ir.SetVectorReg(IR::VectorReg(operand.code), new_dst);
-    }
-    case OperandField::VccLo:
-        UNREACHABLE();
-    case OperandField::VccHi:
-        UNREACHABLE();
-    case OperandField::M0:
-        UNREACHABLE();
-    default:
         UNREACHABLE();
     }
 }
-
-template void Translator::SetDst16<false>(const InstOperand&, const IR::U32F32& value);
-template void Translator::SetDst16<true>(const InstOperand&, const IR::U32F32& value);
 
 void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_raw) {
     IR::U64F64 value_untyped = value_raw;
@@ -1054,66 +581,31 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
     }
 }
 
-template <typename T, bool is_signed>
-void Translator::SetDstPk(const InstOperand& operand, const pk_type<T>& value) {
-    pk_type<T> v = value;
-
-    if constexpr (std::is_same_v<T, IR::F32>) {
-        if (operand.output_modifier.clamp) {
-            v = {ir.FPSaturate(v.first), ir.FPSaturate(v.second)};
-        }
-    } else {
-        if (operand.output_modifier.clamp) {
-            if constexpr (is_signed) {
-                auto lower = ir.Imm32(-32768);
-                auto upper = ir.Imm32(32767);
-                v = {ir.SClamp(v.first, lower, upper), ir.SClamp(v.second, lower, upper)};
-            } else {
-                auto imm = ir.Imm32(0xFFFF);
-                v = {ir.UMin(v.first, imm), ir.UMin(v.second, imm)};
-            }
-        }
-    }
-
-    IR::U32 value_raw{};
-    if constexpr (std::is_same_v<T, IR::F32>) {
-        value_raw =
-            ir.Pack2x16(AmdGpu::NumberFormat::Float, ir.CompositeConstruct(v.first, v.second));
-    } else {
-        value_raw = ir.Pack2x16(AmdGpu::NumberFormat::Uint,
-                                ir.CompositeConstruct(ir.BitCast<IR::F32, IR::U32>(v.first),
-                                                      ir.BitCast<IR::F32, IR::U32>(v.second)));
-    }
-    SetDst(operand, value_raw);
-}
-
-template void Translator::SetDstPk<IR::U32, false>(const InstOperand& operand,
-                                                   const pk_type<IR::U32>& value);
-template void Translator::SetDstPk<IR::U32, true>(const InstOperand& operand,
-                                                  const pk_type<IR::U32>& value);
-template void Translator::SetDstPk<IR::F32, false>(const InstOperand& operand,
-                                                   const pk_type<IR::F32>& value);
-
 void Translator::EmitFetch(const GcnInst& inst) {
     const auto code_sgpr_base = inst.src[0].code;
 
-#if 0
-    // Translate fetch shader inline using regular buffer bindings; useful for debugging.
-    const auto* code = GetFetchShaderCode(info, code_sgpr_base);
-    GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
-    GcnDecodeContext decoder;
+    if (!profile.supports_robust_buffer_access) {
+        EXEC_FF_MARK("[EXECUTOR_FF] inline_branch enter sgpr_base=%u", code_sgpr_base);
+        const auto* code = GetFetchShaderCode(info, code_sgpr_base);
+        GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
+        GcnDecodeContext decoder;
 
-    // Decode and save instructions
-    while (!slice.atEnd()) {
-        const auto sub_inst = decoder.decodeInstruction(slice);
-        if (sub_inst.opcode == Opcode::S_SETPC_B64) {
-            // Assume we're swapping back to the main shader.
-            break;
+        u32 ff_n = 0;
+        while (!slice.atEnd()) {
+            const auto sub_inst = decoder.decodeInstruction(slice);
+            if (sub_inst.opcode == Opcode::S_SETPC_B64) {
+                break;
+            }
+            EXEC_FF_MARK("[EXECUTOR_FF] inline before_translate i=%u op=%u", ff_n,
+                         static_cast<u32>(sub_inst.opcode));
+            TranslateInstruction(sub_inst);
+            EXEC_FF_MARK("[EXECUTOR_FF] inline after_translate i=%u", ff_n);
+            ++ff_n;
         }
-        TranslateInstruction(sub_inst);
+        EXEC_FF_MARK("[EXECUTOR_FF] inline_branch done n=%u", ff_n);
+        return;
     }
-    return;
-#endif
+    EXEC_FF_MARK("[EXECUTOR_FF] robust_branch enter sgpr_base=%u", code_sgpr_base);
 
     info.has_fetch_shader = true;
     info.fetch_shader_sgpr_base = code_sgpr_base;
@@ -1121,7 +613,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
     const auto fetch_data = ParseFetchShader(info);
     ASSERT(fetch_data.has_value());
 
-    if (EmulatorSettings.IsDumpShaders()) {
+    if (Config::dumpShaders()) {
         using namespace Common::FS;
         const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
         if (!std::filesystem::exists(dump_dir)) {
@@ -1133,12 +625,41 @@ void Translator::EmitFetch(const GcnInst& inst) {
         file.WriteRaw<u8>(code, fetch_data->size);
     }
 
+    EXEC_FF_MARK("[EXECUTOR_FF] robust parsed nattr=%zu", fetch_data->attributes.size());
+    u32 ff_ai = 0;
     for (const auto& attrib : fetch_data->attributes) {
         const IR::Attribute attr{IR::Attribute::Param0 + attrib.semantic};
         IR::VectorReg dst_reg{attrib.dest_vgpr};
 
-        // Read the V# of the attribute to figure out component number and type.
+        {
+            u64 tbl_ptr = 0;
+            if (attrib.sgpr_base + 1 < info.user_data.size()) {
+                tbl_ptr = static_cast<u64>(info.user_data[attrib.sgpr_base]) |
+                          (static_cast<u64>(info.user_data[attrib.sgpr_base + 1]) << 32);
+            }
+            EXEC_FF_MARK(
+                "[EXECUTOR_FF] before_getsharp i=%u sgpr_base=%u dword_off=%u tbl_ptr=0x%llx tblReloc=%d",
+                ff_ai, attrib.sgpr_base, attrib.dword_offset, (unsigned long long)tbl_ptr,
+                Libraries::GnmDriver::ExecutorReplayIsRelocated(tbl_ptr) ? 1 : 0);
+        }
         const auto buffer = attrib.GetSharp(info);
+#if defined(__ANDROID__)
+        if (Libraries::GnmDriver::ExecutorReplayActive()) {
+            const u64 vb = buffer.base_address;
+            u32 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            const bool rel = Libraries::GnmDriver::ExecutorReplayIsRelocated(vb);
+            if (rel) {
+                const u32* p = reinterpret_cast<const u32*>(vb);
+                c0 = p[0]; c1 = p[1]; c2 = p[2]; c3 = p[3];
+            }
+            __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
+                                "[EXECUTOR_FF] after_getsharp i=%u base=0x%llx reloc=%d stride=%u "
+                                "num=%u vb=%08x %08x %08x %08x",
+                                ff_ai, (unsigned long long)vb, rel ? 1 : 0, (unsigned)buffer.stride,
+                                (unsigned)buffer.num_records, c0, c1, c2, c3);
+        }
+#endif
+        ++ff_ai;
         const auto values =
             ir.CompositeConstruct(ir.GetAttribute(attr, 0), ir.GetAttribute(attr, 1),
                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));
@@ -1167,7 +688,6 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
     for (const auto& inst : inst_list) {
         pc += inst.length;
 
-        // Special case for emitting fetch shader.
         if (inst.opcode == Opcode::S_SWAPPC_B64) {
             ASSERT(info.stage == Stage::Vertex || info.stage == Stage::Export ||
                    info.stage == Stage::Local);
@@ -1180,7 +700,6 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
 }
 
 void Translator::TranslateInstruction(const GcnInst& inst) {
-    // Emit instructions for each category.
     switch (inst.category) {
     case InstCategory::DataShare:
         EmitDataShare(inst);
@@ -1213,4 +732,4 @@ void Translator::TranslateInstruction(const GcnInst& inst) {
     }
 }
 
-} // namespace Shader::Gcn
+}

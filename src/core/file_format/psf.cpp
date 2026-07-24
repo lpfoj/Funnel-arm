@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <cstring>
-#include <ranges>
 
 #include "common/assert.h"
 #include "common/io_file.h"
@@ -54,7 +52,6 @@ bool PSF::Open(const std::vector<u8>& psf_buffer) {
     map_strings.clear();
     map_integers.clear();
 
-    // Parse file contents
     PSFHeader header{};
     std::memcpy(&header, psf_data, sizeof(header));
 
@@ -144,7 +141,7 @@ void PSF::Encode(std::vector<u8>& psf_buffer) const {
         raw_entry.param_fmt.FromRaw(static_cast<u16>(entry.param_fmt));
         raw_entry.param_max_len = entry.max_len;
         std::ranges::copy(entry.key, std::back_inserter(psf_buffer));
-        psf_buffer.push_back(0); // NULL terminator
+        psf_buffer.push_back(0);
     }
 
     const size_t data_table_offset = psf_buffer.size();
@@ -171,7 +168,7 @@ void PSF::Encode(std::vector<u8>& psf_buffer) const {
             raw_entry.param_len = value.size() + 1;
             additional_padding -= s32(raw_entry.param_len);
             std::ranges::copy(value, std::back_inserter(psf_buffer));
-            psf_buffer.push_back(0); // NULL terminator
+            psf_buffer.push_back(0);
         } break;
         case PSFEntryFmt::Integer: {
             const auto& value = map_integers.at(i);

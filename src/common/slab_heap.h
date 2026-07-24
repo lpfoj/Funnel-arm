@@ -1,10 +1,9 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
-#include <memory>
 #include "common/assert.h"
 #include "common/spin_lock.h"
 
@@ -69,22 +68,17 @@ public:
     }
 
     void Initialize(size_t obj_size, void* memory, size_t memory_size) {
-        // Ensure we don't initialize a slab using null memory.
         ASSERT(memory != nullptr);
 
-        // Set our object size.
         m_obj_size = obj_size;
 
-        // Initialize the base allocator.
         SlabHeapImpl::Initialize();
 
-        // Set our tracking variables.
         const size_t num_obj = (memory_size / obj_size);
         m_start = reinterpret_cast<uintptr_t>(memory);
         m_end = m_start + num_obj * obj_size;
         m_peak = m_start;
 
-        // Free the objects.
         u8* cur = reinterpret_cast<u8*>(m_end);
 
         for (size_t i = 0; i < num_obj; i++) {
@@ -107,7 +101,6 @@ public:
     }
 
     void Free(void* obj) {
-        // Don't allow freeing an object that wasn't allocated from this heap.
         const bool contained = this->Contains(reinterpret_cast<uintptr_t>(obj));
         ASSERT(contained);
         SlabHeapImpl::Free(obj);
@@ -126,7 +119,6 @@ public:
     }
 
     size_t GetNumRemaining() const {
-        // Only calculate the number of remaining objects under debug configuration.
         return 0;
     }
 };
@@ -153,7 +145,6 @@ public:
     }
 
     void Free(T* obj) {
-        std::destroy_at(obj);
         BaseHeap::Free(obj);
     }
 
@@ -162,4 +153,4 @@ public:
     }
 };
 
-} // namespace Common
+}

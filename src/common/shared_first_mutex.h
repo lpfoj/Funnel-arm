@@ -9,7 +9,6 @@
 
 namespace Common {
 
-// Like std::shared_mutex, but reader has priority over writer.
 class SharedFirstMutex {
 public:
     void lock() {
@@ -82,4 +81,4 @@ private:
     bool writer_active = false;
 };
 
-} // namespace Common
+}

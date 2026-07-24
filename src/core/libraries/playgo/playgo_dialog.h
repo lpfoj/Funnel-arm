@@ -35,4 +35,4 @@ CommonDialog::Error PS4_SYSV_ABI scePlayGoDialogTerminate();
 CommonDialog::Status PS4_SYSV_ABI scePlayGoDialogUpdateStatus();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::PlayGo::Dialog
+}

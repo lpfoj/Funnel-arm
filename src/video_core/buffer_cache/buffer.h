@@ -14,7 +14,7 @@
 namespace Vulkan {
 class Instance;
 class Scheduler;
-} // namespace Vulkan
+}
 
 VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -23,12 +23,11 @@ struct VmaAllocationInfo;
 
 namespace VideoCore {
 
-/// Hints and requirements for the backing memory type of a commit
 enum class MemoryUsage {
-    DeviceLocal, ///< Requests device local buffer.
-    Upload,      ///< Requires a host visible memory type optimized for CPU to GPU uploads
-    Download,    ///< Requires a host visible memory type optimized for GPU to CPU readbacks
-    Stream,      ///< Requests device local host visible buffer, falling back host memory.
+    DeviceLocal,
+    Upload,
+    Download,
+    Stream,
 };
 
 constexpr vk::BufferUsageFlags ReadFlags =
@@ -131,13 +130,9 @@ public:
             return {};
         }
 
-        // A memory dependency is unnecessary between two read-only uses. Mixed vertex/index
-        // allocations are common in PS4 titles; replacing one read state with the other used to
-        // emit a whole-buffer barrier and, with dynamic rendering, tear down the render scope
-        // every draw. Accumulate both masks/stages so a later writer still waits for every
-        // preceding reader.
         constexpr vk::AccessFlags2 WriteAccessMask =
-            vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransferWrite |
+            vk::AccessFlagBits2::eMemoryWrite |
+            vk::AccessFlagBits2::eTransferWrite |
             vk::AccessFlagBits2::eShaderWrite;
         const bool src_read_only = !(access_mask & WriteAccessMask);
         const bool dst_read_only = !(dst_acess_mask & WriteAccessMask);
@@ -189,13 +184,12 @@ public:
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                           MemoryUsage usage, u64 size_bytes_);
 
-    /// Reserves a region of memory from the stream buffer.
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 
-    /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
 
-    /// Maps and commits a memory region with user provided data
+    void RetainCurrentAllocation();
+
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
         std::memcpy(data, reinterpret_cast<const void*>(src), size);
@@ -209,10 +203,8 @@ private:
         u64 upper_bound{};
     };
 
-    /// Increases the amount of watches available.
     void ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size);
 
-    /// Waits pending watches until requested upper bound.
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
 
 private:
@@ -226,4 +218,4 @@ private:
     u64 wait_bound{};
 };
 
-} // namespace VideoCore
+}

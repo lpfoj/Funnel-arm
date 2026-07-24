@@ -228,4 +228,4 @@ int PS4_SYSV_ABI sceAjmModuleUnregister();
 int PS4_SYSV_ABI sceAjmStrError();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Ajm
+}

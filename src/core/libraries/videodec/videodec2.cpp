@@ -10,7 +10,7 @@
 
 namespace Libraries::Videodec2 {
 
-static constexpr u64 kMinimumMemorySize = 16_MB; ///> Fake minimum memory size for querying
+static constexpr u64 kMinimumMemorySize = 16_MB;
 
 s32 PS4_SYSV_ABI
 sceVideodec2QueryComputeMemoryInfo(OrbisVideodec2ComputeMemoryInfo* computeMemInfo) {
@@ -61,7 +61,6 @@ sceVideodec2AllocateComputeQueue(const OrbisVideodec2ComputeConfigInfo* computeC
         return ORBIS_VIDEODEC2_ERROR_MEMORY_POINTER;
     }
 
-    // The real library returns a pointer to memory inside cpuGpuMemory
     *computeQueue = computeMemInfo->cpuGpuMemory;
     return ORBIS_OK;
 }
@@ -203,23 +202,35 @@ s32 PS4_SYSV_ABI sceVideodec2GetPictureInfo(const OrbisVideodec2OutputInfo* outp
         LOG_ERROR(Lib_Vdec2, "No picture info available");
         return ORBIS_OK;
     }
-    if (gPictureInfos.empty()) {
-        LOG_ERROR(Lib_Vdec2, "No picture info available");
-        return ORBIS_OK;
-    }
 
-    if (p1stPictureInfoOut) {
-        // Copy enough data to check thisSize.
-        u64 picture_size = 0;
-        memcpy(&picture_size, p1stPictureInfoOut, sizeof(u64));
-        if ((picture_size | 0x10) != sizeof(OrbisVideodec2AvcPictureInfo)) {
-            LOG_ERROR(Lib_Vdec2, "Invalid struct size");
-            return ORBIS_VIDEODEC2_ERROR_STRUCT_SIZE;
+    if (outputInfo->thisSize != sizeof(OrbisVideodec2OutputInfo)) {
+        if (gLegacyPictureInfos.empty()) {
+            LOG_ERROR(Lib_Vdec2, "No picture info available");
+            return ORBIS_OK;
         }
-        // Copy the requested picture data to the output.
-        memcpy(p1stPictureInfoOut, &gPictureInfos.back(), picture_size);
-        // Correct the outputted picture struct size.
-        memcpy(p1stPictureInfoOut, &picture_size, sizeof(u64));
+        if (p1stPictureInfoOut) {
+            OrbisVideodec2LegacyAvcPictureInfo* picInfo =
+                static_cast<OrbisVideodec2LegacyAvcPictureInfo*>(p1stPictureInfoOut);
+            if (picInfo->thisSize != sizeof(OrbisVideodec2LegacyAvcPictureInfo)) {
+                LOG_ERROR(Lib_Vdec2, "Invalid struct size");
+                return ORBIS_VIDEODEC2_ERROR_STRUCT_SIZE;
+            }
+            *picInfo = gLegacyPictureInfos.back();
+        }
+    } else {
+        if (gPictureInfos.empty()) {
+            LOG_ERROR(Lib_Vdec2, "No picture info available");
+            return ORBIS_OK;
+        }
+        if (p1stPictureInfoOut) {
+            OrbisVideodec2AvcPictureInfo* picInfo =
+                static_cast<OrbisVideodec2AvcPictureInfo*>(p1stPictureInfoOut);
+            if (picInfo->thisSize != sizeof(OrbisVideodec2AvcPictureInfo)) {
+                LOG_ERROR(Lib_Vdec2, "Invalid struct size");
+                return ORBIS_VIDEODEC2_ERROR_STRUCT_SIZE;
+            }
+            *picInfo = gPictureInfos.back();
+        }
     }
 
     if (outputInfo->pictureCount > 1) {
@@ -227,12 +238,6 @@ s32 PS4_SYSV_ABI sceVideodec2GetPictureInfo(const OrbisVideodec2OutputInfo* outp
     }
 
     return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceVideodec2GetAvcPictureInfo(const OrbisVideodec2OutputInfo* outputInfo,
-                                               void* p1stPictureInfoOut, void* p2ndPictureInfoOut) {
-    LOG_TRACE(Lib_Vdec2, "called");
-    return sceVideodec2GetPictureInfo(outputInfo, p1stPictureInfoOut, p2ndPictureInfoOut);
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
@@ -252,8 +257,6 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("wJXikG6QFN8", "libSceVideodec2", 1, "libSceVideodec2", sceVideodec2Reset);
     LIB_FUNCTION("NtXRa3dRzU0", "libSceVideodec2", 1, "libSceVideodec2",
                  sceVideodec2GetPictureInfo);
-    LIB_FUNCTION("kjrLbcyhEiw", "libSceVideodec2", 1, "libSceVideodec2",
-                 sceVideodec2GetAvcPictureInfo);
 }
 
-} // namespace Libraries::Videodec2
+}

@@ -15,19 +15,18 @@
 #define IMGUI_FONT_TEXT 0
 #define IMGUI_FONT_MONO 1
 #define IMGUI_FONT_TEXT_BIG 2
-#define IMGUI_FONT_SETTINGS_WINDOW 3
 
 namespace ImGui {
 
 namespace Easing {
 
 inline float FastInFastOutCubic(float x) {
-    constexpr float c4 = 1.587401f; // 4^(1/3)
-    constexpr float c05 = 0.7937f;  // 0.5^(1/3)
+    constexpr float c4 = 1.587401f;
+    constexpr float c05 = 0.7937f;
     return std::pow(c4 * x - c05, 3.0f) + 0.5f;
 }
 
-} // namespace Easing
+}
 
 inline void CentralizeNextWindow() {
     const auto display_size = GetIO().DisplaySize;
@@ -92,15 +91,11 @@ static void DrawCenteredText(const char* text, const char* text_end = nullptr,
     SetCursorPos(pos + content);
 }
 
-// Limited-length InputTextEx wrapper (limits UTF-8 code points)
-// - max_chars counts Unicode code points, not bytes
-// - Works for single-line and multi-line
-// - Chains user callbacks if provided
 struct InputTextLimitCtx {
     int max_chars;
     ImGuiInputTextCallback user_cb;
     void* user_user_data;
-    ImGuiInputTextFlags forward_flags; // original flags requested by caller
+    ImGuiInputTextFlags forward_flags;
 };
 
 inline int InputTextLimitCallback(ImGuiInputTextCallbackData* data) {
@@ -135,7 +130,6 @@ inline int InputTextLimitCallback(ImGuiInputTextCallbackData* data) {
         return 0;
     }
 
-    // Enforce limit: discard extra characters on filter, trim on edit
     if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
         ImGuiContext* g = data->Ctx;
         if (!g) {
@@ -155,13 +149,12 @@ inline int InputTextLimitCallback(ImGuiInputTextCallbackData* data) {
         const int remaining = ctx->max_chars - (cur_chars - sel_chars);
         if (remaining <= 0) {
             data->EventChar = 0;
-            return 1; // discard
+            return 1;
         }
         return 0;
     }
 
     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
-        // Trim tail to ensure text length <= max_chars code points
         const char* s = data->Buf;
         const char* end = s + data->BufTextLen;
         const char* p = s;
@@ -200,4 +193,4 @@ inline bool InputTextExLimited(const char* label, const char* hint, char* buf, i
     return InputTextEx(label, hint, buf, buf_size, size_arg, flags2, InputTextLimitCallback, &ctx);
 }
 
-} // namespace ImGui
+}

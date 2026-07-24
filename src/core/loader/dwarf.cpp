@@ -19,7 +19,6 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
     const u8* p = (u8*)addr;
     uintptr_t result;
 
-    // First get value
     switch (encoding & 0x0F) {
     case DW_EH_PE_ptr:
         result = get<uintptr_t>(addr);
@@ -42,13 +41,11 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
         addr = (uintptr_t)p;
         break;
     case DW_EH_PE_sdata2:
-        // Sign extend from signed 16-bit value.
         result = get<s16>(addr);
         p += sizeof(s16);
         addr = (uintptr_t)p;
         break;
     case DW_EH_PE_sdata4:
-        // Sign extend from signed 32-bit value.
         result = get<s32>(addr);
         p += sizeof(s32);
         addr = (uintptr_t)p;
@@ -62,10 +59,8 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
         UNREACHABLE_MSG("unknown pointer encoding");
     }
 
-    // Then add relative offset
     switch (encoding & 0x70) {
     case DW_EH_PE_absptr:
-        // do nothing
         break;
     case DW_EH_PE_pcrel:
         result += startAddr;
@@ -74,9 +69,6 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
         UNREACHABLE_MSG("DW_EH_PE_textrel pointer encoding not supported");
         break;
     case DW_EH_PE_datarel:
-        // DW_EH_PE_datarel is only valid in a few places, so the parameter has a
-        // default value of 0, and we abort in the event that someone calls this
-        // function with a datarelBase of 0 and DW_EH_PE_datarel encoding.
         if (datarelBase == 0)
             UNREACHABLE_MSG("DW_EH_PE_datarel is invalid with a datarelBase of 0");
         result += datarelBase;
@@ -101,10 +93,7 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
 
 bool DecodeEHHdr(uintptr_t ehHdrStart, uintptr_t ehHdrEnd, EHHeaderInfo& ehHdrInfo) {
     auto p = ehHdrStart;
-    // Ensure that we don't read data beyond the end of .eh_frame_hdr
     if (ehHdrEnd - ehHdrStart < 4) {
-        // Don't print a message for an empty .eh_frame_hdr (this can happen if
-        // the linker script defines symbols for it even in the empty case).
         if (ehHdrEnd == ehHdrStart) {
             return false;
         }
@@ -134,4 +123,4 @@ bool DecodeEHHdr(uintptr_t ehHdrStart, uintptr_t ehHdrEnd, EHHeaderInfo& ehHdrIn
     return true;
 }
 
-} // namespace Dwarf
+}

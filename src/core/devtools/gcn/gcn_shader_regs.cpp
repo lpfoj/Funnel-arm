@@ -1,7 +1,6 @@
 //  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-// Credits to https://github.com/psucien/tlg-emu-tools/
 
 #include "common/types.h"
 #include "gcn/si_ci_vi_merged_offset.h"
@@ -168,4 +167,4 @@ const char* GetShaderRegName(u32 reg_offset) {
     }
     return "<UNK>";
 }
-} // namespace Core::Devtools::Gcn
+}

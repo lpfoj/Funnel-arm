@@ -30,7 +30,6 @@ public:
         }
         Chunk& root{chunks.front()};
         if (root.used_objects == root.num_objects) {
-            // Root chunk has been filled, squash allocations into it
             const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
             chunks.clear();
             chunks.emplace_back(total_objects);
@@ -104,4 +103,4 @@ private:
     size_t new_chunk_size{};
 };
 
-} // namespace Common
+}

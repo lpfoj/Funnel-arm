@@ -1,17 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// This file implements the SSA rewriting algorithm proposed in
-//
-//      Simple and Efficient Construction of Static Single Assignment Form.
-//      Braun M., Buchwald S., Hack S., Leiba R., Mallon C., Zwinkau A. (2013)
-//      In: Jhala R., De Bosschere K. (eds)
-//      Compiler Construction. CC 2013.
-//      Lecture Notes in Computer Science, vol 7791.
-//      Springer, Berlin, Heidelberg
-//
-//      https://link.springer.com/chapter/10.1007/978-3-642-37051-9_6
-//
 
 #include <map>
 #include <span>
@@ -44,7 +33,6 @@ struct GotoVariable : FlagTag {
     u32 index;
 };
 
-// Thread-mask bool spilled to a VGPR lane by V_WRITELANE_B32 and restored by V_READLANE_B32.
 struct MaskLaneVariable : FlagTag {
     MaskLaneVariable() = default;
     explicit MaskLaneVariable(IR::VectorReg vgpr_, u32 lane_) : vgpr{vgpr_}, lane{lane_} {}
@@ -238,7 +226,6 @@ public:
                 if (const IR::Value& def = current_def.Def(block, variable); !def.IsEmpty()) {
                     stack.back().result = def;
                 } else if (!block->IsSsaSealed()) {
-                    // Incomplete CFG
                     IR::Inst* phi{&*block->PrependNewInst(block->begin(), IR::Opcode::Phi)};
                     phi->SetFlags(IR::TypeOf(UndefOpcode(variable)));
 
@@ -246,12 +233,10 @@ public:
                     stack.back().result = IR::Value{&*phi};
                 } else if (const std::span imm_preds = block->ImmPredecessors();
                            imm_preds.size() == 1) {
-                    // Optimize the common case of one predecessor: no phi needed
                     stack.back().pc = Status::SetValue;
                     stack.emplace_back(imm_preds.front());
                     break;
                 } else {
-                    // Break potential cycles with operandless phi
                     IR::Inst* const phi{&*block->PrependNewInst(block->begin(), IR::Opcode::Phi)};
                     phi->SetFlags(IR::TypeOf(UndefOpcode(variable)));
 
@@ -309,34 +294,25 @@ private:
         for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
             const IR::Value& op{phi.Arg(arg_index)};
             if (op.Resolve() == same.Resolve() || op.Resolve() == IR::Value{&phi}) {
-                // Unique value or self-reference
                 continue;
             }
             if (!same.IsEmpty()) {
-                // The phi merges at least two values: not trivial
                 return IR::Value{&phi};
             }
             same = op;
         }
-        // Remove the phi node from the block, it will be reinserted
         IR::Block::InstructionList& list{block->Instructions()};
         list.erase(IR::Block::InstructionList::s_iterator_to(phi));
 
-        // Find the first non-phi instruction and use it as an insertion point
         IR::Block::iterator reinsert_point{std::ranges::find_if_not(list, IR::IsPhi)};
         if (same.IsEmpty()) {
-            // The phi is unreachable or in the start block
-            // Insert an undefined instruction and make it the phi node replacement
-            // The "phi" node reinsertion point is specified after this instruction
             reinsert_point = block->PrependNewInst(reinsert_point, undef_opcode);
             same = IR::Value{&*reinsert_point};
             ++reinsert_point;
         }
-        // Reinsert the phi node and reroute all its uses to the "same" value
         const auto users = phi.Uses();
         list.insert(reinsert_point, phi);
         phi.ReplaceUsesWith(same);
-        // Try to recursively remove all phi users, which might have become trivial
         for (const auto& [user, arg_index] : users) {
             if (user->GetOpcode() == IR::Opcode::Phi) {
                 TryRemoveTrivialPhi(*user, user->GetParent(), undef_opcode);
@@ -447,7 +423,7 @@ void VisitBlock(Pass& pass, IR::Block* block) {
     pass.SealBlock(block);
 }
 
-} // Anonymous namespace
+}
 
 void SsaRewritePass(IR::BlockList& program) {
     Pass pass;
@@ -457,4 +433,4 @@ void SsaRewritePass(IR::BlockList& program) {
     }
 }
 
-} // namespace Shader::Optimization
+}

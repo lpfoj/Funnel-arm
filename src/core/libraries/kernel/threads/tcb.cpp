@@ -22,23 +22,19 @@ Core::Tcb* TcbCtor(Pthread* thread, int initial) {
     auto* addr_out = linker->AllocateTlsForThread(initial);
     ASSERT_MSG(addr_out, "Unable to allocate guest TCB");
 
-    // Initialize allocated memory and allocate DTV table.
     const u32 num_dtvs = linker->MaxTlsIndex();
     const auto static_tls_size = linker->StaticTlsSize();
     auto* dtv_table = new Core::DtvEntry[num_dtvs + 2]{};
 
-    // Initialize thread control block
     u8* addr = reinterpret_cast<u8*>(addr_out);
     auto* tcb = reinterpret_cast<Core::Tcb*>(addr + static_tls_size);
     memset(addr_out, 0, static_tls_size);
     tcb->tcb_self = tcb;
     tcb->tcb_dtv = dtv_table;
 
-    // Dtv[0] is the generation counter. libkernel puts their number into dtv[1]
     dtv_table[0].counter = linker->GenerationCounter();
     dtv_table[1].counter = num_dtvs;
 
-    // Copy init image of main module.
     auto* module = linker->GetModule(0);
     u8* dest = reinterpret_cast<u8*>(addr + static_tls_size - module->tls.offset);
 
@@ -68,17 +64,22 @@ void TcbDtor(Core::Tcb* oldtls) {
     ASSERT_MSG(num_dtvs <= max_tls_index, "Out of bounds DTV access");
 
     const u32 static_tls_size = linker->StaticTlsSize();
-    u8* tls_base = (u8*)oldtls - static_tls_size;
+    const u8* tls_base = (const u8*)oldtls - static_tls_size;
 
     for (int i = 1; i < num_dtvs; i++) {
         u8* dtv_ptr = dtv_table[i + 1].pointer;
         if (dtv_ptr && (dtv_ptr < tls_base || (const u8*)oldtls < dtv_ptr)) {
-            linker->FreeTlsForNonPrimaryThread(dtv_ptr);
+            const auto* module = linker->GetModule(i - 1);
+            const size_t dynamic_size = module && module->tls.image_size ? module->tls.image_size : 1;
+            linker->FreeTlsForNonPrimaryThread(dtv_ptr, dynamic_size);
         }
     }
-    delete[] dtv_table;
 
-    linker->FreeTlsForNonPrimaryThread(tls_base);
+#ifdef __ANDROID__
+    std::memset(const_cast<u8*>(tls_base), 0, static_tls_size + TlsTcbSize);
+#endif
+
+    delete[] dtv_table;
 }
 
 struct TlsIndex {
@@ -95,4 +96,4 @@ void RegisterRtld(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("vNe1w4diLCs", "libkernel", 1, "libkernel", __tls_get_addr);
 }
 
-} // namespace Libraries::Kernel
+}

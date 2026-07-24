@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <imgui.h>
 
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -28,15 +30,13 @@ void Shutdown(const vk::Device& device);
 
 bool ProcessEvent(SDL_Event* event);
 
-void AcquireGamepadInputCapture();
-void ReleaseGamepadInputCapture();
-bool IsGamepadInputCaptured();
-
 ImGuiID NewFrame(bool is_reusing_frame = false);
 
 void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
             const vk::Extent2D& extent);
 
-bool MustKeepDrawing(); // Force the emulator redraw
+bool MustKeepDrawing();
 
-} // namespace ImGui::Core
+std::uint32_t QueueHostGamepadButtons(std::uint32_t button_mask, bool pressed);
+
+}

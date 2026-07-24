@@ -234,4 +234,4 @@ struct AaConfig {
     }
 };
 
-} // namespace AmdGpu
+}

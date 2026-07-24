@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <memory>
 #include <mutex>
 #include <core/libraries/system/userservice.h>
 #include "common/types.h"
@@ -85,4 +84,4 @@ int PS4_SYSV_ABI sceAudioInVmicDestroy();
 int PS4_SYSV_ABI sceAudioInVmicWrite();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::AudioIn
+}

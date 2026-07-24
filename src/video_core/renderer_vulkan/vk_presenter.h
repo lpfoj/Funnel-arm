@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
@@ -23,6 +24,8 @@ struct Liverpool;
 }
 
 namespace Vulkan {
+
+[[nodiscard]] u64 ExecutorGetLivePresentCount() noexcept;
 
 struct Frame {
     u32 width;
@@ -87,6 +90,8 @@ public:
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
         image.usage.vo_surface = 1u;
+        executor_videoout_width.store(image.info.size.width, std::memory_order_release);
+        executor_videoout_height.store(image.info.size.height, std::memory_order_release);
         return image;
     }
 
@@ -100,8 +105,21 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false);
     Frame* PrepareLastFrame();
 
+    bool ExecutorPresentReplayRT();
+
+    [[nodiscard]] bool ExecutorLiveDirectPresentActive() const {
+        return executor_live_direct_present_active.load(std::memory_order_acquire);
+    }
+
 private:
     Frame* GetRenderFrame();
+    void ExecutorRecyclePreparedFrame(Frame* frame);
+    bool WaitForFence(vk::Fence fence, const char* where) noexcept;
+    bool AcquireSwapchainImage(const char* where);
+
+    [[nodiscard]] bool IsDeviceLost() const noexcept;
+    void MarkDeviceLost(vk::Result result, const char* where) noexcept;
+    void MarkTerminal(vk::Result result, const char* where) noexcept;
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
@@ -112,13 +130,13 @@ private:
     u32 expected_frame_width{1920};
     u32 expected_frame_height{1080};
 
-    Frontend::WindowSDL& window;
-    Instance instance;
     HostPasses::FsrPass fsr_pass;
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
+    Frontend::WindowSDL& window;
     AmdGpu::Liverpool* liverpool;
+    Instance instance;
     Scheduler draw_scheduler;
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
@@ -132,8 +150,13 @@ private:
     std::mutex free_mutex;
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
+    std::mutex executor_present_mutex;
+    std::atomic_bool device_lost{false};
+    std::atomic<bool> executor_live_direct_present_active{false};
+    std::atomic<u32> executor_videoout_width{0};
+    std::atomic<u32> executor_videoout_height{0};
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;
 };
 
-} // namespace Vulkan
+}

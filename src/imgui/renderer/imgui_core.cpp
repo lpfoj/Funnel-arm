@@ -1,17 +1,22 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <cstdint>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <unordered_set>
+
+#include "common/config.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
-#include "core/emulator_settings.h"
-#include "font_data.h"
-#include "font_stack.h"
 #include "imgui/imgui_layer.h"
 #include "imgui_core.h"
 #include "imgui_impl_sdl3.h"
@@ -21,42 +26,160 @@
 #include "texture_manager.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
+#include "imgui_fonts/notosansjp_regular.ttf.g.cpp"
+#include "imgui_fonts/proggyvector_regular.ttf.g.cpp"
+
 static void CheckVkResult(const vk::Result err) {
     LOG_ERROR(ImGui, "Vulkan error {}", vk::to_string(err));
 }
 
 static std::vector<ImGui::Layer*> layers;
 
-// Update layers before rendering to allow layer changes to be applied during rendering.
-// Using deque to keep the order of changes in case a Layer is removed then added again between
-// frames.
 static std::deque<std::pair<bool, ImGui::Layer*>> change_layers{};
 static std::mutex change_layers_mutex{};
+static std::unordered_set<ImGui::Layer*> capturing_layers{};
+
+struct HostGamepadEvent {
+    ImGuiKey key;
+    bool pressed;
+};
+
+struct HostGamepadMapping {
+    std::uint32_t mask;
+    ImGuiKey key;
+};
+
+static constexpr std::array host_gamepad_mappings{
+    HostGamepadMapping{0x000008, ImGuiKey_GamepadStart},
+    HostGamepadMapping{0x000002, ImGuiKey_GamepadL3},
+    HostGamepadMapping{0x000004, ImGuiKey_GamepadR3},
+    HostGamepadMapping{0x000010, ImGuiKey_GamepadDpadUp},
+    HostGamepadMapping{0x000020, ImGuiKey_GamepadDpadRight},
+    HostGamepadMapping{0x000040, ImGuiKey_GamepadDpadDown},
+    HostGamepadMapping{0x000080, ImGuiKey_GamepadDpadLeft},
+    HostGamepadMapping{0x000100, ImGuiKey_GamepadL2},
+    HostGamepadMapping{0x000200, ImGuiKey_GamepadR2},
+    HostGamepadMapping{0x000400, ImGuiKey_GamepadL1},
+    HostGamepadMapping{0x000800, ImGuiKey_GamepadR1},
+    HostGamepadMapping{0x001000, ImGuiKey_GamepadFaceUp},
+    HostGamepadMapping{0x002000, ImGuiKey_GamepadFaceRight},
+    HostGamepadMapping{0x004000, ImGuiKey_GamepadFaceDown},
+};
+
+static std::deque<HostGamepadEvent> host_gamepad_events{};
+static std::mutex host_gamepad_mutex{};
+static std::uint32_t host_gamepad_captured_buttons{};
+
+struct HostTextInputEvent {
+    std::string text{};
+    ImGuiKey key{ImGuiKey_None};
+    std::uint32_t repeat_count{};
+};
+
+static std::deque<HostTextInputEvent> host_text_input_events{};
+static std::mutex host_text_input_mutex{};
+static std::atomic_bool host_text_input_active{};
+
+static constexpr std::size_t MaxHostTextInputBytes = 16 * 1024;
 
 static ImGuiID dock_id;
-static std::atomic<std::uint32_t> force_gamepad_input_capture_count{0};
 
 namespace ImGui {
 
 namespace Core {
 
-void AcquireGamepadInputCapture() {
-    force_gamepad_input_capture_count.fetch_add(1, std::memory_order_relaxed);
+static bool HasModalLayer() {
+    std::scoped_lock lock{change_layers_mutex};
+    return !capturing_layers.empty();
 }
 
-void ReleaseGamepadInputCapture() {
-    std::uint32_t expected = force_gamepad_input_capture_count.load(std::memory_order_relaxed);
-    while (expected != 0) {
-        if (force_gamepad_input_capture_count.compare_exchange_weak(
-                expected, expected - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return;
+static void DrainHostGamepadEvents() {
+    std::deque<HostGamepadEvent> pending;
+    {
+        std::scoped_lock lock{host_gamepad_mutex};
+        pending.swap(host_gamepad_events);
+    }
+    auto& io = GetIO();
+    for (const auto& event : pending) {
+        io.AddKeyEvent(event.key, event.pressed);
+    }
+}
+
+static void DrainHostTextInputEvents() {
+    std::deque<HostTextInputEvent> pending;
+    {
+        std::scoped_lock lock{host_text_input_mutex};
+        pending.swap(host_text_input_events);
+    }
+    auto& io = GetIO();
+    for (const auto& event : pending) {
+        if (event.key == ImGuiKey_None) {
+            io.AddInputCharactersUTF8(event.text.c_str());
+            continue;
+        }
+        for (std::uint32_t i = 0; i < event.repeat_count; ++i) {
+            io.AddKeyEvent(event.key, true);
+            io.AddKeyEvent(event.key, false);
         }
     }
-    LOG_WARNING(ImGui, "ReleaseGamepadInputCapture called with no active capture");
 }
 
-bool IsGamepadInputCaptured() {
-    return force_gamepad_input_capture_count.load(std::memory_order_relaxed) > 0;
+static bool QueueHostTextKey(ImGuiKey key, std::uint32_t repeat_count = 1) {
+    if (!host_text_input_active.load(std::memory_order_acquire) || !HasModalLayer() ||
+        repeat_count == 0 || repeat_count > MaxHostTextInputBytes) {
+        return false;
+    }
+    std::scoped_lock lock{host_text_input_mutex};
+    host_text_input_events.push_back({.key = key, .repeat_count = repeat_count});
+    return true;
+}
+
+bool QueueHostTextInput(const char* utf8_text) {
+    if (utf8_text == nullptr || utf8_text[0] == '\0' || !HasModalLayer()) {
+        return false;
+    }
+
+    const std::size_t byte_count = std::strlen(utf8_text);
+    if (byte_count == 0 || byte_count > MaxHostTextInputBytes) {
+        return false;
+    }
+
+    std::scoped_lock lock{host_text_input_mutex};
+    host_text_input_events.push_back({.text = std::string{utf8_text, byte_count}});
+    return true;
+}
+
+std::uint32_t QueueHostGamepadButtons(std::uint32_t button_mask, bool pressed) {
+    std::uint32_t mapped_mask = 0;
+    for (const auto& mapping : host_gamepad_mappings) {
+        mapped_mask |= mapping.mask;
+    }
+    mapped_mask &= button_mask;
+    if (mapped_mask == 0) {
+        return 0;
+    }
+
+    if (pressed && !HasModalLayer()) {
+        return 0;
+    }
+
+    std::scoped_lock lock{host_gamepad_mutex};
+    const std::uint32_t consumed = pressed ? mapped_mask
+                                           : (mapped_mask & host_gamepad_captured_buttons);
+    if (consumed == 0) {
+        return 0;
+    }
+    if (pressed) {
+        host_gamepad_captured_buttons |= consumed;
+    } else {
+        host_gamepad_captured_buttons &= ~consumed;
+    }
+    for (const auto& mapping : host_gamepad_mappings) {
+        if ((consumed & mapping.mask) != 0) {
+            host_gamepad_events.push_back({mapping.key, pressed});
+        }
+    }
+    return consumed;
 }
 
 void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& window,
@@ -72,7 +195,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.DisplaySize = ImVec2((float)window.GetWidth(), (float)window.GetHeight());
-    PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f); // Makes the window edges rounded
+    PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
 
     auto path = config_path.u8string();
     char* config_file_buf = new char[path.size() + 1]();
@@ -84,32 +207,44 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     std::memcpy(log_file_buf, path.c_str(), path.size());
     io.LogFilename = log_file_buf;
 
-    ImFontConfig font_cfg{};
-    font_cfg.OversampleH = 2;
-    font_cfg.OversampleV = 1;
-    io.Fonts->Flags |= ImFontAtlasFlags_NoPowerOfTwoHeight;
-    const int console_language = EmulatorSettings.GetConsoleLanguage();
-    io.FontDefault = FontStack::AddPrimaryUiFont(io.Fonts, 32.0f, console_language, font_cfg, true);
-
-    io.Fonts->AddFontFromMemoryCompressedTTF(imgui_font_proggyvector_regular_compressed_data,
-                                             imgui_font_proggyvector_regular_compressed_size,
-                                             32.0f);
-
-    // Avoid exploding atlas size on Metal/MoltenVK when CJK fallback is enabled.
-    FontStack::AddPrimaryUiFont(io.Fonts, 128.0f, console_language, font_cfg, false);
-
-    // Big Picture
-    FontStack::AddPrimaryUiFont(ImGui::GetIO().Fonts, 64.0f, EmulatorSettings.GetConsoleLanguage(),
-                                font_cfg, true);
-
-    io.Fonts->Build();
+    if (imgui_font_notosansjp_regular_compressed_size <= 1) {
+        io.FontDefault = io.Fonts->AddFontDefault();
+    } else {
+        ImFontGlyphRangesBuilder rb{};
+        rb.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        rb.AddRanges(io.Fonts->GetGlyphRangesGreek());
+        rb.AddRanges(io.Fonts->GetGlyphRangesKorean());
+        rb.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        rb.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+        static ImVector<ImWchar> ranges{};
+        ranges.clear();
+        rb.BuildRanges(&ranges);
+        ImFontConfig font_cfg{};
+        font_cfg.OversampleH = 2;
+        font_cfg.OversampleV = 1;
+        io.FontDefault = io.Fonts->AddFontFromMemoryCompressedTTF(
+            imgui_font_notosansjp_regular_compressed_data,
+            imgui_font_notosansjp_regular_compressed_size, 32.0f, &font_cfg, ranges.Data);
+        io.Fonts->AddFontFromMemoryCompressedTTF(imgui_font_proggyvector_regular_compressed_data,
+                                                 imgui_font_proggyvector_regular_compressed_size,
+                                                 32.0f);
+        io.Fonts->AddFontFromMemoryCompressedTTF(imgui_font_notosansjp_regular_compressed_data,
+                                                 imgui_font_notosansjp_regular_compressed_size,
+                                                 128.0f, &font_cfg, ranges.Data);
+    }
 
     io.FontGlobalScale = 0.5f;
 
     StyleColorsDark();
 
     ::Core::Devtools::Layer::SetupSettings();
+#if !defined(ANDROID)
     Sdl::Init(window.GetSDLWindow());
+#endif
+
+#if defined(ANDROID)
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+#endif
 
     const Vulkan::InitInfo vk_info{
         .instance = instance.GetInstance(),
@@ -134,15 +269,19 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     ImFormatString(label, IM_ARRAYSIZE(label), "WindowOverViewport_%08X", GetMainViewport()->ID);
     dock_id = ImHashStr(label);
 
+#if !defined(ANDROID)
     if (const auto dpi = SDL_GetWindowDisplayScale(window.GetSDLWindow()); dpi > 0.0f) {
         GetIO().FontGlobalScale *= dpi;
     }
+#endif
 
     std::at_quick_exit([] { SaveIniSettingsToDisk(GetIO().IniFilename); });
 }
 
 void OnResize() {
+#if !defined(ANDROID)
     Sdl::OnResize();
+#endif
 }
 
 void OnSurfaceFormatChange(vk::Format surface_format) {
@@ -150,6 +289,7 @@ void OnSurfaceFormatChange(vk::Format surface_format) {
 }
 
 void Shutdown(const vk::Device& device) {
+    host_text_input_active.store(false, std::memory_order_release);
     auto result = device.waitIdle();
     if (result != vk::Result::eSuccess) {
         LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on shutdown: {}",
@@ -163,7 +303,9 @@ void Shutdown(const vk::Device& device) {
     const auto log_filename = (void*)io.LogFilename;
 
     Vulkan::Shutdown();
+#if !defined(ANDROID)
     Sdl::Shutdown();
+#endif
     DestroyContext();
 
     delete[] (char*)ini_filename;
@@ -171,9 +313,10 @@ void Shutdown(const vk::Device& device) {
 }
 
 bool ProcessEvent(SDL_Event* event) {
+#if !defined(ANDROID)
     Sdl::ProcessEvent(event);
+#endif
     switch (event->type) {
-    // Don't block release/up events
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_WHEEL:
     case SDL_EVENT_MOUSE_BUTTON_DOWN: {
@@ -183,28 +326,14 @@ bool ProcessEvent(SDL_Event* event) {
     }
     case SDL_EVENT_TEXT_INPUT:
     case SDL_EVENT_KEY_DOWN: {
-        if (IsGamepadInputCaptured()) {
-            // Keep keyboard events flowing through the regular input-binding path while IME/OSK
-            // captures gamepad input, so keyboard equivalents of pad buttons still update the
-            // virtual controller state.
-            return false;
-        }
         const auto& io = GetIO();
         return io.WantCaptureKeyboard && io.Ctx->NavWindow != nullptr &&
                io.Ctx->NavWindow->ID != dock_id;
     }
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP:
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
-    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
-    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
-    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: {
-        if (IsGamepadInputCaptured()) {
-            // Let controller events continue to input bindings so OSK shortcuts and virtual
-            // controller state keep updating; game-side pad reads are blocked in libScePad.
-            return false;
-        }
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION: {
         const auto& io = GetIO();
         return io.NavActive && io.Ctx->NavWindow != nullptr && io.Ctx->NavWindow->ID != dock_id;
     }
@@ -228,7 +357,19 @@ ImGuiID NewFrame(bool is_reusing_frame) {
         }
     }
 
+#if defined(ANDROID)
+    {
+        ImGuiIO& io = GetIO();
+        if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) {
+            io.DisplaySize = ImVec2(1920.0f, 1080.0f);
+        }
+        io.DeltaTime = 1.0f / 60.0f;
+    }
+#else
     Sdl::NewFrame(is_reusing_frame);
+#endif
+    DrainHostGamepadEvents();
+    DrainHostTextInputEvents();
     ImGui::NewFrame();
 
     ImGuiWindowFlags flags =
@@ -242,6 +383,11 @@ ImGuiID NewFrame(bool is_reusing_frame) {
         layer->Draw();
     }
 
+    const ImGuiContext* context = GetCurrentContext();
+    const bool input_text_active = context != nullptr && context->ActiveId != 0 &&
+                                   context->InputTextState.ID == context->ActiveId && HasModalLayer();
+    host_text_input_active.store(input_text_active, std::memory_order_release);
+
     return dockId;
 }
 
@@ -253,7 +399,7 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
         return;
     }
 
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+    if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "ImGui Render",
         });
@@ -278,25 +424,58 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
     cmdbuf.beginRendering(render_info);
     Vulkan::RenderDrawData(*draw_data, cmdbuf);
     cmdbuf.endRendering();
-    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+    if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 }
 
 bool MustKeepDrawing() {
-    return layers.size() > 1 || change_layers.size() > 1 || DebugState.IsShowingDebugMenuBar();
+    bool modal_or_pending = false;
+    {
+        std::scoped_lock lock{change_layers_mutex};
+        modal_or_pending = !capturing_layers.empty() || !change_layers.empty();
+    }
+    return modal_or_pending || DebugState.IsShowingDebugMenuBar();
 }
 
-} // namespace Core
+}
 
 void Layer::AddLayer(Layer* layer) {
     std::scoped_lock lock{change_layers_mutex};
+    if (layer != nullptr && layer->CapturesGamepadInput()) {
+        capturing_layers.insert(layer);
+    }
     change_layers.emplace_back(true, layer);
 }
 
 void Layer::RemoveLayer(Layer* layer) {
     std::scoped_lock lock{change_layers_mutex};
+    capturing_layers.erase(layer);
+    if (capturing_layers.empty()) {
+        host_text_input_active.store(false, std::memory_order_release);
+    }
     change_layers.emplace_back(false, layer);
 }
 
-} // namespace ImGui
+}
+
+extern "C" std::uint32_t executor_lsx4_runtime_system_ui_gamepad_button(
+    std::uint32_t button_mask, int pressed) {
+    return ImGui::Core::QueueHostGamepadButtons(button_mask, pressed != 0);
+}
+
+extern "C" int executor_lsx4_runtime_system_ui_text_input(const char* utf8_text) {
+    return ImGui::Core::QueueHostTextInput(utf8_text) ? 1 : 0;
+}
+
+extern "C" int executor_lsx4_runtime_system_ui_text_active() {
+    return host_text_input_active.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+extern "C" int executor_lsx4_runtime_system_ui_text_submit() {
+    return ImGui::Core::QueueHostTextKey(ImGuiKey_Enter) ? 1 : 0;
+}
+
+extern "C" int executor_lsx4_runtime_system_ui_text_backspace(std::uint32_t count) {
+    return ImGui::Core::QueueHostTextKey(ImGuiKey_Backspace, count) ? 1 : 0;
+}

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef WIN32
@@ -13,8 +13,8 @@
 #endif
 
 #include <common/singleton.h>
+#include "common/config.h"
 #include "common/logging/log.h"
-#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net_ctl_codes.h"
@@ -162,7 +162,7 @@ int PS4_SYSV_ABI sceNetCtlGetIfStat() {
 
 int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
     LOG_DEBUG(Lib_NetCtl, "code = {}", code);
-    if (!EmulatorSettings.IsConnectedToNetwork()) {
+    if (!Config::getIsConnectedToNetwork()) {
         return ORBIS_NET_CTL_ERROR_NOT_CONNECTED;
     }
 
@@ -177,15 +177,15 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         memcpy(info->ether_addr.data, netinfo->GetEthernetAddr().data(), 6);
     } break;
     case ORBIS_NET_CTL_INFO_MTU:
-        info->mtu = 1500; // default value
+        info->mtu = 1500;
         break;
     case ORBIS_NET_CTL_INFO_LINK:
-        info->link = EmulatorSettings.IsConnectedToNetwork() ? ORBIS_NET_CTL_LINK_CONNECTED
-                                                             : ORBIS_NET_CTL_LINK_DISCONNECTED;
+        info->link = Config::getIsConnectedToNetwork() ? ORBIS_NET_CTL_LINK_CONNECTED
+                                                       : ORBIS_NET_CTL_LINK_DISCONNECTED;
         break;
     case ORBIS_NET_CTL_INFO_IP_ADDRESS: {
         strcpy(info->ip_address,
-               "127.0.0.1"); // placeholder in case ip retrieval failed
+               "127.0.0.1");
         auto success = netinfo->RetrieveIp();
         if (success) {
             strncpy(info->ip_address, netinfo->GetIp().data(), sizeof(info->ip_address));
@@ -216,7 +216,7 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         break;
     }
     case ORBIS_NET_CTL_INFO_HTTP_PROXY_CONFIG:
-        info->http_proxy_config = 0; // off
+        info->http_proxy_config = 0;
         LOG_DEBUG(Lib_NetCtl, "http proxy config: {}", info->http_proxy_config);
         break;
     case ORBIS_NET_CTL_INFO_PRIMARY_DNS:
@@ -236,7 +236,7 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         LOG_DEBUG(Lib_NetCtl, "http proxy config: {}", info->http_proxy_port);
         break;
     case ORBIS_NET_CTL_INFO_IP_CONFIG:
-        info->ip_config = 1; // static
+        info->ip_config = 1;
         LOG_DEBUG(Lib_NetCtl, "ip config: {}", info->ip_config);
         break;
     case ORBIS_NET_CTL_INFO_DHCP_HOSTNAME:
@@ -258,30 +258,8 @@ int PS4_SYSV_ABI sceNetCtlGetInfoV6IpcInt() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetCtlGetNatInfo(OrbisNetCtlNatInfo* nat_info) {
-    if (!nat_info) {
-        return ORBIS_NET_CTL_ERROR_INVALID_ADDR;
-    }
-    if (nat_info->size != sizeof(OrbisNetCtlNatInfo)) {
-        return ORBIS_NET_CTL_ERROR_INVALID_SIZE;
-    }
-
-    auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
-    nat_info->nat_type = netinfo->GetNatType();
-    const u32 ext_ip = netinfo->GetExternalIp();
-    if (ext_ip != 0) {
-        nat_info->stun_status = 1;
-        nat_info->mapped_addr = ext_ip;
-    } else {
-        nat_info->stun_status = 0;
-        nat_info->mapped_addr = inet_addr("127.0.0.1");
-        if (netinfo->RetrieveIp()) {
-            nat_info->mapped_addr = inet_addr(netinfo->GetIp().c_str());
-        }
-    }
-
-    LOG_DEBUG(Lib_NetCtl, "stun_status={} nat_type={} mapped_addr={:#x}", nat_info->stun_status,
-              nat_info->nat_type, nat_info->mapped_addr);
+int PS4_SYSV_ABI sceNetCtlGetNatInfo() {
+    LOG_ERROR(Lib_NetCtl, "(STUBBED) called");
     return ORBIS_OK;
 }
 
@@ -340,7 +318,7 @@ int PS4_SYSV_ABI sceNetCtlGetScanInfoForSsidScanIpcInt() {
 }
 
 int PS4_SYSV_ABI sceNetCtlGetState(int* state) {
-    const auto connected = EmulatorSettings.IsConnectedToNetwork();
+    const auto connected = Config::getIsConnectedToNetwork();
     LOG_DEBUG(Lib_NetCtl, "connected = {}", connected);
     const auto current_state =
         connected ? ORBIS_NET_CTL_STATE_IPOBTAINED : ORBIS_NET_CTL_STATE_DISCONNECTED;
@@ -755,4 +733,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNetCtlApRpUnregisterCallback);
 };
 
-} // namespace Libraries::NetCtl
+}

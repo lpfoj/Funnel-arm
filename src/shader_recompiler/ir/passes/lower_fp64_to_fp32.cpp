@@ -157,4 +157,4 @@ void LowerFp64ToFp32(IR::Program& program) {
     }
 }
 
-} // namespace Shader::Optimization
+}

@@ -34,46 +34,17 @@ static int ConvertReturnErrorCode(int retval) {
 #else
         switch (errno) {
 #endif
-#ifndef _WIN32 // These errorcodes don't exist in WinSock
+#ifndef _WIN32
             ERROR_CASE(EPERM)
             ERROR_CASE(ENOENT)
-            // ERROR_CASE(ESRCH)
-            // ERROR_CASE(EIO)
-            // ERROR_CASE(ENXIO)
-            // ERROR_CASE(E2BIG)
-            // ERROR_CASE(ENOEXEC)
-            // ERROR_CASE(EDEADLK)
             ERROR_CASE(ENOMEM)
-            // ERROR_CASE(ECHILD)
-            // ERROR_CASE(EBUSY)
             ERROR_CASE(EEXIST)
-            // ERROR_CASE(EXDEV)
             ERROR_CASE(ENODEV)
-            // ERROR_CASE(ENOTDIR)
-            // ERROR_CASE(EISDIR)
             ERROR_CASE(ENFILE)
-            // ERROR_CASE(ENOTTY)
-            // ERROR_CASE(ETXTBSY)
-            // ERROR_CASE(EFBIG)
             ERROR_CASE(ENOSPC)
-            // ERROR_CASE(ESPIPE)
-            // ERROR_CASE(EROFS)
-            // ERROR_CASE(EMLINK)
             ERROR_CASE(EPIPE)
-            // ERROR_CASE(EDOM)
-            // ERROR_CASE(ERANGE)
-            // ERROR_CASE(ENOLCK)
-            // ERROR_CASE(ENOSYS)
-            // ERROR_CASE(EIDRM)
-            // ERROR_CASE(EOVERFLOW)
-            // ERROR_CASE(EILSEQ)
-            // ERROR_CASE(ENOTSUP)
             ERROR_CASE(ECANCELED)
-            // ERROR_CASE(EBADMSG)
             ERROR_CASE(ENODATA)
-            // ERROR_CASE(ENOSR)
-            // ERROR_CASE(ENOSTR)
-            // ERROR_CASE(ETIME)
 #endif
             ERROR_CASE(EINTR)
             ERROR_CASE(EBADF)
@@ -114,7 +85,6 @@ static int ConvertReturnErrorCode(int retval) {
         *Libraries::Kernel::__Error() = ORBIS_NET_EINTERNAL;
         return -1;
     }
-    // if it is 0 or positive return it as it is
     return retval;
 }
 
@@ -385,9 +355,8 @@ int UnixSocket::fstat(Libraries::Kernel::OrbisKernelStat* sb) {
     sb->st_size = st.st_size;
     sb->st_blocks = st.st_blocks;
     sb->st_blksize = st.st_blksize;
-    // sb->st_flags = st.st_flags;
     return ConvertReturnErrorCode(result);
 #endif
 }
 
-} // namespace Libraries::Net
+}

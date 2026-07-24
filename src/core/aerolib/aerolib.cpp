@@ -7,7 +7,6 @@
 
 namespace Core::AeroLib {
 
-// Use a direct table here + binary search as contents are static
 static constexpr NidEntry NIDS[] = {
 #define STUB(nid, name) {nid, #name},
 #include "aerolib.inl"
@@ -32,4 +31,4 @@ const NidEntry* FindByNid(const char* nid) {
     return nullptr;
 }
 
-} // namespace Core::AeroLib
+}

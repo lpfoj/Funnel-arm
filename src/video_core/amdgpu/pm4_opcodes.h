@@ -75,4 +75,4 @@ enum class PM4ItOpcode : u32 {
     DrawIndexIndirectCountMulti = 0x9d,
 };
 
-} // namespace AmdGpu
+}

@@ -9,4 +9,4 @@ BaseDevice::BaseDevice() = default;
 
 BaseDevice::~BaseDevice() = default;
 
-} // namespace Core::Devices
+}

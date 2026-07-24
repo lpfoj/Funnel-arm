@@ -8,9 +8,6 @@
 
 namespace Common {
 
-/// General purpose function wrapper similar to std::function.
-/// Unlike std::function, the captured values don't have to be copyable.
-/// This class can be moved but not copied.
 template <typename ResultType, typename... Args>
 class UniqueFunction {
     class CallableBase {
@@ -58,4 +55,4 @@ private:
     std::unique_ptr<CallableBase> callable;
 };
 
-} // namespace Common
+}

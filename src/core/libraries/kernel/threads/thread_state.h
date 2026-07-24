@@ -18,9 +18,9 @@ struct Pthread;
 struct PthreadAttr;
 
 struct Stack {
-    size_t stacksize; /* Stack size (rounded up). */
-    size_t guardsize; /* Guard size. */
-    void* stackaddr;  /* Stack address. */
+    size_t stacksize;
+    size_t guardsize;
+    void* stackaddr;
 };
 
 struct ThreadState {
@@ -84,4 +84,4 @@ struct ThreadState {
 
 using ThrState = Common::Singleton<ThreadState>;
 
-} // namespace Libraries::Kernel
+}

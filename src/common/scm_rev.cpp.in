@@ -38,5 +38,5 @@ const std::string GetRemoteNameFromLink() {
     return remote_host;
 }
 
-} // namespace
+}
 

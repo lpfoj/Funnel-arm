@@ -557,4 +557,4 @@ MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_sample
     return IsPrt(array_mode) ? MacroTileMode(mtm_idx + 8) : MacroTileMode(mtm_idx);
 }
 
-} // namespace AmdGpu
+}

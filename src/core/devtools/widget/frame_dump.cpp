@@ -23,7 +23,6 @@ using namespace DebugStateType;
         out = true;                                                                                \
     }
 
-// 00 to 99
 static std::array<char, 3> small_int_to_str(const s32 i) {
     std::array<char, 3> label{};
     if (i == -1) {
@@ -203,6 +202,6 @@ void FrameDumpViewer::Draw() {
     End();
 }
 
-} // namespace Core::Devtools::Widget
+}
 
 #undef C_V

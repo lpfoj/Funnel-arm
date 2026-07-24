@@ -1,12 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "common/logging/formatter.h"
-#include "core/emulator_settings.h"
+#include "common/config.h"
 #include "video_core/renderdoc.h"
 
-#include <atomic>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -25,18 +23,14 @@ enum class CaptureState {
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
-static std::atomic<u32> screenshot_game_only_count{0};
-static std::atomic<u32> screenshot_with_overlays_count{0};
 
 RENDERDOC_API_1_6_0* rdoc_api{};
 
 void LoadRenderDoc() {
 #ifdef WIN32
 
-    // Check if we are running by RDoc GUI
     HMODULE mod = GetModuleHandleA("renderdoc.dll");
-    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
-        // If enabled in config, try to load RDoc runtime in offline mode
+    if (!mod && Config::isRdocEnabled()) {
         HKEY h_reg_key;
         LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                                     L"SOFTWARE\\Classes\\RenderDoc.RDCCapture.1\\DefaultIcon\\", 0,
@@ -69,10 +63,8 @@ void LoadRenderDoc() {
 #else
     static constexpr const char RENDERDOC_LIB[] = "librenderdoc.so";
 #endif
-    // Check if we are running by RDoc GUI
     void* mod = dlopen(RENDERDOC_LIB, RTLD_NOW | RTLD_NOLOAD);
-    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
-        // If enabled in config, try to load RDoc runtime in offline mode
+    if (!mod && Config::isRdocEnabled()) {
         if ((mod = dlopen(RENDERDOC_LIB, RTLD_NOW))) {
             const auto RENDERDOC_GetAPI =
                 reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(mod, "RENDERDOC_GetAPI"));
@@ -84,11 +76,8 @@ void LoadRenderDoc() {
     }
 #endif
     if (rdoc_api) {
-        // Disable default capture keys as they suppose to trigger present-to-present capturing
-        // and it is not what we want
         rdoc_api->SetCaptureKeys(nullptr, 0);
 
-        // Also remove rdoc crash handler
         rdoc_api->UnloadCrashHandler();
     }
 }
@@ -129,37 +118,4 @@ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix) 
     rdoc_api->SetCaptureFilePathTemplate(fmt::UTF((path / prefix).u8string()).data.data());
 }
 
-bool IsRenderDocLoaded() {
-    return rdoc_api != nullptr;
 }
-
-void RequestScreenshot(const ScreenshotRequest request) {
-    switch (request) {
-    case ScreenshotRequest::GameOnly:
-        screenshot_game_only_count.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case ScreenshotRequest::WithOverlays:
-        screenshot_with_overlays_count.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case ScreenshotRequest::None:
-    default:
-        break;
-    }
-}
-
-u32 ConsumeGameOnlyScreenshotRequests() {
-    return screenshot_game_only_count.exchange(0, std::memory_order_acq_rel);
-}
-
-u32 ConsumeWithOverlaysScreenshotRequests() {
-    return screenshot_with_overlays_count.exchange(0, std::memory_order_acq_rel);
-}
-
-ScreenshotRequests ConsumeScreenshotRequests() {
-    return ScreenshotRequests{
-        .game_only_count = ConsumeGameOnlyScreenshotRequests(),
-        .with_overlays_count = ConsumeWithOverlaysScreenshotRequests(),
-    };
-}
-
-} // namespace VideoCore

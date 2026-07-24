@@ -10,4 +10,4 @@ namespace Shader::IR {
 
 BlockList PostOrder(const AbstractSyntaxNode& root);
 
-} // namespace Shader::IR
+}

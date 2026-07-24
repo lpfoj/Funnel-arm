@@ -20,4 +20,4 @@ extern TOptions Options;
 void LoadOptionsConfig(const char* line);
 void SerializeOptionsConfig(ImGuiTextBuffer* buf);
 
-} // namespace Core::Devtools
+}

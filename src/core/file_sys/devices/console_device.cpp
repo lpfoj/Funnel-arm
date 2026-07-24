@@ -70,4 +70,4 @@ s64 ConsoleDevice::pwrite(const void* buf, u64 nbytes, s64 offset) {
     return 0;
 }
 
-} // namespace Core::Devices
+}

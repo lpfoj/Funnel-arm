@@ -48,13 +48,13 @@ layout (set = 0, binding = 2) uniform sampler InputSampler;
 AH4 FsrEasuRH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, InputSampler), p, 0)); return res; }
 AH4 FsrEasuGH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, InputSampler), p, 1)); return res; }
 AH4 FsrEasuBH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, InputSampler), p, 2)); return res; }
-#endif// SAMPLE_EASU
+#endif
 
 #if SAMPLE_RCAS
 #define FSR_RCAS_H
 AH4 FsrRcasLoadH(ASW2 p) { return AH4(texelFetch(sampler2D(InputTexture, InputSampler), ASU2(p), 0)); }
 void FsrRcasInputH(inout AH1 r, inout AH1 g, inout AH1 b) { }
-#endif// SAMPLE_RCAS
+#endif
 
 #include "fsr/ffx_fsr1.h"
 
@@ -66,20 +66,19 @@ void CurrFilter(AU2 pos)
     if (Sample.x == 1)
     c *= c;
     imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
-    #endif// SAMPLE_EASU
+    #endif
 #if SAMPLE_RCAS
     AH3 c;
     FsrRcasH(c.r, c.g, c.b, pos, Const0);
     if (Sample.x == 1)
     c *= c;
     imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
-    #endif// SAMPLE_RCAS
+    #endif
 }
 
 layout (local_size_x = 64) in;
 void main()
 {
-    // Do remapping of local xy in workgroup for a more PS-like swizzle pattern.
     AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
     CurrFilter(gxy);
     gxy.x += 8u;

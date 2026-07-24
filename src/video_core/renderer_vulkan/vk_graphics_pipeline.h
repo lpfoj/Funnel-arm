@@ -15,7 +15,7 @@
 namespace VideoCore {
 class BufferCache;
 class TextureCache;
-} // namespace VideoCore
+}
 
 namespace Vulkan {
 
@@ -47,6 +47,7 @@ struct GraphicsPipelineKey {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
+        u32 rasterizer_discard_enable : 1;
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;
@@ -100,7 +101,18 @@ public:
         return key;
     }
 
-    /// Gets the attributes and bindings for vertex inputs.
+    u64 GetPipelineHash() const noexcept {
+        return pipeline_hash;
+    }
+
+    vk::Format GetColorFormat0() const noexcept {
+        return color_format0;
+    }
+
+    vk::Format GetDepthFormat() const noexcept {
+        return depth_format;
+    }
+
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
@@ -112,10 +124,13 @@ private:
 
 private:
     GraphicsPipelineKey key;
+    u64 pipeline_hash{};
+    vk::Format color_format0{vk::Format::eUndefined};
+    vk::Format depth_format{vk::Format::eUndefined};
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
 };
 
-} // namespace Vulkan
+}
 
 template <>
 struct std::hash<Vulkan::GraphicsPipelineKey> {

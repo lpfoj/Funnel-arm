@@ -102,4 +102,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceScreenShotSetDrcParam);
 };
 
-} // namespace Libraries::ScreenShot
+}

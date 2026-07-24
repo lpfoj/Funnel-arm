@@ -184,7 +184,7 @@ struct OrbisNgs2CustomSubmixerVoiceSetupParam {
 };
 
 struct OrbisNgs2CustomSubmixerVoiceState {
-    OrbisNgs2VoiceState voiceState; // Voice state
+    OrbisNgs2VoiceState voiceState;
     u32 reserved;
     u32 reserved2;
 };
@@ -441,4 +441,4 @@ struct OrbisNgs2CustomReverbModuleInfo {
     u32 reserved;
 };
 
-} // namespace Libraries::Ngs2
+}

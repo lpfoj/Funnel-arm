@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// UserService library
 constexpr int ORBIS_USER_SERVICE_ERROR_INTERNAL = 0x80960001;
 constexpr int ORBIS_USER_SERVICE_ERROR_NOT_INITIALIZED = 0x80960002;
 constexpr int ORBIS_USER_SERVICE_ERROR_ALREADY_INITIALIZED = 0x80960003;

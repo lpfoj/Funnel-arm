@@ -4,8 +4,13 @@
 #pragma once
 
 #include <string>
-#include <SDL3/SDL_audio.h>
+#include <variant>
+#include <SDL3_mixer/SDL_mixer.h>
+#include <queue>
 
+#include "common/fixed_value.h"
+#include "common/types.h"
+#include "core/libraries/np/np_trophy.h"
 #include "imgui/imgui_layer.h"
 #include "imgui/imgui_texture.h"
 
@@ -17,20 +22,21 @@ public:
              const std::string_view& rarity);
     ~TrophyUI() override;
 
+    bool CapturesGamepadInput() const override {
+        return false;
+    }
     void Finish();
 
     void Draw() override;
 
 private:
-    void PlayMp3(std::vector<unsigned char> mp3Data);
-    void PlayWav(std::vector<unsigned char> wavData);
-
     std::string trophy_name;
     std::string_view trophy_type;
     ImGui::RefCountedTexture trophy_icon;
     ImGui::RefCountedTexture trophy_type_icon;
-    SDL_AudioStream* stream;
-    SDL_AudioDeviceID audioDevice;
+
+    MIX_Mixer* mixer;
+    MIX_Audio* audio;
 };
 
 struct TrophyInfo {
@@ -42,4 +48,4 @@ struct TrophyInfo {
 void AddTrophyToQueue(const std::filesystem::path& trophyIconPath, const std::string& trophyName,
                       const std::string_view& rarity);
 
-}; // namespace Libraries::Np::NpTrophy
+};

@@ -3,19 +3,27 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdarg>
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <vector>
+
+#ifdef __ANDROID__
+#include <aaudio/AAudio.h>
+#include <android/log.h>
+#endif
+
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_hints.h>
 
+#include "common/config.h"
 #include "common/logging/log.h"
-#include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/threads.h"
 
-// SIMD support detection
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #define HAS_SSE2
@@ -25,21 +33,25 @@
 
 namespace Libraries::AudioOut {
 
-// Volume constants
-constexpr float VOLUME_0DB = 32768.0f; // 1 << 15
+constexpr float VOLUME_0DB = 32768.0f;
 constexpr float INV_VOLUME_0DB = 1.0f / VOLUME_0DB;
 constexpr float VOLUME_EPSILON = 0.001f;
-// Timing constants
-constexpr u64 VOLUME_CHECK_INTERVAL_US = 50000; // Check every 50ms
+constexpr u64 VOLUME_CHECK_INTERVAL_US = 50000;
 constexpr u64 MIN_SLEEP_THRESHOLD_US = 10;
-constexpr u64 TIMING_RESYNC_THRESHOLD_US = 100000; // Resync if >100ms behind
+constexpr u64 TIMING_RESYNC_THRESHOLD_US = 100000;
 
-// Queue management
 constexpr u32 QUEUE_MULTIPLIER = 4;
-// Memory alignment for SIMD
 constexpr size_t AUDIO_BUFFER_ALIGNMENT = 32;
 
-// Channel positions
+#ifdef __ANDROID__
+static void AndroidAudioLog(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    __android_log_vprint(ANDROID_LOG_INFO, "LSX4Native", format, args);
+    va_end(args);
+}
+#endif
+
 enum ChannelPos : u8 {
     FL = 0,
     FR = 1,
@@ -86,7 +98,7 @@ public:
         convert(ptr, internal_buffer, buffer_frames, nullptr);
         HandleTiming(current_time);
 
-        if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
+        if ((output_count++ & 0xF) == 0) {
             ManageAudioQueue();
         }
 
@@ -109,9 +121,8 @@ public:
             const float channel_gain = static_cast<float>(ch_volumes[i]) * INV_VOLUME_0DB;
             max_channel_gain = std::max(max_channel_gain, channel_gain);
         }
-        game_gain.store(max_channel_gain, std::memory_order_release);
 
-        const float slider_gain = EmulatorSettings.GetVolumeSlider() * 0.01f; // Faster than /100.0f
+        const float slider_gain = Config::getVolumeSlider() * 0.01f;
         const float total_gain = max_channel_gain * slider_gain;
 
         const float current = current_gain.load(std::memory_order_acquire);
@@ -119,7 +130,6 @@ public:
             return;
         }
 
-        // Apply volume change
         if (SDL_SetAudioStreamGain(stream, total_gain)) {
             current_gain.store(total_gain, std::memory_order_release);
             LOG_DEBUG(Lib_AudioOut,
@@ -136,10 +146,8 @@ public:
 
 private:
     bool Initialize(OrbisAudioOutPort type) {
-        // Calculate timing parameters
         period_us = (1000000ULL * buffer_frames + sample_rate / 2) / sample_rate;
 
-        // Allocate aligned internal buffer for SIMD operations
         internal_buffer_size = buffer_frames * sizeof(float) * num_channels;
 
 #ifdef _WIN32
@@ -156,15 +164,14 @@ private:
             return false;
         }
 
-        // Initialize current gain
-        current_gain.store(EmulatorSettings.GetVolumeSlider() * 0.01f, std::memory_order_relaxed);
+        current_gain.store(Config::getVolumeSlider() * 0.01f, std::memory_order_relaxed);
 
-        if (!OpenDevice(type)) {
+        if (!SelectConverter()) {
             FreeAlignedBuffer();
             return false;
         }
 
-        if (!SelectConverter()) {
+        if (!OpenDevice(type)) {
             FreeAlignedBuffer();
             return false;
         }
@@ -201,11 +208,9 @@ private:
 
         last_volume_check_time = current_time;
 
-        const float config_volume =
-            EmulatorSettings.GetVolumeSlider() * 0.01f * game_gain.load(std::memory_order_acquire);
+        const float config_volume = Config::getVolumeSlider() * 0.01f;
         const float stored_gain = current_gain.load(std::memory_order_acquire);
 
-        // Only update if the difference is significant
         if (std::abs(config_volume - stored_gain) > VOLUME_EPSILON) {
             if (SDL_SetAudioStreamGain(stream, config_volume)) {
                 current_gain.store(config_volume, std::memory_order_release);
@@ -218,7 +223,6 @@ private:
 
     void HandleTiming(u64 current_time) {
         if (next_output_time == 0) [[unlikely]] {
-            // First output - set initial timing
             next_output_time = current_time + period_us;
             return;
         }
@@ -226,20 +230,16 @@ private:
         const s64 time_diff = static_cast<s64>(current_time - next_output_time);
 
         if (time_diff > static_cast<s64>(TIMING_RESYNC_THRESHOLD_US)) [[unlikely]] {
-            // We're far behind - resync
             next_output_time = current_time + period_us;
         } else if (time_diff < 0) {
-            // We're ahead of schedule - wait
             const u64 time_to_wait = static_cast<u64>(-time_diff);
             next_output_time += period_us;
 
             if (time_to_wait > MIN_SLEEP_THRESHOLD_US) {
-                // Sleep for most of the wait period
                 const u64 sleep_duration = time_to_wait - MIN_SLEEP_THRESHOLD_US;
                 std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
             }
         } else {
-            // Slightly behind or on time - just advance
             next_output_time += period_us;
         }
     }
@@ -256,7 +256,12 @@ private:
     }
 
     bool OpenDevice(OrbisAudioOutPort type) {
-        // Determine device
+        const SDL_AudioSpec fmt = {
+            .format = SDL_AUDIO_F32LE,
+            .channels = static_cast<u8>(num_channels),
+            .freq = static_cast<int>(sample_rate),
+        };
+
         const std::string device_name = GetDeviceName(type);
         const SDL_AudioDeviceID dev_id = SelectAudioDevice(device_name, type);
 
@@ -264,55 +269,23 @@ private:
             return false;
         }
 
-        const SDL_AudioSpec fmt = {
-            .format = SDL_AUDIO_F32LE,
-            .channels = static_cast<u8>(num_channels),
-            .freq = static_cast<int>(sample_rate),
-        };
-
-        // Create audio stream
         stream = SDL_OpenAudioDeviceStream(dev_id, &fmt, nullptr, nullptr);
         if (!stream) {
             LOG_ERROR(Lib_AudioOut, "Failed to create SDL audio stream: {}", SDL_GetError());
             return false;
         }
 
-        SDL_AudioSpec dev_spec{};
-        if (num_channels >= 6 &&
-            SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &dev_spec, nullptr) &&
-            dev_spec.channels >= 1 && dev_spec.channels <= 2) {
-            ps4_downmix = true;
-            internal_buffer_size = buffer_frames * sizeof(float) * 2;
-            LOG_INFO(Lib_AudioOut, "Stereo device: using PS4-accurate {}ch->stereo downmix",
-                     num_channels);
-
-            SDL_DestroyAudioStream(stream);
-            const SDL_AudioSpec stereo_fmt = {
-                .format = SDL_AUDIO_F32LE,
-                .channels = 2,
-                .freq = static_cast<int>(sample_rate),
-            };
-            stream = SDL_OpenAudioDeviceStream(dev_id, &stereo_fmt, nullptr, nullptr);
-            if (!stream) {
-                LOG_ERROR(Lib_AudioOut, "Failed to recreate SDL audio stream: {}", SDL_GetError());
-                return false;
-            }
-        }
-
-        // Configure channel mapping (input is already stereo when folding)
-        if (!ps4_downmix && !ConfigureChannelMap()) {
+        if (!ConfigureChannelMap()) {
             SDL_DestroyAudioStream(stream);
             stream = nullptr;
             return false;
         }
 
-        // Set initial volume
         const float initial_gain = current_gain.load(std::memory_order_relaxed);
         if (!SDL_SetAudioStreamGain(stream, initial_gain)) {
             LOG_WARNING(Lib_AudioOut, "Failed to set initial audio gain: {}", SDL_GetError());
         }
 
-        // Start playback
         if (!SDL_ResumeAudioStreamDevice(stream)) {
             LOG_ERROR(Lib_AudioOut, "Failed to resume audio stream: {}", SDL_GetError());
             SDL_DestroyAudioStream(stream);
@@ -336,7 +309,6 @@ private:
             return SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
         }
 
-        // Search for specific device
         int num_devices = 0;
         SDL_AudioDeviceID* dev_array = SDL_GetAudioPlaybackDevices(&num_devices);
 
@@ -373,7 +345,6 @@ private:
         std::vector<int> channel_map(num_channels);
 
         if (is_std && num_channels == 8) {
-            // Standard 8CH layout requires remapping
             channel_map = {FL, FR, FC, LF, STD_SL, STD_SR, STD_BL, STD_BR};
         } else {
             std::copy_n(channel_layout.begin(), num_channels, channel_map.begin());
@@ -391,52 +362,15 @@ private:
         switch (type) {
         case OrbisAudioOutPort::Main:
         case OrbisAudioOutPort::Bgm:
-            return EmulatorSettings.GetSDLMainOutputDevice();
+            return Config::getMainOutputDevice();
         case OrbisAudioOutPort::PadSpk:
-            return EmulatorSettings.GetSDLPadSpkOutputDevice();
+            return Config::getPadSpkOutputDevice();
         default:
-            return EmulatorSettings.GetSDLMainOutputDevice();
-        }
-    }
-
-    static constexpr float DOWNMIX_FRONT = 1.0f;
-    static constexpr float DOWNMIX_CENTER = 0.7071f;
-    static constexpr float DOWNMIX_SURROUND = 0.7071f;
-
-    static void DownmixS16_8CHToStereoPS4(const void* src, void* dst, u32 frames, const float*) {
-        constexpr float INV = 1.0f / 32768.0f;
-        const s16* s = static_cast<const s16*>(src);
-        float* d = static_cast<float*>(dst);
-        for (u32 i = 0; i < frames; i++) {
-            const u32 o = i << 3;
-            const float center = DOWNMIX_CENTER * s[o + FC];
-            d[i * 2 + 0] =
-                (DOWNMIX_FRONT * s[o + FL] + center + DOWNMIX_SURROUND * (s[o + 4] + s[o + 6])) *
-                INV;
-            d[i * 2 + 1] =
-                (DOWNMIX_FRONT * s[o + FR] + center + DOWNMIX_SURROUND * (s[o + 5] + s[o + 7])) *
-                INV;
-        }
-    }
-    static void DownmixF32_8CHToStereoPS4(const void* src, void* dst, u32 frames, const float*) {
-        const float* s = static_cast<const float*>(src);
-        float* d = static_cast<float*>(dst);
-        for (u32 i = 0; i < frames; i++) {
-            const u32 o = i << 3;
-            const float center = DOWNMIX_CENTER * s[o + FC];
-            d[i * 2 + 0] =
-                DOWNMIX_FRONT * s[o + FL] + center + DOWNMIX_SURROUND * (s[o + 4] + s[o + 6]);
-            d[i * 2 + 1] =
-                DOWNMIX_FRONT * s[o + FR] + center + DOWNMIX_SURROUND * (s[o + 5] + s[o + 7]);
+            return Config::getMainOutputDevice();
         }
     }
 
     bool SelectConverter() {
-        if (ps4_downmix) {
-            convert = is_float ? &DownmixF32_8CHToStereoPS4 : &DownmixS16_8CHToStereoPS4;
-            return true;
-        }
-
         if (is_float) {
             switch (num_channels) {
             case 1:
@@ -515,7 +449,7 @@ private:
         const s16* s = static_cast<const s16*>(src);
         float* d = static_cast<float*>(dst);
 
-        const u32 num_samples = frames << 1; // * 2
+        const u32 num_samples = frames << 1;
         for (u32 i = 0; i < num_samples; i++) {
             d[i] = s[i] * INV_VOLUME_0DB;
         }
@@ -530,25 +464,19 @@ private:
         const u32 num_samples = frames << 1;
         u32 i = 0;
 
-        // Process 8 samples at a time (4 stereo frames)
         for (; i + 8 <= num_samples; i += 8) {
-            // Load 8 s16 values
             __m128i s16_vals = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&s[i]));
 
-            // Convert to 32-bit integers
             __m128i s32_lo = _mm_cvtepi16_epi32(s16_vals);
             __m128i s32_hi = _mm_cvtepi16_epi32(_mm_srli_si128(s16_vals, 8));
 
-            // Convert to float and scale
             __m128 f_lo = _mm_mul_ps(_mm_cvtepi32_ps(s32_lo), scale);
             __m128 f_hi = _mm_mul_ps(_mm_cvtepi32_ps(s32_hi), scale);
 
-            // Store results
             _mm_storeu_ps(&d[i], f_lo);
             _mm_storeu_ps(&d[i + 4], f_hi);
         }
 
-        // Handle remaining samples
         for (; i < num_samples; i++) {
             d[i] = s[i] * INV_VOLUME_0DB;
         }
@@ -559,7 +487,7 @@ private:
         const s16* s = static_cast<const s16*>(src);
         float* d = static_cast<float*>(dst);
 
-        const u32 num_samples = frames << 3; // * 8
+        const u32 num_samples = frames << 3;
         for (u32 i = 0; i < num_samples; i++) {
             d[i] = s[i] * INV_VOLUME_0DB;
         }
@@ -574,7 +502,6 @@ private:
         const u32 num_samples = frames << 3;
         u32 i = 0;
 
-        // Process 8 samples at a time
         for (; i + 8 <= num_samples; i += 8) {
             __m128i s16_vals = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&s[i]));
             __m128i s32_lo = _mm_cvtepi16_epi32(s16_vals);
@@ -607,9 +534,8 @@ private:
         const float* s = static_cast<const float*>(src);
         float* d = static_cast<float*>(dst);
 
-        // Channel remapping for standard 8CH layout
         for (u32 i = 0; i < frames; i++) {
-            const u32 offset = i << 3; // * 8
+            const u32 offset = i << 3;
 
             d[offset + FL] = s[offset + FL];
             d[offset + FR] = s[offset + FR];
@@ -622,7 +548,6 @@ private:
         }
     }
 
-    // Audio format parameters
     const u32 frame_size;
     const u32 guest_buffer_size;
     const u32 buffer_frames;
@@ -630,8 +555,6 @@ private:
     const u32 num_channels;
     const bool is_float;
     const bool is_std;
-    // Set when the output device is stereo and we fold 5.1/7.1 ourselves.
-    bool ps4_downmix{false};
     const std::array<int, 8> channel_layout;
 
     alignas(64) u64 period_us{0};
@@ -640,24 +563,212 @@ private:
     u64 last_volume_check_time{0};
     u32 output_count{0};
 
-    // Buffers
     u32 internal_buffer_size{0};
     void* internal_buffer{nullptr};
 
-    // Converter function pointer
     ConverterFunc convert{nullptr};
 
-    // Volume management
     alignas(64) std::atomic<float> current_gain{1.0f};
-    std::atomic<float> game_gain{1.0f};
 
-    // SDL audio stream
     SDL_AudioStream* stream{nullptr};
     u32 queue_threshold{0};
 };
 
+#ifdef __ANDROID__
+class AndroidAAudioPortBackend : public PortBackend {
+public:
+    explicit AndroidAAudioPortBackend(const PortOut& port)
+        : buffer_frames(port.buffer_frames), sample_rate(port.sample_rate),
+          guest_channels(port.format_info.num_channels),
+          output_channels(port.format_info.num_channels == 1 ? 1u : 2u),
+          is_float(port.format_info.is_float) {
+        output_buffer.resize(static_cast<size_t>(buffer_frames) * output_channels);
+        if (!OpenStream()) {
+            Cleanup();
+        }
+    }
+
+    ~AndroidAAudioPortBackend() override {
+        Cleanup();
+    }
+
+    bool IsReady() const {
+        return stream != nullptr;
+    }
+
+    void Output(void* ptr) override {
+        if (!stream || !ptr) {
+            return;
+        }
+
+        static const bool audio_out_disabled = [] {
+            const char* v = std::getenv("EXECUTOR_DISABLE_AUDIO_OUTPUT");
+            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        if (audio_out_disabled) {
+            return;
+        }
+
+        ConvertToOutput(ptr);
+        {
+            bool all_zero = true;
+            for (const float s : output_buffer) {
+                if (s != 0.0f) {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if (all_zero && !output_buffer.empty()) {
+                silence_dither_phase = !silence_dither_phase;
+                output_buffer[0] = silence_dither_phase ? 1.0e-8f : -1.0e-8f;
+            }
+        }
+        const aaudio_result_t written =
+            AAudioStream_write(stream, output_buffer.data(), buffer_frames, 20'000'000);
+
+        if (written < 0) {
+            if (output_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OUTPUT] error=%s",
+                                AAudio_convertResultToText(written));
+            }
+            return;
+        }
+
+        if (output_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            float peak = 0.0f;
+            const size_t sample_count =
+                std::min<size_t>(output_buffer.size(), static_cast<size_t>(512));
+            for (size_t i = 0; i < sample_count; i++) {
+                peak = std::max(peak, std::abs(output_buffer[i]));
+            }
+            AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OUTPUT] frames=%d/%u outCh=%u guestCh=%u "
+                            "float=%d peak=%.4f",
+                            static_cast<int>(written), buffer_frames, output_channels,
+                            guest_channels, is_float ? 1 : 0, peak);
+        }
+    }
+
+    void SetVolume(const std::array<int, 8>& ch_volumes) override {
+        float max_channel_gain = 0.0f;
+        const u32 channels_to_check = std::min(guest_channels, 8u);
+        for (u32 i = 0; i < channels_to_check; i++) {
+            max_channel_gain =
+                std::max(max_channel_gain, static_cast<float>(ch_volumes[i]) * INV_VOLUME_0DB);
+        }
+        gain.store(max_channel_gain * Config::getVolumeSlider() * 0.01f,
+                   std::memory_order_release);
+    }
+
+private:
+    bool OpenStream() {
+        static const bool audio_out_disabled = [] {
+            const char* v = std::getenv("EXECUTOR_DISABLE_AUDIO_OUTPUT");
+            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        if (audio_out_disabled) {
+            AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OPEN] disabled=1 (MIUI AudioTrack crash escape)");
+            return false;
+        }
+        AAudioStreamBuilder* builder = nullptr;
+        aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+        if (result != AAUDIO_OK || !builder) {
+            AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OPEN] create_builder error=%s",
+                            AAudio_convertResultToText(result));
+            return false;
+        }
+
+        AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+        AAudioStreamBuilder_setSampleRate(builder, static_cast<int32_t>(sample_rate));
+        AAudioStreamBuilder_setChannelCount(builder, static_cast<int32_t>(output_channels));
+        AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+        AAudioStreamBuilder_setBufferCapacityInFrames(
+            builder, static_cast<int32_t>(std::max<u32>(buffer_frames * 4, 512)));
+
+        result = AAudioStreamBuilder_openStream(builder, &stream);
+        AAudioStreamBuilder_delete(builder);
+        if (result != AAUDIO_OK || !stream) {
+            AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OPEN] open error=%s",
+                            AAudio_convertResultToText(result));
+            return false;
+        }
+
+        result = AAudioStream_requestStart(stream);
+        if (result != AAUDIO_OK) {
+            AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OPEN] start error=%s",
+                            AAudio_convertResultToText(result));
+            return false;
+        }
+
+        AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OPEN] ok sampleRate=%u guestCh=%u outCh=%u "
+                        "frames=%u",
+                        sample_rate, guest_channels, output_channels, buffer_frames);
+        return true;
+    }
+
+    void Cleanup() {
+        if (stream) {
+            AAudioStream_requestStop(stream);
+            AAudioStream_close(stream);
+            stream = nullptr;
+        }
+    }
+
+    void ConvertToOutput(const void* ptr) {
+        const float current_gain = gain.load(std::memory_order_acquire);
+        if (is_float) {
+            const float* src = static_cast<const float*>(ptr);
+            for (u32 frame = 0; frame < buffer_frames; frame++) {
+                const u32 src_base = frame * guest_channels;
+                const u32 dst_base = frame * output_channels;
+                output_buffer[dst_base] = src[src_base] * current_gain;
+                if (output_channels == 2) {
+                    output_buffer[dst_base + 1] =
+                        src[src_base + (guest_channels > 1 ? 1 : 0)] * current_gain;
+                }
+            }
+            return;
+        }
+
+        const s16* src = static_cast<const s16*>(ptr);
+        for (u32 frame = 0; frame < buffer_frames; frame++) {
+            const u32 src_base = frame * guest_channels;
+            const u32 dst_base = frame * output_channels;
+            output_buffer[dst_base] = src[src_base] * INV_VOLUME_0DB * current_gain;
+            if (output_channels == 2) {
+                output_buffer[dst_base + 1] =
+                    src[src_base + (guest_channels > 1 ? 1 : 0)] * INV_VOLUME_0DB * current_gain;
+            }
+        }
+    }
+
+    const u32 buffer_frames;
+    const u32 sample_rate;
+    const u32 guest_channels;
+    const u32 output_channels;
+    const bool is_float;
+    std::vector<float> output_buffer;
+    bool silence_dither_phase = false;
+    AAudioStream* stream{nullptr};
+    std::atomic<float> gain{Config::getVolumeSlider() * 0.01f};
+    std::atomic_int output_log_budget{4};
+};
+#endif
+
 std::unique_ptr<PortBackend> SDLAudioOut::Open(PortOut& port) {
+#ifdef __ANDROID__
+    static const bool audio_out_disabled = [] {
+        const char* v = std::getenv("EXECUTOR_DISABLE_AUDIO_OUTPUT");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    auto android_backend = std::make_unique<AndroidAAudioPortBackend>(port);
+    if (android_backend->IsReady() || audio_out_disabled) {
+        return android_backend;
+    }
+    AndroidAudioLog("[EXECUTOR_AUDIO_AAUDIO_OPEN] falling back to SDL");
+#endif
     return std::make_unique<SDLPortBackend>(port);
 }
 
-} // namespace Libraries::AudioOut
+}

@@ -5,8 +5,8 @@
 
 #include "common/types.h"
 
-#include <cstdarg> // va_list
-#include <cstddef> // size_t
+#include <cstdarg>
+#include <cstddef>
 
 namespace Core::Loader {
 class SymbolsResolver;
@@ -292,4 +292,4 @@ using AvPlayerLogCallback = int PS4_SYSV_ABI (*)(void* p, const char* format, va
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::AvPlayer
+}

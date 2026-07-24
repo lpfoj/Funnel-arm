@@ -81,4 +81,4 @@ s32 PS4_SYSV_ABI sceJpegEncEncode(OrbisJpegEncHandle handle, const OrbisJpegEncE
 s32 PS4_SYSV_ABI sceJpegEncQueryMemorySize(const OrbisJpegEncCreateParam* param);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::JpegEnc
+}

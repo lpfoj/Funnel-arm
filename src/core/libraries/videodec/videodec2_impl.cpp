@@ -12,6 +12,7 @@
 namespace Libraries::Videodec2 {
 
 std::vector<OrbisVideodec2AvcPictureInfo> gPictureInfos;
+std::vector<OrbisVideodec2LegacyAvcPictureInfo> gLegacyPictureInfos;
 
 static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
     if (src.width == src.linesize[0]) {
@@ -34,7 +35,7 @@ static inline void CopyNV12Data(u8* dst, const AVFrame& src) {
 
 VdecDecoder::VdecDecoder(const OrbisVideodec2DecoderConfigInfo& configInfo,
                          const OrbisVideodec2DecoderMemoryInfo& memoryInfo) {
-    ASSERT(configInfo.codecType == 1); /* AVC */
+    ASSERT(configInfo.codecType == 1);
 
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     ASSERT(codec);
@@ -62,7 +63,6 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& inputData,
     outputInfo.isErrorFrame = true;
     outputInfo.pictureCount = 0;
 
-    // Only set frameFormat if the game uses the newer struct version.
     if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
         outputInfo.frameFormat = 0;
     }
@@ -120,7 +120,7 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& inputData,
         CopyNV12Data((u8*)frameBuffer.frameBuffer, *frame);
         frameBuffer.isAccepted = true;
 
-        outputInfo.codecType = 1; // FIXME: Hardcoded to AVC
+        outputInfo.codecType = 1;
         outputInfo.frameWidth = frame->width;
         outputInfo.frameHeight = frame->height;
         outputInfo.framePitch = frame->width;
@@ -129,29 +129,45 @@ s32 VdecDecoder::Decode(const OrbisVideodec2InputData& inputData,
 
         outputInfo.isValid = true;
         outputInfo.isErrorFrame = false;
-        outputInfo.pictureCount = 1; // TODO: 2 pictures for interlaced video
+        outputInfo.pictureCount = 1;
 
-        // Only set framePitchInBytes if the game uses the newer struct version.
         if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
             outputInfo.framePitchInBytes = frame->width;
-        }
+            if (outputInfo.isValid) {
+                OrbisVideodec2AvcPictureInfo pictureInfo = {};
 
-        if (outputInfo.isValid) {
-            OrbisVideodec2AvcPictureInfo pictureInfo = {};
+                pictureInfo.thisSize = sizeof(OrbisVideodec2AvcPictureInfo);
+                pictureInfo.isValid = true;
 
-            pictureInfo.thisSize = sizeof(OrbisVideodec2AvcPictureInfo);
-            pictureInfo.isValid = true;
+                pictureInfo.ptsData = inputData.ptsData;
+                pictureInfo.dtsData = inputData.dtsData;
+                pictureInfo.attachedData = inputData.attachedData;
 
-            pictureInfo.ptsData = inputData.ptsData;
-            pictureInfo.dtsData = inputData.dtsData;
-            pictureInfo.attachedData = inputData.attachedData;
+                pictureInfo.frameCropLeftOffset = frame->crop_left;
+                pictureInfo.frameCropRightOffset = frame->crop_right;
+                pictureInfo.frameCropTopOffset = frame->crop_top;
+                pictureInfo.frameCropBottomOffset = frame->crop_bottom;
 
-            pictureInfo.frameCropLeftOffset = frame->crop_left;
-            pictureInfo.frameCropRightOffset = frame->crop_right;
-            pictureInfo.frameCropTopOffset = frame->crop_top;
-            pictureInfo.frameCropBottomOffset = frame->crop_bottom;
+                gPictureInfos.push_back(pictureInfo);
+            }
+        } else {
+            if (outputInfo.isValid) {
+                OrbisVideodec2LegacyAvcPictureInfo pictureInfo = {};
 
-            gPictureInfos.push_back(pictureInfo);
+                pictureInfo.thisSize = sizeof(OrbisVideodec2LegacyAvcPictureInfo);
+                pictureInfo.isValid = true;
+
+                pictureInfo.ptsData = inputData.ptsData;
+                pictureInfo.dtsData = inputData.dtsData;
+                pictureInfo.attachedData = inputData.attachedData;
+
+                pictureInfo.frameCropLeftOffset = frame->crop_left;
+                pictureInfo.frameCropRightOffset = frame->crop_right;
+                pictureInfo.frameCropTopOffset = frame->crop_top;
+                pictureInfo.frameCropBottomOffset = frame->crop_bottom;
+
+                gLegacyPictureInfos.push_back(pictureInfo);
+            }
         }
     }
 
@@ -167,7 +183,6 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frameBuffer,
     outputInfo.isErrorFrame = true;
     outputInfo.pictureCount = 0;
 
-    // Only set frameFormat if the game uses the newer struct version.
     if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
         outputInfo.frameFormat = 0;
     }
@@ -198,23 +213,21 @@ s32 VdecDecoder::Flush(OrbisVideodec2FrameBuffer& frameBuffer,
         CopyNV12Data((u8*)frameBuffer.frameBuffer, *frame);
         frameBuffer.isAccepted = true;
 
-        outputInfo.codecType = 1; // FIXME: Hardcoded to AVC
+        outputInfo.codecType = 1;
         outputInfo.frameWidth = frame->width;
         outputInfo.frameHeight = frame->height;
-        outputInfo.framePitch = frame->width;
+        outputInfo.framePitch = frame->linesize[0];
         outputInfo.frameBufferSize = frameBuffer.frameBufferSize;
         outputInfo.frameBuffer = frameBuffer.frameBuffer;
 
         outputInfo.isValid = true;
         outputInfo.isErrorFrame = false;
-        outputInfo.pictureCount = 1; // TODO: 2 pictures for interlaced video
+        outputInfo.pictureCount = 1;
 
-        // Only set framePitchInBytes if the game uses the newer struct version.
         if (outputInfo.thisSize == sizeof(OrbisVideodec2OutputInfo)) {
-            outputInfo.framePitchInBytes = frame->width;
+            outputInfo.framePitchInBytes = frame->linesize[0];
         }
 
-        // FIXME: Should we add picture info here too?
     }
 
     av_frame_free(&frame);
@@ -258,4 +271,4 @@ AVFrame* VdecDecoder::ConvertNV12Frame(AVFrame& frame) {
     return nv12_frame;
 }
 
-} // namespace Libraries::Videodec2
+}

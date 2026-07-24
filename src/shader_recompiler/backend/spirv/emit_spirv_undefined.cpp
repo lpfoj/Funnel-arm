@@ -26,4 +26,4 @@ Id EmitUndefU64(EmitContext&) {
     UNREACHABLE_MSG("SPIR-V Instruction");
 }
 
-} // namespace Shader::Backend::SPIRV
+}

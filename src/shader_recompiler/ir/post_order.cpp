@@ -26,7 +26,6 @@ BlockList PostOrder(const AbstractSyntaxNode& root) {
             if (!visited.insert(branch).second) {
                 return false;
             }
-            // Calling push_back twice is faster than insert on MSVC
             block_stack.push_back(block);
             block_stack.push_back(branch);
             return true;
@@ -39,4 +38,4 @@ BlockList PostOrder(const AbstractSyntaxNode& root) {
     return post_order_blocks;
 }
 
-} // namespace Shader::IR
+}

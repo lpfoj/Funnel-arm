@@ -18,7 +18,7 @@ namespace Libraries::Net {
 struct Socket;
 struct Epoll;
 struct Resolver;
-} // namespace Libraries::Net
+}
 
 namespace Core::FileSys {
 
@@ -32,15 +32,8 @@ public:
     static bool ignore_game_patches;
     struct MntPair {
         std::filesystem::path host_path;
-        std::string mount; // e.g /app0
+        std::string mount;
         bool read_only;
-    };
-
-    enum class HostPathType {
-        Default, // Prioritizes Mod, then patch, then base
-        Base,
-        Patch,
-        Mod
     };
 
     explicit MntPoints() = default;
@@ -52,8 +45,7 @@ public:
     void UnmountAll();
 
     std::filesystem::path GetHostPath(std::string_view guest_directory,
-                                      bool* is_read_only = nullptr,
-                                      HostPathType host_path = HostPathType::Default);
+                                      bool* is_read_only = nullptr, bool force_base_path = false);
     using IterateDirectoryCallback =
         std::function<void(const std::filesystem::path& host_path, bool is_file)>;
     void IterateDirectory(std::string_view guest_directory,
@@ -70,8 +62,6 @@ public:
     const std::optional<MntPair> GetMount(const std::string& guest_path) {
         std::scoped_lock lock{m_mutex};
         const auto it = std::ranges::find_if(m_mnt_pairs, [&](const auto& mount) {
-            // When doing starts-with check, add a trailing slash to make sure we don't match
-            // against only part of the mount path.
             return guest_path == mount.mount || guest_path.starts_with(mount.mount + "/");
         });
         if (it == m_mnt_pairs.end()) {
@@ -88,7 +78,7 @@ private:
 };
 
 enum class FileType {
-    Regular, // standard file
+    Regular,
     Directory,
     Device,
     Socket,
@@ -104,11 +94,11 @@ struct File {
     std::string m_guest_name;
     Common::FS::IOFile f;
     std::mutex m_mutex;
-    std::shared_ptr<Directories::BaseDirectory> directory; // only valid for type == Directory
-    std::shared_ptr<Devices::BaseDevice> device;           // only valid for type == Device
-    std::shared_ptr<Libraries::Net::Socket> socket;        // only valid for type == Socket
-    std::shared_ptr<Libraries::Net::Epoll> epoll;          // only valid for type == Epoll
-    std::shared_ptr<Libraries::Net::Resolver> resolver;    // only valid for type == Resolver
+    std::shared_ptr<Directories::BaseDirectory> directory;
+    std::shared_ptr<Devices::BaseDevice> device;
+    std::shared_ptr<Libraries::Net::Socket> socket;
+    std::shared_ptr<Libraries::Net::Epoll> epoll;
+    std::shared_ptr<Libraries::Net::Resolver> resolver;
 };
 
 class HandleTable {
@@ -132,4 +122,4 @@ private:
     std::mutex m_mutex;
 };
 
-} // namespace Core::FileSys
+}

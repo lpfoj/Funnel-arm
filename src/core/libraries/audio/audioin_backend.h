@@ -28,4 +28,4 @@ public:
     std::unique_ptr<PortInBackend> Open(PortIn& port) override;
 };
 
-} // namespace Libraries::AudioIn
+}

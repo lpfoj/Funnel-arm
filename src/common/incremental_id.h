@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+
 #include <atomic>
 
 namespace Common {
+
 template <typename CounterType>
 class IncrementalIdProvider {
 public:
@@ -19,4 +21,4 @@ private:
     std::atomic<CounterType> counter;
 };
 
-} // namespace Common
+}

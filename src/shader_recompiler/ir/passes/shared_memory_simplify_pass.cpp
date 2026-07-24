@@ -8,7 +8,6 @@
 namespace Shader::Optimization {
 
 static bool Requires16BitSharedAtomic(const IR::Inst& inst) {
-    // Nothing yet
     return false;
 }
 
@@ -58,8 +57,6 @@ IR::Type CalculateSpecialSharedAtomicTypes(IR::Program& program) {
     return extra_atomic_types;
 }
 
-// Simplifies down U16 and U64 shared memory operations to U32 when aliasing is not supported and
-// atomics of the same type are not used.
 void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
     if (program.info.stage != Stage::Compute || profile.supports_workgroup_explicit_memory_layout) {
         return;
@@ -67,12 +64,9 @@ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
 
     const auto atomic_types = CalculateSpecialSharedAtomicTypes(program);
     if (True(atomic_types & IR::Type::U16) && True(atomic_types & IR::Type::U64)) {
-        // If both other atomic types are used, there is nothing to do.
         return;
     }
 
-    // Iterate through shared load/store U16/U64 instructions, replacing with
-    // equivalent U32 ops when the types are not needed for atomics.
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsNon32BitSharedLoadStore(inst)) {
@@ -134,4 +128,4 @@ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
     }
 }
 
-} // namespace Shader::Optimization
+}

@@ -12,7 +12,7 @@
 namespace Shader {
 struct Info;
 struct PushData;
-} // namespace Shader
+}
 
 namespace Vulkan {
 
@@ -36,6 +36,10 @@ public:
         return *pipeline;
     }
 
+    [[nodiscard]] bool IsValid() const noexcept {
+        return static_cast<bool>(pipeline);
+    }
+
     vk::PipelineLayout GetLayout() const noexcept {
         return *pipeline_layout;
     }
@@ -53,11 +57,15 @@ public:
         return *stages[u32(stage)];
     }
 
+    const Shader::Info* TryGetStage(Shader::LogicalStage stage) const noexcept {
+        return stages[u32(stage)];
+    }
+
     bool IsCompute() const {
         return is_compute;
     }
 
-    using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
+    using DescriptorWrites = boost::container::small_vector<vk::WriteDescriptorSet, 16>;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
@@ -78,4 +86,4 @@ protected:
     bool is_compute;
 };
 
-} // namespace Vulkan
+}

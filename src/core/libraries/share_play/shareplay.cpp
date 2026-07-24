@@ -170,4 +170,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceSharePlayGetCurrentConnectionInfo);
 };
 
-} // namespace Libraries::SharePlay
+}

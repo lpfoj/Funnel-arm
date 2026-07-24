@@ -177,4 +177,4 @@ private:
     size_t m_blockByteIndex;
     size_t m_byteCount;
 };
-} // namespace sha1
+}

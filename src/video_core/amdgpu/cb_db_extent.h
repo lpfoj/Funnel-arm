@@ -19,4 +19,4 @@ union CbDbExtent {
     }
 };
 
-} // namespace AmdGpu
+}

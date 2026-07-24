@@ -1,7 +1,6 @@
 //  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-// Credits to https://github.com/psucien/tlg-emu-tools/
 
 #include "common/types.h"
 #include "gcn/si_ci_vi_merged_pm4_it_opcodes.h"
@@ -98,13 +97,13 @@ const char* GetOpCodeName(u32 op) {
     case IT_RELEASE_MEM__CI__VI:
         return "IT_RELEASE_MEM";
     case IT_WRITE_CONST_RAM:
-        return "IT_WRITE_CONST_RAM"; // used in CCB
+        return "IT_WRITE_CONST_RAM";
     case IT_WAIT_ON_DE_COUNTER_DIFF:
-        return "IT_WAIT_ON_DE_COUNTER_DIFF"; // used in CCB
+        return "IT_WAIT_ON_DE_COUNTER_DIFF";
     case IT_DUMP_CONST_RAM:
-        return "IT_DUMP_CONST_RAM"; // used in CCB
+        return "IT_DUMP_CONST_RAM";
     case IT_INCREMENT_CE_COUNTER:
-        return "IT_INCREMENT_CE_COUNTER"; // used in CCB
+        return "IT_INCREMENT_CE_COUNTER";
     case IT_CLEAR_STATE:
         return "IT_CLEAR_STATE";
     case 0xFF:
@@ -115,4 +114,4 @@ const char* GetOpCodeName(u32 op) {
 
     return "<UNK>";
 }
-} // namespace Core::Devtools::Gcn
+}

@@ -92,4 +92,4 @@ void Layer::DrawNullGpuNotice() {
                               &detailsNotice.front(), &detailsNotice.back() + 1);
 }
 
-} // namespace Core::Devtools
+}

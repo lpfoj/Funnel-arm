@@ -79,4 +79,4 @@ int PS4_SYSV_ABI sceGameLiveStreamingTerminate();
 int PS4_SYSV_ABI sceGameLiveStreamingUnregisterCallback();
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::GameLiveStreaming
+}

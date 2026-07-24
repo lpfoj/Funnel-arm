@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// VideoOut library
 constexpr int ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE = 0x80290001;
 constexpr int ORBIS_VIDEO_OUT_ERROR_INVALID_ADDRESS = 0x80290002;
 constexpr int ORBIS_VIDEO_OUT_ERROR_INVALID_PIXEL_FORMAT = 0x80290003;

@@ -9,7 +9,7 @@
 #include "npbind.h"
 
 bool NPBindFile::Load(const std::string& path) {
-    Clear(); // Clear any existing data
+    Clear();
 
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f)
@@ -28,27 +28,22 @@ bool NPBindFile::Load(const std::string& path) {
     if (size < sizeof(NpBindHeader))
         return false;
 
-    // Read header
     memcpy(&m_header, buf.data(), sizeof(NpBindHeader));
     if (m_header.magic != NPBIND_MAGIC)
         return false;
 
-    // offset start of bodies
     size_t offset = sizeof(NpBindHeader);
 
     m_bodies.reserve(static_cast<size_t>(m_header.num_entries));
 
-    // For each body: read 4 TLV entries then skip padding (0x98 = 152 bytes)
-    const u64 body_padding = 0x98; // 152
+    const u64 body_padding = 0x98;
 
     for (u64 bi = 0; bi < m_header.num_entries; ++bi) {
-        // Ensure we have room for 4 entries' headers at least
         if (offset + 4 * 4 > size)
-            return false; // 4 entries x (type+size)
+            return false;
 
         NPBindBody body;
 
-        // helper lambda to read one entry
         auto read_entry = [&](NPBindEntryRaw& e) -> bool {
             if (offset + 4 > size)
                 return false;
@@ -65,7 +60,6 @@ bool NPBindFile::Load(const std::string& path) {
             return true;
         };
 
-        // read 4 entries in order
         if (!read_entry(body.npcommid))
             return false;
         if (!read_entry(body.trophy))
@@ -75,20 +69,16 @@ bool NPBindFile::Load(const std::string& path) {
         if (!read_entry(body.unk2))
             return false;
 
-        // skip fixed padding after body if present (but don't overrun)
         if (offset + body_padding <= size) {
             offset += body_padding;
         } else {
-            // If padding not fully present, allow file to end (some variants may omit)
             offset = size;
         }
 
         m_bodies.push_back(std::move(body));
     }
 
-    // Read digest if available
     if (size >= 20) {
-        // Digest is typically the last 20 bytes, independent of offset
         memcpy(m_digest, &buf[size - 20], 20);
     } else {
         memset(m_digest, 0, 20);
@@ -102,7 +92,6 @@ std::vector<std::string> NPBindFile::GetNpCommIds() const {
     npcommids.reserve(m_bodies.size());
 
     for (const auto& body : m_bodies) {
-        // Convert binary data to string directly
         if (!body.npcommid.data.empty()) {
             std::string raw_string(reinterpret_cast<const char*>(body.npcommid.data.data()),
                                    body.npcommid.data.size());

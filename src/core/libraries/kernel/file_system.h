@@ -42,14 +42,13 @@ struct OrbisKernelStat {
 };
 
 struct OrbisKernelDirent {
-    u32 d_fileno;                    /* file number of entry */
-    u16 d_reclen;                    /* length of this record */
-    u8 d_type;                       /* file type, see below */
-    u8 d_namlen;                     /* length of string in d_name */
-    char d_name[ORBIS_MAX_PATH + 1]; /* name must be no longer than this */
+    u32 d_fileno;
+    u16 d_reclen;
+    u8 d_type;
+    u8 d_namlen;
+    char d_name[ORBIS_MAX_PATH + 1];
 };
 
-// flags for Open
 constexpr int ORBIS_KERNEL_O_RDONLY = 0x0000;
 constexpr int ORBIS_KERNEL_O_WRONLY = 0x0001;
 constexpr int ORBIS_KERNEL_O_RDWR = 0x0002;
@@ -72,6 +71,7 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes);
 s64 PS4_SYSV_ABI sceKernelRead(s32 fd, void* buf, u64 nbytes);
 s64 PS4_SYSV_ABI sceKernelPread(s32 fd, void* buf, u64 nbytes, s64 offset);
 s64 PS4_SYSV_ABI sceKernelPwrite(s32 fd, void* buf, u64 nbytes, s64 offset);
+s64 PS4_SYSV_ABI getdirentries(s32 fd, char* buf, u64 nbytes, s64* basep);
 void RegisterFileSystem(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Kernel
+}

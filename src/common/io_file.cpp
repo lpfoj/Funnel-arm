@@ -139,7 +139,7 @@ namespace {
     }
 }
 
-} // Anonymous namespace
+}
 
 IOFile::IOFile() = default;
 
@@ -234,8 +234,6 @@ void IOFile::Unlink() {
         return;
     }
 
-    // Mark the file for deletion
-    // TODO: Also remove the file path?
 #ifdef _WIN64
     FILE_DISPOSITION_INFORMATION disposition;
     IO_STATUS_BLOCK iosb;
@@ -361,7 +359,6 @@ u64 IOFile::GetSize() const {
         return 0;
     }
 
-    // Flush any unwritten buffered data into the file prior to retrieving the file size.
     std::fflush(file);
 
     std::error_code ec;
@@ -420,4 +417,4 @@ u64 GetDirectorySize(const std::filesystem::path& path) {
     return total;
 }
 
-} // namespace Common::FS
+}

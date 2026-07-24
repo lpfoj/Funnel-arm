@@ -1,17 +1,42 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <mutex>
+#include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+extern "C" int executor_lsx4_android_install_mono_explicit_sigsegv_guard()
+    __attribute__((weak));
+extern "C" void executor_live_dump_posix_sem_records(const char* reason) __attribute__((weak));
+#endif
+
+#include "executor/gnmcap_format.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
 #include "common/assert.h"
+#include "common/config.h"
+#include "common/content_fingerprint.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
 #include "core/debug_state.h"
-#include "core/emulator_settings.h"
+#include "core/signals.h"
 #include "core/libraries/gnmdriver/gnm_error.h"
 #include "core/libraries/gnmdriver/gnmdriver_init.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -22,11 +47,687 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/render_wave_trace.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
 std::unique_ptr<AmdGpu::Liverpool> liverpool;
+
+#ifdef __ANDROID__
+extern "C" std::uint64_t executor_imt_overflow_count() __attribute__((weak));
+extern "C" std::uint64_t executor_imt_alloc_overflow_count() __attribute__((weak));
+extern "C" std::uint64_t executor_imt_tail_overflow_count() __attribute__((weak));
+extern "C" void executor_mono_vtnull_dump() __attribute__((weak));
+extern "C" void executor_mono_vcall_entry_dump() __attribute__((weak));
+extern "C" void executor_lsx4_register_guest_gc_roots() __attribute__((weak));
+extern "C" void executor_mono_value_copy_dump() __attribute__((weak));
+extern "C" void executor_lsx4_android_dump_box64_emu_states(const char* reason)
+    __attribute__((weak));
+extern "C" void executor_live_hle_flight_dump(const char* reason, u64 builder_total,
+                                              u64 builder_draw, u64 builder_shader,
+                                              u64 active_cb, u64 active_dw)
+    __attribute__((weak));
+extern "C" void executor_jit_dump_thread_states(const char* reason) __attribute__((weak));
+extern "C" void executor_live_dump_unity_thread_rips(const char* reason, int pulse);
+extern "C" void executor_live_dump_kernel_sem_records(const char* reason) __attribute__((weak));
+extern "C" void executor_live_dump_mutex_wait_ledger(const char* reason, int pulse)
+    __attribute__((weak));
+extern "C" int executor_lsx4_android_runtime_jit_active() __attribute__((weak));
+
+static bool ExecutorTraceLiveWide() {
+    static const bool enabled = std::getenv("EXECUTOR_TRACE_LIVE_WIDE_HOT") != nullptr;
+    return enabled;
+}
+
+static bool ExecutorLiveShouldPulse(u64 value) {
+    return value <= 4 || (value != 0 && (value & (value - 1)) == 0);
+}
+
+static std::atomic<u64> g_live_gnm_builder_total{0};
+static std::atomic<u64> g_live_gnm_builder_draw{0};
+static std::atomic<u64> g_live_gnm_builder_shader{0};
+static std::atomic<u64> g_live_actual_draws{0};
+static std::atomic<u64> g_live_gnm_builder_submitdone{0};
+static std::atomic<uintptr_t> g_live_active_cmdbuf{0};
+static std::atomic<u32> g_live_active_cmdbuf_size{0};
+static std::atomic<uintptr_t> g_live_active_cmdbuf_end{0};
+static std::atomic<u64> g_live_autosubmitted_hash{0};
+static std::atomic<bool> g_live_post_shader_watchdog_started{false};
+static std::atomic<u64> g_live_submit_calls{0};
+static std::atomic<u64> g_live_submit_done_calls{0};
+static std::atomic<u64> g_live_present_rt_requests{0};
+
+struct ExecutorLiveSubmittedDcb {
+    uintptr_t begin{};
+    u32 valid_dwords{};
+    u64 hash{};
+};
+static std::mutex g_live_submitted_dcb_mutex;
+static std::array<ExecutorLiveSubmittedDcb, 16> g_live_submitted_dcbs{};
+static std::size_t g_live_submitted_dcb_cursor{};
+
+static void ExecutorLiveFrameStats(const char* event, u64 frames) {
+    using Clock = std::chrono::steady_clock;
+    static std::mutex stats_mutex;
+    static auto start = Clock::now();
+    static auto last = start;
+    static u64 last_submits = 0;
+    static u64 last_done = 0;
+    static u64 last_present = 0;
+
+    const auto now = Clock::now();
+    std::scoped_lock lock{stats_mutex};
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last);
+    if (elapsed_ms.count() < 1000) {
+        return;
+    }
+
+    const auto submits = g_live_submit_calls.load(std::memory_order_relaxed);
+    const auto done = g_live_submit_done_calls.load(std::memory_order_relaxed);
+    const auto present = g_live_present_rt_requests.load(std::memory_order_relaxed);
+    const double window_sec = static_cast<double>(elapsed_ms.count()) / 1000.0;
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_LIVE_FPS] source=gnm event=%s elapsedMs=%lld frames=%llu "
+        "submitRate=%.2f submitDoneRate=%.2f presentReqRate=%.2f submits=%llu "
+        "submitDone=%llu presentReq=%llu builderTotal=%llu builderDraw=%llu builderShader=%llu",
+        event ? event : "unknown", static_cast<long long>(total_ms),
+        static_cast<unsigned long long>(frames),
+        static_cast<double>(submits - last_submits) / window_sec,
+        static_cast<double>(done - last_done) / window_sec,
+        static_cast<double>(present - last_present) / window_sec,
+        static_cast<unsigned long long>(submits), static_cast<unsigned long long>(done),
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(g_live_gnm_builder_total.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_live_gnm_builder_draw.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_live_gnm_builder_shader.load(std::memory_order_relaxed)));
+
+    last = now;
+    last_submits = submits;
+    last_done = done;
+    last_present = present;
+}
+
+static bool ExecutorLiveGnmApiIsActualDraw(const char* api) {
+    return api &&
+           (std::strcmp(api, "sceGnmDrawIndex") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndexAuto") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndexIndirect") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndexIndirectCountMulti") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndexIndirectMulti") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndexMultiInstanced") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndexOffset") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndirect") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndirectCountMulti") == 0 ||
+            std::strcmp(api, "sceGnmDrawIndirectMulti") == 0 ||
+            std::strcmp(api, "sceGnmDrawOpaqueAuto") == 0);
+}
+
+static void ExecutorLiveClassifyDcb(const char* tag, const u32* dcb, u32 dwords);
+
+static void ExecutorLiveMaybeStartPostShaderWatchdog(const char* api, const char* result,
+                                                     const bool is_shader) {
+    if (!api || !result || std::strcmp(result, "OK") != 0 || !is_shader) {
+        return;
+    }
+    static const bool watchdog_enabled = std::getenv("EXECUTOR_LIVE_HLE_FLIGHT") != nullptr ||
+                                         std::getenv("EXECUTOR_LIGHT_ORACLE") != nullptr;
+    if (!watchdog_enabled ||
+        g_live_post_shader_watchdog_started.load(std::memory_order_relaxed)) {
+        return;
+    }
+    bool expected = false;
+    if (!g_live_post_shader_watchdog_started.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return;
+    }
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        const auto total = g_live_gnm_builder_total.load(std::memory_order_relaxed);
+        const auto draw = g_live_gnm_builder_draw.load(std::memory_order_relaxed);
+        const auto shader = g_live_gnm_builder_shader.load(std::memory_order_relaxed);
+        const auto active_cb = g_live_active_cmdbuf.load(std::memory_order_relaxed);
+        const auto active_dw = g_live_active_cmdbuf_size.load(std::memory_order_relaxed);
+        if (shader >= 2 && draw == 0) {
+            __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_STALL] reason=post_shader_no_draw "
+                                "builderTotal=%llu builderDraw=%llu builderShader=%llu "
+                                "activeCb=%p activeDw=%llu",
+                                static_cast<unsigned long long>(total),
+                                static_cast<unsigned long long>(draw),
+                                static_cast<unsigned long long>(shader),
+                                reinterpret_cast<void*>(active_cb),
+                                static_cast<unsigned long long>(active_dw));
+            if (active_cb && active_dw != 0) {
+                ExecutorLiveClassifyDcb("post_shader_no_draw_active_cb",
+                                        reinterpret_cast<const u32*>(active_cb),
+                                        static_cast<u32>(std::min<u64>(active_dw, 4096)));
+            }
+            if (executor_live_hle_flight_dump) {
+                executor_live_hle_flight_dump("post_shader_no_draw", total, draw, shader,
+                                              active_cb, active_dw);
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                                    "[EXECUTOR_LIVE_HLE_FLIGHT_DUMP] unavailable=1");
+            }
+            if (executor_jit_dump_thread_states) {
+                executor_jit_dump_thread_states("post-shader-no-draw");
+            }
+            if (executor_lsx4_android_dump_box64_emu_states) {
+                executor_lsx4_android_dump_box64_emu_states("post-shader-no-draw");
+            }
+        }
+    }).detach();
+}
+
+enum class ExecutorLiveGnmBuilderKind : u8 {
+    Auto,
+    Shader,
+};
+
+static uintptr_t ExecutorRenderWaveCmdbufIdentity(const u32* packet) {
+    const auto address = reinterpret_cast<uintptr_t>(packet);
+    const auto active = g_live_active_cmdbuf.load(std::memory_order_relaxed);
+    if (active != 0 && address >= active && address - active < 16_MB) {
+        return active;
+    }
+    return address;
+}
+
+static void ExecutorLiveGnmBuilderLog(const char* api, const char* result, const u32* cmdbuf,
+                                      u32 size, const char* detail = "",
+                                      const ExecutorLiveGnmBuilderKind kind =
+                                          ExecutorLiveGnmBuilderKind::Auto) {
+    if (api) {
+        const bool is_shader = kind == ExecutorLiveGnmBuilderKind::Shader ||
+                               (kind == ExecutorLiveGnmBuilderKind::Auto &&
+                                std::strstr(api, "Shader") != nullptr);
+        const bool is_draw =
+            kind == ExecutorLiveGnmBuilderKind::Auto && ExecutorLiveGnmApiIsActualDraw(api);
+        const bool is_submit =
+            kind == ExecutorLiveGnmBuilderKind::Auto &&
+            (std::strstr(api, "SubmitDone") || std::strstr(api, "Submit"));
+
+        struct BuilderCounterBatch {
+            u32 total{};
+            u32 draw{};
+            u32 shader{};
+            u32 submit{};
+        };
+        static thread_local BuilderCounterBatch batch;
+        ++batch.total;
+        batch.draw += is_draw ? 1u : 0u;
+        batch.shader += is_shader ? 1u : 0u;
+        batch.submit += is_submit ? 1u : 0u;
+        if (batch.total >= 256u) {
+            g_live_gnm_builder_total.fetch_add(batch.total, std::memory_order_relaxed);
+            if (batch.draw != 0) {
+                g_live_gnm_builder_draw.fetch_add(batch.draw, std::memory_order_relaxed);
+            }
+            if (batch.shader != 0) {
+                g_live_gnm_builder_shader.fetch_add(batch.shader, std::memory_order_relaxed);
+            }
+            if (batch.submit != 0) {
+                g_live_gnm_builder_submitdone.fetch_add(batch.submit, std::memory_order_relaxed);
+            }
+            batch = {};
+        }
+        if (cmdbuf && result && std::strcmp(result, "OK") == 0) {
+            const auto begin = reinterpret_cast<uintptr_t>(cmdbuf);
+            const auto end = begin + static_cast<uintptr_t>(size) * sizeof(u32);
+            if (std::strstr(api, "DrawInit") != nullptr) {
+                g_live_active_cmdbuf.store(begin, std::memory_order_relaxed);
+                g_live_active_cmdbuf_end.store(end, std::memory_order_relaxed);
+                g_live_active_cmdbuf_size.store(size, std::memory_order_relaxed);
+#ifdef __ANDROID__
+                AmdGpu::RenderWaveTrace::BuilderBegin(begin);
+#endif
+            } else {
+                const auto base = g_live_active_cmdbuf.load(std::memory_order_relaxed);
+                if (base != 0 && begin >= base && begin - base < (1u << 20)) {
+                    auto previous_end = g_live_active_cmdbuf_end.load(std::memory_order_relaxed);
+                    while (end > previous_end &&
+                           !g_live_active_cmdbuf_end.compare_exchange_weak(
+                               previous_end, end, std::memory_order_relaxed)) {
+                    }
+                    const auto tracked_end = g_live_active_cmdbuf_end.load(std::memory_order_relaxed);
+                    if (tracked_end > base) {
+                        g_live_active_cmdbuf_size.store(
+                            static_cast<u32>((tracked_end - base) / sizeof(u32)),
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
+#ifdef __ANDROID__
+            if (kind == ExecutorLiveGnmBuilderKind::Auto &&
+                ExecutorLiveGnmApiIsActualDraw(api)) {
+                AmdGpu::RenderWaveTrace::BuilderDraw(ExecutorRenderWaveCmdbufIdentity(cmdbuf),
+                                                      begin, api);
+            }
+#endif
+        }
+        ExecutorLiveMaybeStartPostShaderWatchdog(api, result, is_shader);
+    }
+    static std::atomic<int> first_builder_log_budget{8};
+    int first_log_slot = first_builder_log_budget.load(std::memory_order_relaxed);
+    while (first_log_slot > 0 &&
+           !first_builder_log_budget.compare_exchange_weak(
+               first_log_slot, first_log_slot - 1, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+    if (first_log_slot > 0) {
+        char thread_name[32]{};
+        pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+        const auto active = g_live_active_cmdbuf.load(std::memory_order_relaxed);
+        const auto active_end = g_live_active_cmdbuf_end.load(std::memory_order_relaxed);
+        const auto begin = reinterpret_cast<uintptr_t>(cmdbuf);
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_BUILDER_FIRST] slot=%d api=%s result=%s "
+                            "cmdbuf=0x%llx size=%u activeCb=0x%llx activeEnd=0x%llx "
+                            "activeSize=%u inActive=%d thread=%s total=%llu draw=%llu "
+                            "shader=%llu detail=%s",
+                            9 - first_log_slot, api ? api : "<null>",
+                            result ? result : "<null>",
+                            static_cast<unsigned long long>(begin), size,
+                            static_cast<unsigned long long>(active),
+                            static_cast<unsigned long long>(active_end),
+                            g_live_active_cmdbuf_size.load(std::memory_order_relaxed),
+                            active != 0 && begin >= active && begin < active_end ? 1 : 0,
+                            thread_name[0] ? thread_name : "<unnamed>",
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_total.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_draw.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_shader.load(std::memory_order_relaxed)),
+                            detail ? detail : "");
+    }
+    if (!ExecutorTraceLiveWide()) {
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_GNM_BUILDER] api=%s result=%s cmdbuf=%p size=%u %s",
+                        api ? api : "<null>", result ? result : "<null>", cmdbuf, size,
+                        detail ? detail : "");
+}
+
+static void ExecutorLiveGnmUnknownLog(const char* name) {
+    char thread_name[32]{};
+    pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+    __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                        "[EXECUTOR_LIVE_GNM_UNKNOWN] api=%s thread=%s self=0x%llx "
+                        "builderTotal=%llu builderDraw=%llu activeCb=0x%llx activeSize=%u",
+                        name ? name : "<null>", thread_name[0] ? thread_name : "<unnamed>",
+                        static_cast<unsigned long long>(
+                            static_cast<uintptr_t>(pthread_self())),
+                        static_cast<unsigned long long>(
+                            g_live_gnm_builder_total.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(
+                            g_live_gnm_builder_draw.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(
+                            g_live_active_cmdbuf.load(std::memory_order_relaxed)),
+                        g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
+}
+
+static void ExecutorLiveDumpDwords(const char* tag, const u32* data, u32 dwords) {
+    if (!ExecutorTraceLiveWide()) {
+        return;
+    }
+    if (!data || dwords == 0) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_DWORDS] tag=%s addr=%p dwords=%u empty=1",
+                            tag ? tag : "<null>", data, dwords);
+        return;
+    }
+    const u32 limit = std::min<u32>(dwords, 16u);
+    char line[320]{};
+    int used = std::snprintf(line, sizeof(line), "tag=%s addr=%p dwords=%u sample=",
+                             tag ? tag : "<null>", data, dwords);
+    for (u32 i = 0; i < limit && used > 0 && used < static_cast<int>(sizeof(line)); ++i) {
+        used += std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? "," : "",
+                              data[i]);
+    }
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_GNM_DWORDS] %s", line);
+}
+
+static void ExecutorLiveDumpBuilderTail(const char* api, const u32* cmdbuf, u32 size) {
+    if (!ExecutorTraceLiveWide() || !cmdbuf || size == 0) {
+        return;
+    }
+    ExecutorLiveDumpDwords(api, cmdbuf, std::min<u32>(size, 16u));
+}
+
+static void ExecutorLiveClassifyDcb(const char* tag, const u32* dcb, u32 dwords) {
+    if (!ExecutorTraceLiveWide()) {
+        return;
+    }
+    ExecutorLiveDumpDwords(tag, dcb, std::min<u32>(dwords, 16u));
+    if (!dcb || dwords == 0) {
+        return;
+    }
+
+    u32 packets = 0;
+    u32 draws = 0;
+    u32 dispatches = 0;
+    u32 waits = 0;
+    u32 set_sh = 0;
+    u32 set_context = 0;
+    u32 set_uconfig = 0;
+    u32 dma = 0;
+    u32 writes = 0;
+    u32 indirect = 0;
+    u32 set_sh_detail = 0;
+    u32 set_ctx_detail = 0;
+    u32 invalid = 0;
+    u32 first_op = 0xff;
+    u32 last_op = 0xff;
+    u32 first_draw_off = 0xffffffffu;
+    u32 first_setsh_off = 0xffffffffu;
+    u32 off = 0;
+    u32 opcode_counts[256]{};
+
+    while (off < dwords && packets < 4096) {
+        const auto* header = reinterpret_cast<const AmdGpu::PM4Header*>(dcb + off);
+        if (header->type.Value() == 2) {
+            ++packets;
+            ++off;
+            continue;
+        }
+        if (header->type.Value() != 3) {
+            ++invalid;
+            break;
+        }
+        const u32 body_words = header->type3.NumWords();
+        const u32 packet_words = body_words + 1;
+        if (packet_words == 0 || off + packet_words > dwords) {
+            ++invalid;
+            break;
+        }
+        const auto opcode = header->type3.opcode.Value();
+        opcode_counts[static_cast<u32>(opcode) & 0xffu]++;
+        if (first_op == 0xff) {
+            first_op = static_cast<u32>(opcode);
+        }
+        last_op = static_cast<u32>(opcode);
+        ++packets;
+        switch (opcode) {
+        case AmdGpu::PM4ItOpcode::DrawIndex2:
+        case AmdGpu::PM4ItOpcode::DrawIndexOffset2:
+        case AmdGpu::PM4ItOpcode::DrawIndexAuto:
+        case AmdGpu::PM4ItOpcode::DrawIndirect:
+        case AmdGpu::PM4ItOpcode::DrawIndirectMulti:
+        case AmdGpu::PM4ItOpcode::DrawIndexIndirect:
+        case AmdGpu::PM4ItOpcode::DrawIndexIndirectMulti:
+        case AmdGpu::PM4ItOpcode::DrawIndexIndirectCountMulti:
+            if (first_draw_off == 0xffffffffu) {
+                first_draw_off = off;
+            }
+            ++draws;
+            break;
+        case AmdGpu::PM4ItOpcode::DispatchDirect:
+        case AmdGpu::PM4ItOpcode::DispatchIndirect:
+            ++dispatches;
+            break;
+        case AmdGpu::PM4ItOpcode::WaitRegMem:
+        case AmdGpu::PM4ItOpcode::WaitOnCeCounter:
+            ++waits;
+            break;
+        case AmdGpu::PM4ItOpcode::SetShReg:
+            if (first_setsh_off == 0xffffffffu) {
+                first_setsh_off = off;
+            }
+            ++set_sh;
+            if (set_sh_detail++ < 16) {
+                const auto* set_data = reinterpret_cast<const AmdGpu::PM4CmdSetData*>(&dcb[off]);
+                const u32 value_words = body_words > 0 ? body_words - 1 : 0;
+                const u32* values = dcb + off + 2;
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_LIVE_DCB_SET_SH] tag=%s n=%u off=%u reg=0x%x words=%u "
+                    "v=%08x %08x %08x %08x %08x %08x %08x %08x",
+                    tag ? tag : "<null>", set_sh, off, set_data->reg_offset.Value(), value_words,
+                    value_words > 0 ? values[0] : 0u, value_words > 1 ? values[1] : 0u,
+                    value_words > 2 ? values[2] : 0u, value_words > 3 ? values[3] : 0u,
+                    value_words > 4 ? values[4] : 0u, value_words > 5 ? values[5] : 0u,
+                    value_words > 6 ? values[6] : 0u, value_words > 7 ? values[7] : 0u);
+            }
+            break;
+        case AmdGpu::PM4ItOpcode::SetContextReg:
+            ++set_context;
+            if (set_ctx_detail++ < 12) {
+                const auto* set_data = reinterpret_cast<const AmdGpu::PM4CmdSetData*>(&dcb[off]);
+                const u32 value_words = body_words > 0 ? body_words - 1 : 0;
+                const u32* values = dcb + off + 2;
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_LIVE_DCB_SET_CTX] tag=%s n=%u off=%u reg=0x%x words=%u "
+                    "v=%08x %08x %08x %08x",
+                    tag ? tag : "<null>", set_context, off, set_data->reg_offset.Value(),
+                    value_words, value_words > 0 ? values[0] : 0u,
+                    value_words > 1 ? values[1] : 0u, value_words > 2 ? values[2] : 0u,
+                    value_words > 3 ? values[3] : 0u);
+            }
+            break;
+        case AmdGpu::PM4ItOpcode::SetUconfigReg:
+            ++set_uconfig;
+            break;
+        case AmdGpu::PM4ItOpcode::DmaData:
+            ++dma;
+            if (dma <= 8) {
+                const auto* dma_data = reinterpret_cast<const AmdGpu::PM4DmaData*>(&dcb[off]);
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_LIVE_DCB_DMA] tag=%s n=%u off=%u srcSel=%u dstSel=%u "
+                    "src=0x%llx dst=0x%llx bytes=%u data=%08x command=%08x",
+                    tag ? tag : "<null>", dma, off, u32(dma_data->src_sel.Value()),
+                    u32(dma_data->dst_sel.Value()),
+                    static_cast<unsigned long long>(
+                        dma_data->src_sel == AmdGpu::DmaDataSrc::Data
+                            ? 0ull
+                            : dma_data->SrcAddress<VAddr>()),
+                    static_cast<unsigned long long>(dma_data->DstAddress<VAddr>()),
+                    dma_data->NumBytes(), dma_data->data, dma_data->command);
+            }
+            break;
+        case AmdGpu::PM4ItOpcode::WriteData:
+            ++writes;
+            break;
+        case AmdGpu::PM4ItOpcode::IndirectBuffer:
+        case AmdGpu::PM4ItOpcode::IndirectBufferConst:
+            ++indirect;
+            break;
+        default:
+            break;
+        }
+        off += packet_words;
+    }
+
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_LIVE_DCB_CLASSIFY] tag=%s dwords=%u packets=%u draws=%u dispatches=%u "
+        "waits=%u setSh=%u setCtx=%u setUcfg=%u dma=%u writes=%u indirect=%u invalid=%u "
+        "firstOp=0x%02x lastOp=0x%02x firstDrawOff=%u firstSetShOff=%u",
+        tag ? tag : "<null>", dwords, packets, draws, dispatches, waits, set_sh, set_context,
+        set_uconfig, dma, writes, indirect, invalid, first_op, last_op, first_draw_off,
+        first_setsh_off);
+
+    char hist[512]{};
+    int used = 0;
+    for (u32 pass = 0; pass < 12; ++pass) {
+        u32 best_op = 0;
+        u32 best_count = 0;
+        for (u32 op = 0; op < 256; ++op) {
+            if (opcode_counts[op] > best_count) {
+                best_op = op;
+                best_count = opcode_counts[op];
+            }
+        }
+        if (best_count == 0 || used >= static_cast<int>(sizeof(hist)) - 32) {
+            break;
+        }
+        used += std::snprintf(hist + used, sizeof(hist) - used, "%s0x%02x:%u",
+                              used ? "," : "", best_op, best_count);
+        opcode_counts[best_op] = 0;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_DCB_OPCODE_HIST] tag=%s top=%s",
+                        tag ? tag : "<null>", hist);
+}
+
+struct ExecutorLiveDcbAnalysis {
+    u32 valid_dwords = 0;
+    u32 draws = 0;
+    u32 packets = 0;
+    u64 hash = 0;
+};
+
+static ExecutorLiveDcbAnalysis ExecutorLiveAnalyzeDcb(const u32* dcb, u32 max_dwords) {
+    ExecutorLiveDcbAnalysis result{};
+    if (!dcb || max_dwords == 0) {
+        return result;
+    }
+    Common::ContentFingerprint64 fingerprint{Common::FingerprintDomain::CommandStream};
+    u32 off = 0;
+    while (off < max_dwords && result.packets < 4096) {
+        const auto* header = reinterpret_cast<const AmdGpu::PM4Header*>(dcb + off);
+        u32 packet_words = 0;
+        if (header->type.Value() == 2) {
+            packet_words = 1;
+        } else if (header->type.Value() == 3) {
+            const u32 body_words = header->type3.NumWords();
+            packet_words = body_words + 1;
+            if (packet_words == 0 || off + packet_words > max_dwords) {
+                break;
+            }
+            switch (header->type3.opcode.Value()) {
+            case AmdGpu::PM4ItOpcode::DrawIndex2:
+            case AmdGpu::PM4ItOpcode::DrawIndexOffset2:
+            case AmdGpu::PM4ItOpcode::DrawIndexAuto:
+            case AmdGpu::PM4ItOpcode::DrawIndirect:
+            case AmdGpu::PM4ItOpcode::DrawIndirectMulti:
+            case AmdGpu::PM4ItOpcode::DrawIndexIndirect:
+            case AmdGpu::PM4ItOpcode::DrawIndexIndirectMulti:
+            case AmdGpu::PM4ItOpcode::DrawIndexIndirectCountMulti:
+                ++result.draws;
+                break;
+            default:
+                break;
+            }
+        } else {
+            break;
+        }
+        for (u32 i = 0; i < packet_words; ++i) {
+            fingerprint.UpdateLittleEndian(dcb[off + i]);
+        }
+        off += packet_words;
+        result.valid_dwords = off;
+        ++result.packets;
+    }
+    result.hash = fingerprint.Finish();
+    return result;
+}
+
+static void ExecutorLiveRememberExplicitDcb(const u32* dcb,
+                                            const ExecutorLiveDcbAnalysis& analysis) {
+    if (!dcb || analysis.valid_dwords == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_live_submitted_dcb_mutex};
+    auto& record = g_live_submitted_dcbs[g_live_submitted_dcb_cursor++ %
+                                         g_live_submitted_dcbs.size()];
+    record.begin = reinterpret_cast<uintptr_t>(dcb);
+    record.valid_dwords = analysis.valid_dwords;
+    record.hash = analysis.hash;
+}
+
+static bool ExecutorLiveWasExplicitlySubmitted(const u32* dcb,
+                                               const ExecutorLiveDcbAnalysis& analysis) {
+    if (!dcb || analysis.valid_dwords == 0) {
+        return false;
+    }
+    const auto begin = reinterpret_cast<uintptr_t>(dcb);
+    std::scoped_lock lock{g_live_submitted_dcb_mutex};
+    return std::ranges::any_of(g_live_submitted_dcbs, [&](const auto& record) {
+        return record.begin == begin && record.valid_dwords == analysis.valid_dwords &&
+               record.hash == analysis.hash;
+    });
+}
+#endif
+
+namespace {
+std::mutex g_presenter_init_mutex;
+
+bool EnsureGnmPresenter(const char* reason) {
+    if (presenter) {
+#ifdef __ANDROID__
+        if (ExecutorTraceLiveWide()) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_PRESENTER] result=already reason=%s",
+                                reason ? reason : "<null>");
+        }
+#endif
+        return true;
+    }
+    std::scoped_lock init_lock{g_presenter_init_mutex};
+    if (presenter) {
+#ifdef __ANDROID__
+        if (ExecutorTraceLiveWide()) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_PRESENTER] result=already_after_lock reason=%s",
+                                reason ? reason : "<null>");
+        }
+#endif
+        return true;
+    }
+    if (!g_window) {
+        LOG_ERROR(Lib_GnmDriver, "EXECUTOR_GNM_PRESENTER phase=ensure result=no_window reason={}",
+                  reason);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_PRESENTER] result=no_window reason=%s",
+                            reason ? reason : "<null>");
+#endif
+        return false;
+    }
+    try {
+        presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+        Libraries::VideoOut::ReplayBufferRegistrationsToPresenter();
+        LOG_INFO(Lib_GnmDriver, "EXECUTOR_GNM_PRESENTER phase=ensure result=OK reason={}", reason);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_PRESENTER] result=OK reason=%s",
+                            reason ? reason : "<null>");
+#endif
+        return true;
+    } catch (const std::exception& e) {
+        presenter.reset();
+        LOG_ERROR(Lib_GnmDriver,
+                  "EXECUTOR_GNM_PRESENTER phase=ensure result=failed reason={} error={}", reason,
+                  e.what());
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_PRESENTER] result=failed reason=%s error=%s",
+                            reason ? reason : "<null>", e.what());
+#endif
+        return false;
+    } catch (...) {
+        presenter.reset();
+        LOG_ERROR(Lib_GnmDriver,
+                  "EXECUTOR_GNM_PRESENTER phase=ensure result=failed reason={} error=unknown",
+                  reason);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_PRESENTER] result=failed reason=%s error=unknown",
+                            reason ? reason : "<null>");
+#endif
+        return false;
+    }
+}
+}
 
 namespace Libraries::GnmDriver {
 
@@ -57,23 +758,17 @@ enum ShaderStages : u32 {
 
 static constexpr std::array indirect_sgpr_offsets{0u, 0u, 0x4cu, 0u, 0xccu, 0u, 0x14cu};
 
-// Gates use of what appear to be the neo-mode init sequences but with the older
-// IA_MULTI_VGT_PARAM register address. No idea what this is for as the ioctl
-// that controls it is still a mystery, but leaving the sequences in gated behind
-// this flag in case we need it in the future.
 static constexpr bool UseNeoCompatSequences = false;
 
-// In case if `submitDone` is issued we need to block submissions until GPU idle
 static u32 submission_lock{};
 std::condition_variable cv_lock{};
 std::mutex m_submission{};
-static u64 frames_submitted{};      // frame counter
-static bool send_init_packet{true}; // initialize HW state before first game's submit in a frame
+static u64 frames_submitted{};
+static bool send_init_packet{true};
 static s32 sdk_version{0};
 
 static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 
-// This address is initialized in sceGnmGetTheTessellationFactorRingBufferBaseAddress
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
@@ -83,27 +778,71 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
     cv_lock.notify_all();
 }
 
-static void WaitGpuIdle() {
+static bool WaitGpuIdle(const char* where = "gnm_wait_gpu_idle") {
     HLE_TRACE;
     std::unique_lock lock{m_submission};
+#ifdef __ANDROID__
+    (void)where;
+    constexpr auto WaitSlice = std::chrono::milliseconds{250};
+    while (submission_lock != 0) {
+        if (liverpool && liverpool->IsRendererTerminal()) {
+            submission_lock = 0;
+            cv_lock.notify_all();
+            return false;
+        }
+        cv_lock.wait_for(lock, WaitSlice, [] { return submission_lock == 0; });
+    }
+    if (liverpool && liverpool->IsRendererTerminal()) {
+        return false;
+    }
+    return true;
+#else
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+    return true;
+#endif
 }
 
-// Write a special ending NOP packet with N DWs data block
+#ifdef __ANDROID__
+static bool ExecutorEnvFlag(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static bool ExecutorTraceHotGnmEqEvent() {
+    static const bool enabled = ExecutorEnvFlag("EXECUTOR_TRACE_GNM_EQ_EVENT");
+    return enabled;
+}
+
+static bool ExecutorLiveGnmSyncSubmit() {
+    static const bool enabled = ExecutorEnvFlag("EXECUTOR_FORCE_GNM_SYNC_SUBMIT");
+    return enabled;
+}
+
+static void ExecutorLogLiveGnmStage(const char* stage, u32 workload, u32 cbpair, std::size_t dcb_dw,
+                                    std::size_t ccb_dw) {
+    static const bool trace_gnm_stage = std::getenv("EXECUTOR_TRACE_GNM_STAGE") != nullptr;
+    if (!trace_gnm_stage || !ExecutorTraceLiveWide()) {
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_GNM_STAGE] stage=%s workload=%u cbpair=%u dcbDw=%zu ccbDw=%zu",
+                        stage ? stage : "<null>", workload, cbpair, dcb_dw, ccb_dw);
+}
+#endif
+
 static inline u32* WriteTrailingNop(u32* cmdbuf, u32 data_block_size) {
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
     nop->header = PM4Type3Header{PM4ItOpcode::Nop, data_block_size - 1};
-    nop->data_block[0] = 0u; // only one out of `data_block_size` is initialized
-    return cmdbuf + data_block_size + 1 /* header */;
+    nop->data_block[0] = 0u;
+    return cmdbuf + data_block_size + 1;
 }
 
-// Write a special ending NOP packet with N DWs data block
 template <u32 data_block_size>
 static inline u32* WriteTrailingNop(u32* cmdbuf) {
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
     nop->header = PM4Type3Header{PM4ItOpcode::Nop, data_block_size - 1};
-    nop->data_block[0] = 0u; // only one out of `data_block_size` is initialized
-    return cmdbuf + data_block_size + 1 /* header */;
+    nop->data_block[0] = 0u;
+    return cmdbuf + data_block_size + 1;
 }
 
 static inline u32* ClearContextState(u32* cmdbuf) {
@@ -125,9 +864,21 @@ static inline bool IsValidEventType(Platform::InterruptId id) {
 
 s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
     LOG_TRACE(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    if (ExecutorTraceHotGnmEqEvent()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_EQ_EVENT] op=add_enter eq=%ld id=0x%llx udata=%p",
+                            eq, static_cast<unsigned long long>(id), udata);
+    }
+#endif
 
     auto equeue = GetEqueue(eq);
     if (!equeue) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_EQ_EVENT] op=add_missing_eq eq=%ld id=0x%llx",
+                            eq, static_cast<unsigned long long>(id));
+#endif
         return ORBIS_KERNEL_ERROR_EBADF;
     }
 
@@ -146,16 +897,32 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
         [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == static_cast<Platform::InterruptId>(id), "An unexpected IRQ occured");
 
-            // We need to convert IRQ# to event id
             if (!IsValidEventType(irq))
                 return;
 
-            // Event data is expected to be an event type as per sceGnmGetEqEventType.
             equeue->TriggerEvent(static_cast<GnmEventType>(id),
                                  OrbisKernelEvent::Filter::GraphicsCore,
                                  reinterpret_cast<void*>(id));
+#ifdef __ANDROID__
+            if (id == static_cast<u64>(GnmEventType::GfxEop)) {
+                AmdGpu::ExecutorEopTraceEqTrigger(id, static_cast<s64>(eq));
+            }
+            if (ExecutorTraceHotGnmEqEvent()) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_LIVE_GNM_EQ_EVENT] op=trigger irq=%u id=0x%llx eq=%ld",
+                    static_cast<u32>(irq), static_cast<unsigned long long>(id), eq);
+            }
+#endif
         },
         equeue);
+#ifdef __ANDROID__
+    if (ExecutorTraceHotGnmEqEvent()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_EQ_EVENT] op=add_return eq=%ld id=0x%llx rc=0",
+                            eq, static_cast<unsigned long long>(id));
+    }
+#endif
     return ORBIS_OK;
 }
 
@@ -213,55 +980,46 @@ int PS4_SYSV_ABI sceGnmCreateWorkloadStream(u64 param1, u32* workload_stream) {
 
 int PS4_SYSV_ABI sceGnmDebuggerGetAddressWatch() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerHaltWavefront() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerReadGds() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerReadSqIndirectRegister() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerResumeWavefront() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerResumeWavefrontCreation() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerSetAddressWatch() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerWriteGds() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebuggerWriteSqIndirectRegister() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
@@ -297,7 +1055,9 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
-    WaitGpuIdle();
+    if (!WaitGpuIdle("sceGnmDingDong")) {
+        return;
+    }
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -313,8 +1073,6 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     if (next_offs_dw < offs_dw && next_offs_dw != 0) {
-        // For cases if a submission is split at the end of the ring buffer, we need to submit it in
-        // two parts to handle the wrap
         liverpool->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
                                         asc_queue.ring_size_dw - offs_dw});
         offs_dw = 0;
@@ -336,9 +1094,6 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
             seq_num = 0u;
         }
 
-        // Up to this point, all ACB submissions have been stored in a secondary command buffer.
-        // Dumping them using the current ring pointer would result in files containing only the
-        // `IndirectBuffer` command. To access the actual command stream, we need to unwrap the IB.
         auto acb = acb_span;
         auto base_addr = reinterpret_cast<uintptr_t>(acb_ptr);
         const auto* indirect_buffer =
@@ -380,7 +1135,7 @@ s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 
         cmdbuf = WriteHeader<PM4ItOpcode::DispatchDirect>(cmdbuf, 4, PM4ShaderType::ShaderCompute,
                                                           predicate);
         cmdbuf = WriteBody(cmdbuf, threads_x, threads_y, threads_z);
-        cmdbuf[0] = (flags & 0x18) + 1; // ordered append mode
+        cmdbuf[0] = (flags & 0x18) + 1;
 
         WriteTrailingNop<3>(cmdbuf + 1);
         return ORBIS_OK;
@@ -396,7 +1151,7 @@ s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, 
         cmdbuf = WriteHeader<PM4ItOpcode::DispatchIndirect>(cmdbuf, 2, PM4ShaderType::ShaderCompute,
                                                             predicate);
         cmdbuf[0] = data_offset;
-        cmdbuf[1] = (flags & 0x18) + 1; // ordered append mode
+        cmdbuf[1] = (flags & 0x18) + 1;
 
         WriteTrailingNop<3>(cmdbuf + 2);
         return ORBIS_OK;
@@ -425,22 +1180,22 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
     cmdbuf = PM4CmdSetData::SetShReg<PM4ShaderType::ShaderCompute>(
         cmdbuf, 0x216u,
-        0xffffffffu); // COMPUTE_STATIC_THREAD_MGMT_SE0
+        0xffffffffu);
     cmdbuf = PM4CmdSetData::SetShReg<PM4ShaderType::ShaderCompute>(
         cmdbuf, 0x217u,
-        0xffffffffu); // COMPUTE_STATIC_THREAD_MGMT_SE1
+        0xffffffffu);
 
     if (sceKernelIsNeoMode()) {
         cmdbuf = PM4CmdSetData::SetShReg<PM4ShaderType::ShaderCompute>(
             cmdbuf, 0x219u,
-            0xffffffffu); // COMPUTE_STATIC_THREAD_MGMT_SE2
+            0xffffffffu);
         cmdbuf = PM4CmdSetData::SetShReg<PM4ShaderType::ShaderCompute>(
             cmdbuf, 0x21au,
-            0xffffffffu); // COMPUTE_STATIC_THREAD_MGMT_SE3
+            0xffffffffu);
     }
 
     cmdbuf = PM4CmdSetData::SetShReg<PM4ShaderType::ShaderCompute>(
-        cmdbuf, 0x215u, 0x170u); // COMPUTE_RESOURCE_LIMITS
+        cmdbuf, 0x215u, 0x170u);
 
     cmdbuf = WriteHeader<PM4ItOpcode::AcquireMem>(cmdbuf, 6);
     cmdbuf = WriteBody(cmdbuf, 0x28000000u, 0u, 0u, 0u, 0u, 0xau);
@@ -453,9 +1208,30 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr_t index_addr,
                                  u32 flags, u32 type) {
     LOG_TRACE(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_DRAW] api=sceGnmDrawIndex cmdbuf=%p size=%u count=%u index=0x%llx flags=0x%x type=%u",
+                            cmdbuf, size, index_count,
+                            static_cast<unsigned long long>(index_addr), flags, type);
+        LOG_INFO(Lib_GnmDriver,
+                 "EXECUTOR_GNM_DRAW_ATTEMPT api=sceGnmDrawIndex index_count={} size={} flags={:#x}",
+                 index_count, size, flags);
+        LOG_INFO(Lib_GnmDriver,
+                 "EXECUTOR_GNM_DRAW api=sceGnmDrawIndex index_count={} size={} flags={:#x}",
+                 index_count, size, flags);
+    }
+#else
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_GNM_DRAW_ATTEMPT api=sceGnmDrawIndex index_count={} size={} flags={:#x}",
+             index_count, size, flags);
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_GNM_DRAW api=sceGnmDrawIndex index_count={} size={} flags={:#x}",
+             index_count, size, flags);
+#endif
 
     if (cmdbuf && (size == 10) && (index_addr != 0) && (index_addr & 1) == 0 &&
-        (flags & 0x1ffffffe) == 0) { // no predication will be set in the packet
+        (flags & 0x1ffffffe) == 0) {
         auto* draw_index = reinterpret_cast<PM4CmdDrawIndex2*>(cmdbuf);
         draw_index->header =
             PM4Type3Header{PM4ItOpcode::DrawIndex2, 4, PM4ShaderType::ShaderGraphics};
@@ -466,22 +1242,56 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
         draw_index->draw_initiator = sceKernelIsNeoMode() ? flags & 0xe0000000u : 0;
 
         WriteTrailingNop<3>(cmdbuf + 6);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndex", "OK", cmdbuf, size);
+        ExecutorLiveDumpBuilderTail("sceGnmDrawIndex", cmdbuf, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndex", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32 flags) {
     LOG_TRACE(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_DRAW] api=sceGnmDrawIndexAuto cmdbuf=%p size=%u count=%u flags=0x%x",
+                            cmdbuf, size, index_count, flags);
+        LOG_INFO(Lib_GnmDriver,
+                 "EXECUTOR_GNM_DRAW_ATTEMPT api=sceGnmDrawIndexAuto index_count={} size={} flags={:#x}",
+                 index_count, size, flags);
+        LOG_INFO(Lib_GnmDriver,
+                 "EXECUTOR_GNM_DRAW api=sceGnmDrawIndexAuto index_count={} size={} flags={:#x}",
+                 index_count, size, flags);
+    }
+#else
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_GNM_DRAW_ATTEMPT api=sceGnmDrawIndexAuto index_count={} size={} flags={:#x}",
+             index_count, size, flags);
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_GNM_DRAW api=sceGnmDrawIndexAuto index_count={} size={} flags={:#x}",
+             index_count, size, flags);
+#endif
 
     if (cmdbuf && (size == 7) &&
-        (flags & 0x1ffffffe) == 0) { // no predication will be set in the packet
+        (flags & 0x1ffffffe) == 0) {
         cmdbuf = WritePacket<PM4ItOpcode::DrawIndexAuto>(
             cmdbuf, PM4ShaderType::ShaderGraphics, index_count,
             sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u);
         WriteTrailingNop<3>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndexAuto", "OK", cmdbuf - 3, size);
+        ExecutorLiveDumpBuilderTail("sceGnmDrawIndexAuto", cmdbuf - 3, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndexAuto", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -506,8 +1316,14 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirect(u32* cmdbuf, u32 size, u32 data_offset,
 
         cmdbuf += 4;
         WriteTrailingNop<3>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndexIndirect", "OK", cmdbuf - 7, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndexIndirect", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -543,8 +1359,14 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexIndirectCountMulti(u32* cmdbuf, u32 size, u32 da
 
         cmdbuf += 9;
         WriteTrailingNop<2>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndexIndirectCountMulti", "OK", cmdbuf - 14, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndexIndirectCountMulti", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -572,8 +1394,14 @@ int PS4_SYSV_ABI sceGnmDrawIndexIndirectMulti(u32* cmdbuf, u32 size, u32 data_of
 
         cmdbuf += 6;
         WriteTrailingNop<3>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndexIndirectMulti", "OK", cmdbuf - 9, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndexIndirectMulti", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -595,8 +1423,14 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, 
                            sceKernelIsNeoMode() ? flags & 0xe0000000u : 0u);
 
         WriteTrailingNop<3>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndexOffset", "OK", cmdbuf - 5, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndexOffset", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -616,12 +1450,18 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 
         cmdbuf[0] = data_offset;
         cmdbuf[1] = vertex_sgpr_offset == 0 ? 0 : (vertex_sgpr_offset & 0xffffu) + sgpr_offset;
         cmdbuf[2] = instance_sgpr_offset == 0 ? 0 : (instance_sgpr_offset & 0xffffu) + sgpr_offset;
-        cmdbuf[3] = sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u; // auto index
+        cmdbuf[3] = sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u;
 
         cmdbuf += 4;
         WriteTrailingNop<3>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndirect", "OK", cmdbuf - 7, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndirect", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -648,12 +1488,18 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
         cmdbuf[2] = instance_sgpr_offset == 0 ? 0 : (instance_sgpr_offset & 0xffffu) + sgpr_offset;
         cmdbuf[3] = max_count;
         cmdbuf[4] = sizeof(DrawIndirectArgs);
-        cmdbuf[5] = sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u; // auto index
+        cmdbuf[5] = sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u;
 
         cmdbuf += 6;
         WriteTrailingNop<3>(cmdbuf);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawIndirectMulti", "OK", cmdbuf - 9, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawIndirectMulti", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
@@ -661,6 +1507,9 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState", "bad_size", cmdbuf, size);
+#endif
         return 0;
     }
 
@@ -679,16 +1528,26 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
         return HwInitPacketSize;
     };
 
-    return SetupContext(cmdbuf, size, true);
+    const u32 written = SetupContext(cmdbuf, size, true);
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState", "OK", cmdbuf, written,
+                              "written=256");
+#endif
+    return written;
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState175", "bad_size", cmdbuf,
+                                  size);
+#endif
         return 0;
     }
 
+    auto* const cmdbuf_begin = cmdbuf;
     const auto* cmdbuf_end = cmdbuf + HwInitPacketSize;
     cmdbuf = ClearContextState(cmdbuf);
     std::memcpy(cmdbuf, &InitSequence175[2], (InitSequence175.size() - 2) * 4);
@@ -697,6 +1556,11 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
     const auto cmdbuf_left = cmdbuf_end - cmdbuf - 1;
     WriteTrailingNop(cmdbuf, cmdbuf_left);
 
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState175", "OK", cmdbuf_begin,
+                              HwInitPacketSize,
+                              "written=256");
+#endif
     return HwInitPacketSize;
 }
 
@@ -704,6 +1568,10 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState200", "bad_size", cmdbuf,
+                                  size);
+#endif
         return 0;
     }
 
@@ -733,13 +1601,22 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
         return HwInitPacketSize;
     };
 
-    return SetupContext200(cmdbuf, size, true);
+    const u32 written = SetupContext200(cmdbuf, size, true);
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState200", "OK", cmdbuf, written,
+                              "written=256");
+#endif
+    return written;
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size < HwInitPacketSize) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState350", "bad_size", cmdbuf,
+                                  size);
+#endif
         return 0;
     }
 
@@ -769,7 +1646,12 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
         return HwInitPacketSize;
     };
 
-    return SetupContext350(cmdbuf, size, true);
+    const u32 written = SetupContext350(cmdbuf, size, true);
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawInitDefaultHardwareState350", "OK", cmdbuf, written,
+                              "written=256");
+#endif
+    return written;
 }
 
 u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
@@ -777,6 +1659,9 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
 
     constexpr auto CtxInitPacketSize = 0x20u;
     if (size != CtxInitPacketSize) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawInitToDefaultContextState", "bad_size", cmdbuf, size);
+#endif
         return 0;
     }
 
@@ -785,6 +1670,10 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState(u32* cmdbuf, u32 size) {
     } else {
         std::memcpy(cmdbuf, CtxInitSequence.data(), CtxInitSequence.size() * 4);
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawInitToDefaultContextState", "OK", cmdbuf, size,
+                              "written=32");
+#endif
     return CtxInitPacketSize;
 }
 
@@ -793,6 +1682,10 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState400(u32* cmdbuf, u32 size) {
 
     constexpr auto CtxInitPacketSize = 0x100u;
     if (size != CtxInitPacketSize) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmDrawInitToDefaultContextState400", "bad_size", cmdbuf,
+                                  size);
+#endif
         return 0;
     }
 
@@ -806,6 +1699,10 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState400(u32* cmdbuf, u32 size) {
     } else {
         std::memcpy(cmdbuf, CtxInitSequence400.data(), CtxInitSequence400.size() * 4);
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmDrawInitToDefaultContextState400", "OK", cmdbuf, size,
+                              "written=256");
+#endif
     return CtxInitPacketSize;
 }
 
@@ -816,67 +1713,56 @@ int PS4_SYSV_ABI sceGnmDrawOpaqueAuto() {
 
 bool PS4_SYSV_ABI sceGnmDriverCaptureInProgress() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return false;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterface() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterfaceForGpuDebugger() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterfaceForGpuException() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterfaceForHDRScopes() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterfaceForReplay() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterfaceForResourceRegistration() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 u32 PS4_SYSV_ABI sceGnmDriverInternalRetrieveGnmInterfaceForValidation() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0x80000000;
 }
 
 int PS4_SYSV_ABI sceGnmDriverInternalVirtualQuery() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 bool PS4_SYSV_ABI sceGnmDriverTraceInProgress() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return false;
 }
 
 int PS4_SYSV_ABI sceGnmDriverTriggerCapture() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_CAPTURE_RAZOR_NOT_LOADED;
 }
 
@@ -889,7 +1775,6 @@ int PS4_SYSV_ABI sceGnmEndWorkload(u64 workload) {
 
 s32 PS4_SYSV_ABI sceGnmFindResourcesPublic() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
@@ -914,7 +1799,6 @@ int PS4_SYSV_ABI sceGnmGetCoredumpProtectionFaultTimestamp() {
 
 int PS4_SYSV_ABI sceGnmGetDbgGcHandle() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return -1;
 }
 
@@ -935,25 +1819,21 @@ int PS4_SYSV_ABI sceGnmGetEqTimeStamp() {
 
 int PS4_SYSV_ABI sceGnmGetGpuBlockStatus() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 u32 PS4_SYSV_ABI sceGnmGetGpuCoreClockFrequency() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // On console this uses an ioctl check, but we assume it is equal to just checking for neo mode.
     return sceKernelIsNeoMode() ? 911'000'000 : 800'000'000;
 }
 
 int PS4_SYSV_ABI sceGnmGetGpuInfoStatus() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmGetLastWaitedAddress() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
@@ -969,61 +1849,51 @@ int PS4_SYSV_ABI sceGnmGetOffChipTessellationBufferSize() {
 
 int PS4_SYSV_ABI sceGnmGetOwnerName() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetPhysicalCounterFromVirtualized() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 u32 PS4_SYSV_ABI sceGnmGetProtectionFaultTimeStamp() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0;
 }
 
 int PS4_SYSV_ABI sceGnmGetResourceBaseAddressAndSizeInBytes() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetResourceName() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetResourceShaderGuid() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetResourceType() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetResourceUserData() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetShaderProgramBaseAddress() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmGetShaderStatus() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
@@ -1041,17 +1911,24 @@ VAddr PS4_SYSV_ABI sceGnmGetTheTessellationFactorRingBufferBaseAddress() {
 
 void PS4_SYSV_ABI sceGnmGpuPaDebugEnter() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
 }
 
 void PS4_SYSV_ABI sceGnmGpuPaDebugLeave() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertDingDongMarker(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
+#ifdef __ANDROID__
+    static std::atomic<bool> traced{false};
+    if (!traced.exchange(true, std::memory_order_relaxed)) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_GNM_PC_ABI] api=sceGnmInsertDingDongMarker "
+                            "cmdbuf=%p size=%u",
+                            cmdbuf, size);
+    }
+#endif
     if (cmdbuf == nullptr || size != 4) {
         return -1;
     }
@@ -1066,13 +1943,24 @@ s32 PS4_SYSV_ABI sceGnmInsertPopMarker(u32* cmdbuf, u32 size) {
         cmdbuf =
             WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics,
                                           PM4CmdNop::PayloadType::DebugMarkerPop, 0u, 0u, 0u, 0u);
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmInsertPopMarker", "OK", cmdbuf - 6, size);
+#endif
         return ORBIS_OK;
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmInsertPopMarker", "bad_args", cmdbuf, size);
+#endif
     return -1;
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* marker, u32 color) {
     LOG_TRACE(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    char detail[160]{};
+    std::snprintf(detail, sizeof(detail), "marker=\"%.96s\" color=0x%x",
+                  marker ? marker : "<null>", color);
+#endif
 
     if (cmdbuf && marker) {
         const auto len = std::strlen(marker);
@@ -1088,14 +1976,24 @@ s32 PS4_SYSV_ABI sceGnmInsertPushColorMarker(u32* cmdbuf, u32 size, const char* 
                 color;
             std::memset(reinterpret_cast<u8*>(&nop->data_block[1]) + marker_len + 8 + sizeof(u32),
                         0, packet_size * 4 - marker_len - 8 - sizeof(u32));
+#ifdef __ANDROID__
+            ExecutorLiveGnmBuilderLog("sceGnmInsertPushColorMarker", "OK", cmdbuf, size, detail);
+#endif
             return ORBIS_OK;
         }
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmInsertPushColorMarker", "bad_args", cmdbuf, size, detail);
+#endif
     return -1;
 }
 
 s32 PS4_SYSV_ABI sceGnmInsertPushMarker(u32* cmdbuf, u32 size, const char* marker) {
     LOG_TRACE(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    char detail[144]{};
+    std::snprintf(detail, sizeof(detail), "marker=\"%.96s\"", marker ? marker : "<null>");
+#endif
 
     if (cmdbuf && marker) {
         const auto len = std::strlen(marker);
@@ -1109,9 +2007,15 @@ s32 PS4_SYSV_ABI sceGnmInsertPushMarker(u32* cmdbuf, u32 size, const char* marke
             std::memcpy(&nop->data_block[1], marker, marker_len);
             std::memset(reinterpret_cast<u8*>(&nop->data_block[1]) + marker_len, 0,
                         packet_size * 4 - marker_len);
+#ifdef __ANDROID__
+            ExecutorLiveGnmBuilderLog("sceGnmInsertPushMarker", "OK", cmdbuf, size, detail);
+#endif
             return ORBIS_OK;
         }
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmInsertPushMarker", "bad_args", cmdbuf, size, detail);
+#endif
     return -1;
 }
 
@@ -1122,6 +2026,10 @@ int PS4_SYSV_ABI sceGnmInsertSetColorMarker() {
 
 s32 PS4_SYSV_ABI sceGnmInsertSetMarker(u32* cmdbuf, u32 size, const char* marker) {
     LOG_TRACE(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    char detail[144]{};
+    std::snprintf(detail, sizeof(detail), "marker=\"%.96s\"", marker ? marker : "<null>");
+#endif
 
     if (cmdbuf && marker) {
         const auto len = std::strlen(marker);
@@ -1135,15 +2043,20 @@ s32 PS4_SYSV_ABI sceGnmInsertSetMarker(u32* cmdbuf, u32 size, const char* marker
             std::memcpy(&nop->data_block[1], marker, marker_len);
             std::memset(reinterpret_cast<u8*>(&nop->data_block[1]) + marker_len, 0,
                         packet_size * 4 - marker_len);
+#ifdef __ANDROID__
+            ExecutorLiveGnmBuilderLog("sceGnmInsertSetMarker", "OK", cmdbuf, size, detail);
+#endif
             return ORBIS_OK;
         }
     }
+#ifdef __ANDROID__
+    ExecutorLiveGnmBuilderLog("sceGnmInsertSetMarker", "bad_args", cmdbuf, size, detail);
+#endif
     return -1;
 }
 
 int PS4_SYSV_ABI sceGnmInsertThreadTraceMarker() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
@@ -1151,21 +2064,87 @@ s32 PS4_SYSV_ABI sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, 
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size != 7) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_WAIT_FLIP] result=bad_size cmdbuf=%p size=%u handle=%d buf=%u",
+                            cmdbuf, size, vo_handle, buf_idx);
+        char detail[96]{};
+        std::snprintf(detail, sizeof(detail), "handle=%d buf=%u", vo_handle, buf_idx);
+        ExecutorLiveGnmBuilderLog("sceGnmInsertWaitFlipDone", "bad_size", cmdbuf, size, detail);
+#endif
         return -1;
     }
 
     uintptr_t label_addr{};
     ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
                "sceVideoOutGetBufferLabelAddress call failed");
+    u32 effective_buf_idx = buf_idx;
+    const bool resolved_buf =
+        VideoOut::ExecutorResolveVoBufferIndex(vo_handle, buf_idx, &effective_buf_idx);
+    const auto* labels = reinterpret_cast<const u64*>(label_addr);
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        const u64 label0 = labels ? labels[0] : 0;
+        const u64 label1 = labels ? labels[1] : 0;
+        const u64 label2 = labels ? labels[2] : 0;
+        const u64 label3 = labels ? labels[3] : 0;
+        const u64 requested_label =
+            labels && buf_idx < 16 ? labels[buf_idx] : 0xffff'ffff'ffff'ffffull;
+        const u64 effective_label =
+            labels && resolved_buf && effective_buf_idx < 16 ? labels[effective_buf_idx]
+                                                             : 0xffff'ffff'ffff'ffffull;
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_WAIT_FLIP] cmdbuf=%p size=%u handle=%d requested=%u effective=%u resolved=%u labelAddr=0x%llx reqLabel=%llu effLabel=%llu labels=%llu,%llu,%llu,%llu",
+            cmdbuf, size, vo_handle, buf_idx, effective_buf_idx, resolved_buf ? 1u : 0u,
+            static_cast<unsigned long long>(label_addr),
+            static_cast<unsigned long long>(requested_label),
+            static_cast<unsigned long long>(effective_label),
+            static_cast<unsigned long long>(label0), static_cast<unsigned long long>(label1),
+            static_cast<unsigned long long>(label2), static_cast<unsigned long long>(label3));
+    }
+#endif
 
     auto* wait_reg_mem = reinterpret_cast<PM4CmdWaitRegMem*>(cmdbuf);
     wait_reg_mem->header = PM4Type3Header{PM4ItOpcode::WaitRegMem, 5};
     wait_reg_mem->raw = 0x13u;
+    const u32 wait_buf_idx = resolved_buf ? effective_buf_idx : buf_idx;
     *reinterpret_cast<uintptr_t*>(&wait_reg_mem->poll_addr_lo) =
-        (label_addr + buf_idx * sizeof(uintptr_t)) & ~0x3ull;
+        (label_addr + wait_buf_idx * sizeof(uintptr_t)) & ~0x3ull;
     wait_reg_mem->ref = 0u;
     wait_reg_mem->mask = 0xffff'ffffu;
     wait_reg_mem->poll_interval = 10u;
+#ifdef __ANDROID__
+    if (std::getenv("EXECUTOR_LIVE_FORCE_FLIP_DONE") != nullptr) {
+        const uintptr_t poll_addr = *reinterpret_cast<uintptr_t*>(&wait_reg_mem->poll_addr_lo);
+        const u32 value = wait_reg_mem->ref;
+        const bool wrote = VideoOut::ExecutorTryWriteVoLabelAlias(
+            reinterpret_cast<const void*>(poll_addr), &value, sizeof(value));
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_FORCE_FLIP_DONE] op=wait_flip_label handle=%d requested=%u effective=%u resolved=%u wait=%u poll=0x%llx ref=0x%x wrote=%u",
+            vo_handle, buf_idx, effective_buf_idx, resolved_buf ? 1u : 0u, wait_buf_idx,
+            static_cast<unsigned long long>(poll_addr), value, wrote ? 1u : 0u);
+    }
+    if (ExecutorTraceLiveWide()) {
+        const uintptr_t poll_addr = *reinterpret_cast<uintptr_t*>(&wait_reg_mem->poll_addr_lo);
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_WAIT_FLIP_PACKET] poll=0x%llx ref=0x%x mask=0x%x interval=%u raw=0x%x",
+            static_cast<unsigned long long>(poll_addr), wait_reg_mem->ref, wait_reg_mem->mask,
+            wait_reg_mem->poll_interval, wait_reg_mem->raw);
+    }
+#endif
+#ifdef __ANDROID__
+    char builder_detail[160]{};
+    const uintptr_t builder_poll_addr = *reinterpret_cast<uintptr_t*>(&wait_reg_mem->poll_addr_lo);
+    std::snprintf(builder_detail, sizeof(builder_detail),
+                  "handle=%d requested=%u effective=%u resolved=%u wait=%u poll=0x%llx",
+                  vo_handle, buf_idx, effective_buf_idx, resolved_buf ? 1u : 0u, wait_buf_idx,
+                  static_cast<unsigned long long>(builder_poll_addr));
+    ExecutorLiveGnmBuilderLog("sceGnmInsertWaitFlipDone", "OK", cmdbuf, size, builder_detail);
+    ExecutorLiveDumpBuilderTail("sceGnmInsertWaitFlipDone", cmdbuf, size);
+#endif
     return ORBIS_OK;
 }
 
@@ -1176,18 +2155,33 @@ int PS4_SYSV_ABI sceGnmIsCoredumpValid() {
 
 bool PS4_SYSV_ABI sceGnmIsUserPaEnabled() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
-    return false;
+    const bool enabled = std::getenv("EXECUTOR_LIVE_GNM_USER_PA") != nullptr;
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_RETURN] api=sceGnmIsUserPaEnabled value=%u",
+                            enabled ? 1u : 0u);
+    }
+#endif
+    return enabled;
 }
 
 int PS4_SYSV_ABI sceGnmLogicalCuIndexToPhysicalCuIndex() {
-    LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
+    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceGnmLogicalCuMaskToPhysicalCuMask(s64, s32 logical_cu_mask) {
     LOG_INFO(Lib_GnmDriver, "called, logical_cu_mask: {}", logical_cu_mask);
+#ifdef __ANDROID__
+    static std::atomic<bool> traced{false};
+    if (!traced.exchange(true, std::memory_order_relaxed)) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_GNM_PC_ABI] "
+                            "api=sceGnmLogicalCuMaskToPhysicalCuMask mask=0x%x",
+                            static_cast<u32>(logical_cu_mask));
+    }
+#endif
     return logical_cu_mask;
 }
 
@@ -1208,7 +2202,7 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
         return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_QUEUE_ID;
     }
 
-    if (VAddr(ring_base_addr) % 256 != 0) { // alignment check
+    if (VAddr(ring_base_addr) % 256 != 0) {
         return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_RING_BASE_ADDR;
     }
 
@@ -1216,13 +2210,12 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
         return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_RING_SIZE;
     }
 
-    if (VAddr(read_ptr_addr) % 4 != 0) { // alignment check
+    if (VAddr(read_ptr_addr) % 4 != 0) {
         return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_READ_PTR_ADDR;
     }
 
     const auto vqid =
         liverpool->asc_queues.insert(VAddr(ring_base_addr), read_ptr_addr, ring_size_dw, pipe_id);
-    // We need to offset index as `dingDong` assumes it to be from the range [1..64]
     const auto gnm_vqid = vqid.index + 1;
     LOG_INFO(Lib_GnmDriver, "ASC pipe {} queue {} mapped to vqueue {}", pipe_id, queue_id,
              gnm_vqid);
@@ -1244,48 +2237,40 @@ int PS4_SYSV_ABI sceGnmMapComputeQueueWithPriority(u32 pipe_id, u32 queue_id, VA
 
 int PS4_SYSV_ABI sceGnmPaDisableFlipCallbacks() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmPaEnableFlipCallbacks() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmPaHeartbeat() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmQueryResourceRegistrationUserMemoryRequirements() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmRaiseUserExceptionEvent() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmRegisterGdsResource() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 void PS4_SYSV_ABI sceGnmRegisterGnmLiveCallbackConfig() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
 }
 
 s32 PS4_SYSV_ABI sceGnmRegisterOwner(void* handle, const char* name) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
@@ -1293,17 +2278,25 @@ s32 PS4_SYSV_ABI sceGnmRegisterResource(void* res_handle, void* owner_handle, co
                                         size_t size, const char* name, int res_type,
                                         u64 user_data) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDone() {
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_GNM_REQUEST_SUBMIT_DONE] api=sceGnmRequestFlipAndSubmitDone");
+#endif
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload() {
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+#ifdef __ANDROID__
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_LIVE_GNM_REQUEST_SUBMIT_DONE] api=sceGnmRequestFlipAndSubmitDoneForWorkload");
+#endif
     return ORBIS_OK;
 }
 
@@ -1319,61 +2312,53 @@ s32 PS4_SYSV_ABI sceGnmResetVgtControl(u32* cmdbuf, u32 size) {
     }
     if (sceKernelIsNeoMode()) {
         if (!UseNeoCompatSequences) {
-            PM4CmdSetData::SetUconfigReg(cmdbuf, 0x40000258u, 0x6d007fu); // IA_MULTI_VGT_PARAM
+            PM4CmdSetData::SetUconfigReg(cmdbuf, 0x40000258u, 0x6d007fu);
         } else {
-            PM4CmdSetData::SetContextReg(cmdbuf, 0x100002aau, 0xd00ffu); // IA_MULTI_VGT_PARAM
+            PM4CmdSetData::SetContextReg(cmdbuf, 0x100002aau, 0xd00ffu);
         }
     } else {
-        PM4CmdSetData::SetContextReg(cmdbuf, 0x2aau, 0xffu); // IA_MULTI_VGT_PARAM
+        PM4CmdSetData::SetContextReg(cmdbuf, 0x2aau, 0xffu);
     }
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaClose() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaConstFill() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaCopyLinear() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaCopyTiled() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaCopyWindow() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaFlush() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaGetMinCmdSize() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSdmaOpen() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
@@ -1393,12 +2378,12 @@ s32 PS4_SYSV_ABI sceGnmSetCsShader(u32* cmdbuf, u32 size, const u32* cs_regs) {
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x20cu, cs_regs[0],
-                                     0u); // COMPUTE_PGM_LO/COMPUTE_PGM_HI
+                                     0u);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x212u, cs_regs[2],
-                                     cs_regs[3]); // COMPUTE_PGM_RSRC1/COMPUTE_PGM_RSRC2
+                                     cs_regs[3]);
     cmdbuf = PM4CmdSetData::SetShReg(
         cmdbuf, 0x207u, cs_regs[4], cs_regs[5],
-        cs_regs[6]); // COMPUTE_NUM_THREAD_X/COMPUTE_NUM_THREAD_Y/COMPUTE_NUM_THREAD_Z
+        cs_regs[6]);
 
     WriteTrailingNop<11>(cmdbuf);
     return ORBIS_OK;
@@ -1425,13 +2410,13 @@ s32 PS4_SYSV_ABI sceGnmSetCsShaderWithModifier(u32* cmdbuf, u32 size, const u32*
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x20cu, cs_regs[0],
-                                     0u); // COMPUTE_PGM_LO/COMPUTE_PGM_HI
+                                     0u);
     const u32 rsrc1 = modifier == 0 ? cs_regs[2] : (cs_regs[2] & 0xfffffc3fu) | modifier;
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x212u, rsrc1,
-                                     cs_regs[3]); // COMPUTE_PGM_RSRC1/COMPUTE_PGM_RSRC2
+                                     cs_regs[3]);
     cmdbuf = PM4CmdSetData::SetShReg(
         cmdbuf, 0x207u, cs_regs[4], cs_regs[5],
-        cs_regs[6]); // COMPUTE_NUM_THREAD_X/COMPUTE_NUM_THREAD_Y/COMPUTE_NUM_THREAD_Z
+        cs_regs[6]);
 
     WriteTrailingNop<11>(cmdbuf);
     return ORBIS_OK;
@@ -1446,60 +2431,49 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedPsShader(u32* cmdbuf, u32 size, u32 shader_id,
         return ORBIS_GNM_ERROR_FAILURE;
     }
 
-    // clang-format off
     constexpr static std::array ps0_code alignas(256) = {
-        0xbeeb03ffu, 0x00000003u, // s_mov_b32     vcc_hi, $0x00000003
-        0x7e000280u,              // v_mov_b32     v0, 0
-        0x5e000100u,              // v_cvt_pkrtz_f16_f32 v0, v0, v0
-        0xbf800000u,              // s_nop
-        0xf8001c0fu, 0x00000000u, // exp           mrt0, v0, v0 compr vm done
-        0xbf810000u,              // s_endpgm
+        0xbeeb03ffu, 0x00000003u,
+        0x7e000280u,
+        0x5e000100u,
+        0xbf800000u,
+        0xf8001c0fu, 0x00000000u,
+        0xbf810000u,
 
-        // Binary header
         0x5362724fu, 0x07726468u, 0x00002043u, 0u, 0xb0a45b2bu, 0x1d39766du, 0x72044b7bu, 0x0000000fu,
-        // PS regs
         0x0fe000f0u, 0u, 0xc0000u, 4u, 0u, 4u, 2u, 2u, 0u, 0u, 0x10u, 0xfu, 0xcu, 0u, 0u, 0u,
     };
 
-    const auto shader0_addr = uintptr_t(ps0_code.data()); // Original address is 0xfe000f00
+    const auto shader0_addr = uintptr_t(ps0_code.data());
     const static u32 ps0_regs[] = {
         u32(shader0_addr >> 8), u32(shader0_addr >> 40), 0xc0000u, 4u, 0u, 4u, 2u, 2u, 0u, 0u, 0x10u, 0xfu, 0xcu};
 
     constexpr static std::array ps1_code alignas(256) = {
-        0xbeeb03ffu, 0x00000003u, // s_mov_b32     vcc_hi, $0x00000003
-        0x7e040280u,              // v_mov_b32     v2, 0 
-        0xf8001803u, 0x02020202u, // exp           mrt0, v2, v2, off, off vm done
-        0xbf810000u,              // s_endpgm
+        0xbeeb03ffu, 0x00000003u,
+        0x7e040280u,
+        0xf8001803u, 0x02020202u,
+        0xbf810000u,
 
-        // Binary header
         0x5362724fu, 0x07726468u, 0x00001841u, 0x04080002u, 0x98b9cb94u, 0u, 0x6f130734u, 0x0000000fu,
-        // PS regs
         0x0fe000f2u, 0u, 0x2000u, 0u, 0u, 2u, 2u, 2u, 0u, 0u, 0x10u, 3u, 0xcu,
     };
 
-    const auto shader1_addr = uintptr_t(ps1_code.data()); // Original address is 0xfe000f20
+    const auto shader1_addr = uintptr_t(ps1_code.data());
     const static u32 ps1_regs[] = {
         u32(shader1_addr >> 8), u32(shader1_addr >> 40), 0x2000u, 0u, 0u, 2u, 2u, 2u, 0u, 0u, 0x10u, 3u, 0xcu};
-    // clang-format on
-
     const auto ps_regs = shader_id == 0 ? ps0_regs : ps1_regs;
 
-    // Normally the driver will do a call to `sceGnmSetPsShader350()`, but this function has
-    // a check for zero in the upper part of shader address. In our case, the address is a
-    // pointer to a stack memory, so the check will likely fail. To workaround it we will
-    // repeat set shader functionality here as it is trivial.
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
-                                     ps_regs[1]); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+                                     ps_regs[1]);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2],
-                                     ps_regs[3]); // SPI_SHADER_PGM_RSRC1_PS/SPI_SHADER_PGM_RSRC2_PS
+                                     ps_regs[3]);
     cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1c4u, ps_regs[4],
-                                          ps_regs[5]); // SPI_SHADER_Z_FORMAT/SPI_SHADER_COL_FORMAT
+                                          ps_regs[5]);
     cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b3u, ps_regs[6],
-                                          ps_regs[7]); // SPI_PS_INPUT_ENA/SPI_PS_INPUT_ADDR
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b6u, ps_regs[8]);  // SPI_PS_IN_CONTROL
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b8u, ps_regs[9]);  // SPI_BARYC_CNTL
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, ps_regs[10]); // DB_SHADER_CONTROL
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, ps_regs[11]);  // CB_SHADER_MASK
+                                          ps_regs[7]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b6u, ps_regs[8]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b8u, ps_regs[9]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, ps_regs[10]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, ps_regs[11]);
 
     WriteTrailingNop<11>(cmdbuf);
 
@@ -1515,44 +2489,35 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
         return ORBIS_GNM_ERROR_FAILURE;
     }
 
-    // A fullscreen triangle with one uv set
-    // clang-format off
     constexpr static std::array shader_code alignas(256) = {
-        0xbeeb03ffu, 0x00000007u, // s_mov_b32     vcc_hi, $0x00000007
-        0x36020081u,              // v_and_b32     v1, 1, v0
-        0x34020281u,              // v_lshlrev_b32 v1, 1, v1
-        0x360000c2u,              // v_and_b32     v0, -2, v0
-        0x4a0202c1u,              // v_add_i32     v1, vcc, -1, v1
-        0x4a0000c1u,              // v_add_i32     v0, vcc, -1, v0
-        0x7e020b01u,              // v_cvt_f32_i32 v1, v1
-        0x7e000b00U,              // v_cvt_f32_i32 v0, v0
-        0x7e040280u,              // v_mov_b32     v2, 0
-        0x7e0602f2u,              // v_mov_b32     v3, 1.0
-        0xf80008cfu, 0x03020001u, // exp           pos0, v1, v0, v2, v3 done
-        0xf800020fu, 0x03030303u, // exp           param0, v3, v3, v3, v3
-        0xbf810000u,              // s_endpgm
+        0xbeeb03ffu, 0x00000007u,
+        0x36020081u,
+        0x34020281u,
+        0x360000c2u,
+        0x4a0202c1u,
+        0x4a0000c1u,
+        0x7e020b01u,
+        0x7e000b00U,
+        0x7e040280u,
+        0x7e0602f2u,
+        0xf80008cfu, 0x03020001u,
+        0xf800020fu, 0x03030303u,
+        0xbf810000u,
 
-        // Binary header
         0x5362724fu, 0x07726468u, 0x00004047u, 0u, 0x47f8c29fu, 0x9b2da5cfu, 0xff7c5b7du, 0x00000017u,
-        // VS regs
         0x0fe000f1u, 0u, 0x000c0000u, 4u, 0u, 4u, 0u, 7u,
     };
-    // clang-format on
 
-    const auto shader_addr = uintptr_t(shader_code.data()); // Original address is 0xfe000f10
+    const auto shader_addr = uintptr_t(shader_code.data());
     const static u32 vs_regs[] = {
         u32(shader_addr >> 8), u32(shader_addr >> 40), 0xc0000u, 4, 0, 4, 0, 7};
 
-    // Normally the driver will do a call to `sceGnmSetVsShader()`, but this function has
-    // a check for zero in the upper part of shader address. In our case, the address is a
-    // pointer to a stack memory, so the check will likely fail. To workaround it we will
-    // repeat set shader functionality here as it is trivial.
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x48u, vs_regs[0], vs_regs[1]); // SPI_SHADER_PGM_LO_VS
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x48u, vs_regs[0], vs_regs[1]);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x4au, vs_regs[2],
-                                     vs_regs[3]); // SPI_SHADER_PGM_RSRC1_VS/SPI_SHADER_PGM_RSRC2_VS
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x207u, vs_regs[6]); // PA_CL_VS_OUT_CNTL
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b1u, vs_regs[4]); // SPI_VS_OUT_CONFIG
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1c3u, vs_regs[5]); // SPI_SHADER_POS_FORMAT
+                                     vs_regs[3]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x207u, vs_regs[6]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b1u, vs_regs[4]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1c3u, vs_regs[5]);
 
     WriteTrailingNop<11>(cmdbuf);
     return ORBIS_OK;
@@ -1560,6 +2525,7 @@ s32 PS4_SYSV_ABI sceGnmSetEmbeddedVsShader(u32* cmdbuf, u32 size, u32 shader_id,
 
 s32 PS4_SYSV_ABI sceGnmSetEsShader(u32* cmdbuf, u32 size, const u32* es_regs, u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
 
     if (!cmdbuf || size < 0x14) {
         return -1;
@@ -1582,10 +2548,15 @@ s32 PS4_SYSV_ABI sceGnmSetEsShader(u32* cmdbuf, u32 size, const u32* es_regs, u3
 
     const u32 var =
         shader_modifier == 0 ? es_regs[2] : ((es_regs[2] & 0xfcfffc3f) | shader_modifier);
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0xc8u, es_regs[0], 0u);  // SPI_SHADER_PGM_LO_ES
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0xcau, var, es_regs[3]); // SPI_SHADER_PGM_RSRC1_ES
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0xc8u, es_regs[0], 0u);
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0xcau, var, es_regs[3]);
 
     WriteTrailingNop<11>(cmdbuf);
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Es, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), u64{es_regs[0]} << 8);
+#endif
     return ORBIS_OK;
 }
 
@@ -1596,6 +2567,7 @@ int PS4_SYSV_ABI sceGnmSetGsRingSizes() {
 
 s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
 
     if (!cmdbuf || size < 0x1d) {
         return -1;
@@ -1611,19 +2583,25 @@ s32 PS4_SYSV_ABI sceGnmSetGsShader(u32* cmdbuf, u32 size, const u32* gs_regs) {
         return -1;
     }
 
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x88u, gs_regs[0], 0u); // SPI_SHADER_PGM_LO_GS
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x88u, gs_regs[0], 0u);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x8au, gs_regs[2],
-                                     gs_regs[3]); // SPI_SHADER_PGM_RSRC1_GS/SPI_SHADER_PGM_RSRC2_GS
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2e5u, gs_regs[4]); // VGT_STRMOUT_CONFIG
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x29bu, gs_regs[5]); // VGT_GS_OUT_PRIM_TYPE
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2e4u, gs_regs[6]); // VGT_GS_INSTANCE_CNT
+                                     gs_regs[3]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2e5u, gs_regs[4]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x29bu, gs_regs[5]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2e4u, gs_regs[6]);
 
     WriteTrailingNop<11>(cmdbuf);
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Gs, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), u64{gs_regs[0]} << 8);
+#endif
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u32 param4) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
     if (!cmdbuf || size < 0x1E) {
         return -1;
     }
@@ -1638,22 +2616,25 @@ s32 PS4_SYSV_ABI sceGnmSetHsShader(u32* cmdbuf, u32 size, const u32* hs_regs, u3
         return -1;
     }
 
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x108u, hs_regs[0], 0u); // SPI_SHADER_PGM_LO_HS
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x108u, hs_regs[0], 0u);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x10au, hs_regs[2],
-                                     hs_regs[3]); // SPI_SHADER_PGM_RSRC1_HS/SPI_SHADER_PGM_RSRC2_HS
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x286u,
-                                          hs_regs[5],                  // VGT_HOS_MAX_TESS_LEVEL
-                                          hs_regs[6]);                 // VGT_HOS_MIN_TESS_LEVEL
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2dbu, hs_regs[4]); // VGT_TF_PARAM
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2d6u, param4);     // VGT_LS_HS_CONFIG
+                                     hs_regs[3]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x286u, hs_regs[5], hs_regs[6]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2dbu, hs_regs[4]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x2d6u, param4);
 
-    // right padding?
     WriteTrailingNop<11>(cmdbuf);
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Hs, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), u64{hs_regs[0]} << 8);
+#endif
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
 
     if (!cmdbuf || size < 0x17) {
         return -1;
@@ -1677,110 +2658,159 @@ s32 PS4_SYSV_ABI sceGnmSetLsShader(u32* cmdbuf, u32 size, const u32* ls_regs, u3
 
     const u32 var =
         shader_modifier == 0 ? ls_regs[2] : ((ls_regs[2] & modifier_mask) | shader_modifier);
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x148u, ls_regs[0], 0u);  // SPI_SHADER_PGM_LO_LS
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x14bu, ls_regs[3]);      // SPI_SHADER_PGM_RSRC2_LS
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x14au, var, ls_regs[3]); // SPI_SHADER_PGM_RSRC1_LS
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x148u, ls_regs[0], 0u);
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x14bu, ls_regs[3]);
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x14au, var, ls_regs[3]);
 
     WriteTrailingNop<11>(cmdbuf);
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Ls, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), u64{ls_regs[0]} << 8);
+#endif
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_CMD_WRITE] api=sceGnmSetPsShader cmdbuf=%p size=%u regs=%p pgmLo=0x%x rsrc1=0x%x rsrc2=0x%x",
+            cmdbuf, size, ps_regs, ps_regs ? ps_regs[0] : 0u, ps_regs ? ps_regs[2] : 0u,
+            ps_regs ? ps_regs[3] : 0u);
+    }
+#endif
 
     if (!cmdbuf || size <= 0x27) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmSetPsShader", "bad_size", cmdbuf, size, "",
+                                  ExecutorLiveGnmBuilderKind::Shader);
+#endif
         return -1;
     }
     if (!ps_regs) {
-        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, 0u); // DB_SHADER_CONTROL
+        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u, 0u);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, 0u);
 
         WriteTrailingNop<0x20>(cmdbuf);
     } else {
         if (ps_regs[1] != 0) {
             LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
+#ifdef __ANDROID__
+            ExecutorLiveGnmBuilderLog("sceGnmSetPsShader", "bad_shader_addr", cmdbuf, size, "",
+                                      ExecutorLiveGnmBuilderKind::Shader);
+#endif
             return -1;
         }
 
-        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0], 0u);
         cmdbuf =
-            PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2],
-                                    ps_regs[3]); // SPI_SHADER_PGM_RSRC1_PS/SPI_SHADER_PGM_RSRC2_PS
+            PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2], ps_regs[3]);
         cmdbuf = PM4CmdSetData::SetContextReg(
-            cmdbuf, 0x1c4u, ps_regs[4], ps_regs[5]); // SPI_SHADER_Z_FORMAT/SPI_SHADER_COL_FORMAT
+            cmdbuf, 0x1c4u, ps_regs[4], ps_regs[5]);
         cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b3u, ps_regs[6],
-                                              ps_regs[7]); // SPI_PS_INPUT_ENA/SPI_PS_INPUT_ADDR
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b6u, ps_regs[8]);  // SPI_PS_IN_CONTROL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b8u, ps_regs[9]);  // SPI_BARYC_CNTL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, ps_regs[10]); // DB_SHADER_CONTROL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, ps_regs[11]);  // CB_SHADER_MASK
+                                              ps_regs[7]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b6u, ps_regs[8]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b8u, ps_regs[9]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, ps_regs[10]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, ps_regs[11]);
 
         WriteTrailingNop<11>(cmdbuf);
     }
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Ps, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), ps_regs ? u64{ps_regs[0]} << 8 : 0);
+    ExecutorLiveGnmBuilderLog("sceGnmSetPsShader", "OK", cmdbuf, size,
+                              ps_regs ? "regs=bound" : "regs=null",
+                              ExecutorLiveGnmBuilderKind::Shader);
+    ExecutorLiveDumpBuilderTail("sceGnmSetPsShader", cmdbuf_begin, size);
+#endif
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceGnmSetPsShader350(u32* cmdbuf, u32 size, const u32* ps_regs) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_CMD_WRITE] api=sceGnmSetPsShader350 cmdbuf=%p size=%u regs=%p pgmLo=0x%x rsrc1=0x%x rsrc2=0x%x",
+            cmdbuf, size, ps_regs, ps_regs ? ps_regs[0] : 0u, ps_regs ? ps_regs[2] : 0u,
+            ps_regs ? ps_regs[3] : 0u);
+    }
+#endif
 
     if (!cmdbuf || size <= 0x27) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmSetPsShader350", "bad_size", cmdbuf, size, "",
+                                  ExecutorLiveGnmBuilderKind::Shader);
+#endif
         return -1;
     }
     if (!ps_regs) {
-        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, 0u);  // DB_SHADER_CONTROL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, 0xfu); // CB_SHADER_MASK
+        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u, 0u);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, 0u);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, 0xfu);
 
         WriteTrailingNop<0x1d>(cmdbuf);
     } else {
         if (ps_regs[1] != 0) {
             LOG_ERROR(Lib_GnmDriver, "Invalid shader address.");
+#ifdef __ANDROID__
+            ExecutorLiveGnmBuilderLog("sceGnmSetPsShader350", "bad_shader_addr", cmdbuf, size,
+                                      "", ExecutorLiveGnmBuilderKind::Shader);
+#endif
             return -1;
         }
 
-        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+        cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0], 0u);
         cmdbuf =
-            PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2],
-                                    ps_regs[3]); // SPI_SHADER_PGM_RSRC1_PS/SPI_SHADER_PGM_RSRC2_PS
+            PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2], ps_regs[3]);
         cmdbuf = PM4CmdSetData::SetContextReg(
-            cmdbuf, 0x1c4u, ps_regs[4], ps_regs[5]); // SPI_SHADER_Z_FORMAT/SPI_SHADER_COL_FORMAT
+            cmdbuf, 0x1c4u, ps_regs[4], ps_regs[5]);
         cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b3u, ps_regs[6],
-                                              ps_regs[7]); // SPI_PS_INPUT_ENA/SPI_PS_INPUT_ADDR
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b6u, ps_regs[8]);  // SPI_PS_IN_CONTROL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b8u, ps_regs[9]);  // SPI_BARYC_CNTL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, ps_regs[10]); // DB_SHADER_CONTROL
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, ps_regs[11]);  // CB_SHADER_MASK
+                                              ps_regs[7]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b6u, ps_regs[8]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b8u, ps_regs[9]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x203u, ps_regs[10]);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, ps_regs[11]);
 
         WriteTrailingNop<11>(cmdbuf);
     }
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Ps, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), ps_regs ? u64{ps_regs[0]} << 8 : 0);
+    ExecutorLiveGnmBuilderLog("sceGnmSetPsShader350", "OK", cmdbuf, size,
+                              ps_regs ? "regs=bound" : "regs=null",
+                              ExecutorLiveGnmBuilderKind::Shader);
+    ExecutorLiveDumpBuilderTail("sceGnmSetPsShader350", cmdbuf_begin, size);
+#endif
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmSetResourceRegistrationUserMemory() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSetResourceUserData() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSetSpiEnableSqCounters() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSetSpiEnableSqCountersForUnitInstance() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
@@ -1808,48 +2838,82 @@ s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_mi
                 : prim_group_sz_minus_one & 0x1cffffu | wd_switch_on_eop | switch_on_eoi | 0x50000u;
         if (!UseNeoCompatSequences) {
             PM4CmdSetData::SetUconfigReg(cmdbuf, 0x40000258u,
-                                         reg_value | 0x600000u); // IA_MULTI_VGT_PARAM
+                                         reg_value | 0x600000u);
         } else {
-            PM4CmdSetData::SetContextReg(cmdbuf, 0x100002aau, reg_value); // IA_MULTI_VGT_PARAM
+            PM4CmdSetData::SetContextReg(cmdbuf, 0x100002aau, reg_value);
         }
     } else {
         const u32 reg_value =
             ((partial_vs_wave_mode & 1) << 0x10) | (prim_group_sz_minus_one & 0xffffu);
-        PM4CmdSetData::SetContextReg(cmdbuf, 0x2aau, reg_value); // IA_MULTI_VGT_PARAM
+        PM4CmdSetData::SetContextReg(cmdbuf, 0x2aau, reg_value);
     }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u32 shader_modifier) {
     LOG_TRACE(Lib_GnmDriver, "called");
+    const u32* cmdbuf_begin = cmdbuf;
+#ifdef __ANDROID__
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_CMD_WRITE] api=sceGnmSetVsShader cmdbuf=%p size=%u regs=%p pgmLo=0x%x rsrc1=0x%x rsrc2=0x%x modifier=0x%x",
+            cmdbuf, size, vs_regs, vs_regs ? vs_regs[0] : 0u, vs_regs ? vs_regs[2] : 0u,
+            vs_regs ? vs_regs[3] : 0u, shader_modifier);
+    }
+#endif
 
     if (!cmdbuf || size <= 0x1c) {
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmSetVsShader", "bad_size", cmdbuf, size, "",
+                                  ExecutorLiveGnmBuilderKind::Shader);
+#endif
         return -1;
     }
 
     if (!vs_regs) {
         LOG_ERROR(Lib_GnmDriver, "Null pointer passed as argument");
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmSetVsShader", "null_regs", cmdbuf, size, "",
+                                  ExecutorLiveGnmBuilderKind::Shader);
+#endif
         return -1;
     }
 
     if (shader_modifier & 0xfcfffc3f) {
         LOG_ERROR(Lib_GnmDriver, "Invalid modifier mask");
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmSetVsShader", "bad_modifier", cmdbuf, size, "",
+                                  ExecutorLiveGnmBuilderKind::Shader);
+#endif
         return -1;
     }
 
     if (vs_regs[1] != 0) {
         LOG_ERROR(Lib_GnmDriver, "Invalid shader address");
+#ifdef __ANDROID__
+        ExecutorLiveGnmBuilderLog("sceGnmSetVsShader", "bad_shader_addr", cmdbuf, size, "",
+                                  ExecutorLiveGnmBuilderKind::Shader);
+#endif
         return -1;
     }
 
     const u32 var = shader_modifier == 0 ? vs_regs[2] : (vs_regs[2] & 0xfcfffc3f) | shader_modifier;
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x48u, vs_regs[0], 0u);   // SPI_SHADER_PGM_LO_VS
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x4au, var, vs_regs[3]);  // SPI_SHADER_PGM_RSRC1_VS
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x207u, vs_regs[6]); // PA_CL_VS_OUT_CNTL
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b1u, vs_regs[4]); // SPI_VS_OUT_CONFIG
-    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1c3u, vs_regs[5]); // SPI_SHADER_POS_FORMAT
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x48u, vs_regs[0], 0u);
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x4au, var, vs_regs[3]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x207u, vs_regs[6]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1b1u, vs_regs[4]);
+    cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x1c3u, vs_regs[5]);
 
     WriteTrailingNop<11>(cmdbuf);
+#ifdef __ANDROID__
+    AmdGpu::RenderWaveTrace::BuilderShader(
+        AmdGpu::RenderWaveTrace::Stage::Vs, ExecutorRenderWaveCmdbufIdentity(cmdbuf_begin),
+        reinterpret_cast<uintptr_t>(cmdbuf_begin), u64{vs_regs[0]} << 8);
+    ExecutorLiveGnmBuilderLog("sceGnmSetVsShader", "OK", cmdbuf, size, "regs=bound",
+                              ExecutorLiveGnmBuilderKind::Shader);
+    ExecutorLiveDumpBuilderTail("sceGnmSetVsShader", cmdbuf_begin, size);
+#endif
     return ORBIS_OK;
 }
 
@@ -1865,229 +2929,191 @@ int PS4_SYSV_ABI sceGnmSetWaveLimitMultipliers() {
 
 int PS4_SYSV_ABI sceGnmSpmEndSpm() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmInit() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmInit2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmSetDelay() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmSetMuxRam() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmSetMuxRam2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmSetSelectCounter() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmSetSpmSelects() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmSetSpmSelects2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSpmStartSpm() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttFini() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttFinishTrace() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetBcInfo() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetGpuClocks() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetHiWater() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetStatus() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetTraceCounter() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetTraceWptr() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetWrapCounts() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetWrapCounts2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttGetWritebackLabels() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttInit() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSelectMode() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSelectTarget() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSelectTokens() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetCuPerfMask() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetDceEventWrite() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetHiWater() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetTraceBuffer2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetTraceBuffers() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetUserData() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSetUserdataTimer() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttStartTrace() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttStopTrace() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSwitchTraceBuffer() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttSwitchTraceBuffer2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmSqttWaitForEvent() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
                                    s64 flip_arg, void* unk) {
-    // check for `prepareFlip` packet
     cmdbuf += size - 64;
     ASSERT_MSG(cmdbuf[0] == 0xc03e1000, "Can't find `prepareFlip` packet");
 
@@ -2098,8 +3124,21 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
                "Invalid flip packet");
     ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
 
-    const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
-                                                               flip_arg, nullptr /*unk*/);
+    u32 effective_buf_idx = buf_idx;
+    if (VideoOut::ExecutorResolveVoBufferIndex(static_cast<s32>(vo_handle), buf_idx,
+                                               &effective_buf_idx)) {
+#ifdef __ANDROID__
+        if (effective_buf_idx != buf_idx) {
+            __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                                "[EXECUTOR_GNM_FLIP_INDEX_FIXUP] handle=%u requested=%u effective=%u",
+                                vo_handle, buf_idx, effective_buf_idx);
+        }
+#endif
+        buf_idx = effective_buf_idx;
+    }
+
+    const s32 flip_result =
+        VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode, flip_arg, nullptr);
     if (flip_result != 0) {
         if (flip_result == 0x80290012) {
             LOG_ERROR(Lib_GnmDriver, "Flip queue is full");
@@ -2114,13 +3153,13 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     ASSERT_MSG(VideoOut::sceVideoOutGetBufferLabelAddress(vo_handle, &label_addr) == 16,
                "sceVideoOutGetBufferLabelAddress call failed");
 
-    // Write event to lock the VO surface
     auto* write_lock = reinterpret_cast<PM4CmdWriteData*>(cmdbuf);
     write_lock->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
     write_lock->raw = 0x500u;
     const auto addr = (label_addr + buf_idx * sizeof(label_addr)) & ~0x3ull;
     write_lock->Address<uintptr_t>(addr);
     write_lock->data[0] = 1;
+    VideoOut::ExecutorRegisterVoLabelAlias(vo_handle, addr, buf_idx);
 
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf + 5);
 
@@ -2132,7 +3171,6 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x34};
             nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
 
-            // Write event to update label
             auto* write_label = reinterpret_cast<PM4CmdWriteData*>(cmdbuf + 0x3b);
             write_label->header = PM4Type3Header{PM4ItOpcode::WriteData, 3};
             write_label->raw = 0x500u;
@@ -2166,6 +3204,19 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
         }
     }
 
+#ifdef __ANDROID__
+    static std::atomic<u32> patched_flip_write_log_count{0};
+    const u32 patched_flip_write_log =
+        patched_flip_write_log_count.fetch_add(1, std::memory_order_relaxed);
+    if (patched_flip_write_log < 8) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_PATCHED_FLIP_WRITTEN] ordinal=%u dcb=%p sizeDw=%u source=0x%x marker=0x%x count=%u buffer=%u",
+            patched_flip_write_log + 1, cmdbuf - (size - 64), size, backup[1],
+            nop->data_block[0], nop->header.count.Value(), buf_idx);
+    }
+#endif
+
     return ORBIS_OK;
 }
 
@@ -2182,12 +3233,20 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_GNM_FLIP_ATTEMPT api=sceGnmSubmitAndFlipCommandBuffersForWorkload "
+             "workload={} count={} vo_handle={} buf_idx={} flip_mode={} flip_arg={}",
+             workload, count, vo_handle, buf_idx, flip_mode, flip_arg);
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_GNM_FLIP api=sceGnmSubmitAndFlipCommandBuffersForWorkload workload={} "
+             "count={} vo_handle={} buf_idx={} flip_mode={} flip_arg={}",
+             workload, count, vo_handle, buf_idx, flip_mode, flip_arg);
 
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
+        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr);
     if (patch_result != ORBIS_OK) {
         return patch_result;
     }
@@ -2197,6 +3256,424 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
                                       ccb_sizes_in_bytes);
 }
 
+bool ExecutorEnsureLiverpoolForReplay() {
+    if (liverpool) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_REPLAY_LIVERPOOL] result=already");
+#endif
+        return true;
+    }
+    try {
+        liverpool = std::make_unique<AmdGpu::Liverpool>();
+        if (Config::copyGPUCmdBuffers()) {
+            liverpool->ReserveCopyBufferSpace();
+        }
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_REPLAY_LIVERPOOL] result=created");
+#endif
+        return true;
+    } catch (const std::exception& e) {
+        liverpool.reset();
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                            "[EXECUTOR_REPLAY_LIVERPOOL] result=failed error=%s", e.what());
+#endif
+        return false;
+    }
+}
+
+bool ExecutorEnsureGnmPresenter(const char* reason) {
+    return EnsureGnmPresenter(reason);
+}
+
+bool ExecutorPresentReplayRT() {
+#ifdef __ANDROID__
+    g_live_present_rt_requests.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (presenter) {
+        return presenter->ExecutorPresentReplayRT();
+    }
+    return false;
+}
+
+ExecutorGnmHudStats ExecutorGetGnmHudStats() noexcept {
+#ifdef __ANDROID__
+    return {
+        .builder_total = g_live_gnm_builder_total.load(std::memory_order_relaxed),
+        .actual_draw = g_live_actual_draws.load(std::memory_order_relaxed),
+        .builder_shader = g_live_gnm_builder_shader.load(std::memory_order_relaxed),
+        .submit_calls = g_live_submit_calls.load(std::memory_order_relaxed),
+        .submit_done_calls = g_live_submit_done_calls.load(std::memory_order_relaxed),
+        .present_requests = g_live_present_rt_requests.load(std::memory_order_relaxed),
+    };
+#else
+    return {};
+#endif
+}
+
+bool ExecutorLivePresentRtEnabled() {
+#ifdef __ANDROID__
+    static const bool enabled = std::getenv("EXECUTOR_LIVE_PRESENT_RT") != nullptr;
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool ExecutorLiveDirectPresentActive() {
+#ifdef __ANDROID__
+    return presenter && presenter->ExecutorLiveDirectPresentActive();
+#else
+    return false;
+#endif
+}
+
+static bool g_gnm_capture_on_submit = false;
+static std::string g_gnm_capture_dir;
+static u32 g_gnm_capture_seq = 0;
+static constexpr u32 kGnmCaptureMax = 8;
+static constexpr u64 kGnmMaxRangeBytes = 16ull * 1024 * 1024;
+
+namespace {
+struct CapRange {
+    u64 addr{};
+    u64 size{};
+    u32 usage{};
+    std::vector<u8> bytes;
+};
+struct CapShader {
+    u32 stage{};
+    u64 hash{};
+    std::vector<u8> code;
+};
+struct CapSession {
+    std::mutex mtx;
+    bool active = false;
+    u32 submit_id = 0;
+    u32 draw_count = 0;
+    std::vector<u32> dcb;
+    std::vector<u32> ccb;
+    std::vector<CapRange> ranges;
+    std::vector<CapShader> shaders;
+};
+CapSession g_cap;
+
+void RecordRangeUnlocked(u32 usage, u64 guest_addr, u64 size) {
+    if (guest_addr == 0 || size == 0 || size > kGnmMaxRangeBytes) {
+        return;
+    }
+    for (auto& r : g_cap.ranges) {
+        if (guest_addr >= r.addr && guest_addr + size <= r.addr + r.size) {
+            return;
+        }
+    }
+    CapRange r;
+    r.addr = guest_addr;
+    r.size = size;
+    r.usage = usage;
+    r.bytes.resize(static_cast<size_t>(size));
+    std::memcpy(r.bytes.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(guest_addr)),
+                static_cast<size_t>(size));
+    g_cap.ranges.push_back(std::move(r));
+}
+
+void FinalizeSessionLocked() {
+    using namespace Executor::GnmCap;
+    if (!g_cap.active || g_cap.dcb.empty()) {
+        g_cap.active = false;
+        return;
+    }
+    Capture cap;
+    u32 idx = 1;
+    const u32 dcb_idx = idx++;
+    const u32 ccb_idx = g_cap.ccb.empty() ? 0xFFFFFFFFu : idx++;
+    {
+        auto& s = cap.AddSection(SectionType::Submit);
+        SubmitRec rec{g_cap.submit_id, g_cap.ccb.empty() ? 1u : 2u, dcb_idx, ccb_idx};
+        Capture::AppendPod(s.payload, rec);
+    }
+    {
+        auto& s = cap.AddSection(SectionType::QueueBlob);
+        QueueBlobHdr h{static_cast<uint32_t>(QueueType::Dcb), 0ull,
+                       static_cast<uint32_t>(g_cap.dcb.size()), 0u};
+        Capture::AppendPod(s.payload, h);
+        Capture::AppendBytes(s.payload, g_cap.dcb.data(), g_cap.dcb.size() * sizeof(u32));
+    }
+    if (!g_cap.ccb.empty()) {
+        auto& s = cap.AddSection(SectionType::QueueBlob);
+        QueueBlobHdr h{static_cast<uint32_t>(QueueType::Ccb), 0ull,
+                       static_cast<uint32_t>(g_cap.ccb.size()), 0u};
+        Capture::AppendPod(s.payload, h);
+        Capture::AppendBytes(s.payload, g_cap.ccb.data(), g_cap.ccb.size() * sizeof(u32));
+    }
+    for (const auto& sh : g_cap.shaders) {
+        auto& s = cap.AddSection(SectionType::Shader);
+        ShaderHdr h{sh.hash, sh.stage, static_cast<uint32_t>(sh.code.size()), 0u, 0u};
+        Capture::AppendPod(s.payload, h);
+        Capture::AppendBytes(s.payload, sh.code.data(), sh.code.size());
+    }
+    for (const auto& r : g_cap.ranges) {
+        auto& s = cap.AddSection(SectionType::MemoryRange);
+        MemoryRangeHdr h{r.addr, r.size, r.usage, 0u, 0ull, 0ull};
+        Capture::AppendPod(s.payload, h);
+        Capture::AppendBytes(s.payload, r.bytes.data(), r.bytes.size());
+    }
+    const std::vector<u8> bytes = Serialize(cap);
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/live-submit-%u.gnmcap", g_gnm_capture_dir.c_str(),
+                  g_cap.submit_id);
+    if (FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+        LOG_INFO(Lib_GnmDriver,
+                 "EXECUTOR_GNM_CAPTURE finalize submit={} draws={} dcbDw={} shaders={} ranges={} "
+                 "bytes={} path={}",
+                 g_cap.submit_id, g_cap.draw_count, g_cap.dcb.size(), g_cap.shaders.size(),
+                 g_cap.ranges.size(), bytes.size(), path);
+    }
+    g_cap.active = false;
+    g_cap.dcb.clear();
+    g_cap.ccb.clear();
+    g_cap.ranges.clear();
+    g_cap.shaders.clear();
+    g_cap.draw_count = 0;
+}
+}
+
+void ExecutorSetGnmCaptureOnSubmit(bool enable, const char* dir) {
+    g_gnm_capture_on_submit = enable;
+    g_gnm_capture_dir = (enable && dir) ? dir : "";
+    g_gnm_capture_seq = 0;
+    LOG_INFO(Lib_GnmDriver, "EXECUTOR_GNM_CAPTURE config enable={} dir={}", enable, g_gnm_capture_dir);
+}
+
+bool ExecutorGnmCaptureActive() {
+    return g_cap.active;
+}
+
+namespace {
+struct ReplayReloc {
+    u64 old_base;
+    u64 new_base;
+    u64 size;
+};
+std::mutex g_replay_mtx;
+bool g_replay_active = false;
+std::vector<ReplayReloc> g_replay_relocs;
+u32 g_replay_miss_count = 0;
+}
+
+void ExecutorReplayWaitGpuIdle() {
+    if (!liverpool) {
+        return;
+    }
+    liverpool->SubmitDone();
+    liverpool->WaitRasterizerIdleForExecutor();
+}
+
+void ExecutorReplaySetActive(bool active) {
+    std::lock_guard lk(g_replay_mtx);
+    g_replay_active = active;
+    if (active) {
+        g_replay_relocs.clear();
+        g_replay_miss_count = 0;
+    }
+}
+
+void ExecutorReplayAddReloc(u64 old_base, u64 new_base, u64 size) {
+    std::lock_guard lk(g_replay_mtx);
+    g_replay_relocs.push_back({old_base, new_base, size});
+}
+
+bool ExecutorReplayActive() {
+    return g_replay_active;
+}
+
+bool ExecutorReplayForcePsConst() {
+    static const bool v = [] {
+        const char* e = std::getenv("EXECUTOR_FORCE_PS_CONST");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+bool ExecutorReplayIsRelocated(u64 addr) {
+    if (!g_replay_active || addr == 0) {
+        return false;
+    }
+    std::lock_guard lk(g_replay_mtx);
+    for (const auto& r : g_replay_relocs) {
+        if (addr >= r.new_base && addr < r.new_base + r.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+u64 ExecutorReplayRelocate(u64 addr) {
+    if (!g_replay_active || addr == 0) {
+        return 0;
+    }
+    std::lock_guard lk(g_replay_mtx);
+    for (const auto& r : g_replay_relocs) {
+        if (addr >= r.old_base && addr < r.old_base + r.size) {
+            return r.new_base + (addr - r.old_base);
+        }
+    }
+    for (const auto& r : g_replay_relocs) {
+        if (addr >= r.new_base && addr < r.new_base + r.size) {
+            return addr;
+        }
+    }
+    return 0;
+}
+
+void ExecutorReplayCheckAddr(u32 usage, u64 addr, u64 size) {
+    if (!g_replay_active || addr == 0) {
+        return;
+    }
+    std::lock_guard lk(g_replay_mtx);
+    if (!g_replay_active) {
+        return;
+    }
+    for (const auto& r : g_replay_relocs) {
+        if (addr >= r.new_base && addr < r.new_base + r.size) {
+            return;
+        }
+        if (addr >= r.old_base && addr < r.old_base + r.size) {
+            return;
+        }
+    }
+    if (g_replay_miss_count < 64) {
+        ++g_replay_miss_count;
+        LOG_ERROR(Lib_GnmDriver,
+                  "EXECUTOR_GNMCAP_RELOC_MISS usage={} addr=0x{:x} size={} (resource not captured/"
+                  "relocated -- capture this on PC or patch its descriptor)",
+                  usage, addr, size);
+    }
+}
+
+void ExecutorGnmCaptureOnDraw() {
+    if (g_cap.active) {
+        ++g_cap.draw_count;
+    }
+}
+
+void ExecutorGnmRecordActualDraw(u64 count) noexcept {
+#ifdef __ANDROID__
+    g_live_actual_draws.fetch_add(count, std::memory_order_relaxed);
+#else
+    (void)count;
+#endif
+}
+
+void ExecutorGnmCaptureRecordResource(u32 usage, u64 guest_addr, u64 size) {
+    if (!g_cap.active || guest_addr == 0 || size == 0 || size > kGnmMaxRangeBytes) {
+        return;
+    }
+    std::lock_guard lk(g_cap.mtx);
+    if (!g_cap.active) {
+        return;
+    }
+    RecordRangeUnlocked(usage, guest_addr, size);
+}
+
+void ExecutorGnmCaptureRecordShader(u32 stage, u64 hash, u64 guest_addr, u32 code_bytes) {
+    if (!g_cap.active || guest_addr == 0 || code_bytes == 0 || code_bytes > kGnmMaxRangeBytes) {
+        return;
+    }
+    std::lock_guard lk(g_cap.mtx);
+    if (!g_cap.active) {
+        return;
+    }
+    for (auto& sh : g_cap.shaders) {
+        if (sh.hash == hash && sh.stage == stage) {
+            return;
+        }
+    }
+    CapShader sh;
+    sh.stage = stage;
+    sh.hash = hash;
+    sh.code.resize(code_bytes);
+    std::memcpy(sh.code.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(guest_addr)),
+                code_bytes);
+    g_cap.shaders.push_back(std::move(sh));
+    RecordRangeUnlocked(0u, guest_addr, static_cast<u64>(code_bytes) + 1024u);
+}
+
+static void ExecutorCaptureSubmitGnmcap(std::span<const u32> dcb_span, std::span<const u32> ccb_span) {
+    static std::once_flag env_once;
+    static u32 g_gnm_capture_skip = 0;
+    static u32 g_gnm_submit_seen = 0;
+    std::call_once(env_once, [] {
+        if (!g_gnm_capture_on_submit) {
+            if (const char* dir = std::getenv("EXECUTOR_GNM_CAPTURE_DIR"); dir && dir[0]) {
+                g_gnm_capture_on_submit = true;
+                g_gnm_capture_dir = dir;
+                g_gnm_capture_seq = 0;
+                if (const char* sk = std::getenv("EXECUTOR_GNM_CAPTURE_SKIP"); sk && sk[0]) {
+                    g_gnm_capture_skip = static_cast<u32>(std::strtoul(sk, nullptr, 10));
+                }
+                LOG_INFO(Lib_GnmDriver, "EXECUTOR_GNM_CAPTURE env-enabled dir={} skip={}", dir,
+                         g_gnm_capture_skip);
+            }
+        }
+    });
+    if (!g_gnm_capture_on_submit || g_gnm_capture_dir.empty() || dcb_span.empty()) {
+        return;
+    }
+
+#ifdef __ANDROID__
+    if (g_gnm_submit_seen++ < g_gnm_capture_skip) {
+        return;
+    }
+    if (g_gnm_capture_seq >= kGnmCaptureMax) {
+        return;
+    }
+    const u32 submit_id = g_gnm_capture_seq++;
+    const std::vector<u8> bytes =
+        liverpool ? liverpool->ExecutorCaptureGnmcapFrame(dcb_span, ccb_span) : std::vector<u8>{};
+    if (!bytes.empty()) {
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/live-submit-%u.gnmcap", g_gnm_capture_dir.c_str(),
+                      submit_id);
+        if (FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(bytes.data(), 1, bytes.size(), f);
+            std::fclose(f);
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_GNM_CAPTURE_ANDROID] submit=%u dcbDw=%zu ccbDw=%zu "
+                                "bytes=%zu path=%s memoryComplete=NO",
+                                submit_id, dcb_span.size(), ccb_span.size(), bytes.size(), path);
+        } else {
+            __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
+                                "[EXECUTOR_GNM_CAPTURE_ANDROID] submit=%u write_failed path=%s",
+                                submit_id, path);
+        }
+    }
+    return;
+#endif
+
+    std::lock_guard lk(g_cap.mtx);
+    if (g_cap.active) {
+        FinalizeSessionLocked();
+    }
+    if (g_gnm_submit_seen++ < g_gnm_capture_skip) {
+        return;
+    }
+    if (g_gnm_capture_seq >= kGnmCaptureMax) {
+        return;
+    }
+    g_cap.submit_id = g_gnm_capture_seq++;
+    g_cap.dcb.assign(dcb_span.begin(), dcb_span.end());
+    g_cap.ccb.assign(ccb_span.begin(), ccb_span.end());
+    g_cap.ranges.clear();
+    g_cap.shaders.clear();
+    g_cap.draw_count = 0;
+    g_cap.active = true;
+}
+
 int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        const u32* dcb_gpu_addrs[],
                                                        u32* dcb_sizes_in_bytes,
@@ -2204,6 +3681,38 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        u32* ccb_sizes_in_bytes) {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+#ifdef __ANDROID__
+    g_live_submit_calls.fetch_add(1, std::memory_order_relaxed);
+    ExecutorLiveFrameStats("submit_enter", frames_submitted);
+    if (ExecutorTraceLiveWide()) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_SUBMIT] workload=%u count=%u dcb=%p dcb_sizes=%p ccb=%p ccb_sizes=%p",
+                            workload, count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_gpu_addrs,
+                            ccb_sizes_in_bytes);
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_BUILDER_COUNTS] total=%llu draw=%llu shader=%llu submitdone=%llu",
+            static_cast<unsigned long long>(g_live_gnm_builder_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_live_gnm_builder_draw.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_live_gnm_builder_shader.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_live_gnm_builder_submitdone.load(std::memory_order_relaxed)));
+    }
+    if (ExecutorTraceLiveWide() && dcb_gpu_addrs != nullptr && dcb_sizes_in_bytes != nullptr) {
+        for (u32 i = 0; i < count && i < 8; ++i) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_SUBMIT_DCB] i=%u addr=%p bytes=%u", i,
+                                dcb_gpu_addrs[i], dcb_sizes_in_bytes[i]);
+        }
+    }
+#endif
+    LOG_DEBUG(Lib_GnmDriver,
+              "EXECUTOR_GNM_SUBMIT_ATTEMPT api=sceGnmSubmitCommandBuffersForWorkload workload={} "
+              "count={}",
+              workload, count);
+    LOG_DEBUG(Lib_GnmDriver,
+              "EXECUTOR_GNM_DRAW api=sceGnmSubmitCommandBuffersForWorkload workload={} count={}",
+              workload, count);
 
     if (!dcb_gpu_addrs || !dcb_sizes_in_bytes) {
         LOG_ERROR(Lib_GnmDriver, "dcbGpuAddrs and dcbSizesInBytes must not be NULL");
@@ -2227,34 +3736,94 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         }
     }
 
-    WaitGpuIdle();
+#ifdef __ANDROID__
+    const bool live_sync_submit = ExecutorLiveGnmSyncSubmit();
+    const bool live_gpu_trace = ExecutorTraceLiveWide();
+    ExecutorLogLiveGnmStage("before_presenter", workload, 0, 0, 0);
+#endif
+    const bool presenter_ready = EnsureGnmPresenter("sceGnmSubmitCommandBuffersForWorkload");
+#ifdef __ANDROID__
+    if (live_gpu_trace) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_STAGE] stage=after_presenter workload=%u ready=%u sync=%u",
+            workload, presenter_ready ? 1u : 0u, live_sync_submit ? 1u : 0u);
+    }
+    ExecutorLogLiveGnmStage("before_submission_lock_idle", workload, 0, 0, 0);
+#endif
+
+    if (!WaitGpuIdle("sceGnmSubmitCommandBuffersForWorkload")) {
+        return ORBIS_OK;
+    }
+#ifdef __ANDROID__
+    ExecutorLogLiveGnmStage("after_submission_lock_idle", workload, 0, 0, 0);
+
+    auto submit_gfx_live = [&](std::span<const u32> submit_dcb, std::span<const u32> submit_ccb,
+                               const char* label, u32 cbpair) {
+        AmdGpu::ExecutorEopTraceHleSubmit(submit_dcb, submit_ccb, label, workload, cbpair);
+        if (live_gpu_trace) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_LIVE_GNM_STAGE] stage=before_%s workload=%u cbpair=%u dcbDw=%zu ccbDw=%zu",
+                label ? label : "submit", workload, cbpair, submit_dcb.size(), submit_ccb.size());
+        }
+        liverpool->SubmitGfx(submit_dcb, submit_ccb);
+        if (live_gpu_trace) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_STAGE] stage=queued_%s workload=%u cbpair=%u",
+                                label ? label : "submit", workload, cbpair);
+        }
+        if (live_sync_submit) {
+            if (live_gpu_trace) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_LIVE_GNM_STAGE] stage=before_drain_%s workload=%u cbpair=%u",
+                    label ? label : "submit", workload, cbpair);
+            }
+            liverpool->WaitRasterizerIdleForExecutor();
+            if (live_gpu_trace) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_LIVE_GNM_STAGE] stage=after_drain_%s workload=%u cbpair=%u",
+                    label ? label : "submit", workload, cbpair);
+            }
+        }
+    };
+#else
+    auto submit_gfx_live = [&](std::span<const u32> submit_dcb, std::span<const u32> submit_ccb,
+                               const char*, u32) { liverpool->SubmitGfx(submit_dcb, submit_ccb); };
+#endif
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
     }
 
     if (send_init_packet) {
-        if (sdk_version < Common::ElfInfo::FW_200) {
-            liverpool->SubmitGfx(InitSequence, {});
-        } else if (sdk_version < Common::ElfInfo::FW_400) {
+        if (sdk_version < Common::ElfInfo::FW_20) {
+            submit_gfx_live(std::span<const u32>{InitSequence}, {}, "init_fw_lt20", 0);
+        } else if (sdk_version < Common::ElfInfo::FW_40) {
             if (sceKernelIsNeoMode()) {
                 if (!UseNeoCompatSequences) {
-                    liverpool->SubmitGfx(InitSequence200Neo, {});
+                    submit_gfx_live(std::span<const u32>{InitSequence200Neo}, {},
+                                    "init_fw20_neo", 0);
                 } else {
-                    liverpool->SubmitGfx(InitSequence200NeoCompat, {});
+                    submit_gfx_live(std::span<const u32>{InitSequence200NeoCompat}, {},
+                                    "init_fw20_neo_compat", 0);
                 }
             } else {
-                liverpool->SubmitGfx(InitSequence200, {});
+                submit_gfx_live(std::span<const u32>{InitSequence200}, {}, "init_fw20", 0);
             }
         } else {
             if (sceKernelIsNeoMode()) {
                 if (!UseNeoCompatSequences) {
-                    liverpool->SubmitGfx(InitSequence350Neo, {});
+                    submit_gfx_live(std::span<const u32>{InitSequence350Neo}, {},
+                                    "init_fw35_neo", 0);
                 } else {
-                    liverpool->SubmitGfx(InitSequence350NeoCompat, {});
+                    submit_gfx_live(std::span<const u32>{InitSequence350NeoCompat}, {},
+                                    "init_fw35_neo_compat", 0);
                 }
             } else {
-                liverpool->SubmitGfx(InitSequence350, {});
+                submit_gfx_live(std::span<const u32>{InitSequence350}, {}, "init_fw35", 0);
             }
         }
         send_init_packet = false;
@@ -2269,6 +3838,19 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
 
         const auto& dcb_span = std::span{dcb_gpu_addrs[cbpair], dcb_size_dw};
         const auto& ccb_span = std::span{ccb, ccb_size_dw};
+#ifdef __ANDROID__
+        char dcb_tag[64]{};
+        std::snprintf(dcb_tag, sizeof(dcb_tag), "submit_work%u_pair%u", workload, cbpair);
+        ExecutorLiveClassifyDcb(dcb_tag, dcb_gpu_addrs[cbpair], dcb_size_dw);
+        ExecutorLiveRememberExplicitDcb(dcb_gpu_addrs[cbpair],
+                                        ExecutorLiveAnalyzeDcb(dcb_gpu_addrs[cbpair], dcb_size_dw));
+        if (ccb && ccb_size_dw != 0) {
+            char ccb_tag[64]{};
+            std::snprintf(ccb_tag, sizeof(ccb_tag), "submit_work%u_pair%u_ccb", workload,
+                          cbpair);
+            ExecutorLiveDumpDwords(ccb_tag, ccb, std::min<u32>(ccb_size_dw, 16u));
+        }
+#endif
 
         if (DebugState.DumpingCurrentFrame()) {
             static auto last_frame_num = -1LL;
@@ -2297,9 +3879,13 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                 .base_addr = reinterpret_cast<uintptr_t>(ccb),
             });
         }
-        liverpool->SubmitGfx(dcb_span, ccb_span);
+        ExecutorCaptureSubmitGnmcap(dcb_span, ccb_span);
+        submit_gfx_live(dcb_span, ccb_span, "live_submit", cbpair);
     }
 
+#ifdef __ANDROID__
+    ExecutorLogLiveGnmStage("before_return_ok", workload, 0, 0, 0);
+#endif
     return ORBIS_OK;
 }
 
@@ -2313,14 +3899,265 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
-    WaitGpuIdle();
+#ifdef __ANDROID__
+    if (executor_lsx4_register_guest_gc_roots) {
+        executor_lsx4_register_guest_gc_roots();
+    }
+    if (executor_mono_value_copy_dump) {
+        executor_mono_value_copy_dump();
+    }
+    g_live_submit_done_calls.fetch_add(1, std::memory_order_relaxed);
+    ExecutorLiveFrameStats("submit_done_enter", frames_submitted);
+    static std::atomic<bool> mono_sigsegv_guard_requested{false};
+    if (!mono_sigsegv_guard_requested.exchange(true) && std::getenv("MONO_DEBUG") &&
+        std::strstr(std::getenv("MONO_DEBUG"), "explicit-null-checks") &&
+        executor_lsx4_android_install_mono_explicit_sigsegv_guard) {
+        executor_lsx4_android_install_mono_explicit_sigsegv_guard();
+    }
+    static std::atomic<u64> submit_done_log_count{0};
+    const u64 submit_done_call = ++submit_done_log_count;
+    if (submit_done_call == 64 &&
+        std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") != nullptr) {
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(6));
+            if (executor_jit_dump_thread_states) {
+                executor_jit_dump_thread_states("delayed-submitdone-stall");
+            }
+            if (executor_live_dump_mutex_wait_ledger) {
+                executor_live_dump_mutex_wait_ledger("delayed-submitdone-stall", 64);
+            }
+        }).detach();
+    }
+    AmdGpu::ExecutorEopTraceSubmitDonePulse(submit_done_call);
+    const bool submit_done_log =
+        submit_done_call <= 16 || (submit_done_call & (submit_done_call - 1)) == 0 ||
+        std::getenv("EXECUTOR_TRACE_LIVE_WIDE") != nullptr;
+    if (submit_done_log) {
+        if (executor_mono_vtnull_dump) {
+            executor_mono_vtnull_dump();
+        }
+        if (executor_mono_vcall_entry_dump) {
+            executor_mono_vcall_entry_dump();
+        }
+        const std::uint64_t imt_dyn =
+            executor_imt_overflow_count ? executor_imt_overflow_count() : 0;
+        const std::uint64_t imt_alloc_overflow =
+            executor_imt_alloc_overflow_count ? executor_imt_alloc_overflow_count() : 0;
+        const std::uint64_t imt_tail_overflow =
+            executor_imt_tail_overflow_count ? executor_imt_tail_overflow_count() : 0;
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_SUBMIT_DONE] call=%llu stage=enter gpuIdle=%u "
+                            "frames=%llu builderTotal=%llu builderDraw=%llu builderShader=%llu "
+                            "builderSubmit=%llu imtDyn=%llu imtAllocOverflow=%llu "
+                            "imtTailOverflow=%llu",
+                            static_cast<unsigned long long>(submit_done_call),
+                            liverpool && liverpool->IsGpuIdle() ? 1u : 0u,
+                            static_cast<unsigned long long>(frames_submitted),
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_total.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_draw.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_shader.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                g_live_gnm_builder_submitdone.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(imt_dyn),
+                            static_cast<unsigned long long>(imt_alloc_overflow),
+                            static_cast<unsigned long long>(imt_tail_overflow));
+    }
+    if (std::getenv("EXECUTOR_TRACE_LIVE_THREAD_RIPS") != nullptr &&
+        submit_done_call >= 12 &&
+        submit_done_call <= 24 && (submit_done_call % 4) == 0 &&
+        g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0) {
+        executor_live_dump_unity_thread_rips("submitdone", static_cast<int>(submit_done_call));
+    }
+    static std::atomic<bool> sync_frontier_dump_started{false};
+    if (executor_live_hle_flight_dump && submit_done_call == 10 &&
+        g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0 &&
+        !sync_frontier_dump_started.exchange(true, std::memory_order_relaxed)) {
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            executor_live_hle_flight_dump(
+                "submitdone-sync-frontier",
+                g_live_gnm_builder_total.load(std::memory_order_relaxed),
+                g_live_gnm_builder_draw.load(std::memory_order_relaxed),
+                g_live_gnm_builder_shader.load(std::memory_order_relaxed),
+                reinterpret_cast<u64>(g_live_active_cmdbuf.load(std::memory_order_relaxed)),
+                g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
+            if (executor_live_dump_kernel_sem_records) {
+                executor_live_dump_kernel_sem_records("submitdone-sync-frontier");
+            }
+            if (executor_live_dump_posix_sem_records) {
+                executor_live_dump_posix_sem_records("submitdone-sync-frontier");
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(47));
+            executor_live_hle_flight_dump(
+                "submitdone-late-sync-frontier",
+                g_live_gnm_builder_total.load(std::memory_order_relaxed),
+                g_live_gnm_builder_draw.load(std::memory_order_relaxed),
+                g_live_gnm_builder_shader.load(std::memory_order_relaxed),
+                reinterpret_cast<u64>(g_live_active_cmdbuf.load(std::memory_order_relaxed)),
+                g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
+            if (executor_live_dump_kernel_sem_records) {
+                executor_live_dump_kernel_sem_records("submitdone-late-sync-frontier");
+            }
+            if (executor_live_dump_posix_sem_records) {
+                executor_live_dump_posix_sem_records("submitdone-late-sync-frontier");
+            }
+        }).detach();
+    }
+    if (std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") != nullptr &&
+        executor_live_dump_mutex_wait_ledger != nullptr) {
+        executor_live_dump_mutex_wait_ledger("submitdone",
+                                             static_cast<int>(submit_done_call));
+    }
+    if ((std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") || ExecutorTraceLiveWide()) &&
+        executor_jit_dump_thread_states &&
+        g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0 &&
+        ExecutorLiveShouldPulse(submit_done_call)) {
+        if (executor_live_hle_flight_dump) {
+            executor_live_hle_flight_dump(
+                "submitdone-no-workload-draw",
+                g_live_gnm_builder_total.load(std::memory_order_relaxed),
+                g_live_gnm_builder_draw.load(std::memory_order_relaxed),
+                g_live_gnm_builder_shader.load(std::memory_order_relaxed),
+                reinterpret_cast<u64>(g_live_active_cmdbuf.load(std::memory_order_relaxed)),
+                g_live_active_cmdbuf_size.load(std::memory_order_relaxed));
+        }
+        executor_jit_dump_thread_states("submitdone-no-workload-draw");
+    }
+    if (std::getenv("EXECUTOR_TRACE_LIVE_EMU_DUMP") &&
+        executor_lsx4_android_dump_box64_emu_states) {
+        executor_lsx4_android_dump_box64_emu_states("gnm-submitdone-enter");
+    }
+    if (executor_live_dump_posix_sem_records &&
+        (std::getenv("EXECUTOR_TRACE_LIVE_SYNC") ||
+         std::getenv("EXECUTOR_TRACE_LIVE_WIDE"))) {
+        executor_live_dump_posix_sem_records("gnm-submitdone-enter");
+    }
+    if (ExecutorTraceLiveWide() && ExecutorLiveShouldPulse(submit_done_call)) {
+        const auto active_cb =
+            reinterpret_cast<const u32*>(g_live_active_cmdbuf.load(std::memory_order_relaxed));
+        const auto active_size = g_live_active_cmdbuf_size.load(std::memory_order_relaxed);
+        if (active_cb && active_size != 0) {
+            ExecutorLiveClassifyDcb("active_builder_before_submitdone", active_cb,
+                                    std::min<u32>(active_size, 4096u));
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_ACTIVE_CB] stage=submitdone none=1");
+        }
+    }
+    if (std::getenv("EXECUTOR_LIVE_STALL_THREAD_DUMP") &&
+        executor_lsx4_android_dump_box64_emu_states) {
+        const auto active_cb =
+            reinterpret_cast<const u32*>(g_live_active_cmdbuf.load(std::memory_order_relaxed));
+        const auto active_size = g_live_active_cmdbuf_size.load(std::memory_order_relaxed);
+        const auto active =
+            ExecutorLiveAnalyzeDcb(active_cb, std::min<u32>(active_size, 4096u));
+        const bool likely_stalled_after_first_submit =
+            submit_done_call >= 2 &&
+            g_live_gnm_builder_total.load(std::memory_order_relaxed) >= 8 &&
+            g_live_gnm_builder_draw.load(std::memory_order_relaxed) == 0;
+        const bool active_builder_has_draw =
+            active_cb && active.valid_dwords != 0 && active.draws != 0;
+        if ((likely_stalled_after_first_submit || active_builder_has_draw) &&
+            ExecutorLiveShouldPulse(submit_done_call)) {
+            __android_log_print(
+                ANDROID_LOG_WARN, "LSX4Native",
+                "[EXECUTOR_LIVE_STALL_THREAD_DUMP] call=%llu activeCb=%p activeDw=%u "
+                "activeDraws=%u activeHash=0x%llx builderTotal=%llu builderDraw=%llu",
+                static_cast<unsigned long long>(submit_done_call), active_cb, active.valid_dwords,
+                active.draws, static_cast<unsigned long long>(active.hash),
+                static_cast<unsigned long long>(
+                    g_live_gnm_builder_total.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(
+                    g_live_gnm_builder_draw.load(std::memory_order_relaxed)));
+            executor_lsx4_android_dump_box64_emu_states("live-stall-after-first-submit");
+        }
+    }
+    const auto active_cb =
+        reinterpret_cast<const u32*>(g_live_active_cmdbuf.load(std::memory_order_relaxed));
+    const auto active_size = g_live_active_cmdbuf_size.load(std::memory_order_relaxed);
+    const auto analysis = ExecutorLiveAnalyzeDcb(active_cb, std::min<u32>(active_size, 4096u));
+    const u64 previous_hash = g_live_autosubmitted_hash.load(std::memory_order_relaxed);
+    const bool guest_used_explicit_submit =
+        g_live_submit_calls.load(std::memory_order_relaxed) != 0;
+    const bool jit_active = executor_lsx4_android_runtime_jit_active &&
+                                  executor_lsx4_android_runtime_jit_active() != 0;
+    const bool active_dcb_already_submitted = ExecutorLiveWasExplicitlySubmitted(active_cb, analysis);
+    const bool suppress_active_dcb =
+        jit_active || active_dcb_already_submitted || guest_used_explicit_submit;
+    if (!suppress_active_dcb && active_cb && analysis.draws != 0 &&
+        analysis.valid_dwords != 0 && analysis.hash != previous_hash) {
+        Core::g_executor_render_tid.store(static_cast<int>(gettid()), std::memory_order_relaxed);
+        __android_log_print(
+            ANDROID_LOG_WARN, "LSX4Native",
+            "[EXECUTOR_LIVE_GNM_SUBMITDONE_DRAIN] stage=enter cb=%p validDw=%u draws=%u "
+            "packets=%u hash=0x%llx previous=0x%llx call=%llu",
+            active_cb, analysis.valid_dwords, analysis.draws, analysis.packets,
+            static_cast<unsigned long long>(analysis.hash),
+            static_cast<unsigned long long>(previous_hash),
+            static_cast<unsigned long long>(submit_done_call));
+        const bool presenter_ready = EnsureGnmPresenter("submitdone-drain-active-cb");
+        if (presenter_ready && liverpool) {
+            LOG_INFO(Lib_GnmDriver,
+                     "EXECUTOR_GNM_DRAW api=sceGnmSubmitDoneDrainActiveCb count=1 dwords={} "
+                     "draws={}",
+                     analysis.valid_dwords, analysis.draws);
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_GNM_DRAW] api=sceGnmSubmitDoneDrainActiveCb count=1 dwords=%u draws=%u",
+                analysis.valid_dwords, analysis.draws);
+            __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_SUBMITDONE_DRAIN] stage=before_submitgfx");
+            liverpool->SubmitGfx(std::span<const u32>{active_cb, analysis.valid_dwords}, {});
+            __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_SUBMITDONE_DRAIN] stage=before_waitidle");
+            liverpool->WaitRasterizerIdleForExecutor();
+            g_live_autosubmitted_hash.store(analysis.hash, std::memory_order_relaxed);
+            __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                                "[EXECUTOR_LIVE_GNM_SUBMITDONE_DRAIN] stage=done hash=0x%llx",
+                                static_cast<unsigned long long>(analysis.hash));
+        } else {
+            __android_log_print(
+                ANDROID_LOG_WARN, "LSX4Native",
+                "[EXECUTOR_LIVE_GNM_SUBMITDONE_DRAIN] stage=skip presenterReady=%u liverpool=%u",
+                presenter_ready ? 1u : 0u, liverpool ? 1u : 0u);
+        }
+    }
+#endif
+    if (!WaitGpuIdle("sceGnmSubmitDone")) {
+        send_init_packet = true;
+        return ORBIS_OK;
+    }
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
     liverpool->SubmitDone();
+#ifdef __ANDROID__
+    if (executor_live_dump_posix_sem_records &&
+        (std::getenv("EXECUTOR_TRACE_LIVE_SYNC") ||
+         std::getenv("EXECUTOR_TRACE_LIVE_WIDE"))) {
+        executor_live_dump_posix_sem_records("gnm-submitdone-after-submitdone");
+    }
+#endif
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();
+#ifdef __ANDROID__
+#endif
+#ifdef __ANDROID__
+    if (submit_done_log) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_LIVE_GNM_SUBMIT_DONE] call=%llu stage=return frames=%llu",
+                            static_cast<unsigned long long>(submit_done_call),
+                            static_cast<unsigned long long>(frames_submitted));
+    }
+    if (std::getenv("EXECUTOR_TRACE_LIVE_EMU_DUMP") &&
+        executor_lsx4_android_dump_box64_emu_states) {
+        executor_lsx4_android_dump_box64_emu_states("gnm-submitdone-return");
+    }
+#endif
     return ORBIS_OK;
 }
 
@@ -2331,19 +4168,16 @@ int PS4_SYSV_ABI sceGnmUnmapComputeQueue(u32 vqid) {
 
 int PS4_SYSV_ABI sceGnmUnregisterAllResourcesForOwner() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmUnregisterOwnerAndResources() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmUnregisterResource() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
@@ -2364,9 +4198,9 @@ s32 PS4_SYSV_ABI sceGnmUpdateGsShader(u32* cmdbuf, u32 size, const u32* gs_regs)
         return -1;
     }
 
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x88u, gs_regs[0], 0u); // SPI_SHADER_PGM_LO_GS
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x88u, gs_regs[0], 0u);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x8au, gs_regs[2],
-                                     gs_regs[3]); // SPI_SHADER_PGM_RSRC1_GS/SPI_SHADER_PGM_RSRC2_GS
+                                     gs_regs[3]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e02e5u,
                                            gs_regs[4]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e029bu,
@@ -2396,16 +4230,16 @@ int PS4_SYSV_ABI sceGnmUpdateHsShader(u32* cmdbuf, u32 size, const u32* hs_regs,
     }
 
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x108u, hs_regs[0],
-                                     0u); // SPI_SHADER_PGM_LO_HS/SPI_SHADER_PGM_HI_HS
+                                     0u);
     cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x10au, hs_regs[2],
-                                     hs_regs[3]); // SPI_SHADER_PGM_RSRC1_HS/SPI_SHADER_PGM_RSRC1_LS
+                                     hs_regs[3]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(
         cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e0286u, hs_regs[5],
-        hs_regs[6]); // VGT_HOS_MAX_TESS_LEVEL/VGT_HOS_MIN_TESS_LEVEL update
+        hs_regs[6]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e02dbu,
-                                           hs_regs[4]); // VGT_TF_PARAM update
+                                           hs_regs[4]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e02d6u,
-                                           ls_hs_config); // VGT_LS_HS_CONFIG update
+                                           ls_hs_config);
 
     WriteTrailingNop<11>(cmdbuf);
     return ORBIS_OK;
@@ -2419,9 +4253,9 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
     }
     if (!ps_regs) {
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+                                         0u);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e0203u,
-                                               0u); // DB_SHADER_CONTROL update
+                                               0u);
         WriteTrailingNop<0x20>(cmdbuf);
     } else {
         if (ps_regs[1] != 0) {
@@ -2430,24 +4264,24 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader(u32* cmdbuf, u32 size, const u32* ps_regs)
         }
 
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+                                         0u);
         cmdbuf =
             PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2],
-                                    ps_regs[3]); // SPI_SHADER_PGM_RSRC1_PS/SPI_SHADER_PGM_RSRC2_PS
+                                    ps_regs[3]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(
             cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01c4u, ps_regs[4],
-            ps_regs[5]); // SPI_SHADER_Z_FORMAT/SPI_SHADER_COL_FORMAT update
+            ps_regs[5]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(
             cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b3u, ps_regs[6],
-            ps_regs[7]); // SPI_PS_INPUT_ENA/SPI_PS_INPUT_ADDR update
+            ps_regs[7]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b6u,
-                                               ps_regs[8]); // SPI_PS_IN_CONTROL update
+                                               ps_regs[8]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b8u,
-                                               ps_regs[9]); // SPI_BARYC_CNTL update
+                                               ps_regs[9]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e0203u,
-                                               ps_regs[10]); // DB_SHADER_CONTROL update
+                                               ps_regs[10]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e008fu,
-                                               ps_regs[11]); // CB_SHADER_MASK update
+                                               ps_regs[11]);
 
         WriteTrailingNop<11>(cmdbuf);
     }
@@ -2462,10 +4296,10 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
     }
     if (!ps_regs) {
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, 0u,
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+                                         0u);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e0203u,
-                                               0u);                 // DB_SHADER_CONTROL update
-        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, 0xfu); // CB_SHADER_MASK
+                                               0u);
+        cmdbuf = PM4CmdSetData::SetContextReg(cmdbuf, 0x8fu, 0xfu);
 
         WriteTrailingNop<0x1d>(cmdbuf);
     } else {
@@ -2475,24 +4309,24 @@ s32 PS4_SYSV_ABI sceGnmUpdatePsShader350(u32* cmdbuf, u32 size, const u32* ps_re
         }
 
         cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 8u, ps_regs[0],
-                                         0u); // SPI_SHADER_PGM_LO_PS/SPI_SHADER_PGM_HI_PS
+                                         0u);
         cmdbuf =
             PM4CmdSetData::SetShReg(cmdbuf, 10u, ps_regs[2],
-                                    ps_regs[3]); // SPI_SHADER_PGM_RSRC1_PS/SPI_SHADER_PGM_RSRC2_PS
+                                    ps_regs[3]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(
             cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01c4u, ps_regs[4],
-            ps_regs[5]); // SPI_SHADER_Z_FORMAT/SPI_SHADER_COL_FORMAT update
+            ps_regs[5]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(
             cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b3u, ps_regs[6],
-            ps_regs[7]); // SPI_PS_INPUT_ENA/SPI_PS_INPUT_ADDR update
+            ps_regs[7]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b6u,
-                                               ps_regs[8]); // SPI_PS_IN_CONTROL update
+                                               ps_regs[8]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b8u,
-                                               ps_regs[9]); // SPI_BARYC_CNTL update
+                                               ps_regs[9]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e0203u,
-                                               ps_regs[10]); // DB_SHADER_CONTROL update
+                                               ps_regs[10]);
         cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e008fu,
-                                               ps_regs[11]); // CB_SHADER_MASK update
+                                               ps_regs[11]);
 
         WriteTrailingNop<11>(cmdbuf);
     }
@@ -2524,14 +4358,14 @@ s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
 
     const u32 var =
         shader_modifier == 0 ? vs_regs[2] : ((vs_regs[2] & 0xfcfffc3f) | shader_modifier);
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x48u, vs_regs[0], 0u);  // SPI_SHADER_PGM_LO_VS
-    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x4au, var, vs_regs[3]); // SPI_SHADER_PGM_RSRC1_VS
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x48u, vs_regs[0], 0u);
+    cmdbuf = PM4CmdSetData::SetShReg(cmdbuf, 0x4au, var, vs_regs[3]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e0207u,
-                                           vs_regs[6]); // PA_CL_VS_OUT_CNTL update
+                                           vs_regs[6]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01b1u,
-                                           vs_regs[4]); // PA_CL_VS_OUT_CNTL update
+                                           vs_regs[4]);
     cmdbuf = WritePacket<PM4ItOpcode::Nop>(cmdbuf, PM4ShaderType::ShaderGraphics, 0xc01e01c3u,
-                                           vs_regs[5]); // PA_CL_VS_OUT_CNTL update
+                                           vs_regs[5]);
 
     WriteTrailingNop<11>(cmdbuf);
     return ORBIS_OK;
@@ -2539,285 +4373,369 @@ s32 PS4_SYSV_ABI sceGnmUpdateVsShader(u32* cmdbuf, u32 size, const u32* vs_regs,
 
 s32 PS4_SYSV_ABI sceGnmValidateCommandBuffers() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateDisableDiagnostics() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateDisableDiagnostics2() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateDispatchCommandBuffers() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateDrawCommandBuffers() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateGetDiagnosticInfo() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateGetDiagnostics() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidateGetVersion() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return 0;
 }
 
 bool PS4_SYSV_ABI sceGnmValidateOnSubmitEnabled() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return false;
 }
 
 int PS4_SYSV_ABI sceGnmValidateResetState() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceGnmValidationRegisterMemoryCheckCallback() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_VALIDATION_NOT_ENABLED;
 }
 
 int PS4_SYSV_ABI sceRazorCaptureCommandBuffersOnlyImmediate() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_CAPTURE_FAILED_INTERNAL;
 }
 
 int PS4_SYSV_ABI sceRazorCaptureCommandBuffersOnlySinceLastFlip() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_CAPTURE_FAILED_INTERNAL;
 }
 
 int PS4_SYSV_ABI sceRazorCaptureImmediate() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_CAPTURE_FAILED_INTERNAL;
 }
 
 int PS4_SYSV_ABI sceRazorCaptureSinceLastFlip() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_CAPTURE_FAILED_INTERNAL;
 }
 
 bool PS4_SYSV_ABI sceRazorIsLoaded() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return false;
 }
 
 int PS4_SYSV_ABI Func_063D065A2D6359C3() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_063D065A2D6359C3");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_0CABACAFB258429D() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_0CABACAFB258429D");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_150CF336FC2E99A3() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_150CF336FC2E99A3");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_17CA687F9EE52D49() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_17CA687F9EE52D49");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_1870B89F759C6B45() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_1870B89F759C6B45");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_26F9029EF68A955E() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_26F9029EF68A955E");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_301E3DBBAB092DB0() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_301E3DBBAB092DB0");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_30BAFE172AF17FEF() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_30BAFE172AF17FEF");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_3E6A3E8203D95317() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_3E6A3E8203D95317");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_40FEEF0C6534C434() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_40FEEF0C6534C434");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_416B9079DE4CBACE() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_416B9079DE4CBACE");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_4774D83BB4DDBF9A() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_4774D83BB4DDBF9A");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_50678F1CCEEB9A00() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_50678F1CCEEB9A00");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_54A2EC5FA4C62413() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_54A2EC5FA4C62413");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_5A9C52C83138AE6B() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_5A9C52C83138AE6B");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_5D22193A31EA1142() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_5D22193A31EA1142");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_725A36DEBB60948D() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_725A36DEBB60948D");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_8021A502FA61B9BB() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_8021A502FA61B9BB");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_9D002FE0FA40F0E6() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_9D002FE0FA40F0E6");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_9D297F36A7028B71() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_9D297F36A7028B71");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_A2D7EC7A7BCF79B3() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_A2D7EC7A7BCF79B3");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_AA12A3CB8990854A() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_AA12A3CB8990854A");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_ADC8DDC005020BC6() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_ADC8DDC005020BC6");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_B0A8688B679CB42D() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_B0A8688B679CB42D");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_B489020B5157A5FF() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_B489020B5157A5FF");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_BADE7B4C199140DD() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_BADE7B4C199140DD");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_D1511B9DCFFB3DD9() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_D1511B9DCFFB3DD9");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_D53446649B02E58E() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_D53446649B02E58E");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_D8B6E8E28E1EF0A3() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_D8B6E8E28E1EF0A3");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_D93D733A19DD7454() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_D93D733A19DD7454");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_DE995443BC2A8317() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_DE995443BC2A8317");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_DF6E9528150C23FF() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_DF6E9528150C23FF");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_ECB4C6BA41FE3350() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_ECB4C6BA41FE3350");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmDebugModuleReset() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmDebugReset() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI Func_C4C328B7CF3B4171() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_C4C328B7CF3B4171");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalCommand(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (sdk_version >= Common::ElfInfo::FW_400) {
+    if (sdk_version >= Common::ElfInfo::FW_40) {
         return sceGnmDrawInitToDefaultContextState400(cmdbuf, size);
     }
     return sceGnmDrawInitToDefaultContextState(cmdbuf, size);
@@ -2825,7 +4743,7 @@ int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalCommand(u32* cmdbuf,
 
 int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalSize() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    if (sdk_version >= Common::ElfInfo::FW_400) {
+    if (sdk_version >= Common::ElfInfo::FW_40) {
         return 0x100;
     }
     return 0x20;
@@ -2833,43 +4751,55 @@ int PS4_SYSV_ABI sceGnmDrawInitToDefaultContextStateInternalSize() {
 
 int PS4_SYSV_ABI sceGnmFindResources() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmGetResourceRegistrationBuffers() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI sceGnmRegisterOwnerForSystem() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    // Not available in retail firmware
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
 int PS4_SYSV_ABI Func_1C43886B16EE5530() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_1C43886B16EE5530");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_81037019ECCD0E01() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_81037019ECCD0E01");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_BFB41C057478F0BF() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_BFB41C057478F0BF");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_E51D44DB8151238C() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_E51D44DB8151238C");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI Func_F916890425496553() {
+#ifdef __ANDROID__
+    ExecutorLiveGnmUnknownLog("Func_F916890425496553");
+#endif
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -2877,14 +4807,31 @@ int PS4_SYSV_ABI Func_F916890425496553() {
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
     liverpool = std::make_unique<AmdGpu::Liverpool>();
+#if defined(__ANDROID__) && defined(EXECUTOR_ANDROID_NATIVE_CORE_PROBE_NO_DESKTOP_MEDIA_USB)
+    const bool jit_active = executor_lsx4_android_runtime_jit_active &&
+                                  executor_lsx4_android_runtime_jit_active() != 0;
+    if (jit_active) {
+        Config::setCopyGPUCmdBuffers(true);
+        presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+        LOG_INFO(Lib_GnmDriver,
+                 "EXECUTOR_VULKAN_WSI phase=presenter_eager result=OK "
+                 "reason=jit_reference");
+    } else {
+    LOG_INFO(Lib_GnmDriver,
+             "EXECUTOR_VULKAN_WSI phase=presenter_deferred result=lazy "
+             "reason=avoid_piglet_surface_conflict windowBridgeReady={}",
+             g_window != nullptr ? "YES" : "NO");
+    }
+#else
     presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+#endif
 
     const s32 result = sceKernelGetCompiledSdkVersion(&sdk_version);
     if (result != ORBIS_OK) {
         sdk_version = 0;
     }
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    if (Config::copyGPUCmdBuffers()) {
         liverpool->ReserveCopyBufferSpace();
     }
 
@@ -3251,4 +5198,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  Func_BADE7B4C199140DD);
 };
 
-} // namespace Libraries::GnmDriver
+}

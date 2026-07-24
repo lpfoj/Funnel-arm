@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <map>
 #include <mutex>
-#include <thread>
 #include <queue>
+#include <thread>
 
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -18,9 +20,48 @@ namespace tracy {
 class VkCtxScope;
 }
 
+namespace Libraries::GnmDriver {
+bool ExecutorReplayActive();
+}
+
 namespace Vulkan {
 
 class Instance;
+
+#ifdef __ANDROID__
+enum class ExecutorVkJournalDrawType : u32 {
+    Direct = 1,
+    IndexedDirect = 2,
+    Indirect = 3,
+    IndexedIndirect = 4,
+};
+
+u64 ExecutorVkJournalGraphicsDraw(const void* stream, u64 tick, u64 pipeline_key_hash,
+                                  u64 pipeline_handle, u64 vs_hash, u64 ps_hash,
+                                  ExecutorVkJournalDrawType draw_type, u32 primitive_type,
+                                  u32 element_count,
+                                  u32 instance_count, u32 max_draw_count, u32 stride,
+                                  VAddr argument_address, VAddr count_address,
+                                  VAddr color_address, VAddr depth_address,
+                                  u64 attachment_signature, u32 color_attachment_count,
+                                  u32 color_width, u32 color_height, u32 color_format,
+                                  u32 depth_format, u32 descriptor_writes,
+                                  u32 buffer_descriptors, u32 image_descriptors,
+                                  bool force_record = false) noexcept;
+void ExecutorVkJournalComputeDispatch(const void* stream, u64 tick, u64 pipeline_key_hash,
+                                      u64 pipeline_handle, u64 cs_hash, bool indirect,
+                                      u32 dim_x, u32 dim_y, u32 dim_z,
+                                      VAddr argument_address, u32 descriptor_writes,
+                                      u32 buffer_descriptors, u32 image_descriptors,
+                                      bool force_record = false) noexcept;
+void ExecutorVkJournalSubmit(const void* stream, u64 tick, bool completed,
+                             vk::Result result) noexcept;
+void ExecutorVkJournalArmContentProbe(const void* stream, u64 journal_sequence,
+                                      u64 selected_draw_sequence, u64 fragment_hash) noexcept;
+void ExecutorVkJournalArmFrameCapture(u64 epoch) noexcept;
+void ExecutorVkJournalFinishFrameCapture(u64 epoch) noexcept;
+void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept;
+#endif
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -55,15 +96,19 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 3> wait_semas;
     std::array<u64, 3> wait_ticks;
+    std::array<vk::PipelineStageFlags, 3> wait_stage_masks;
     std::array<vk::Semaphore, 3> signal_semas;
     std::array<u64, 3> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1,
+                 vk::PipelineStageFlags stage_mask = vk::PipelineStageFlagBits::eAllCommands) {
+        ASSERT(num_wait_semas < wait_semas.size());
         wait_semas[num_wait_semas] = semaphore;
-        wait_ticks[num_wait_semas++] = tick;
+        wait_ticks[num_wait_semas] = tick;
+        wait_stage_masks[num_wait_semas++] = stage_mask;
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
@@ -124,6 +169,7 @@ struct DynamicState {
         bool color_write_masks : 1;
         bool line_width : 1;
         bool feedback_loop_enabled : 1;
+        bool fragment_shading_rate : 1;
     } dirty_state{};
 
     Viewports viewports{};
@@ -161,13 +207,17 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+    u64 invalidation_epoch{};
 
-    /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
 
-    /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        ++invalidation_epoch;
+    }
+
+    [[nodiscard]] u64 InvalidationEpoch() const noexcept {
+        return invalidation_epoch;
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -347,56 +397,83 @@ struct DynamicState {
 
 class Scheduler {
 public:
+    enum class ExecutorFinishReason : u32 {
+        Unknown,
+        BufferReadbackWave,
+        BufferReadbackDirect,
+        BufferProbe,
+        TextureReadback,
+        TextureProbe,
+        Rasterizer,
+        PresenterShutdown,
+        Count,
+    };
+
     explicit Scheduler(const Instance& instance);
     ~Scheduler();
 
-    /// Sends the current execution context to the GPU
-    /// and increments the scheduler timeline semaphore.
     void Flush(SubmitInfo& info);
 
-    /// Sends the current execution context to the GPU
-    /// and increments the scheduler timeline semaphore.
     void Flush();
 
-    /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(ExecutorFinishReason reason = ExecutorFinishReason::Unknown);
 
-    /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
-    /// Attempts to execute operations whose tick the GPU has caught up with.
-    void PopPendingOperations();
+    void WaitRetirement(u64 tick);
 
-    /// Starts a new rendering scope with provided state.
+    void PopPendingOperations(bool force = false, bool timeline_current = false);
+
     void BeginRendering(const RenderState& new_state);
 
-    /// Ends current rendering scope.
     void EndRendering();
 
-    /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
     }
 
-    /// Returns the current pipeline dynamic state tracking.
+    u64 RenderingEpoch() const {
+        return rendering_epoch;
+    }
+
     DynamicState& GetDynamicState() {
         return dynamic_state;
     }
 
-    /// Returns the current command buffer and marks it as carrying recorded work, which lets
-    /// Flush/Finish skip submitting untouched command buffers.
     vk::CommandBuffer CommandBuffer() const {
         command_buffer_used = true;
+        command_recording_epoch.fetch_add(1, std::memory_order_relaxed);
         return current_cmdbuf;
     }
 
-    /// Returns the current command buffer tick.
+    vk::CommandBuffer CommandBuffer(u64& access_epoch) const {
+        command_buffer_used = true;
+        access_epoch =
+            command_recording_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+        return current_cmdbuf;
+    }
+
+    [[nodiscard]] u64 CommandRecordingEpoch() const noexcept {
+        return command_recording_epoch.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore.CurrentTick();
     }
 
-    /// Returns true when a tick has been triggered by the GPU.
+    [[nodiscard]] bool HasPendingWork() const noexcept {
+        return command_buffer_used ||
+               pending_ops_count.load(std::memory_order_acquire) != 0;
+    }
+
+    [[nodiscard]] bool IsDeviceLost() const noexcept {
+        return master_semaphore.IsDeviceLost();
+    }
+
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
+        if (master_semaphore.IsDeviceLost()) {
+            return false;
+        }
         if (master_semaphore.IsFree(tick)) {
             return true;
         }
@@ -404,39 +481,50 @@ public:
         return master_semaphore.IsFree(tick);
     }
 
-    /// Returns the master timeline semaphore.
     [[nodiscard]] MasterSemaphore* GetMasterSemaphore() noexcept {
         return &master_semaphore;
     }
 
-    /// Defers an operation until the gpu has reached the current cpu tick.
-    /// Will be run when submitting or calling PopPendingOperations.
+    void MarkTerminal(vk::Result result, const char* where) noexcept;
+
     void DeferOperation(Common::UniqueFunction<void>&& func) {
+        std::scoped_lock lk{pending_ops_mutex};
         pending_ops.emplace(std::move(func), CurrentTick());
+        const u64 previous_count =
+            pending_ops_count.fetch_add(1, std::memory_order_release);
+        if (previous_count == 0) {
+            pending_ops_poll_sequence.store(0, std::memory_order_relaxed);
+        }
     }
 
-    /// Defers an operation until the gpu has reached the current cpu tick.
-    /// Runs as soon as possible in another thread.
-    void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
-        {
-            std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
-        }
-        priority_pending_ops_cv.notify_one();
-    }
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func);
+
+    void DeferPriorityOperationAt(u64 gpu_tick, Common::UniqueFunction<void>&& func);
 
     static std::mutex submit_mutex;
 
 private:
+    enum class ExecutorSubmitKind : u32 {
+        FlushInfo,
+        FlushPlain,
+        Finish,
+        WaitCurrent,
+        Count,
+    };
+
     void AllocateWorkerCommandBuffers();
 
-    void SubmitExecution(SubmitInfo& info);
+    void SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
+                         ExecutorFinishReason finish_reason = ExecutorFinishReason::Unknown);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+    void RetirementPendingOpsThread(std::stop_token stoken);
 
 private:
     const Instance& instance;
     MasterSemaphore master_semaphore;
+    mutable bool command_buffer_used{};
+    mutable std::atomic<u64> command_recording_epoch{};
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
@@ -445,18 +533,38 @@ private:
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
     };
-    // Consumers fetch the command buffer through CommandBuffer() (also from const contexts), so
-    // the recorded-work marker is mutable. True initially: the constructor-begun buffer predates
-    // the marker and must submit as before.
-    mutable bool command_buffer_used{true};
     std::queue<PendingOp> pending_ops;
+    std::atomic<u64> pending_ops_count{};
+    std::atomic<u32> pending_ops_poll_sequence{};
+    std::mutex pending_ops_mutex;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
+    std::map<u64, std::queue<PendingOp>> retirement_pending_ops;
+    std::map<u64, u64> retirement_outstanding_ops;
+    std::mutex retirement_pending_ops_mutex;
+    std::condition_variable_any retirement_pending_ops_cv;
+    std::jthread retirement_pending_ops_thread;
+    std::atomic<u64> retirement_completed_tick{};
+#ifdef __ANDROID__
+    std::array<u64, static_cast<std::size_t>(ExecutorSubmitKind::Count)>
+        executor_submit_kind_counts{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_reason_counts{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_wait_counts{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_wait_ns{};
+    std::array<u64, static_cast<std::size_t>(ExecutorFinishReason::Count)>
+        executor_finish_wait_max_ns{};
+    u64 executor_finish_wait_total{};
+    u64 executor_submit_kind_total{};
+#endif
     RenderState render_state;
+    u64 rendering_epoch{};
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
 };
 
-} // namespace Vulkan
+}

@@ -8,9 +8,6 @@
 
 namespace Shader {
 
-/**
- * Compilation parameters used to identify and locate a guest shader program.
- */
 struct ShaderParams {
     static constexpr u32 NumShaderUserData = 16;
 
@@ -23,4 +20,4 @@ struct ShaderParams {
     }
 };
 
-} // namespace Shader
+}

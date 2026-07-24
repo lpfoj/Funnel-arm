@@ -46,4 +46,4 @@ Id EmitGroupAny(EmitContext& ctx, Id bit) {
     return ctx.OpGroupNonUniformAny(ctx.U1[1], SubgroupScope(ctx), bit);
 }
 
-} // namespace Shader::Backend::SPIRV
+}

@@ -117,7 +117,7 @@ void DebugStateImpl::PushQueueDump(QueueDump dump) {
     ASSERT(DumpingCurrentFrame());
     std::unique_lock lock{frame_dump_list_mutex};
     auto& frame = GetFrameDump();
-    { // Find draw calls
+    {
         auto data = std::span{dump.data};
         auto initial_data = data.data();
         while (!data.empty()) {

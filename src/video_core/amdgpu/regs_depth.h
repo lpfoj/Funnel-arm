@@ -265,7 +265,7 @@ struct DepthBuffer {
     }
 
     u32 NumSamples() const {
-        return 1u << z_info.num_samples; // spec doesn't say it is a log2
+        return 1u << z_info.num_samples;
     }
 
     u32 NumBits() const {
@@ -274,7 +274,7 @@ struct DepthBuffer {
 
     u32 GetDepthSliceSize() const {
         ASSERT(z_info.format != ZFormat::Invalid);
-        const auto bpe = NumBits() >> 3; // in bytes
+        const auto bpe = NumBits() >> 3;
         return (depth_slice.tile_max + 1) * 64 * bpe * NumSamples();
     }
 
@@ -288,4 +288,4 @@ struct DepthBuffer {
     }
 };
 
-} // namespace AmdGpu
+}

@@ -10,11 +10,6 @@
 
 namespace VideoCore {
 
-/**
- * @brief All classes of format compatibility according to the Vulkan specification
- * @url
- * https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/d37c676f/layers/generated/vk_format_utils.h#L47-L131
- */
 enum class CompatibilityClass {
     NONE = 0,
     _128BIT = 1 << 0,
@@ -45,13 +40,6 @@ enum class CompatibilityClass {
 };
 DECLARE_ENUM_FLAG_OPERATORS(CompatibilityClass)
 
-/**
- * @brief The format compatibility class according to the Vulkan specification
- * @url
- * https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#formats-compatibility-classes
- * @url
- * https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/d37c676f/layers/generated/vk_format_utils.cpp#L70-L812
- */
 static const std::unordered_map<vk::Format, CompatibilityClass> FORMAT_TABLE = {
     {vk::Format::eA1R5G5B5UnormPack16, CompatibilityClass::_16BIT},
     {vk::Format::eA2B10G10R10SintPack32, CompatibilityClass::_32BIT},
@@ -217,4 +205,4 @@ bool IsVulkanFormatCompatible(vk::Format base, vk::Format view) {
     return (base_comp & view_comp) == view_comp;
 }
 
-} // namespace VideoCore
+}

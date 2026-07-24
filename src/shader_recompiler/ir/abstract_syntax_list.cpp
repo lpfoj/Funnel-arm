@@ -41,4 +41,4 @@ std::string DumpASLNode(const AbstractSyntaxNode& node,
     UNREACHABLE();
 }
 
-} // namespace Shader::IR
+}

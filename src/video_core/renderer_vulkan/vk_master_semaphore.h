@@ -28,8 +28,13 @@ public:
         return gpu_tick.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] bool IsDeviceLost() const noexcept {
+        return device_lost.load(std::memory_order_acquire) ||
+               device_terminal.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
-        return KnownGpuTick() >= tick;
+        return !IsDeviceLost() && KnownGpuTick() >= tick;
     }
 
     [[nodiscard]] u64 NextTick() noexcept {
@@ -40,17 +45,26 @@ public:
         return semaphore.get();
     }
 
-    /// Refresh the known GPU tick
     void Refresh();
 
-    /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
+
+    void MarkDeviceLost(vk::Result result, const char* where) noexcept;
+
+    void MarkTerminal(vk::Result result, const char* where) noexcept;
+
+    [[nodiscard]] static bool IsDeviceTerminal() noexcept {
+        return device_terminal.load(std::memory_order_acquire);
+    }
 
 protected:
     const Instance& instance;
-    vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.
-    std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
-    std::atomic<u64> current_tick{1}; ///< Current logical tick.
+    vk::UniqueSemaphore semaphore;
+    std::atomic<u64> gpu_tick{0};
+    std::atomic<u64> current_tick{1};
+    std::atomic_bool device_lost{false};
+    static std::atomic_bool device_terminal;
+    static std::atomic<u32> live_instances;
 };
 
-} // namespace Vulkan
+}

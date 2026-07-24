@@ -216,4 +216,4 @@ void RegisterReprojection(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("oxoDINgOrZk", "libSceHmd", 1, "libSceHmd", Func_A31A0320D80EAD99);
     LIB_FUNCTION("uab6BzXsfkk", "libSceHmd", 1, "libSceHmd", Func_B9A6FA0735EC7E49);
 }
-} // namespace Libraries::Hmd
+}

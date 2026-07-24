@@ -10,7 +10,6 @@
 namespace Shader::IR {
 
 enum class Attribute : u64 {
-    // Export targets
     RenderTarget0 = 0,
     RenderTarget1 = 1,
     RenderTarget2 = 2,
@@ -57,7 +56,6 @@ enum class Attribute : u64 {
     Param29 = 61,
     Param30 = 62,
     Param31 = 63,
-    // System values
     ClipDistance = 64,
     CullDistance = 65,
     RenderTargetIndex = 66,
@@ -80,11 +78,11 @@ enum class Attribute : u64 {
     BaryCoordSmoothCentroid = 83,
     BaryCoordSmoothSample = 84,
     BaryCoordPullModel = 85,
-    InvocationId = 86, // TCS id in output patch and instanced geometry shader id
+    InvocationId = 86,
     PatchVertices = 87,
     TessellationEvaluationPointU = 88,
     TessellationEvaluationPointV = 89,
-    PackedHullInvocationInfo = 90, // contains patch id within the VGT and invocation ID
+    PackedHullInvocationInfo = 90,
     OffChipLdsBase = 91,
     TessFactorsBufferBase = 92,
     PointSize = 93,
@@ -133,7 +131,7 @@ constexpr bool IsBarycentricCoord(Attribute attribute) noexcept {
     return static_cast<Attribute>(result);
 }
 
-} // namespace Shader::IR
+}
 
 template <>
 struct fmt::formatter<Shader::IR::Attribute> {

@@ -97,4 +97,4 @@ struct BufferCopy {
     std::size_t size;
 };
 
-} // namespace VideoCore
+}

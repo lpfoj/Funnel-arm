@@ -49,6 +49,25 @@ static inline u64 FencedRDTSC() {
 }
 #endif
 
+static inline u64 RelaxedRDTSC() {
+#ifdef ARCH_X86_64
+#ifdef _MSC_VER
+    return __rdtsc();
+#else
+    u32 eax;
+    u32 edx;
+    asm volatile("rdtsc" : "=a"(eax), "=d"(edx));
+    return (static_cast<u64>(edx) << 32) | eax;
+#endif
+#elif defined(ARCH_ARM64)
+    u64 ret;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(ret));
+    return ret;
+#else
+#error "Missing RelaxedRDTSC() implementation for target CPU architecture."
+#endif
+}
+
 u64 EstimateRDTSCFrequency();
 
-} // namespace Common
+}

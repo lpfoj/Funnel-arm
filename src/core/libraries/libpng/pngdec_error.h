@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// PngDec library
 constexpr int ORBIS_PNG_DEC_ERROR_INVALID_ADDR = 0x80690001;
 constexpr int ORBIS_PNG_DEC_ERROR_INVALID_SIZE = 0x80690002;
 constexpr int ORBIS_PNG_DEC_ERROR_INVALID_PARAM = 0x80690003;

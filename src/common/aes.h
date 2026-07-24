@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <vector>
 
-/** AES cipher APIs */
 namespace aes {
 namespace detail {
 
@@ -18,7 +17,6 @@ const int kWordSize = 4;
 typedef unsigned int Word;
 
 const int kBlockSize = 4;
-/** @private */
 struct State {
     Word w[4];
     Word& operator[](const int index) {
@@ -29,7 +27,7 @@ struct State {
     }
 };
 
-const int kStateSize = 16; // Word * BlockSize
+const int kStateSize = 16;
 typedef State RoundKey;
 typedef std::vector<RoundKey> RoundKeys;
 
@@ -131,7 +129,7 @@ inline unsigned char mul2(const unsigned char b) {
 inline unsigned char mul(const unsigned char b, const unsigned char m) {
     unsigned char v = 0;
     unsigned char t = b;
-    for (int i = 0; i < 8; ++i) { // 8-bits
+    for (int i = 0; i < 8; ++i) {
         if ((m >> i) & 0x01) {
             v ^= t;
         }
@@ -182,10 +180,6 @@ inline Word rot_word(const Word v) {
     return ((v >> 8) & 0x00FFFFFF) | ((v & 0xFF) << 24);
 }
 
-/**
- * @private
- * @throws std::invalid_argument
- */
 inline unsigned int get_round_count(const int key_size) {
     switch (key_size) {
     case 16:
@@ -199,10 +193,6 @@ inline unsigned int get_round_count(const int key_size) {
     }
 }
 
-/**
- * @private
- * @throws std::invalid_argument
- */
 inline RoundKeys expand_key(const unsigned char* key, const int key_size) {
     if (key_size != 16 && key_size != 24 && key_size != 32) {
         throw std::invalid_argument("Invalid key size");
@@ -256,7 +246,6 @@ inline void xor_data(unsigned char data[kStateSize], const unsigned char v[kStat
     }
 }
 
-/** increment counter (128-bit int) by 1 */
 inline void incr_counter(unsigned char counter[kStateSize]) {
     unsigned n = kStateSize, c = 1;
     do {
@@ -329,33 +318,8 @@ namespace gcm {
 const int kBlockBitSize = 128;
 const int kBlockByteSize = kBlockBitSize / 8;
 
-/**
- * @private
- * GCM operation unit as bit.
- * This library handles 128 bit little endian bit array.
- * e.g. 0^127 || 1 == "000...0001" (bit string) == 1
- */
 typedef std::bitset<kBlockBitSize> bitset128;
 
-/**
- * @private
- * GCM operation unit.
- * Little endian byte array
- *
- * If bitset128 is 1: 0^127 || 1 == "000...0001" (bit string) == 1
- * byte array is 0x00, 0x00, 0x00 ... 0x01 (low -> high).
- * Byte array is NOT 0x01, 0x00 ... 0x00.
- *
- * This library handles GCM bit string in two ways.
- * One is an array of bitset, which is a little endian 128-bit array's array.
- *
- * <- first byte
- * bitset128 || bitset128 || bitset128...
- *
- * The other one is a byte array.
- * <- first byte
- * byte || byte || byte...
- */
 class Block {
 public:
     Block() {
@@ -370,7 +334,7 @@ public:
         init_v(&bytes[0], bytes.size());
     }
 
-    Block(const std::bitset<128>& bits); // implementation below
+    Block(const std::bitset<128>& bits);
 
     inline unsigned char* data() {
         return v_;
@@ -411,14 +375,12 @@ private:
     }
 };
 
-// Workaround for clang optimization in 32-bit build via Visual Studio producing incorrect results
-// (https://github.com/kkAyataka/plusaes/issues/43)
 #if defined(__clang__) && defined(_WIN32) && !defined(_WIN64)
 #pragma optimize("", off)
 #endif
 inline Block::Block(const std::bitset<128>& bits) {
     init_v(0, 0);
-    const std::bitset<128> mask(0xFF); // 1 byte mask
+    const std::bitset<128> mask(0xFF);
     for (std::size_t i = 0; i < 16; ++i) {
         v_[15 - i] = static_cast<unsigned char>(((bits >> (i * 8)) & mask).to_ulong());
     }
@@ -462,10 +424,7 @@ std::bitset<N> inc32(const std::bitset<N> X) {
 
     const auto a = msb<N - S>(X);
     const std::bitset<S> b(
-        (lsb<S>(X).to_ulong() + 1)); // % (2^32);
-                                     // lsb<32> is low 32-bit value
-                                     // Spec.'s "mod 2^S" is not necessary when S is 32 (inc32).
-                                     // ...and 2^32 is over 32-bit integer.
+        (lsb<S>(X).to_ulong() + 1));
 
     return a || b;
 }
@@ -473,9 +432,8 @@ std::bitset<N> inc32(const std::bitset<N> X) {
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wself-assign"
-#endif // __clang__
+#endif
 
-/** Algorithm 1 @private */
 inline Block mul_blocks(const Block X, const Block Y) {
     const bitset128 R = (std::bitset<8>("11100001") || std::bitset<120>());
 
@@ -483,14 +441,12 @@ inline Block mul_blocks(const Block X, const Block Y) {
     bitset128 Z;
     bitset128 V = Y.to_bits();
     for (int i = 127; i >= 0; --i) {
-        // Z
         if (X_bits[i] == false) {
             Z = Z;
         } else {
             Z = Z ^ V;
         }
 
-        // V
         if (V[0] == false) {
             V = V >> 1;
         } else {
@@ -503,9 +459,8 @@ inline Block mul_blocks(const Block X, const Block Y) {
 
 #ifdef __clang__
 #pragma clang diagnostic pop
-#endif // __clang__
+#endif
 
-/** Algorithm 2 @private */
 inline Block ghash(const Block& H, const std::vector<unsigned char>& X) {
     const std::size_t m = X.size() / kBlockByteSize;
     Block Ym;
@@ -527,7 +482,6 @@ std::bitset<N> make_bitset(const unsigned char* bytes, const std::size_t bytes_s
     return bits;
 }
 
-/** Algorithm 3 @private */
 inline std::vector<unsigned char> gctr(const detail::RoundKeys& rkeys, const Block& ICB,
                                        const unsigned char* X, const std::size_t X_size) {
     if (!X || X_size == 0) {
@@ -538,22 +492,19 @@ inline std::vector<unsigned char> gctr(const detail::RoundKeys& rkeys, const Blo
 
         Block CB;
         for (std::size_t i = 0; i < n; ++i) {
-            // CB
-            if (i == 0) { // first
+            if (i == 0) {
                 CB = ICB;
             } else {
                 CB = inc32(CB.to_bits());
             }
 
-            // CIPH
             Block eCB;
             encrypt_state(rkeys, CB.data(), eCB.data());
 
-            // Y
             int op_size = 0;
             if (i < n - 1) {
                 op_size = kBlockByteSize;
-            } else { // last
+            } else {
                 op_size = (X_size % kBlockByteSize) ? (X_size % kBlockByteSize) : kBlockByteSize;
             }
             const Block Yi = Block(X + i * kBlockBitSize / 8, op_size) ^ eCB;
@@ -570,7 +521,7 @@ inline void push_back(std::vector<unsigned char>& bytes, const unsigned char* da
 }
 
 inline void push_back(std::vector<unsigned char>& bytes, const std::bitset<64>& bits) {
-    const std::bitset<64> mask(0xFF); // 1 byte mask
+    const std::bitset<64> mask(0xFF);
     for (std::size_t i = 0; i < 8; ++i) {
         bytes.push_back(static_cast<unsigned char>(((bits >> ((7 - i) * 8)) & mask).to_ulong()));
     }
@@ -629,11 +580,9 @@ inline void calc_gcm_tag(const unsigned char* data, const std::size_t data_size,
     const gcm::Block S = gcm::ghash(H, ghash_in);
     const std::vector<unsigned char> T = gcm::gctr(rkeys, J0, S.data(), gcm::kBlockByteSize);
 
-    // return
     memcpy(tag, &T[0], (std::min)(tag_size, static_cast<std::size_t>(16)));
 }
 
-/** Algorithm 4 and 5 @private */
 inline void crypt_gcm(const unsigned char* data, const std::size_t data_size,
                       const unsigned char* key, const std::size_t key_size, const unsigned char* iv,
                       const std::size_t iv_size, unsigned char* crypted) {
@@ -649,64 +598,52 @@ inline void crypt_gcm(const unsigned char* data, const std::size_t data_size,
     }
 }
 
-} // namespace gcm
+}
 
-} // namespace detail
+}
 
-/** @defgroup Base Base
- * Base definitions and convenient functions
- * @{ */
 
-/** Create 128-bit key from string. */
 inline std::vector<unsigned char> key_from_string(const char (*key_str)[17]) {
     return detail::key_from_string<17>(key_str);
 }
 
-/** Create 192-bit key from string. */
 inline std::vector<unsigned char> key_from_string(const char (*key_str)[25]) {
     return detail::key_from_string<25>(key_str);
 }
 
-/** Create 256-bit key from string. */
 inline std::vector<unsigned char> key_from_string(const char (*key_str)[33]) {
     return detail::key_from_string<33>(key_str);
 }
 
-/** Calculates encrypted data size when padding is enabled. */
 inline unsigned long get_padded_encrypted_size(const unsigned long data_size) {
     return data_size + detail::kStateSize - (data_size % detail::kStateSize);
 }
 
-/** Error code */
 typedef enum {
     kErrorOk = 0,
     kErrorInvalidDataSize = 1,
     kErrorInvalidKeySize,
     kErrorInvalidBufferSize,
     kErrorInvalidKey,
-    kErrorDeprecated, // kErrorInvalidNonceSize
+    kErrorDeprecated,
     kErrorInvalidIvSize,
     kErrorInvalidTagSize,
     kErrorInvalidTag
 } Error;
 
-/** @} */
 
 namespace detail {
 
 inline Error check_encrypt_cond(const unsigned long data_size, const unsigned long key_size,
                                 const unsigned long encrypted_size, const bool pads) {
-    // check data size
     if (!pads && (data_size % kStateSize != 0)) {
         return kErrorInvalidDataSize;
     }
 
-    // check key size
     if (!detail::is_valid_key_size(key_size)) {
         return kErrorInvalidKeySize;
     }
 
-    // check encrypted buffer size
     if (pads) {
         const unsigned long required_size = get_padded_encrypted_size(data_size);
         if (encrypted_size < required_size) {
@@ -723,17 +660,14 @@ inline Error check_encrypt_cond(const unsigned long data_size, const unsigned lo
 inline Error check_decrypt_cond(const unsigned long data_size, const unsigned long key_size,
                                 const unsigned long decrypted_size,
                                 const unsigned long* padded_size) {
-    // check data size
     if (data_size % 16 != 0) {
         return kErrorInvalidDataSize;
     }
 
-    // check key size
     if (!detail::is_valid_key_size(key_size)) {
         return kErrorInvalidKeySize;
     }
 
-    // check decrypted buffer size
     if (!padded_size) {
         if (decrypted_size < data_size) {
             return kErrorInvalidBufferSize;
@@ -763,7 +697,6 @@ inline bool check_padding(const unsigned long padding, const unsigned char data[
 
 inline Error check_gcm_cond(const std::size_t key_size, const std::size_t iv_size,
                             const std::size_t tag_size) {
-    // check key size
     if (!detail::is_valid_key_size(key_size)) {
         return kErrorInvalidKeySize;
     }
@@ -772,7 +705,6 @@ inline Error check_gcm_cond(const std::size_t key_size, const std::size_t iv_siz
         return kErrorInvalidIvSize;
     }
 
-    // check tag size
     if ((tag_size < 12 || 16 < tag_size) && (tag_size != 8) && (tag_size != 4)) {
         return kErrorInvalidTagSize;
     }
@@ -780,27 +712,9 @@ inline Error check_gcm_cond(const std::size_t key_size, const std::size_t iv_siz
     return kErrorOk;
 }
 
-} // namespace detail
+}
 
-/** @defgroup ECB ECB
- * ECB mode functions
- * @{ */
 
-/**
- * Encrypts data with ECB mode.
- * @param [in]  data Data.
- * @param [in]  data_size Data size.
- *  If the pads is false, data size must be multiple of 16.
- * @param [in]  key key bytes. The key length must be 16 (128-bit), 24 (192-bit) or 32 (256-bit).
- * @param [in]  key_size key size.
- * @param [out] encrypted Encrypted data buffer.
- * @param [in]  encrypted_size Encrypted data buffer size.
- * @param [in]  pads If this value is true, encrypted data is padded by PKCS.
- *  Encrypted data size must be multiple of 16.
- *  If the pads is true, encrypted data is padded with PKCS.
- *  So the data is multiple of 16, encrypted data size needs additonal 16 bytes.
- * @since 1.0.0
- */
 inline Error encrypt_ecb(const unsigned char* data, const unsigned long data_size,
                          const unsigned char* key, const unsigned long key_size,
                          unsigned char* encrypted, const unsigned long encrypted_size,
@@ -832,19 +746,6 @@ inline Error encrypt_ecb(const unsigned char* data, const unsigned long data_siz
     return kErrorOk;
 }
 
-/**
- * Decrypts data with ECB mode.
- * @param [in]  data Data bytes.
- * @param [in]  data_size Data size.
- * @param [in]  key Key bytes.
- * @param [in]  key_size Key size.
- * @param [out] decrypted Decrypted data buffer.
- * @param [in]  decrypted_size Decrypted data buffer size.
- * @param [out] padded_size If this value is NULL, this function does not remove padding.
- *  If this value is not NULL, this function removes padding by PKCS
- *  and returns padded size using padded_size.
- * @since 1.0.0
- */
 inline Error decrypt_ecb(const unsigned char* data, const unsigned long data_size,
                          const unsigned char* key, const unsigned long key_size,
                          unsigned char* decrypted, const unsigned long decrypted_size,
@@ -883,28 +784,8 @@ inline Error decrypt_ecb(const unsigned char* data, const unsigned long data_siz
     return kErrorOk;
 }
 
-/** @} */
 
-/** @defgroup CBC CBC
- * CBC mode functions
- * @{ */
 
-/**
- * Encrypt data with CBC mode.
- * @param [in]  data Data.
- * @param [in]  data_size Data size.
- *  If the pads is false, data size must be multiple of 16.
- * @param [in]  key key bytes. The key length must be 16 (128-bit), 24 (192-bit) or 32 (256-bit).
- * @param [in]  key_size key size.
- * @param [in]  iv Initialize vector.
- * @param [out] encrypted Encrypted data buffer.
- * @param [in]  encrypted_size Encrypted data buffer size.
- * @param [in]  pads If this value is true, encrypted data is padded by PKCS.
- *  Encrypted data size must be multiple of 16.
- *  If the pads is true, encrypted data is padded with PKCS.
- *  So the data is multiple of 16, encrypted data size needs additonal 16 bytes.
- * @since 1.0.0
- */
 inline Error encrypt_cbc(const unsigned char* data, const unsigned long data_size,
                          const unsigned char* key, const unsigned long key_size,
                          const unsigned char iv[16], unsigned char* encrypted,
@@ -916,14 +797,12 @@ inline Error encrypt_cbc(const unsigned char* data, const unsigned long data_siz
 
     const detail::RoundKeys rkeys = detail::expand_key(key, static_cast<int>(key_size));
 
-    unsigned char s[detail::kStateSize] = {}; // encrypting data
+    unsigned char s[detail::kStateSize] = {};
 
-    // calculate padding value
     const bool ge16 = (data_size >= detail::kStateSize);
     const int rem = data_size % detail::kStateSize;
     const unsigned char pad_v = detail::kStateSize - rem;
 
-    // encrypt 1st state
     if (ge16) {
         memcpy(s, data, detail::kStateSize);
     } else {
@@ -935,7 +814,6 @@ inline Error encrypt_cbc(const unsigned char* data, const unsigned long data_siz
     }
     detail::encrypt_state(rkeys, s, encrypted);
 
-    // encrypt mid
     const unsigned long bc = data_size / detail::kStateSize;
     for (unsigned long i = 1; i < bc; ++i) {
         const long offset = i * detail::kStateSize;
@@ -945,7 +823,6 @@ inline Error encrypt_cbc(const unsigned char* data, const unsigned long data_siz
         detail::encrypt_state(rkeys, s, encrypted + offset);
     }
 
-    // enctypt last
     if (pads && ge16) {
         std::vector<unsigned char> ib(detail::kStateSize, pad_v), ob(detail::kStateSize);
         memcpy(&ib[0], data + data_size - rem, rem);
@@ -959,20 +836,6 @@ inline Error encrypt_cbc(const unsigned char* data, const unsigned long data_siz
     return kErrorOk;
 }
 
-/**
- * Decrypt data with CBC mode.
- * @param [in]  data Data bytes.
- * @param [in]  data_size Data size.
- * @param [in]  key Key bytes.
- * @param [in]  key_size Key size.
- * @param [in]  iv Initialize vector.
- * @param [out] decrypted Decrypted data buffer.
- * @param [in]  decrypted_size Decrypted data buffer size.
- * @param [out] padded_size If this value is NULL, this function does not remove padding.
- *  If this value is not NULL, this function removes padding by PKCS
- *  and returns padded size using padded_size.
- * @since 1.0.0
- */
 inline Error decrypt_cbc(const unsigned char* data, const unsigned long data_size,
                          const unsigned char* key, const unsigned long key_size,
                          const unsigned char iv[16], unsigned char* decrypted,
@@ -984,13 +847,11 @@ inline Error decrypt_cbc(const unsigned char* data, const unsigned long data_siz
 
     const detail::RoundKeys rkeys = detail::expand_key(key, static_cast<int>(key_size));
 
-    // decrypt 1st state
     detail::decrypt_state(rkeys, data, decrypted);
     if (iv) {
         detail::xor_data(decrypted, iv);
     }
 
-    // decrypt mid
     const unsigned long bc = data_size / detail::kStateSize - 1;
     for (unsigned long i = 1; i < bc; ++i) {
         const long offset = i * detail::kStateSize;
@@ -998,7 +859,6 @@ inline Error decrypt_cbc(const unsigned char* data, const unsigned long data_siz
         detail::xor_data(decrypted + offset, data + offset - detail::kStateSize);
     }
 
-    // decrypt last
     unsigned char last[detail::kStateSize] = {};
     if (data_size > detail::kStateSize) {
         detail::decrypt_state(rkeys, data + (bc * detail::kStateSize), last);
@@ -1026,23 +886,8 @@ inline Error decrypt_cbc(const unsigned char* data, const unsigned long data_siz
     return kErrorOk;
 }
 
-/** @} */
 
-/** @defgroup GCM GCM
- * GCM mode functions
- * @{ */
 
-/**
- * Encrypts data with GCM mode and gets an authentication tag.
- *
- * You can specify iv size and tag size.
- * But usually you should use the other overloaded function whose iv and tag size is fixed.
- *
- * @returns kErrorOk
- * @returns kErrorInvalidKeySize
- * @returns kErrorInvalidIvSize
- * @returns kErrorInvalidTagSize
- */
 inline Error encrypt_gcm(unsigned char* data, const std::size_t data_size,
                          const unsigned char* aadata, const std::size_t aadata_size,
                          const unsigned char* key, const std::size_t key_size,
@@ -1060,23 +905,6 @@ inline Error encrypt_gcm(unsigned char* data, const std::size_t data_size,
     return kErrorOk;
 }
 
-/**
- * Encrypts data with GCM mode and gets an authentication tag.
- *
- * @param [in,out] data Input data and output buffer.
- *      This buffer is replaced with encrypted data.
- * @param [in] data_size data size
- * @param [in] aadata Additional Authenticated data
- * @param [in] aadata_size aadata size
- * @param [in] key Cipher key
- * @param [in] key_size Cipher key size. This value must be 16 (128-bit), 24 (192-bit), or 32
- * (256-bit).
- * @param [in] iv Initialization vector
- * @param [out] tag Calculated authentication tag data
- *
- * @returns kErrorOk
- * @returns kErrorInvalidKeySize
- */
 inline Error encrypt_gcm(unsigned char* data, const std::size_t data_size,
                          const unsigned char* aadata, const std::size_t aadata_size,
                          const unsigned char* key, const std::size_t key_size,
@@ -1084,18 +912,6 @@ inline Error encrypt_gcm(unsigned char* data, const std::size_t data_size,
     return encrypt_gcm(data, data_size, aadata, aadata_size, key, key_size, *iv, 12, *tag, 16);
 }
 
-/**
- * Decrypts data with GCM mode and checks an authentication tag.
- *
- * You can specify iv size and tag size.
- * But usually you should use the other overloaded function whose iv and tag size is fixed.
- *
- * @returns kErrorOk
- * @returns kErrorInvalidKeySize
- * @returns kErrorInvalidIvSize
- * @returns kErrorInvalidTagSize
- * @returns kErrorInvalidTag
- */
 inline Error decrypt_gcm(unsigned char* data, const std::size_t data_size,
                          const unsigned char* aadata, const std::size_t aadata_size,
                          const unsigned char* key, const std::size_t key_size,
@@ -1120,24 +936,6 @@ inline Error decrypt_gcm(unsigned char* data, const std::size_t data_size,
     }
 }
 
-/**
- * Decrypts data with GCM mode and checks an authentication tag.
- *
- * @param [in,out] data Input data and output buffer.
- *      This buffer is replaced with decrypted data.
- * @param [in] data_size data size
- * @param [in] aadata Additional Authenticated data
- * @param [in] aadata_size aadata size
- * @param [in] key Cipher key
- * @param [in] key_size Cipher key size. This value must be 16 (128-bit), 24 (192-bit), or 32
- * (256-bit).
- * @param [in] iv Initialization vector
- * @param [in] tag Authentication tag data
- *
- * @returns kErrorOk
- * @returns kErrorInvalidKeySize
- * @returns kErrorInvalidTag
- */
 inline Error decrypt_gcm(unsigned char* data, const std::size_t data_size,
                          const unsigned char* aadata, const std::size_t aadata_size,
                          const unsigned char* key, const std::size_t key_size,
@@ -1145,27 +943,8 @@ inline Error decrypt_gcm(unsigned char* data, const std::size_t data_size,
     return decrypt_gcm(data, data_size, aadata, aadata_size, key, key_size, *iv, 12, *tag, 16);
 }
 
-/** @} */
 
-/** @defgroup CTR CTR
- * CTR mode function
- * @{ */
 
-/**
- * Encrypts or decrypt data in-place with CTR mode.
- *
- * @param [in,out] data Input data and output buffer.
- *      This buffer is replaced with encrypted / decrypted data.
- * @param [in] data_size Data size.
- * @param [in] key Cipher key
- * @param [in] key_size Cipher key size. This value must be 16 (128-bit), 24 (192-bit), or 32
- * (256-bit).
- * @param [in] nonce Nonce of the counter initialization.
- *
- * @returns kErrorOk
- * @returns kErrorInvalidKeySize
- * @since 1.0.0
- */
 inline Error crypt_ctr(unsigned char* data, const std::size_t data_size, const unsigned char* key,
                        const std::size_t key_size, const unsigned char (*nonce)[16]) {
     if (!detail::is_valid_key_size(key_size))
@@ -1190,6 +969,5 @@ inline Error crypt_ctr(unsigned char* data, const std::size_t data_size, const u
     return kErrorOk;
 }
 
-/** @} */
 
-} // namespace aes
+}

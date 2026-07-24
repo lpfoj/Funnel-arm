@@ -1,7 +1,6 @@
 //  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
-// Credits to https://github.com/psucien/tlg-emu-tools/
 
 #pragma once
 
@@ -16,7 +15,7 @@
 namespace AmdGpu {
 union PM4Type3Header;
 enum class PM4ItOpcode : u32;
-} // namespace AmdGpu
+}
 
 namespace Core::Devtools::Widget {
 
@@ -76,4 +75,4 @@ public:
     void Draw(bool only_batches_view, CmdListFilter& filter);
 };
 
-} // namespace Core::Devtools::Widget
+}

@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-// reference
-// https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/include/orbis/_types/sys_service.h
 #pragma once
 
 #include <mutex>
@@ -181,7 +179,7 @@ int PS4_SYSV_ABI sceLncUtilGetGpuCrashFullDumpAppStatus();
 int PS4_SYSV_ABI sceLncUtilGetLocalProcessStatusList();
 int PS4_SYSV_ABI sceLncUtilGetParentSocket();
 int PS4_SYSV_ABI sceLncUtilGetResultKillApp();
-int PS4_SYSV_ABI sceLncUtilGetResultLaunchAppByTitleId();
+int PS4_SYSV_ABI sceLncUtilGetResultLaunchAppByTitleId(const char* title_id);
 int PS4_SYSV_ABI sceLncUtilInitialize();
 int PS4_SYSV_ABI sceLncUtilIsActiveCdlg();
 int PS4_SYSV_ABI sceLncUtilIsAppLaunched();
@@ -193,7 +191,7 @@ int PS4_SYSV_ABI sceLncUtilKickCoredumpOnlyProcMem();
 int PS4_SYSV_ABI sceLncUtilKillApp();
 int PS4_SYSV_ABI sceLncUtilKillAppWithReason();
 int PS4_SYSV_ABI sceLncUtilKillLocalProcess();
-int PS4_SYSV_ABI sceLncUtilLaunchApp();
+int PS4_SYSV_ABI sceLncUtilLaunchApp(const char* title_id, const char* argv[], const void* params);
 int PS4_SYSV_ABI sceLncUtilLoadExec();
 int PS4_SYSV_ABI sceLncUtilNotifyCoredumpRequestEnd();
 int PS4_SYSV_ABI sceLncUtilNotifyCoredumpRequestProgress();
@@ -213,7 +211,8 @@ int PS4_SYSV_ABI sceLncUtilSetCdlgExec();
 int PS4_SYSV_ABI sceLncUtilSetControllerFocus();
 int PS4_SYSV_ABI sceLncUtilSetControllerFocusPermission();
 int PS4_SYSV_ABI sceLncUtilStartKillApp();
-int PS4_SYSV_ABI sceLncUtilStartLaunchAppByTitleId();
+int PS4_SYSV_ABI sceLncUtilStartLaunchAppByTitleId(const char* title_id, const char* argv[],
+                                                   const void* params);
 int PS4_SYSV_ABI sceLncUtilSuspendApp();
 int PS4_SYSV_ABI sceLncUtilSuspendBackgroundApp();
 int PS4_SYSV_ABI sceLncUtilSuspendLocalProcess();
@@ -365,7 +364,7 @@ int PS4_SYSV_ABI sceShellCoreUtilIsShowCrashReport();
 int PS4_SYSV_ABI sceShellCoreUtilIsTemperatureDanger();
 int PS4_SYSV_ABI sceShellCoreUtilIsTitleWorkaroundEnabled();
 int PS4_SYSV_ABI sceShellCoreUtilIsUsbMassStorageMounted();
-int PS4_SYSV_ABI sceShellCoreUtilLaunchByUri();
+int PS4_SYSV_ABI sceShellCoreUtilLaunchByUri(const char* uri);
 int PS4_SYSV_ABI sceShellCoreUtilLeavePowerLockSection();
 int PS4_SYSV_ABI sceShellCoreUtilLog();
 int PS4_SYSV_ABI sceShellCoreUtilMakeManifestFile();
@@ -386,7 +385,7 @@ int PS4_SYSV_ABI sceShellCoreUtilNotifyYouTubeAccountLinkStatusChanged();
 int PS4_SYSV_ABI sceShellCoreUtilPfAuthClientConsoleTokenClearCache();
 int PS4_SYSV_ABI sceShellCoreUtilPostActivityForPsNow();
 int PS4_SYSV_ABI sceShellCoreUtilPostErrorLog();
-int PS4_SYSV_ABI sceShellCoreUtilPostLaunchConfirmResult();
+int PS4_SYSV_ABI sceShellCoreUtilPostLaunchConfirmResult(int result);
 int PS4_SYSV_ABI sceShellCoreUtilPostPsmEventToShellUI();
 int PS4_SYSV_ABI sceShellCoreUtilPreNotifyOfGameLiveStreaming();
 int PS4_SYSV_ABI sceShellCoreUtilPreNotifyOfRemotePlay();
@@ -497,7 +496,8 @@ int PS4_SYSV_ABI sceSystemServiceIsShellUiFgAndGameBgCpuMode();
 int PS4_SYSV_ABI sceSystemServiceKillApp();
 int PS4_SYSV_ABI sceSystemServiceKillLocalProcess();
 int PS4_SYSV_ABI sceSystemServiceKillLocalProcessForPsmKit();
-int PS4_SYSV_ABI sceSystemServiceLaunchApp();
+int PS4_SYSV_ABI sceSystemServiceLaunchApp(const char* title_id, const char* argv[],
+                                           const void* params);
 int PS4_SYSV_ABI sceSystemServiceLaunchEventDetails();
 int PS4_SYSV_ABI sceSystemServiceLaunchTournamentList();
 int PS4_SYSV_ABI sceSystemServiceLaunchTournamentsTeamProfile();
@@ -609,4 +609,4 @@ int PS4_SYSV_ABI Func_CB5E885E225F69F0();
 void PushSystemServiceEvent(const OrbisSystemServiceEvent& event);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::SystemService
+}

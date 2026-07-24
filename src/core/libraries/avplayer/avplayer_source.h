@@ -182,6 +182,7 @@ private:
     void DemuxerThread(std::stop_token stop);
     void VideoDecoderThread(std::stop_token stop);
     void AudioDecoderThread(std::stop_token stop);
+    bool RewindDemuxer();
 
     bool HasRunningThreads() const;
 
@@ -200,6 +201,10 @@ private:
     std::atomic_bool m_is_looping = false;
     std::atomic_bool m_is_paused = false;
     std::atomic_bool m_is_eof = false;
+    bool m_fast_forward_intro = false;
+    u64 m_fast_forward_target_ms = 0;
+    std::atomic_bool m_fast_forward_video_drop_logged = false;
+    std::atomic_bool m_fast_forward_audio_drop_logged = false;
 
     std::unique_ptr<IDataStreamer> m_up_data_streamer;
 
@@ -243,4 +248,4 @@ private:
     std::chrono::high_resolution_clock::duration m_pause_duration{};
 };
 
-} // namespace Libraries::AvPlayer
+}

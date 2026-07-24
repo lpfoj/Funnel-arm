@@ -25,7 +25,7 @@ typedef int net_socket;
 #include <net/if_dl.h>
 #include <net/route.h>
 #endif
-#if defined(__linux__) || defined(__FreeBSD__)
+#if __linux__
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -81,8 +81,6 @@ bool NetUtilInternal::RetrieveEthernetAddr() {
         }
         freeifaddrs(ifap);
     }
-#elif defined(__FreeBSD__)
-    // todo
 #else
     ifreq ifr;
     ifconf ifc;
@@ -132,7 +130,7 @@ bool NetUtilInternal::RetrieveDefaultGateway() {
 
 #ifdef _WIN32
     ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS;
-    ULONG family = AF_INET; // Only IPv4
+    ULONG family = AF_INET;
     ULONG buffer_size = 15000;
 
     std::vector<BYTE> buffer(buffer_size);
@@ -166,16 +164,12 @@ bool NetUtilInternal::RetrieveDefaultGateway() {
 
     return false;
 #elif defined(__APPLE__)
-    // adapted from
-    // https://github.com/seladb/PcapPlusPlus/blob/a49a79e0b67b402ad75ffa96c1795def36df75c8/Pcap%2B%2B/src/PcapLiveDevice.cpp#L1236
-    // route message struct for communication in APPLE device
     struct BSDRoutingMessage {
         struct rt_msghdr header;
         char messageSpace[512];
     };
 
     struct BSDRoutingMessage routingMessage;
-    // It creates a raw socket that can be used for routing-related operations
     int sockfd = socket(PF_ROUTE, SOCK_RAW, 0);
     if (sockfd < 0) {
         return false;
@@ -193,7 +187,6 @@ bool NetUtilInternal::RetrieveDefaultGateway() {
         return false;
     }
 
-    // Read the response from the route socket
     if (read(sockfd, reinterpret_cast<char*>(&routingMessage), sizeof(routingMessage)) < 0) {
         return false;
     }
@@ -228,8 +221,7 @@ bool NetUtilInternal::RetrieveDefaultGateway() {
     inet_ntop(AF_INET, gateAddr, str, sizeof(str));
     this->default_gateway = str;
     return true;
-#elif defined(__FreeBSD__)
-    return true;
+
 #else
     std::ifstream route{"/proc/net/route"};
     std::string line;
@@ -271,7 +263,7 @@ bool NetUtilInternal::RetrieveNetmask() {
 
 #ifdef _WIN32
     ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    ULONG family = AF_INET; // Only IPv4
+    ULONG family = AF_INET;
     ULONG buffer_size = 15000;
 
     std::vector<BYTE> buffer(buffer_size);
@@ -288,7 +280,6 @@ bool NetUtilInternal::RetrieveNetmask() {
         return false;
 
     for (auto adapter = adapter_addresses; adapter != nullptr; adapter = adapter->Next) {
-        // Skip loopback and down interfaces
         if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || adapter->OperStatus != IfOperStatusUp)
             continue;
 
@@ -332,18 +323,6 @@ bool NetUtilInternal::RetrieveNetmask() {
 
 const std::string& NetUtilInternal::GetIp() const {
     return ip;
-}
-
-u32 NetUtilInternal::GetExternalIp() const {
-    return external_ip;
-}
-
-void NetUtilInternal::SetExternalIp(u32 addr) {
-    external_ip = addr;
-}
-
-u32 NetUtilInternal::GetNatType() const {
-    return nat_type;
 }
 
 bool NetUtilInternal::RetrieveIp() {
@@ -398,7 +377,6 @@ int NetUtilInternal::ResolveHostname(const char* hostname, Libraries::Net::Orbis
 
     auto ret = ORBIS_OK;
     if (gai_result != 0) {
-        // handle more errors
         LOG_ERROR(Lib_Net, "address resolution for {} failed: {}", hostname, gai_result);
         ret = ORBIS_NET_ERETURN;
     } else {
@@ -413,4 +391,4 @@ int NetUtilInternal::ResolveHostname(const char* hostname, Libraries::Net::Orbis
     return ret;
 }
 
-} // namespace NetUtil
+}

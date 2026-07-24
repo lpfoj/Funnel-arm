@@ -93,4 +93,4 @@ int PS4_SYSV_ABI sceRtcTickAddWeeks(OrbisRtcTick* pTick1, OrbisRtcTick* pTick2, 
 int PS4_SYSV_ABI sceRtcTickAddYears(OrbisRtcTick* pTick1, OrbisRtcTick* pTick2, int32_t lAdd);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-} // namespace Libraries::Rtc
+}

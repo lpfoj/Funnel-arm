@@ -39,4 +39,4 @@ private:
     vk::UniquePipelineLayout fault_process_pipeline_layout;
 };
 
-} // namespace VideoCore
+}

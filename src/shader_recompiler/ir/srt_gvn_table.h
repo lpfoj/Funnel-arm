@@ -13,9 +13,6 @@
 
 namespace Shader::Optimization {
 
-// Does global value numbering on a subset of instructions that are used
-// for loads from shader resource tables.
-// Inspiration from spirv-opt
 
 class SrtGvnTable {
 public:
@@ -42,7 +39,7 @@ public:
 private:
     u32 ComputeInstValueNumber(IR::Inst* inst) {
         ASSERT(!value_numbers.contains(
-            IR::Value(inst))); // Should always be checking before calling this function
+            IR::Value(inst)));
 
         if (inst->MayHaveSideEffects()) {
             return NextValueNumber(IR::Value(inst));
@@ -122,4 +119,4 @@ private:
     std::unordered_map<InstVector, u32, HashInstVector> iv_to_vn;
 };
 
-} // namespace Shader::Optimization
+}

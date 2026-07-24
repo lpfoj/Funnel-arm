@@ -15,9 +15,6 @@
 
 namespace Common {
 
-/**
- * Native endianness
- */
 template <typename T>
 using NativeEndian = T;
 
@@ -231,7 +228,7 @@ template <typename T>
 using BigEndian =
     std::conditional_t<std::endian::native == std::endian::big, NativeEndian<T>, SwappedEndian<T>>;
 
-} // namespace Common
+}
 
 using u16_be = Common::BigEndian<u16>;
 using u32_be = Common::BigEndian<u32>;

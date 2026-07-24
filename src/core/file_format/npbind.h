@@ -17,39 +17,36 @@ struct NpBindHeader {
     u64_be file_size;
     u64_be entry_size;
     u64_be num_entries;
-    char padding[0x60]; // 96 bytes
+    char padding[0x60];
 };
 #pragma pack(pop)
 
 struct NPBindEntryRaw {
     u16_be type;
-    u16_be size; // includes internal padding
+    u16_be size;
     std::vector<u8> data;
 };
 
 struct NPBindBody {
-    NPBindEntryRaw npcommid; // expected type 0x0010, size 12
-    NPBindEntryRaw trophy;   // expected type 0x0011, size 12
-    NPBindEntryRaw unk1;     // expected type 0x0012, size 176
-    NPBindEntryRaw unk2;     // expected type 0x0013, size 16
-    // The 0x98 padding after these entries is skipped while parsing
+    NPBindEntryRaw npcommid;
+    NPBindEntryRaw trophy;
+    NPBindEntryRaw unk1;
+    NPBindEntryRaw unk2;
 };
 
 class NPBindFile {
 private:
     NpBindHeader m_header;
     std::vector<NPBindBody> m_bodies;
-    u8 m_digest[20]; // zeroed if absent
+    u8 m_digest[20];
 
 public:
     NPBindFile() {
         memset(m_digest, 0, sizeof(m_digest));
     }
 
-    // Load from file
     bool Load(const std::string& path);
 
-    // Accessors
     const NpBindHeader& Header() const {
         return m_header;
     }
@@ -60,25 +57,20 @@ public:
         return m_digest;
     }
 
-    // Get npcommid data
     std::vector<std::string> GetNpCommIds() const;
 
-    // Get specific body
     const NPBindBody& GetBody(size_t index) const {
         return m_bodies.at(index);
     }
 
-    // Get number of bodies
     u64 BodyCount() const {
         return m_bodies.size();
     }
 
-    // Check if file was loaded successfully
     bool IsValid() const {
         return m_header.magic == NPBIND_MAGIC;
     }
 
-    // Clear all data
     void Clear() {
         m_header = NpBindHeader{};
         m_bodies.clear();

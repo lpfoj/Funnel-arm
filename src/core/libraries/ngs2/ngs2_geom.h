@@ -77,4 +77,4 @@ struct OrbisNgs2GeomAttribute {
     u32 reserved[4];
 };
 
-} // namespace Libraries::Ngs2
+}

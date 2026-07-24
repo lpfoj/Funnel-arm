@@ -44,4 +44,4 @@ s64 BaseDirectory::lseek(s64 offset, s32 whence) {
     return file_offset;
 }
 
-} // namespace Core::Directories
+}

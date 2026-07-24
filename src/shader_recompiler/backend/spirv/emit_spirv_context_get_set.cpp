@@ -1,10 +1,12 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "core/emulator_settings.h"
+#include "common/config.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_bounds.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/patch.h"
 #include "shader_recompiler/runtime_info.h"
@@ -58,10 +60,9 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
 
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    if (!Config::directMemoryAccess()) {
         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }
-    // We can only provide a fallback for immediate offsets.
     if (flatbuf_off_dw == 0) {
         return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const_dynamic, addr, offset);
     } else {
@@ -78,6 +79,10 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
     const Id result{ctx.OpLoad(ctx.U32[1], ptr)};
+    if (const Id size = buffer.Size(PointerSize::B32); Sirit::ValidId(size)) {
+        const Id in_bounds = ctx.OpULessThan(ctx.U1[1], index, size);
+        return ctx.OpSelect(ctx.U32[1], in_bounds, result, ctx.u32_zero_value);
+    }
     return result;
 }
 
@@ -109,9 +114,15 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         }();
         return param.is_integer ? ctx.OpBitcast(ctx.F32[1], value) : value;
     }
-    if (IR::IsBarycentricCoord(attr) && ctx.profile.supports_fragment_shader_barycentric) {
+    if (IR::IsBarycentricCoord(attr) &&
+        !ctx.profile.supports_amd_shader_explicit_vertex_parameter &&
+        ctx.profile.supports_fragment_shader_barycentric) {
         ++comp;
     }
+    const auto extract_input = [&ctx](Id value, u32 component) {
+        ASSERT(Sirit::ValidId(value));
+        return ctx.OpCompositeExtract(ctx.F32[1], value, component);
+    };
     switch (attr) {
     case IR::Attribute::Position0:
         ASSERT(ctx.l_stage == LogicalStage::Geometry);
@@ -119,31 +130,27 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
                           ctx.OpAccessChain(ctx.input_f32, ctx.gl_in, ctx.ConstU32(index),
                                             ctx.ConstU32(0U), ctx.ConstU32(comp)));
     case IR::Attribute::FragCoord:
-        return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.frag_coord, ctx.ConstU32(comp)));
+        return extract_input(ctx.frag_coord_value, comp);
     case IR::Attribute::TessellationEvaluationPointU:
-        return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.u32_zero_value));
+        return extract_input(ctx.tess_coord_value, 0);
     case IR::Attribute::TessellationEvaluationPointV:
-        return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.ConstU32(1U)));
+        return extract_input(ctx.tess_coord_value, 1);
     case IR::Attribute::BaryCoordSmooth:
-        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth,
-                                                        ctx.ConstU32(comp)));
+        return extract_input(ctx.bary_coord_smooth_value, comp);
     case IR::Attribute::BaryCoordSmoothCentroid:
-        return ctx.OpLoad(
-            ctx.F32[1],
-            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_centroid, ctx.ConstU32(comp)));
+        return extract_input(ctx.bary_coord_smooth_centroid_value, comp);
     case IR::Attribute::BaryCoordSmoothSample:
-        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample,
-                                                        ctx.ConstU32(comp)));
+        return extract_input(ctx.bary_coord_smooth_sample_value, comp);
     case IR::Attribute::BaryCoordNoPersp:
-        return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp,
-                                                        ctx.ConstU32(comp)));
+        return extract_input(ctx.bary_coord_nopersp_value, comp);
+    case IR::Attribute::BaryCoordNoPerspCentroid:
+        return extract_input(ctx.bary_coord_nopersp_centroid_value, comp);
     case IR::Attribute::BaryCoordNoPerspSample:
-        return ctx.OpLoad(
-            ctx.F32[1],
-            ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_nopersp_sample, ctx.ConstU32(comp)));
+        return extract_input(ctx.bary_coord_nopersp_sample_value, comp);
+    case IR::Attribute::BaryCoordPullModel:
+        ASSERT_MSG(ctx.profile.supports_amd_shader_explicit_vertex_parameter,
+                   "BaryCoordPullModel requires SPV_AMD_shader_explicit_vertex_parameter");
+        return extract_input(ctx.bary_coord_pull_model_value, comp);
     default:
         UNREACHABLE_MSG("Read attribute {}", attr);
     }
@@ -180,14 +187,7 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
         return ctx.OpLoad(ctx.U32[1], ctx.patch_vertices);
     case IR::Attribute::PackedHullInvocationInfo: {
         ASSERT(ctx.info.l_stage == LogicalStage::TessellationControl);
-        // [0:8]: patch id within VGT
-        // [8:12]: output control point id
-        // But 0:8 should be treated as 0 for attribute addressing purposes
         if (ctx.runtime_info.hs_info.IsPassthrough()) {
-            // Gcn shader would run with 1 thread, but we need to run a thread for
-            // each output control point.
-            // If Gcn shader uses this value, we should make sure all threads in the
-            // Vulkan shader use 0
             return ctx.ConstU32(0u);
         } else {
             const Id invocation_id = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
@@ -228,6 +228,26 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     if (IR::IsMrt(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
         const auto& info{ctx.frag_outputs.at(index)};
+        if (Libraries::GnmDriver::ExecutorReplayActive() &&
+            Libraries::GnmDriver::ExecutorReplayForcePsConst()) {
+            Id cval = ctx.ConstF32(element == 1 ? 0.0f : 1.0f);
+            if (!ctx.input_params.empty()) {
+                const auto& p = ctx.input_params.at(0);
+                if (!p.is_array && element < p.num_components) {
+                    Id v = p.num_components > 1
+                               ? ctx.OpLoad(p.component_type,
+                                            ctx.OpAccessChain(p.pointer_type, p.id, ctx.ConstU32(element)))
+                               : ctx.OpLoad(p.component_type, p.id);
+                    cval = p.is_integer ? ctx.OpBitcast(ctx.F32[1], v) : v;
+                }
+            }
+            if (info.num_components == 1) {
+                ctx.OpStore(info.id, cval);
+            } else {
+                ctx.OpStore(ctx.OpAccessChain(info.pointer_type, info.id, ctx.ConstU32(element)), cval);
+            }
+            return;
+        }
         if (info.num_components == 1) {
             return op_store(info.id);
         } else {
@@ -264,6 +284,34 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     }
 }
 
+void EmitSetAttributeVector(EmitContext& ctx, IR::Attribute attr,
+                            std::span<const Id> values) {
+    ASSERT(IR::IsMrt(attr));
+    const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
+    const auto& info{ctx.frag_outputs.at(index)};
+    ASSERT(values.size() == info.num_components);
+    ASSERT(values.size() > 1 && values.size() <= 4);
+
+    if (Libraries::GnmDriver::ExecutorReplayActive() &&
+        Libraries::GnmDriver::ExecutorReplayForcePsConst()) {
+        for (u32 component = 0; component < values.size(); ++component) {
+            EmitSetAttribute(ctx, attr, values[component], component);
+        }
+        return;
+    }
+
+    std::array<Id, 4> converted{};
+    for (u32 component = 0; component < values.size(); ++component) {
+        converted[component] =
+            info.is_integer ? ctx.OpBitcast(info.component_type, values[component])
+                            : values[component];
+    }
+    const Id vector_type{ctx.TypeVector(info.component_type, static_cast<u32>(values.size()))};
+    const Id vector{ctx.OpCompositeConstruct(
+        vector_type, std::span<const Id>{converted.data(), values.size()})};
+    ctx.OpStore(info.id, vector);
+}
+
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,
@@ -278,7 +326,6 @@ Id EmitReadTcsGenericOuputAttribute(EmitContext& ctx, Id vertex_index, Id attr_i
 }
 
 void EmitSetTcsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id comp_index) {
-    // Implied vertex index is invocation_id
     const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
     Id pointer =
         ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
@@ -325,6 +372,8 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    constexpr bool is_float = alias == PointerType::F32;
+    const auto flags = inst->Flags<IR::BufferInstInfo>();
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -337,10 +386,19 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id result_i = ctx.OpLoad(data_types[1], ptr_i);
-        ids.push_back(result_i);
+        if (!flags.typed) {
+            ids.push_back(LoadAccessBoundsCheck<32, 1, is_float>(
+                ctx, index_i, spv_buffer.Size(PointerSize::B32), result_i));
+        } else {
+            ids.push_back(result_i);
+        }
     }
 
     const Id result = N == 1 ? ids[0] : ctx.OpCompositeConstruct(data_types[N], ids);
+    if (flags.typed) {
+        return LoadAccessBoundsCheck<32, N, is_float>(ctx, address,
+                                                      spv_buffer.Size(PointerSize::B32), result);
+    }
     return result;
 }
 
@@ -352,7 +410,7 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
     const Id result{ctx.OpLoad(ctx.U8, ptr)};
-    return result;
+    return LoadAccessBoundsCheck<8>(ctx, address, spv_buffer.Size(PointerSize::B8), result);
 }
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -363,7 +421,7 @@ Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
     const Id result{ctx.OpLoad(ctx.U16, ptr)};
-    return result;
+    return LoadAccessBoundsCheck<16>(ctx, address, spv_buffer.Size(PointerSize::B16), result);
 }
 
 Id EmitLoadBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -390,7 +448,7 @@ Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
     const Id result{ctx.OpLoad(ctx.U64, ptr)};
-    return result;
+    return LoadAccessBoundsCheck<64>(ctx, address, spv_buffer.Size(PointerSize::B64), result);
 }
 
 Id EmitLoadBufferF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -416,6 +474,8 @@ Id EmitLoadBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addr
 template <u32 N, PointerType alias>
 static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
                                  Id value) {
+    constexpr bool is_float = alias == PointerType::F32;
+    const auto flags = inst->Flags<IR::BufferInstInfo>();
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -423,11 +483,29 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
     const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
 
-    for (u32 i = 0; i < N; i++) {
-        const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
-        const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
-        ctx.OpStore(ptr_i, value_i);
+    auto store = [&] {
+        for (u32 i = 0; i < N; i++) {
+            const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+            const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
+            const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
+            auto store_i = [&] {
+                ctx.OpStore(ptr_i, value_i);
+                return Id{};
+            };
+            if (!flags.typed) {
+                AccessBoundsCheck<32, 1, is_float>(ctx, index_i, spv_buffer.Size(PointerSize::B32),
+                                                   store_i);
+            } else {
+                store_i();
+            }
+        }
+        return Id{};
+    };
+
+    if (flags.typed) {
+        AccessBoundsCheck<32, N, is_float>(ctx, address, spv_buffer.Size(PointerSize::B32), store);
+    } else {
+        store();
     }
 }
 
@@ -438,7 +516,10 @@ void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id v
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    ctx.OpStore(ptr, value);
+    AccessBoundsCheck<8>(ctx, address, spv_buffer.Size(PointerSize::B8), [&] {
+        ctx.OpStore(ptr, value);
+        return Id{};
+    });
 }
 
 void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id value) {
@@ -448,7 +529,10 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-    ctx.OpStore(ptr, value);
+    AccessBoundsCheck<16>(ctx, address, spv_buffer.Size(PointerSize::B16), [&] {
+        ctx.OpStore(ptr, value);
+        return Id{};
+    });
 }
 
 void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
@@ -474,7 +558,10 @@ void EmitStoreBufferU64(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
-    ctx.OpStore(ptr, value);
+    AccessBoundsCheck<64>(ctx, address, spv_buffer.Size(PointerSize::B64), [&] {
+        ctx.OpStore(ptr, value);
+        return Id{};
+    });
 }
 
 void EmitStoreBufferF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
@@ -537,4 +624,4 @@ void EmitGetMaskLaneVariable(EmitContext&) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
-} // namespace Shader::Backend::SPIRV
+}

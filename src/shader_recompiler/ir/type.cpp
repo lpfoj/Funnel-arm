@@ -33,4 +33,4 @@ bool AreTypesCompatible(Type lhs, Type rhs) noexcept {
     return lhs == rhs || lhs == Type::Opaque || rhs == Type::Opaque;
 }
 
-} // namespace Shader::IR
+}

@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <cerrno>
+#include <dlfcn.h>
+#include <map>
+#include <mutex>
+#include <sys/mman.h>
+#endif
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -22,6 +30,24 @@ namespace Libraries::Kernel {
 static s32 g_sdk_version = -1;
 static bool g_alias_dmem = false;
 
+#ifdef __ANDROID__
+static bool ExecutorIsHostMmapAddr(VAddr addr);
+static int ExecutorToHostProt(Core::MemoryProt prot);
+static int ExecutorRegisterFexHostExecutableRange(VAddr addr, u64 size,
+                                                  Core::MemoryProt prot,
+                                                  const char* source);
+
+static void ExecutorLiveMmapLog(const char* event, const void* in_addr, u64 len, s32 prot,
+                                s32 flags, s32 fd, s64 phys_addr, const void* out_addr,
+                                int err, s32 result) {
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_LIVE_MMAP] event=%s in=%p len=0x%llx prot=0x%x flags=0x%x "
+                        "fd=%d phys=0x%llx out=%p errno=%d result=0x%x",
+                        event, in_addr, static_cast<unsigned long long>(len), prot, flags, fd,
+                        static_cast<unsigned long long>(phys_addr), out_addr, err, result);
+}
+#endif
+
 u64 PS4_SYSV_ABI sceKernelGetDirectMemorySize() {
     LOG_TRACE(Kernel_Vmm, "called");
     const auto* memory = Core::Memory::Instance();
@@ -36,6 +62,16 @@ s32 PS4_SYSV_ABI sceKernelEnableDmemAliasing() {
 
 s32 PS4_SYSV_ABI sceKernelAllocateDirectMemory(s64 searchStart, s64 searchEnd, u64 len,
                                                u64 alignment, s32 memoryType, s64* physAddrOut) {
+#ifdef __ANDROID__
+    if (len == 0x10000000ull &&
+        access("/data/data/app.lsx4.android/files/lsx4-home/diag-fail-directmem", F_OK) ==
+            0) {
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_DIAG_FAIL_DIRECTMEM] len=0x%llx -> forced EAGAIN",
+                            static_cast<unsigned long long>(len));
+        return ORBIS_KERNEL_ERROR_EAGAIN;
+    }
+#endif
     if (searchStart < 0 || searchEnd < 0) {
         LOG_ERROR(Kernel_Vmm, "Invalid parameters!");
         return ORBIS_KERNEL_ERROR_EINVAL;
@@ -78,6 +114,16 @@ s32 PS4_SYSV_ABI sceKernelAllocateDirectMemory(s64 searchStart, s64 searchEnd, u
              "searchStart = {:#x}, searchEnd = {:#x}, len = {:#x}, "
              "alignment = {:#x}, memoryType = {:#x}, physAddrOut = {:#x}",
              searchStart, searchEnd, len, alignment, memoryType, phys_addr);
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_DMEM_ALLOC] searchStart=0x%llx searchEnd=0x%llx len=0x%llx "
+                        "alignment=0x%llx memoryType=0x%x physOutPtr=%p phys=0x%llx",
+                        static_cast<unsigned long long>(searchStart),
+                        static_cast<unsigned long long>(searchEnd),
+                        static_cast<unsigned long long>(len),
+                        static_cast<unsigned long long>(alignment), memoryType,
+                        static_cast<void*>(physAddrOut), static_cast<unsigned long long>(phys_addr));
+#endif
 
     return ORBIS_OK;
 }
@@ -169,14 +215,7 @@ s32 PS4_SYSV_ABI sceKernelReserveVirtualRange(void** addr, u64 len, s32 flags, u
 
     auto* memory = Core::Memory::Instance();
     const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
-    auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
-
-    if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
-        if (Common::ElfInfo::FW_170 <= g_sdk_version) {
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
-        map_flags &= ~Core::MemoryMapFlags::Fixed;
-    }
+    const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
 
     s32 result = memory->MapMemory(addr, in_addr, len, Core::MemoryProt::NoAccess, map_flags,
                                    Core::VMAType::Reserved, "anon", false, -1, alignment);
@@ -221,29 +260,28 @@ s32 PS4_SYSV_ABI sceKernelMapNamedDirectMemory(void** addr, u64 len, s32 prot, s
         return ORBIS_KERNEL_ERROR_EACCES;
     }
 
-    auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+    const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
     const VAddr in_addr = reinterpret_cast<VAddr>(*addr);
 
     auto* memory = Core::Memory::Instance();
     bool should_check = false;
-    if (g_sdk_version >= Common::ElfInfo::FW_250 &&
-        False(map_flags & Core::MemoryMapFlags::Stack)) {
-        // Under these conditions, this would normally redirect to sceKernelMapDirectMemory2.
+    if (g_sdk_version >= Common::ElfInfo::FW_25 && False(map_flags & Core::MemoryMapFlags::Stack)) {
         should_check = !g_alias_dmem;
     }
-
-    if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
-        if (Common::ElfInfo::FW_170 <= g_sdk_version) {
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
-        map_flags &= ~Core::MemoryMapFlags::Fixed;
-    }
-
     const auto ret =
         memory->MapMemory(addr, in_addr, len, mem_prot, map_flags, Core::VMAType::Direct, name,
                           should_check, phys_addr, alignment);
 
     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr));
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_DMEM_MAP] name=%s in=0x%llx len=0x%llx prot=0x%x flags=0x%x "
+                        "phys=0x%llx alignment=0x%llx ret=0x%x out=%p",
+                        name ? name : "<null>", static_cast<unsigned long long>(in_addr),
+                        static_cast<unsigned long long>(len), prot, flags,
+                        static_cast<unsigned long long>(phys_addr),
+                        static_cast<unsigned long long>(alignment), ret, *addr);
+#endif
     return ret;
 }
 
@@ -292,7 +330,6 @@ s32 PS4_SYSV_ABI sceKernelMapDirectMemory2(void** addr, u64 len, s32 type, s32 p
                           !g_alias_dmem, phys_addr, alignment);
 
     if (ret == 0) {
-        // If the map call succeeds, set the direct memory type using the output address.
         auto* memory = Core::Memory::Instance();
         const auto out_addr = reinterpret_cast<VAddr>(*addr);
         memory->SetDirectMemoryType(out_addr, len, type);
@@ -322,16 +359,8 @@ s32 PS4_SYSV_ABI sceKernelMapNamedFlexibleMemory(void** addr_in_out, u64 len, s3
 
     const VAddr in_addr = reinterpret_cast<VAddr>(*addr_in_out);
     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
-    auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
+    const auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
     auto* memory = Core::Memory::Instance();
-
-    if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
-        if (Common::ElfInfo::FW_170 <= g_sdk_version) {
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
-        map_flags &= ~Core::MemoryMapFlags::Fixed;
-    }
-
     const auto ret = memory->MapMemory(addr_in_out, in_addr, len, mem_prot, map_flags,
                                        Core::VMAType::Flexible, name);
     LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr_in_out));
@@ -342,45 +371,6 @@ s32 PS4_SYSV_ABI sceKernelMapFlexibleMemory(void** addr_in_out, u64 len, s32 pro
     return sceKernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "anon");
 }
 
-s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 len, s32 prot,
-                                                       s32 flags, const char* name) {
-    LOG_INFO(Kernel_Vmm, "in_addr = {}, len = {:#x}, prot = {:#x}, flags = {:#x}, name = '{}'",
-             fmt::ptr(*addr_in_out), len, prot, flags, name);
-    if (len == 0 || !Common::Is16KBAligned(len)) {
-        LOG_ERROR(Kernel_Vmm, "len is 0 or not 16kb multiple");
-        return ORBIS_KERNEL_ERROR_EINVAL;
-    }
-
-    if (name == nullptr) {
-        LOG_ERROR(Kernel_Vmm, "name is invalid!");
-        return ORBIS_KERNEL_ERROR_EFAULT;
-    }
-
-    auto map_flags = static_cast<Core::MemoryMapFlags>(flags);
-    VAddr in_addr = reinterpret_cast<VAddr>(*addr_in_out);
-    if (True(map_flags & Core::MemoryMapFlags::Fixed) && in_addr == 0) {
-        if (Common::ElfInfo::FW_170 <= g_sdk_version) {
-            return ORBIS_KERNEL_ERROR_EINVAL;
-        }
-        map_flags &= ~Core::MemoryMapFlags::Fixed;
-    }
-
-    if (std::strlen(name) >= ORBIS_KERNEL_MAXIMUM_NAME_LENGTH) {
-        LOG_ERROR(Kernel_Vmm, "name exceeds 32 bytes!");
-        return ORBIS_KERNEL_ERROR_ENAMETOOLONG;
-    }
-
-    if (in_addr == 0) {
-        in_addr = 0x880000000;
-    }
-    const auto mem_prot = static_cast<Core::MemoryProt>(prot);
-    auto* memory = Core::Memory::Instance();
-    const auto ret = memory->MapMemory(addr_in_out, in_addr, len, mem_prot, map_flags,
-                                       Core::VMAType::System, name);
-    LOG_INFO(Kernel_Vmm, "out_addr = {}", fmt::ptr(*addr_in_out));
-    return ret;
-}
-
 s32 PS4_SYSV_ABI sceKernelQueryMemoryProtection(void* addr, void** start, void** end, u32* prot) {
     auto* memory = Core::Memory::Instance();
     return memory->QueryProtection(std::bit_cast<VAddr>(addr), start, end, prot);
@@ -389,24 +379,48 @@ s32 PS4_SYSV_ABI sceKernelQueryMemoryProtection(void* addr, void** start, void**
 s32 PS4_SYSV_ABI sceKernelMprotect(const void* addr, u64 size, s32 prot) {
     LOG_INFO(Kernel_Vmm, "called addr = {}, size = {:#x}, prot = {:#x}", fmt::ptr(addr), size,
              prot);
-    // Align addr and size to the nearest page boundary.
+
+    if (size == 0) {
+        return ORBIS_OK;
+    }
+
     const VAddr in_addr = reinterpret_cast<VAddr>(addr);
+
+#ifdef __ANDROID__
+    if (ExecutorIsHostMmapAddr(in_addr)) {
+        constexpr VAddr HostPageSize = 4_KB;
+        const VAddr host_aligned_addr = Common::AlignDown(in_addr, HostPageSize);
+        const u64 host_aligned_size =
+            Common::AlignUp(size + in_addr - host_aligned_addr, HostPageSize);
+        const auto protection_flags = static_cast<Core::MemoryProt>(prot);
+        const int host_prot = ExecutorToHostProt(protection_flags);
+        if (::mprotect(reinterpret_cast<void*>(host_aligned_addr), host_aligned_size, host_prot) !=
+            0) {
+            *__Error() = errno;
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                            "[EXECUTOR_HOST_MPROTECT] addr=0x%llx size=0x%llx rawAddr=0x%llx "
+                            "rawSize=0x%llx prot=0x%x hostProt=0x%x",
+                            static_cast<unsigned long long>(host_aligned_addr),
+                            static_cast<unsigned long long>(host_aligned_size),
+                            static_cast<unsigned long long>(in_addr),
+                            static_cast<unsigned long long>(size), prot, host_prot);
+        return ORBIS_OK;
+    }
+#endif
+
     auto aligned_addr = Common::AlignDown(in_addr, 16_KB);
     auto aligned_size = Common::AlignUp(size + in_addr - aligned_addr, 16_KB);
 
     if (aligned_size == 0) {
-        // Nothing to do.
         return ORBIS_OK;
     }
 
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
 
-    s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
-    if (result == ORBIS_OK) {
-        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
-    }
-    return result;
+    return memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
 }
 
 s32 PS4_SYSV_ABI posix_mprotect(const void* addr, u64 size, s32 prot) {
@@ -421,13 +435,11 @@ s32 PS4_SYSV_ABI posix_mprotect(const void* addr, u64 size, s32 prot) {
 s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s32 prot) {
     LOG_INFO(Kernel_Vmm, "called addr = {}, size = {:#x}, prot = {:#x}", fmt::ptr(addr), size,
              prot);
-    // Align addr and size to the nearest page boundary.
     const VAddr in_addr = reinterpret_cast<VAddr>(addr);
     auto aligned_addr = Common::AlignDown(in_addr, 16_KB);
     auto aligned_size = Common::AlignUp(size + in_addr - aligned_addr, 16_KB);
 
     if (aligned_size == 0) {
-        // Nothing to do.
         return ORBIS_OK;
     }
 
@@ -437,7 +449,6 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
     if (result == ORBIS_OK) {
         memory_manager->SetDirectMemoryType(aligned_addr, aligned_size, mtype);
-        memory_manager->InvalidateMemory(aligned_addr, aligned_size);
     }
     return result;
 }
@@ -452,6 +463,11 @@ s32 PS4_SYSV_ABI sceKernelDirectMemoryQuery(u64 offset, s32 flags, OrbisQueryInf
 s32 PS4_SYSV_ABI sceKernelAvailableFlexibleMemorySize(u64* out_size) {
     auto* memory = Core::Memory::Instance();
     *out_size = memory->GetAvailableFlexibleSize();
+#ifdef __ANDROID__
+    if (*out_size < 0x20000000ull) {
+        *out_size = 0x20000000ull;
+    }
+#endif
     LOG_INFO(Kernel_Vmm, "called size = {:#x}", *out_size);
     return ORBIS_OK;
 }
@@ -484,7 +500,7 @@ u32 PS4_SYSV_ABI sceKernelIsAddressSanitizerEnabled() {
 s32 PS4_SYSV_ABI sceKernelBatchMap(OrbisKernelBatchMapEntry* entries, s32 numEntries,
                                    s32* numEntriesOut) {
     return sceKernelBatchMap2(entries, numEntries, numEntriesOut,
-                              MemoryFlags::ORBIS_KERNEL_MAP_FIXED); // 0x10, 0x410?
+                              MemoryFlags::ORBIS_KERNEL_MAP_FIXED);
 }
 
 s32 PS4_SYSV_ABI sceKernelBatchMap2(OrbisKernelBatchMapEntry* entries, s32 numEntries,
@@ -494,7 +510,7 @@ s32 PS4_SYSV_ABI sceKernelBatchMap2(OrbisKernelBatchMapEntry* entries, s32 numEn
     for (s32 i = 0; i < numEntries; i++, processed++) {
         if (entries == nullptr || entries[i].length == 0 || entries[i].operation > 4) {
             result = ORBIS_KERNEL_ERROR_EINVAL;
-            break; // break and assign a value to numEntriesOut.
+            break;
         }
 
         switch (entries[i].operation) {
@@ -532,7 +548,7 @@ s32 PS4_SYSV_ABI sceKernelBatchMap2(OrbisKernelBatchMapEntry* entries, s32 numEn
             break;
         }
     }
-    if (numEntriesOut != NULL) { // can be zero. do not return an error code.
+    if (numEntriesOut != NULL) {
         *numEntriesOut = processed;
     }
     return result;
@@ -728,12 +744,119 @@ s32 PS4_SYSV_ABI sceKernelMemoryPoolGetBlockStats(OrbisKernelMemoryPoolBlockStat
     u64 size_to_copy = size < sizeof(OrbisKernelMemoryPoolBlockStats)
                            ? size
                            : sizeof(OrbisKernelMemoryPoolBlockStats);
-    // As of firmware 12.02, the kernel does not check if stats is null,
-    // this can cause crashes on real hardware, so have an assert for this case.
     ASSERT_MSG(stats != nullptr || size == 0, "Block stats cannot be null");
     std::memcpy(stats, &local_stats, size_to_copy);
     return ORBIS_OK;
 }
+
+#ifdef __ANDROID__
+static std::mutex g_host_mmap_mutex;
+static std::map<VAddr, u64> g_host_mmap_ranges;
+
+void ExecutorRecordHostMmapRange(VAddr start, u64 size) {
+    std::scoped_lock lk{g_host_mmap_mutex};
+    g_host_mmap_ranges[start] = size;
+}
+
+static bool ExecutorTakeHostMmapRange(VAddr addr) {
+    std::scoped_lock lk{g_host_mmap_mutex};
+    auto it = g_host_mmap_ranges.find(addr);
+    if (it == g_host_mmap_ranges.end()) {
+        return false;
+    }
+    g_host_mmap_ranges.erase(it);
+    return true;
+}
+
+static bool ExecutorIsHostMmapAddr(VAddr addr) {
+    std::scoped_lock lk{g_host_mmap_mutex};
+    auto it = g_host_mmap_ranges.upper_bound(addr);
+    if (it == g_host_mmap_ranges.begin()) {
+        return false;
+    }
+    --it;
+    return addr >= it->first && addr < it->first + it->second;
+}
+
+static int ExecutorToHostProt(Core::MemoryProt prot) {
+    int host_prot = PROT_NONE;
+    if (True(prot & Core::MemoryProt::CpuRead)) {
+        host_prot |= PROT_READ;
+    }
+    if (True(prot & Core::MemoryProt::CpuWrite)) {
+        host_prot |= PROT_READ | PROT_WRITE;
+    }
+    if (True(prot & Core::MemoryProt::CpuExec)) {
+        host_prot |= PROT_EXEC;
+    }
+    return host_prot;
+}
+
+using ExecutorFexRegisterGuestExecutableRangeFn = int (*)(std::uint64_t address,
+                                                           std::uint64_t size,
+                                                           std::uint32_t prot);
+
+static ExecutorFexRegisterGuestExecutableRangeFn ExecutorResolveFexExecRangeRegistrar() {
+    void* sym = dlsym(RTLD_DEFAULT, "executor_fexcore_register_guest_executable_range");
+    if (sym == nullptr) {
+        void* handle = dlopen("libexecutor_fexcore_embed.so", RTLD_NOW | RTLD_NOLOAD);
+        if (handle != nullptr) {
+            sym = dlsym(handle, "executor_fexcore_register_guest_executable_range");
+        }
+    }
+    return reinterpret_cast<ExecutorFexRegisterGuestExecutableRangeFn>(sym);
+}
+
+static std::uint32_t ExecutorToElfSegmentProt(Core::MemoryProt prot) {
+    constexpr std::uint32_t ElfPfExecute = 0x1;
+    constexpr std::uint32_t ElfPfWrite = 0x2;
+    constexpr std::uint32_t ElfPfRead = 0x4;
+
+    std::uint32_t elf_prot = 0;
+    if (True(prot & Core::MemoryProt::CpuRead)) {
+        elf_prot |= ElfPfRead;
+    }
+    if (True(prot & Core::MemoryProt::CpuWrite)) {
+        elf_prot |= ElfPfWrite;
+    }
+    if (True(prot & Core::MemoryProt::CpuExec)) {
+        elf_prot |= ElfPfExecute;
+    }
+    return elf_prot;
+}
+
+static int ExecutorRegisterFexHostExecutableRange(VAddr addr, u64 size,
+                                                  Core::MemoryProt prot,
+                                                  const char* source) {
+    if (!True(prot & Core::MemoryProt::CpuExec) || size == 0) {
+        return 0;
+    }
+
+    const ExecutorFexRegisterGuestExecutableRangeFn registrar =
+        ExecutorResolveFexExecRangeRegistrar();
+    if (registrar == nullptr) {
+        __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
+                            "[EXECUTOR_FEX_DYNAMIC_EXEC_RANGE] source=%s addr=0x%llx "
+                            "size=0x%llx prot=0x%x result=no_registrar",
+                            source ? source : "unknown",
+                            static_cast<unsigned long long>(addr),
+                            static_cast<unsigned long long>(size),
+                            static_cast<unsigned int>(prot));
+        return -1;
+    }
+
+    const std::uint32_t elf_prot = ExecutorToElfSegmentProt(prot);
+    const int rc = registrar(addr, size, elf_prot);
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_FEX_DYNAMIC_EXEC_RANGE] source=%s addr=0x%llx size=0x%llx "
+                        "orbisProt=0x%x elfProt=0x%x rc=%d",
+                        source ? source : "unknown",
+                        static_cast<unsigned long long>(addr),
+                        static_cast<unsigned long long>(size),
+                        static_cast<unsigned int>(prot), elf_prot, rc);
+    return rc;
+}
+#endif
 
 void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, s64 phys_addr) {
     LOG_INFO(
@@ -742,9 +865,12 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, 
         fmt::ptr(addr), len, prot, flags, fd, phys_addr);
 
     if (len == 0) {
-        // If length is 0, mmap returns EINVAL.
         ErrSceToPosix(ORBIS_KERNEL_ERROR_EINVAL);
-        LOG_ERROR(Kernel_Vmm, "Invalid length");
+#ifdef __ANDROID__
+        ExecutorLiveMmapLog("posix_mmap_len0", addr, len, prot, flags, fd, phys_addr,
+                            reinterpret_cast<void*>(-1), *__Error(),
+                            ORBIS_KERNEL_ERROR_EINVAL);
+#endif
         return reinterpret_cast<void*>(-1);
     }
 
@@ -754,49 +880,74 @@ void* PS4_SYSV_ABI posix_mmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd, 
     const auto mem_flags = static_cast<Core::MemoryMapFlags>(flags);
     const auto vaddr = reinterpret_cast<VAddr>(addr);
 
-    // Align address and size here. Both align up to the next page
     const VAddr aligned_addr = Common::AlignUp(vaddr, 16_KB);
     const u64 aligned_size = Common::AlignUp(len, 16_KB);
 
+#ifdef __ANDROID__
+    if ((True(mem_flags & Core::MemoryMapFlags::Anon) ||
+         True(mem_flags & Core::MemoryMapFlags::Stack)) &&
+        fd == -1) {
+        const bool fixed = True(mem_flags & Core::MemoryMapFlags::Fixed);
+        int host_flags = MAP_PRIVATE | MAP_ANONYMOUS | (fixed ? MAP_FIXED : 0);
+        void* host_addr = ::mmap(fixed ? reinterpret_cast<void*>(aligned_addr) : nullptr, aligned_size,
+                                 prot, host_flags, -1, 0);
+        if (host_addr == MAP_FAILED) {
+            *__Error() = errno;
+#ifdef __ANDROID__
+            ExecutorLiveMmapLog("posix_mmap_host_fail", addr, len, prot, flags, fd, phys_addr,
+                                reinterpret_cast<void*>(-1), *__Error(), -1);
+#endif
+            return reinterpret_cast<void*>(-1);
+        }
+        ExecutorRecordHostMmapRange(reinterpret_cast<VAddr>(host_addr), aligned_size);
+        ExecutorRegisterFexHostExecutableRange(reinterpret_cast<VAddr>(host_addr), aligned_size,
+                                               mem_prot, "posix_mmap_host");
+#ifdef __ANDROID__
+        ExecutorLiveMmapLog("posix_mmap_host_ok", addr, len, prot, flags, fd, phys_addr,
+                            host_addr, 0, ORBIS_OK);
+#endif
+        return host_addr;
+    }
+#endif
+
     if (True(mem_flags & Core::MemoryMapFlags::Fixed) && vaddr != aligned_addr) {
-        // If flags Fixed is specified, the input address must be aligned.
         ErrSceToPosix(ORBIS_KERNEL_ERROR_EINVAL);
-        LOG_ERROR(Kernel_Vmm, "Misaligned input address");
+#ifdef __ANDROID__
+        ExecutorLiveMmapLog("posix_mmap_fixed_unaligned", addr, len, prot, flags, fd, phys_addr,
+                            reinterpret_cast<void*>(-1), *__Error(),
+                            ORBIS_KERNEL_ERROR_EINVAL);
+#endif
         return reinterpret_cast<void*>(-1);
     }
 
     s32 result = ORBIS_OK;
     if (True(mem_flags & Core::MemoryMapFlags::Anon)) {
-        // Maps flexible or system memory
-        const Core::VMAType mapping_type = True(mem_flags & Core::MemoryMapFlags::System)
-                                               ? Core::VMAType::System
-                                               : Core::VMAType::Flexible;
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
-                                   mapping_type, "anon", false);
+                                   Core::VMAType::Flexible, "anon", false);
     } else if (True(mem_flags & Core::MemoryMapFlags::Stack)) {
-        // Maps stack memory
         result = memory->MapMemory(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags,
                                    Core::VMAType::Stack, "anon", false);
     } else if (True(mem_flags & Core::MemoryMapFlags::Void)) {
-        // Reserves memory
         result =
             memory->MapMemory(&addr_out, aligned_addr, aligned_size, Core::MemoryProt::NoAccess,
                               mem_flags, Core::VMAType::Reserved, "anon", false);
     } else {
-        // Default to file mapping
         result = memory->MapFile(&addr_out, aligned_addr, aligned_size, mem_prot, mem_flags, fd,
                                  phys_addr);
     }
 
     if (result != ORBIS_OK) {
-        // If the memory mappings fail, mmap sets errno to the appropriate error code,
-        // then returns (void*)-1;
         ErrSceToPosix(result);
-        LOG_ERROR(Kernel_Vmm, "error = {}", *__Error());
+#ifdef __ANDROID__
+        ExecutorLiveMmapLog("posix_mmap_vm_fail", addr, len, prot, flags, fd, phys_addr,
+                            reinterpret_cast<void*>(-1), *__Error(), result);
+#endif
         return reinterpret_cast<void*>(-1);
     }
-
-    LOG_INFO(Kernel_Vmm, "addr_out = {}", fmt::ptr(addr_out));
+#ifdef __ANDROID__
+    ExecutorLiveMmapLog("posix_mmap_vm_ok", addr, len, prot, flags, fd, phys_addr, addr_out, 0,
+                        result);
+#endif
     return addr_out;
 }
 
@@ -805,12 +956,20 @@ s32 PS4_SYSV_ABI sceKernelMmap(void* addr, u64 len, s32 prot, s32 flags, s32 fd,
     void* addr_out = posix_mmap(addr, len, prot, flags, fd, phys_addr);
 
     if (addr_out == reinterpret_cast<void*>(-1)) {
-        // posix_mmap failed, calculate and return the appropriate kernel error code using errno.
-        return ErrnoToSceKernelError(*__Error());
+        LOG_ERROR(Kernel_Fs, "error = {}", *__Error());
+        const auto result = ErrnoToSceKernelError(*__Error());
+#ifdef __ANDROID__
+        ExecutorLiveMmapLog("sceKernelMmap_fail", addr, len, prot, flags, fd, phys_addr, addr_out,
+                            *__Error(), result);
+#endif
+        return result;
     }
 
-    // Set the outputted address
     *res = addr_out;
+#ifdef __ANDROID__
+    ExecutorLiveMmapLog("sceKernelMmap_ok", addr, len, prot, flags, fd, phys_addr, addr_out, 0,
+                        ORBIS_OK);
+#endif
     return ORBIS_OK;
 }
 
@@ -829,6 +988,17 @@ s32 PS4_SYSV_ABI sceKernelMunmap(void* addr, u64 len) {
     if (len == 0) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+#ifdef __ANDROID__
+    if (ExecutorIsHostMmapAddr(std::bit_cast<VAddr>(addr))) {
+        const u64 aligned_size = Common::AlignUp(len, 16_KB);
+        ExecutorTakeHostMmapRange(std::bit_cast<VAddr>(addr));
+        if (::munmap(addr, aligned_size) != 0) {
+            *__Error() = errno;
+            return ORBIS_KERNEL_ERROR_EINVAL;
+        }
+        return ORBIS_OK;
+    }
+#endif
     auto* memory = Core::Memory::Instance();
     return memory->UnmapMemory(std::bit_cast<VAddr>(addr), len);
 }
@@ -841,17 +1011,6 @@ s32 PS4_SYSV_ABI posix_munmap(void* addr, u64 len) {
         return -1;
     }
     return result;
-}
-
-s32 PS4_SYSV_ABI sceKernelMlock(void* addr, u64 len) {
-    LOG_ERROR(Kernel_Vmm, "(STUBBED) called, addr = {}, len = {:#x}", fmt::ptr(addr), len);
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI posix_msync(void* addr, u64 len, s32 flags) {
-    LOG_ERROR(Kernel_Vmm, "(STUBBED) called, addr = {}, len = {:#x}, flags = {}", fmt::ptr(addr),
-              len, flags);
-    return ORBIS_OK;
 }
 
 static constexpr s32 MAX_PRT_APERTURES = 3;
@@ -918,7 +1077,6 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("PGhQHd-dzv8", "libkernel", 1, "libkernel", sceKernelMmap);
     LIB_FUNCTION("cQke9UuBQOk", "libkernel", 1, "libkernel", sceKernelMunmap);
     LIB_FUNCTION("mL8NDH86iQI", "libkernel", 1, "libkernel", sceKernelMapNamedFlexibleMemory);
-    LIB_FUNCTION("kc+LEEIYakc", "libkernel", 1, "libkernel", sceKernelMapNamedSystemFlexibleMemory);
     LIB_FUNCTION("aNz11fnnzi4", "libkernel", 1, "libkernel", sceKernelAvailableFlexibleMemorySize);
     LIB_FUNCTION("aNz11fnnzi4", "libkernel_avlfmem", 1, "libkernel",
                  sceKernelAvailableFlexibleMemorySize);
@@ -934,7 +1092,6 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("YQOfxL4QfeU", "libScePosix", 1, "libkernel", posix_mprotect);
     LIB_FUNCTION("9bfdLIyuwCY", "libkernel", 1, "libkernel", sceKernelMtypeprotect);
 
-    // Memory pool
     LIB_FUNCTION("qCSfqDILlns", "libkernel", 1, "libkernel", sceKernelMemoryPoolExpand);
     LIB_FUNCTION("pU-QydtGcGY", "libkernel", 1, "libkernel", sceKernelMemoryPoolReserve);
     LIB_FUNCTION("Vzl66WmfLvk", "libkernel", 1, "libkernel", sceKernelMemoryPoolCommit);
@@ -946,13 +1103,9 @@ void RegisterMemory(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("BPE9s9vQQXo", "libScePosix", 1, "libkernel", posix_mmap);
     LIB_FUNCTION("UqDGjXA5yUM", "libkernel", 1, "libkernel", posix_munmap);
     LIB_FUNCTION("UqDGjXA5yUM", "libScePosix", 1, "libkernel", posix_munmap);
-    LIB_FUNCTION("3k6kx-zOOSQ", "libkernel", 1, "libkernel", sceKernelMlock);
-    LIB_FUNCTION("tZY4+SZNFhA", "libkernel", 1, "libkernel", posix_msync);
-    LIB_FUNCTION("tZY4+SZNFhA", "libScePosix", 1, "libkernel", posix_msync);
 
-    // PRT memory management
     LIB_FUNCTION("BohYr-F7-is", "libkernel", 1, "libkernel", sceKernelSetPrtAperture);
     LIB_FUNCTION("L0v2Go5jOuM", "libkernel", 1, "libkernel", sceKernelGetPrtAperture);
 }
 
-} // namespace Libraries::Kernel
+}

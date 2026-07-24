@@ -11,4 +11,4 @@ namespace Libraries::Kernel {
 
 void RegisterDebug(Core::Loader::SymbolsResolver* sym);
 
-} // namespace Libraries::Kernel
+}

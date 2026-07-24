@@ -105,7 +105,6 @@ struct DialogResult {
     std::array<char, 32> reserved{};
 };
 
-// State is used to copy all the data from the param struct
 class MsgDialogState {
 public:
     struct UserState {
@@ -174,8 +173,6 @@ public:
     void Draw() override;
 };
 
-// Utility function to show a message dialog
-// !!! This function can block !!!
 DialogResult ShowMsgDialog(MsgDialogState state, bool block = true);
 
-}; // namespace Libraries::MsgDialog
+};

@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// Posix error codes
 constexpr int POSIX_EPERM = 1;
 constexpr int POSIX_ENOENT = 2;
 constexpr int POSIX_ESRCH = 3;

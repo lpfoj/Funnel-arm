@@ -1,25 +1,109 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <mutex>
 #include <queue>
 
+#include "common/config.h"
 #include "common/logging/log.h"
 
-#include <core/user_settings.h>
-#include <queue>
-#include "common/singleton.h"
-#include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
-#include "core/libraries/np/np_handler.h"
-#include "core/libraries/np/np_manager.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/system/userservice_error.h"
-#include "core/tls.h"
-#include "input/controller.h"
 
 namespace Libraries::UserService {
 
-static bool g_shadnet_enabled = false;
+namespace {
+
+struct HeadlessUserSession {
+    std::mutex mutex;
+    bool started{};
+    std::array<OrbisUserServiceUserId, ORBIS_USER_SERVICE_MAX_LOGIN_USERS> logged_in_users{};
+    std::queue<OrbisUserServiceEvent> events;
+};
+
+HeadlessUserSession& GetHeadlessUserSession() {
+    static HeadlessUserSession session;
+    return session;
+}
+
+void ResetSessionLocked(HeadlessUserSession& session) {
+    session.started = true;
+    session.logged_in_users.fill(ORBIS_USER_SERVICE_USER_ID_INVALID);
+    session.logged_in_users[0] = ORBIS_USER_SERVICE_DEFAULT_USER_ID;
+    session.events = {};
+    session.events.push(
+        {OrbisUserServiceEventType::Login, ORBIS_USER_SERVICE_DEFAULT_USER_ID});
+}
+
+void EnsureSessionStartedLocked(HeadlessUserSession& session) {
+    if (!session.started) {
+        ResetSessionLocked(session);
+    }
+}
+
+void EnsureUserServiceSessionStarted() {
+    auto& session = GetHeadlessUserSession();
+    std::scoped_lock lock(session.mutex);
+    EnsureSessionStartedLocked(session);
+}
+
+bool IsKnownUser(OrbisUserServiceUserId user_id) {
+    return user_id == ORBIS_USER_SERVICE_DEFAULT_USER_ID;
+}
+
+}
+
+void StartUserServiceSession() {
+    auto& session = GetHeadlessUserSession();
+    {
+        std::scoped_lock lock(session.mutex);
+        ResetSessionLocked(session);
+    }
+    LOG_INFO(Lib_UserService, "Started headless user session: user_id={}",
+             ORBIS_USER_SERVICE_DEFAULT_USER_ID);
+}
+
+void AddUserServiceEvent(OrbisUserServiceEvent event) {
+    auto& session = GetHeadlessUserSession();
+    bool queued = false;
+    {
+        std::scoped_lock lock(session.mutex);
+        EnsureSessionStartedLocked(session);
+
+        if (!IsKnownUser(event.userId)) {
+            LOG_ERROR(Lib_UserService, "Ignoring event for unknown user_id={}", event.userId);
+            return;
+        }
+
+        auto user = std::find(session.logged_in_users.begin(), session.logged_in_users.end(),
+                              event.userId);
+        if (event.event == OrbisUserServiceEventType::Login) {
+            if (user != session.logged_in_users.end()) {
+                return;
+            }
+            session.logged_in_users[0] = event.userId;
+            queued = true;
+        } else if (event.event == OrbisUserServiceEventType::Logout) {
+            if (user == session.logged_in_users.end()) {
+                return;
+            }
+            *user = ORBIS_USER_SERVICE_USER_ID_INVALID;
+            queued = true;
+        }
+
+        if (queued) {
+            session.events.push(event);
+        }
+    }
+
+    if (queued) {
+        LOG_DEBUG(Lib_UserService, "Event added to queue: {} {}", static_cast<u8>(event.event),
+                  event.userId);
+    }
+}
 
 int PS4_SYSV_ABI sceUserServiceInitializeForShellCore() {
     LOG_ERROR(Lib_UserService, "(STUBBED) called");
@@ -116,28 +200,23 @@ int PS4_SYSV_ABI sceUserServiceGetDiscPlayerFlag() {
     return ORBIS_OK;
 }
 
-std::queue<OrbisUserServiceEvent> user_service_event_queue = {};
-
-void AddUserServiceEvent(const OrbisUserServiceEvent e) {
-    LOG_DEBUG(Lib_UserService, "Event added to queue: {} {}", (u8)e.event, e.userId);
-    user_service_event_queue.push(e);
-}
-
 s32 PS4_SYSV_ABI sceUserServiceGetEvent(OrbisUserServiceEvent* event) {
     LOG_TRACE(Lib_UserService, "called");
-
-    if (!user_service_event_queue.empty()) {
-        OrbisUserServiceEvent& temp = user_service_event_queue.front();
-        event->event = temp.event;
-        event->userId = temp.userId;
-        user_service_event_queue.pop();
-        Libraries::Np::NpManager::NotifyNpStateFromUserServiceEvent(temp.event, temp.userId);
-        LOG_INFO(Lib_UserService, "Event processed by the game: {} {}", (u8)temp.event,
-                 temp.userId);
-        return ORBIS_OK;
+    if (event == nullptr) {
+        LOG_ERROR(Lib_UserService, "event is null");
+        return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
 
-    return ORBIS_USER_SERVICE_ERROR_NO_EVENT;
+    auto& session = GetHeadlessUserSession();
+    std::scoped_lock lock(session.mutex);
+    EnsureSessionStartedLocked(session);
+    if (session.events.empty()) {
+        return ORBIS_USER_SERVICE_ERROR_NO_EVENT;
+    }
+
+    *event = session.events.front();
+    session.events.pop();
+    return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceUserServiceGetEventCalendarType() {
@@ -516,7 +595,8 @@ s32 PS4_SYSV_ABI sceUserServiceGetInitialUser(int* user_id) {
         LOG_ERROR(Lib_UserService, "user_id is null");
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
-    *user_id = UserManagement.GetDefaultUser().user_id;
+    EnsureUserServiceSessionStarted();
+    *user_id = ORBIS_USER_SERVICE_DEFAULT_USER_ID;
     return ORBIS_OK;
 }
 
@@ -586,29 +666,20 @@ int PS4_SYSV_ABI sceUserServiceGetLoginFlag() {
 }
 
 s32 PS4_SYSV_ABI sceUserServiceGetLoginUserIdList(OrbisUserServiceLoginUserIdList* userIdList) {
+    LOG_DEBUG(Lib_UserService, "called");
     if (userIdList == nullptr) {
-        LOG_ERROR(Lib_UserService, "userIdList is null");
+        LOG_ERROR(Lib_UserService, "user_id is null");
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
+    auto& session = GetHeadlessUserSession();
+    std::scoped_lock lock(session.mutex);
+    EnsureSessionStartedLocked(session);
+    std::copy(session.logged_in_users.begin(), session.logged_in_users.end(),
+              userIdList->user_id);
 
-    // Initialize all slots to invalid (-1)
-    for (int i = 0; i < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; i++) {
-        userIdList->user_id[i] = ORBIS_USER_SERVICE_USER_ID_INVALID;
-    }
-
-    auto& user_manager = UserManagement;
-
-    auto logged_in_users = user_manager.GetLoggedInUsers();
-
-    for (int i = 0; i < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; i++) {
-        s32 id =
-            logged_in_users[i] ? logged_in_users[i]->user_id : ORBIS_USER_SERVICE_USER_ID_INVALID;
-        userIdList->user_id[i] = id;
-        LOG_DEBUG(Lib_UserService, "Slot {}: User ID {} (port {})", i, id,
-                  logged_in_users[i] ? logged_in_users[i]->player_index : -1);
-    }
     return ORBIS_OK;
 }
+
 int PS4_SYSV_ABI sceUserServiceGetMicLevel() {
     LOG_ERROR(Lib_UserService, "(STUBBED) called");
     return ORBIS_OK;
@@ -1070,13 +1141,17 @@ int PS4_SYSV_ABI sceUserServiceGetTraditionalChineseInputType() {
 }
 
 s32 PS4_SYSV_ABI sceUserServiceGetUserColor(int user_id, OrbisUserServiceUserColor* color) {
-    // TODO fix me better
     LOG_DEBUG(Lib_UserService, "called user_id = {}", user_id);
     if (color == nullptr) {
         LOG_ERROR(Lib_UserService, "color is null");
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
-    *color = (OrbisUserServiceUserColor)UserManagement.GetUserByID(user_id)->user_color;
+    if (!IsKnownUser(user_id)) {
+        LOG_ERROR(Lib_UserService, "invalid user_id={}", user_id);
+        return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
+    }
+    EnsureUserServiceSessionStarted();
+    *color = OrbisUserServiceUserColor::Blue;
     return ORBIS_OK;
 }
 
@@ -1096,33 +1171,18 @@ int PS4_SYSV_ABI sceUserServiceGetUserGroupNum() {
 }
 
 s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::size_t size) {
-    LOG_DEBUG(Lib_UserService, "called user_id = {}, size = {} ", user_id, size);
-    if (user_id == ORBIS_USER_SERVICE_USER_ID_INVALID) {
-        LOG_ERROR(Lib_UserService, "invalid user_id");
+    LOG_DEBUG(Lib_UserService, "called user_id = {} ,size = {} ", user_id, size);
+    if (!IsKnownUser(user_id)) {
+        LOG_ERROR(Lib_UserService, "invalid user_id={}", user_id);
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
     if (user_name == nullptr) {
         LOG_ERROR(Lib_UserService, "user_name is null");
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
-
-    std::string name = "LSX4";
-    auto const* u = UserManagement.GetUserByID(user_id);
-    if (u != nullptr) {
-        name = u->user_name;
-    } else {
-        LOG_ERROR(Lib_UserService, "No user found");
-    }
-    // once signed in shadnet onlineid is set as username
-    if (g_shadnet_enabled && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
-        const auto np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
-        const std::size_t handle_len = strnlen(np_id.handle.data, sizeof(np_id.handle.data));
-        if (handle_len > 0) {
-            name.assign(np_id.handle.data, handle_len);
-        }
-    }
-
-    if (size < name.length() + 1) {
+    EnsureUserServiceSessionStarted();
+    std::string name = Config::getUserName();
+    if (size == 0 || size <= name.length()) {
         LOG_ERROR(Lib_UserService, "buffer is too short");
         return ORBIS_USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
     }
@@ -1172,6 +1232,7 @@ int PS4_SYSV_ABI sceUserServiceGetVolumeForSidetone() {
 
 s32 PS4_SYSV_ABI sceUserServiceInitialize(const OrbisUserServiceInitializeParams* initParams) {
     LOG_WARNING(Lib_UserService, "(dummy) called");
+    EnsureUserServiceSessionStarted();
     return ORBIS_OK;
 }
 
@@ -2216,7 +2277,6 @@ int PS4_SYSV_ABI Func_D2B814603E7B4477() {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();
     LIB_FUNCTION("Psl9mfs3duM", "libSceUserServiceForShellCore", 1, "libSceUserService",
                  sceUserServiceInitializeForShellCore);
     LIB_FUNCTION("CydP+QtA0KI", "libSceUserServiceForShellCore", 1, "libSceUserService",
@@ -3065,4 +3125,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceUserServiceGetRegisteredUserIdList);
 };
 
-} // namespace Libraries::UserService
+}

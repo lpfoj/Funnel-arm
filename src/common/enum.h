@@ -158,4 +158,4 @@ private:
     }
 };
 
-} // namespace Common
+}

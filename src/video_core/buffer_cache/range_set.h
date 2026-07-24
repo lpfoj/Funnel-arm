@@ -322,4 +322,4 @@ private:
     IntervalMap m_ranges_map;
 };
 
-} // namespace VideoCore
+}

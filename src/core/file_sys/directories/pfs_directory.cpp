@@ -92,7 +92,6 @@ s64 PfsDirectory::getdents(void* buf, u64 nbytes, s64* basep) {
     if (basep)
         *basep = file_offset;
 
-    // same as others, we just don't need a variable
     if (file_offset >= directory_size)
         return 0;
 
@@ -103,29 +102,19 @@ s64 PfsDirectory::getdents(void* buf, u64 nbytes, s64* basep) {
         const PfsDirectoryDirent* pfs_dirent =
             reinterpret_cast<PfsDirectoryDirent*>(this->dirent_cache_bin.data() + buffer_position);
 
-        // bad, incomplete or OOB entry
         if (pfs_dirent->d_namlen == 0)
             break;
 
         if (starting_offset < file_offset) {
-            // reading starts from the nearest full dirent
             starting_offset += pfs_dirent->d_reclen;
             buffer_position = bytes_written + starting_offset;
             continue;
         }
 
         if ((bytes_written + pfs_dirent->d_reclen) > nbytes)
-            // dirents are aligned to the last full one
             break;
 
-        // if this dirent breaks alignment, skip
-        // dirents are count-aligned here, excess data is simply not written
-        // if (Common::AlignUp(buffer_position, count) !=
-        //     Common::AlignUp(buffer_position + pfs_dirent->d_reclen, count))
-        //     break;
 
-        // reclen for both is the same despite difference in var sizes, extra 0s are padded after
-        // the name
         NormalDirectoryDirent normal_dirent{};
         normal_dirent.d_fileno = pfs_dirent->d_fileno;
         normal_dirent.d_reclen = pfs_dirent->d_reclen;
@@ -143,4 +132,4 @@ s64 PfsDirectory::getdents(void* buf, u64 nbytes, s64* basep) {
                       : (file_offset + bytes_written);
     return bytes_written;
 }
-} // namespace Core::Directories
+}

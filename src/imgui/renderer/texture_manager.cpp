@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <deque>
@@ -6,11 +6,11 @@
 
 #include <imgui.h>
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
 #include "common/stb.h"
 #include "common/thread.h"
-#include "core/emulator_settings.h"
 #include "imgui_impl_vulkan.h"
 #include "texture_manager.h"
 
@@ -27,7 +27,7 @@ struct Inner {
 
     ~Inner();
 };
-} // namespace Core::TextureManager
+}
 
 using namespace Core::TextureManager;
 
@@ -108,7 +108,7 @@ struct Job {
 struct UploadJob {
     Inner* core = nullptr;
     Vulkan::UploadTextureData data;
-    int tick = 0; // Used to skip the first frame when destroying to await the current frame to draw
+    int tick = 0;
 };
 
 static bool g_is_worker_running = false;
@@ -152,12 +152,11 @@ void WorkerLoop() {
             g_job_list.pop_front();
             g_job_list_mtx.unlock();
 
-            if (EmulatorSettings.IsVkCrashDiagnosticEnabled()) {
-                // FIXME: Crash diagnostic hangs when building the command buffer here
+            if (Config::getVkCrashDiagnosticEnabled()) {
                 continue;
             }
 
-            if (!path.empty()) { // Decode PNG from file
+            if (!path.empty()) {
                 Common::FS::IOFile file(path, Common::FS::FileAccessMode::Read);
                 if (!file.IsOpen()) {
                     LOG_ERROR(ImGui, "Failed to open PNG file: {}", path.string());
@@ -230,7 +229,6 @@ void Submit() {
         if (g_upload_list.empty()) {
             return;
         }
-        // Upload one texture at a time to avoid slow down
         upload = g_upload_list.front();
         g_upload_list.pop_front();
         if (upload.tick > 0) {
@@ -249,6 +247,6 @@ void Submit() {
         upload.data.Destroy();
     }
 }
-} // namespace Core::TextureManager
+}
 
-} // namespace ImGui
+}

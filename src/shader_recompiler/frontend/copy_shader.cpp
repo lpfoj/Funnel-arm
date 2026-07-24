@@ -97,4 +97,4 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
     return data;
 }
 
-} // namespace Shader
+}

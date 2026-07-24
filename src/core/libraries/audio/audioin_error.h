@@ -5,7 +5,6 @@
 
 #include "core/libraries/error_codes.h"
 
-// AudioIn library
 constexpr int ORBIS_AUDIO_IN_ERROR_INVALID_HANDLE = 0x80260101;
 constexpr int ORBIS_AUDIO_IN_ERROR_INVALID_SIZE = 0x80260102;
 constexpr int ORBIS_AUDIO_IN_ERROR_INVALID_FREQ = 0x80260103;

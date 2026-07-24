@@ -21,4 +21,4 @@ enum class AuxShaderType : u32 {
 [[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type,
                                                       const FragmentRuntimeInfo& fs_info);
 
-} // namespace Shader::Backend::SPIRV
+}

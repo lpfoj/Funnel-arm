@@ -62,4 +62,4 @@ void RegisterlibSceLibcInternalThreads(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("LaPaA6mYA38", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxdst);
 }
 
-} // namespace Libraries::LibcInternal
+}

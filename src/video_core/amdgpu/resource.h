@@ -11,7 +11,6 @@
 
 namespace AmdGpu {
 
-// Table 8.5 Buffer Resource Descriptor [Sea Islands Series Instruction Set Architecture]
 struct Buffer {
     u64 base_address : 44;
     u64 _padding0 : 4;
@@ -29,7 +28,7 @@ struct Buffer {
     u32 index_stride : 2;
     u32 add_tid_enable : 1;
     u32 _padding1 : 6;
-    u32 type : 2; // overlaps with T# type, so should be 0 for buffer
+    u32 type : 2;
 
     static constexpr Buffer Null() {
         Buffer buffer{};
@@ -91,16 +90,14 @@ struct Buffer {
     }
 
     u32 GetIndexStride() const noexcept {
-        // Index stride is 2 bits, meaning 8, 16, 32, or 64.
         return 8 << index_stride;
     }
 
     u32 GetElementSize() const noexcept {
-        // Element size is 2 bits, meaning 2, 4, 8, or 16.
         return 2 << element_size;
     }
 };
-static_assert(sizeof(Buffer) == 16); // 128bits
+static_assert(sizeof(Buffer) == 16);
 
 enum class ImageType : u64 {
     Invalid = 0,
@@ -161,7 +158,7 @@ struct Image {
     u64 pow2pad : 1;
     u64 mtype2 : 1;
     u64 atc : 1;
-    u64 type : 4; // overlaps with V# type, so shouldn't be 0 for buffer
+    u64 type : 4;
 
     u64 depth : 13;
     u64 pitch : 14;
@@ -172,13 +169,9 @@ struct Image {
     u64 min_lod_warn : 12;
     u64 counter_bank_id : 8;
     u64 lod_hw_cnt_en : 1;
-    /// Neo-mode only
     u64 compression_en : 1;
-    /// Neo-mode only
     u64 alpha_is_on_msb : 1;
-    /// Neo-mode only
     u64 color_transform : 1;
-    /// Neo-mode only
     u64 alt_tile_mode : 1;
     u64 : 39;
 
@@ -222,13 +215,10 @@ struct Image {
     }
 
     [[nodiscard]] u32 NumLayers() const noexcept {
-        // Depth is the number of layers for Array images.
         u32 slices = depth + 1;
         if (GetType() == ImageType::Color3D) {
-            // Depth is the actual texture depth for 3D images.
             slices = 1;
         } else if (IsCube()) {
-            // Depth is the number of full cubes for Cube images.
             slices *= 6;
         }
         if (pow2pad) {
@@ -310,7 +300,6 @@ struct Image {
     ImageType GetViewType(const bool is_array) const noexcept {
         const auto base_type = GetType();
         if (IsCube()) {
-            // Cube needs to remain array type regardless of instruction array specifier.
             return base_type;
         }
         if (base_type == ImageType::Color1DArray && !is_array) {
@@ -331,7 +320,6 @@ struct Image {
         case ImageType::Color2DMsaaArray:
             return 1;
         default:
-            // Constrain to actual number of available levels.
             const auto max_level = std::min<u32>(last_level + 1, NumLevels());
             return max_level > base_level ? max_level - base_level : 1;
         }
@@ -345,15 +333,13 @@ struct Image {
         case ImageType::Color3D:
             return 1;
         default:
-            // Constrain to actual number of available layers.
             const auto max_array = std::min<u32>(last_array + 1, NumLayers());
             return max_array > base_array ? max_array - base_array : 1;
         }
     }
 };
-static_assert(sizeof(Image) == 32); // 256bits
+static_assert(sizeof(Image) == 32);
 
-// 8.2.7. Image Sampler [RDNA 2 Instruction Set Architecture]
 enum class ClampMode : u64 {
     Wrap = 0,
     Mirror = 1,
@@ -414,7 +400,6 @@ enum class BorderColor : u64 {
     Custom = 3,
 };
 
-// Table 8.12 Sampler Resource Definition
 struct Sampler {
     union {
         u64 raw0;
@@ -495,7 +480,7 @@ struct Sampler {
     }
 };
 
-} // namespace AmdGpu
+}
 
 template <>
 struct fmt::formatter<AmdGpu::ImageType> {

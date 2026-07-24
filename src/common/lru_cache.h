@@ -132,4 +132,4 @@ private:
     Item* last_item{};
 };
 
-} // namespace Common
+}

@@ -44,6 +44,9 @@ public:
 
     Id Def(const IR::Value& value);
 
+    void LoadBuiltInVectorInputs();
+    void ResetSampledImageDescriptorCache();
+
     void DefineBufferProperties();
     void DefineAmdPerVertexAttribs();
     void DefineWorkgroupIndex();
@@ -154,18 +157,15 @@ public:
         OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
         OpBranchConditional(is_available, available_label, fallback_label);
 
-        // Available
         AddLabel(available_label);
         const Id addr_ptr = OpConvertUToPtr(physical_pointer_type_u32, addr);
         const Id result = OpLoad(U32[1], addr_ptr, spv::MemoryAccessMask::Aligned, 4u);
         OpBranch(merge_label);
 
-        // Fallback
         AddLabel(fallback_label);
         const Id fallback_result = fallback();
         OpBranch(merge_label);
 
-        // Merge
         AddLabel(merge_label);
         const Id final_result =
             OpPhi(U32[1], fallback_result, fallback_label, result, available_label);
@@ -176,7 +176,6 @@ public:
         if (std::popcount(static_cast<u32>(info.shared_types)) > 1) {
             return OpAccessChain(result_type, shared_mem, u32_zero_value, index);
         }
-        // Workgroup layout struct omitted.
         return OpAccessChain(result_type, shared_mem, index);
     }
 
@@ -204,6 +203,7 @@ public:
     Id U16{};
     Id S16{};
     Id U64{};
+    Id S64{};
     VectorIds F16{};
     VectorIds F32{};
     VectorIds F64{};
@@ -254,6 +254,7 @@ public:
     Id push_data_block{};
     Id base_vertex{};
     Id frag_coord{};
+    Id frag_coord_value{};
     Id front_facing{};
     Id frag_depth{};
     Id stencil_ref{};
@@ -265,7 +266,8 @@ public:
     Id patch_vertices{};
     Id output_tess_level_outer{};
     Id output_tess_level_inner{};
-    Id tess_coord;
+    Id tess_coord{};
+    Id tess_coord_value{};
     std::array<Id, 30> patches{};
 
     Id workgroup_id{};
@@ -286,14 +288,24 @@ public:
     Id shared_memory_u64_type{};
 
     Id bary_coord_smooth{};
+    Id bary_coord_smooth_value{};
     Id bary_coord_smooth_centroid{};
+    Id bary_coord_smooth_centroid_value{};
     Id bary_coord_smooth_sample{};
+    Id bary_coord_smooth_sample_value{};
     Id bary_coord_nopersp{};
+    Id bary_coord_nopersp_value{};
+    Id bary_coord_nopersp_centroid{};
+    Id bary_coord_nopersp_centroid_value{};
     Id bary_coord_nopersp_sample{};
+    Id bary_coord_nopersp_sample_value{};
+    Id bary_coord_pull_model{};
+    Id bary_coord_pull_model_value{};
 
     struct TextureDefinition {
         const VectorIds* data_types;
         Id id;
+        Id value;
         Id sampled_type;
         Id image_type;
         AmdGpu::ImageType view_type;
@@ -329,6 +341,7 @@ public:
         u32 binding;
         BufferType buffer_type;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
+        std::array<Id, u32(PointerSize::NumClass)> sizes;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
 
         template <class Self>
@@ -340,6 +353,11 @@ public:
         auto& Offset(this Self& self, PointerSize size) {
             return self.offsets[u32(size)];
         }
+
+        template <class Self>
+        auto& Size(this Self& self, PointerSize size) {
+            return self.sizes[u32(size)];
+        }
     };
 
     Bindings& binding;
@@ -347,6 +365,7 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
+    boost::container::small_vector<Id, 4> sampler_values;
     std::unordered_map<u32, Id> first_to_last_label_map;
 
     size_t flatbuf_index{};
@@ -372,6 +391,7 @@ public:
     Id input_attr_array;
     Id output_attr_array;
     std::array<SpirvAttribute, IR::NumParams> input_params{};
+    std::array<Id, IR::NumParams> input_param_values{};
     std::array<SpirvAttribute, IR::NumParams> output_params{};
     std::array<SpirvAttribute, IR::NumRenderTargets> frag_outputs{};
 
@@ -413,4 +433,4 @@ private:
     Id GetBufferSize(u32 sharp_idx);
 };
 
-} // namespace Shader::Backend::SPIRV
+}

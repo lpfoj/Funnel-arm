@@ -95,7 +95,6 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     if (!info.is_storage) {
         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
-    // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
     vk::Format format = info.format;
     vk::ImageAspectFlags aspect = image.aspect_mask;
     if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
@@ -146,4 +145,4 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
 
 ImageView::~ImageView() = default;
 
-} // namespace VideoCore
+}

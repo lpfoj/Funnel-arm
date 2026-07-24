@@ -31,4 +31,4 @@ struct LambdaTraits<ReturnType (LambdaType::*)(Args...) const> {
     static constexpr size_t NUM_ARGS{sizeof...(Args)};
 };
 
-} // namespace Common
+}

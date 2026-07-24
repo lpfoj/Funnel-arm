@@ -3,7 +3,6 @@
 
 #pragma once
 
-// net errno codes
 constexpr int ORBIS_NET_EPERM = 1;
 constexpr int ORBIS_NET_ENOENT = 2;
 constexpr int ORBIS_NET_EINTR = 4;
@@ -66,7 +65,6 @@ constexpr int ORBIS_NET_EINTERNAL = 204;
 constexpr int ORBIS_NET_ERETURN = 205;
 constexpr int ORBIS_NET_ENOALLOCMEM = 206;
 
-// errno for dns resolver
 constexpr int ORBIS_NET_RESOLVER_EINTERNAL = 220;
 constexpr int ORBIS_NET_RESOLVER_EBUSY = 221;
 constexpr int ORBIS_NET_RESOLVER_ENOSPACE = 222;
@@ -82,8 +80,7 @@ constexpr int ORBIS_NET_RESOLVER_ESERVERREFUSED = 232;
 constexpr int ORBIS_NET_RESOLVER_ENORECORD = 233;
 constexpr int ORBIS_NET_RESOLVER_EALIGNMENT = 234;
 
-// error codes
-constexpr int ORBIS_NET_ERROR_BASE = 0x80410100; // not existed used for calculation
+constexpr int ORBIS_NET_ERROR_BASE = 0x80410100;
 constexpr int ORBIS_NET_ERROR_EPERM = 0x80410101;
 constexpr int ORBIS_NET_ERROR_ENOENT = 0x80410102;
 constexpr int ORBIS_NET_ERROR_EINTR = 0x80410104;

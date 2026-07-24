@@ -51,7 +51,6 @@ void SleepqAdd(void* wchan, Pthread* td) {
         sq = td->sleepqueue;
         sc->sc_queues.push_front(*sq);
         sq->sq_wchan = wchan;
-        /* sq->sq_type = type; */
     }
     td->sleepqueue = nullptr;
     td->wchan = wchan;
@@ -98,4 +97,4 @@ void SleepqDrop(SleepQueue* sq, void (*callback)(Pthread*, void*), void* arg) {
     sq->sq_freeq.clear();
 }
 
-} // namespace Libraries::Kernel
+}

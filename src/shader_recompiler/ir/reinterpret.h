@@ -8,10 +8,7 @@
 
 namespace Shader::IR {
 
-/// Applies a component swizzle to a vec4.
 inline Value ApplySwizzle(IREmitter& ir, const Value& vector, const AmdGpu::CompMapping& swizzle) {
-    // Constants are indexed as 0 and 1, and components are 4-7. Thus we can apply a swizzle
-    // using two vectors and a shuffle, using one vector of constants and one of the components.
     const auto zero = ir.Imm32(0.f);
     const auto one = ir.Imm32(1.f);
     const auto constants_vec = ir.CompositeConstruct(zero, one, zero, zero);
@@ -21,7 +18,6 @@ inline Value ApplySwizzle(IREmitter& ir, const Value& vector, const AmdGpu::Comp
     return swizzled;
 }
 
-/// Converts gamma corrected value to linear space
 inline F32 ApplyGammaToLinear(IREmitter& ir, const F32& c) {
     const F32 a =
         ir.FPPow(ir.FPMul(ir.FPAdd(c, ir.Imm32(0.055f)), ir.Imm32(1.0f / 1.055f)), ir.Imm32(2.4f));
@@ -34,14 +30,12 @@ inline Value ApplyForceDegamma(IREmitter& ir, const Value& value) {
     auto y = F32{ir.CompositeExtract(value, 1)};
     auto z = F32{ir.CompositeExtract(value, 2)};
     auto w = F32{ir.CompositeExtract(value, 3)};
-    // Gamma correction is only applied to RGB components
     x = ApplyGammaToLinear(ir, x);
     y = ApplyGammaToLinear(ir, y);
     z = ApplyGammaToLinear(ir, z);
     return ir.CompositeConstruct(x, y, z, w);
 }
 
-/// Applies a number conversion in the read direction.
 inline F32 ApplyReadNumberConversion(IREmitter& ir, const F32& value,
                                      const AmdGpu::NumberConversion& conversion) {
     switch (conversion) {
@@ -52,7 +46,6 @@ inline F32 ApplyReadNumberConversion(IREmitter& ir, const F32& value,
     case AmdGpu::NumberConversion::SintToSscaled:
         return ir.ConvertSToF(32, 32, ir.BitCast<U32>(value));
     case AmdGpu::NumberConversion::UnormToUbnorm:
-        // Convert 0...1 to -1...1
         return ir.FPSub(ir.FPMul(value, ir.Imm32(2.f)), ir.Imm32(1.f));
     case AmdGpu::NumberConversion::Sint8ToSnormNz: {
         const IR::U32 additon = ir.IAdd(ir.IMul(ir.BitCast<U32>(value), ir.Imm32(2)), ir.Imm32(1));
@@ -90,20 +83,16 @@ inline Value ApplyReadNumberConversionVec4(IREmitter& ir, const Value& value,
     return ir.CompositeConstruct(x, y, z, w);
 }
 
-/// Applies a number conversion in the write direction.
 inline F32 ApplyWriteNumberConversion(IREmitter& ir, const F32& value,
                                       const AmdGpu::NumberConversion& conversion) {
     switch (conversion) {
     case AmdGpu::NumberConversion::None:
         return value;
     case AmdGpu::NumberConversion::UintToUscaled:
-        // Need to return float type to maintain IR semantics.
         return ir.BitCast<F32>(U32{ir.ConvertFToU(32, value)});
     case AmdGpu::NumberConversion::SintToSscaled:
-        // Need to return float type to maintain IR semantics.
         return ir.BitCast<F32>(U32{ir.ConvertFToS(32, value)});
     case AmdGpu::NumberConversion::UnormToUbnorm:
-        // Convert -1...1 to 0...1
         return ir.FPDiv(ir.FPAdd(value, ir.Imm32(1.f)), ir.Imm32(2.f));
     case AmdGpu::NumberConversion::Sint8ToSnormNz: {
         const IR::F32 max = ir.Imm32(float(std::numeric_limits<u8>::max()));
@@ -142,4 +131,4 @@ inline Value ApplyWriteNumberConversionVec4(IREmitter& ir, const Value& value,
     return ir.CompositeConstruct(x, y, z, w);
 }
 
-} // namespace Shader::IR
+}

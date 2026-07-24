@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include "common/assert.h"
-#include "core/libraries/kernel/process.h"
 #include "shader_recompiler/frontend/decode.h"
 
 #include <magic_enum/magic_enum.hpp>
@@ -15,7 +14,7 @@ template <typename T>
 T extract(T value, u32 lst, u32 fst) {
     return (value >> fst) & ~(~T(0) << (lst - fst + 1));
 }
-} // namespace bit
+}
 
 InstEncoding GetInstructionEncoding(u32 token) {
     auto encoding = static_cast<InstEncoding>(token & (u32)EncodingMask::MASK_9bit);
@@ -40,7 +39,6 @@ InstEncoding GetInstructionEncoding(u32 token) {
     encoding = static_cast<InstEncoding>(token & (u32)EncodingMask::MASK_6bit);
     switch (encoding) {
     case InstEncoding::VOP3:
-    case InstEncoding::VOP3P:
     case InstEncoding::EXP:
     case InstEncoding::VINTRP:
     case InstEncoding::DS:
@@ -84,6 +82,7 @@ InstEncoding GetInstructionEncoding(u32 token) {
         break;
     }
 
+    UNREACHABLE();
     return InstEncoding::ILLEGAL;
 }
 
@@ -112,28 +111,21 @@ GcnInst GcnDecodeContext::decodeInstruction(GcnCodeSlice& code) {
     const uint32_t token = code.at(0);
 
     InstEncoding encoding = GetInstructionEncoding(token);
-    ASSERT_MSG(encoding != InstEncoding::ILLEGAL, "illegal encoding: {:#x}", token);
+    ASSERT_MSG(encoding != InstEncoding::ILLEGAL, "illegal encoding");
     uint32_t encodingLen = getEncodingLength(encoding);
 
-    // Clear the instruction
     m_instruction = GcnInst();
 
-    // Decode
     if (encodingLen == sizeof(uint32_t)) {
         decodeInstruction32(encoding, code);
     } else {
         decodeInstruction64(encoding, code);
     }
 
-    // Update instruction meta info.
     updateInstructionMeta(encoding);
 
-    // Detect literal constant. Only 32 bits instructions may have literal constant.
-    // Note: Literal constant decode must be performed after meta info updated.
     if (encodingLen == sizeof(u32)) {
         decodeLiteralConstant(encoding, code);
-        decodeSubDwordAddressing(encoding, code);
-        decodeDataParallelPrimitive(encoding, code);
     }
 
     repairOperandType();
@@ -158,7 +150,6 @@ uint32_t GcnDecodeContext::getEncodingLength(InstEncoding encoding) {
         break;
 
     case InstEncoding::VOP3:
-    case InstEncoding::VOP3P:
     case InstEncoding::MUBUF:
     case InstEncoding::MTBUF:
     case InstEncoding::MIMG:
@@ -192,9 +183,6 @@ uint32_t GcnDecodeContext::getOpMapOffset(InstEncoding encoding) {
         break;
     case InstEncoding::VOP3:
         offset = (uint32_t)OpcodeMap::OP_MAP_VOP3;
-        break;
-    case InstEncoding::VOP3P:
-        offset = (uint32_t)OpcodeMap::OP_MAP_VOP3P;
         break;
     case InstEncoding::EXP:
         offset = (uint32_t)OpcodeMap::OP_MAP_EXP;
@@ -233,18 +221,17 @@ uint32_t GcnDecodeContext::getOpMapOffset(InstEncoding encoding) {
 }
 
 uint32_t GcnDecodeContext::mapEncodingOp(InstEncoding encoding, Opcode opcode) {
-    // Map from uniform opcode to encoding specific opcode.
     uint32_t encodingOp = 0;
     if (encoding == InstEncoding::VOP3) {
         if (opcode >= Opcode::V_CMP_F_F32 && opcode <= Opcode::V_CMPX_T_U64) {
             uint32_t op =
                 static_cast<uint32_t>(opcode) - static_cast<uint32_t>(OpcodeMap::OP_MAP_VOPC);
             encodingOp = op + static_cast<uint32_t>(OpMapVOP3VOPX::VOP3_TO_VOPC);
-        } else if (opcode >= Opcode::V_CNDMASK_B32 && opcode <= Opcode::V_LDEXP_F16) {
+        } else if (opcode >= Opcode::V_CNDMASK_B32 && opcode <= Opcode::V_CVT_PK_I16_I32) {
             uint32_t op =
                 static_cast<uint32_t>(opcode) - static_cast<uint32_t>(OpcodeMap::OP_MAP_VOP2);
             encodingOp = op + static_cast<uint32_t>(OpMapVOP3VOPX::VOP3_TO_VOP2);
-        } else if (opcode >= Opcode::V_NOP && opcode <= Opcode::V_SQRT_F16) {
+        } else if (opcode >= Opcode::V_NOP && opcode <= Opcode::V_MOVRELSD_B32) {
             uint32_t op =
                 static_cast<uint32_t>(opcode) - static_cast<uint32_t>(OpcodeMap::OP_MAP_VOP1);
             encodingOp = op + static_cast<uint32_t>(OpMapVOP3VOPX::VOP3_TO_VOP1);
@@ -276,9 +263,7 @@ void GcnDecodeContext::updateInstructionMeta(InstEncoding encoding) {
     m_instruction.src_count = instFormat.src_count;
     m_instruction.length = getEncodingLength(encoding);
 
-    // Update src operand scalar type.
     auto setOperandType = [&instFormat](InstOperand& src) {
-        // Only update uninitialized numeric type.
         if (src.type == ScalarType::Undefined) {
             src.type = instFormat.src_type;
         }
@@ -286,12 +271,9 @@ void GcnDecodeContext::updateInstructionMeta(InstEncoding encoding) {
 
     std::for_each_n(m_instruction.src.begin(), m_instruction.src_count, setOperandType);
 
-    // Update dst operand scalar type.
     switch (m_instruction.dst_count) {
     case 2: {
         if (m_instruction.dst[1].type == ScalarType::Undefined) {
-            // Only VOP3B has an additional sdst operand,
-            // and it must be Uint64
             m_instruction.dst[1].type = ScalarType::Uint64;
         }
     }
@@ -305,10 +287,6 @@ void GcnDecodeContext::updateInstructionMeta(InstEncoding encoding) {
 }
 
 void GcnDecodeContext::repairOperandType() {
-    // Some instructions' operand type is not uniform,
-    // it's best to change the instruction table's format and fix them there,
-    // but it's a hard work.
-    // We fix them here.
     switch (m_instruction.opcode) {
     case Opcode::V_MAD_U64_U32:
         m_instruction.src[2].type = ScalarType::Uint64;
@@ -388,9 +366,6 @@ void GcnDecodeContext::decodeInstruction64(InstEncoding encoding, GcnCodeSlice& 
     case InstEncoding::VOP3:
         decodeInstructionVOP3(hexInstruction);
         break;
-    case InstEncoding::VOP3P:
-        decodeInstructionVOP3P(hexInstruction);
-        break;
     case InstEncoding::MUBUF:
         decodeInstructionMUBUF(hexInstruction);
         break;
@@ -423,121 +398,12 @@ void GcnDecodeContext::decodeLiteralConstant(InstEncoding encoding, GcnCodeSlice
         return;
     }
 
-    // Find if the instruction contains a literal constant
     const auto it = std::ranges::find_if(m_instruction.src, [](InstOperand& src) {
         return src.field == OperandField::LiteralConst;
     });
     if (it != m_instruction.src.end()) {
         it->code = code.readu32();
         m_instruction.length += sizeof(u32);
-    }
-}
-
-void GcnDecodeContext::decodeSubDwordAddressing(InstEncoding encoding, GcnCodeSlice& code) {
-    // Find if the instruction contains SDWA (it's legal only as src0)
-    if (m_instruction.src[0].field == OperandField::Sdwa) {
-        m_instruction.src[0].code = code.readu32();
-        m_instruction.length += sizeof(u32);
-
-        if (encoding == InstEncoding::VOPC) {
-            SdwaVopc sdwa = *reinterpret_cast<SdwaVopc*>(&m_instruction.src[0].code);
-
-            m_instruction.src[0].field =
-                sdwa.s0 == 0 ? OperandField::VectorGPR : getOperandField(sdwa.src0);
-            m_instruction.src[0].code = sdwa.src0;
-            m_instruction.src[0].sdwa_sel = SdwaSelector(sdwa.src0_sel);
-
-            m_instruction.src[0].input_modifier.neg = sdwa.src0_neg;
-            m_instruction.src[0].input_modifier.abs = sdwa.src0_abs;
-            m_instruction.src[0].input_modifier.sext = sdwa.src0_sext;
-
-            m_instruction.src[1].field =
-                sdwa.s1 == 0 ? OperandField::VectorGPR : getOperandField(m_instruction.src[1].code);
-            m_instruction.src[1].sdwa_sel = SdwaSelector(sdwa.src1_sel);
-
-            m_instruction.src[1].input_modifier.neg = sdwa.src1_neg;
-            m_instruction.src[1].input_modifier.abs = sdwa.src1_abs;
-            m_instruction.src[1].input_modifier.sext = sdwa.src1_sext;
-
-            m_instruction.dst[0].field = sdwa.sd ? OperandField::ScalarGPR : OperandField::VccLo;
-            m_instruction.dst[0].code = sdwa.sdst;
-
-        } else if (encoding == InstEncoding::VOP1 || encoding == InstEncoding::VOP2) {
-            SdwaVop12 sdwa = *reinterpret_cast<SdwaVop12*>(&m_instruction.src[0].code);
-
-            m_instruction.src[0].field =
-                sdwa.s0 == 0 ? OperandField::VectorGPR : getOperandField(sdwa.src0);
-            m_instruction.src[0].code = sdwa.src0;
-            m_instruction.src[0].sdwa_sel = SdwaSelector(sdwa.src0_sel);
-
-            m_instruction.src[0].input_modifier.neg = sdwa.src0_neg;
-            m_instruction.src[0].input_modifier.abs = sdwa.src0_abs;
-            m_instruction.src[0].input_modifier.sext = sdwa.src0_sext;
-
-            m_instruction.src[1].field =
-                sdwa.s1 == 0 ? OperandField::VectorGPR : getOperandField(m_instruction.src[1].code);
-            m_instruction.src[1].sdwa_sel = SdwaSelector(sdwa.src1_sel);
-
-            m_instruction.src[1].input_modifier.neg = sdwa.src1_neg;
-            m_instruction.src[1].input_modifier.abs = sdwa.src1_abs;
-            m_instruction.src[1].input_modifier.sext = sdwa.src1_sext;
-
-            m_instruction.dst[0].sdwa_sel = SdwaSelector(sdwa.dst_sel);
-            m_instruction.dst[0].sdwa_dst = SdwaDstUnused(sdwa.dst_u);
-            m_instruction.dst[0].output_modifier.clamp = sdwa.clamp;
-
-            switch (sdwa.omod) {
-            case 0:
-                m_instruction.dst[0].output_modifier.multiplier = 0.f;
-                break;
-            case 1:
-                m_instruction.dst[0].output_modifier.multiplier = 2.0f;
-                break;
-            case 2:
-                m_instruction.dst[0].output_modifier.multiplier = 4.0f;
-                break;
-            case 3:
-                m_instruction.dst[0].output_modifier.multiplier = 0.5f;
-                break;
-            }
-        } else {
-            LOG_WARNING(Render_Recompiler, "illegal instruction: SDWA used outside VOP1/VOP2/VOPC");
-        }
-    }
-}
-
-void GcnDecodeContext::decodeDataParallelPrimitive(InstEncoding encoding, GcnCodeSlice& code) {
-    // Find if the instruction contains DPP
-    if (m_instruction.src[0].field == OperandField::Dpp) {
-        m_instruction.src[0].code = code.readu32();
-        m_instruction.length += sizeof(u32);
-
-        Dpp dpp = *reinterpret_cast<Dpp*>(&m_instruction.src[0].code);
-
-        m_instruction.src[0].field = OperandField::VectorGPR;
-        m_instruction.src[0].code = dpp.src0;
-
-        if (dpp.src0_abs) {
-            m_instruction.src[0].input_modifier.abs = true;
-        }
-        if (dpp.src0_neg) {
-            m_instruction.src[0].input_modifier.neg = true;
-        }
-        if (dpp.src1_abs) {
-            m_instruction.src[1].input_modifier.abs = true;
-        }
-        if (dpp.src1_neg) {
-            m_instruction.src[1].input_modifier.neg = true;
-        }
-
-        auto op = dpp.GetOperation();
-        LOG_ERROR(
-            Render_Recompiler,
-            "unhandled DPP operation: {} ({:#x}), value {}, bc {}, row_mask {:#b}, bank_mask {:#b}",
-            magic_enum::enum_name(op.op), u32(op.op), op.value, bool(dpp.bc), u8(dpp.row_mask),
-            u8(dpp.bank_mask));
-
-        m_instruction.src[0].dpp = op;
     }
 }
 
@@ -639,9 +505,6 @@ void GcnDecodeContext::decodeInstructionVOPC(u32 hexInstruction) {
         m_instruction.src[0].field == OperandField::VectorGPR ? src0 - VectorGPRMin : src0;
     m_instruction.src[1].field = OperandField::VectorGPR;
     m_instruction.src[1].code = vsrc1;
-    // VOPC dst is forced to VCC.
-    // In order to be unified with VOP3 encoding,
-    // we store it to dst[1]
     m_instruction.dst[1].field = OperandField::VccLo;
     m_instruction.dst[1].type = ScalarType::Uint64;
     m_instruction.dst[1].code = static_cast<u32>(OperandField::VccLo);
@@ -666,14 +529,11 @@ void GcnDecodeContext::decodeInstructionVOP2(u32 hexInstruction) {
 
     OpcodeVOP2 vop2Op = static_cast<OpcodeVOP2>(op);
     if (vop2Op == OpcodeVOP2::V_READLANE_B32) {
-        // vsrc1 is scalar for lane instructions
         m_instruction.src[1].field = getOperandField(vsrc1);
-        // dst is sgpr
         m_instruction.dst[0].field = getOperandField(vdst);
         m_instruction.dst[0].type = ScalarType::Uint32;
     } else if (vop2Op == OpcodeVOP2::V_WRITELANE_B32) {
         m_instruction.src[1].field = getOperandField(vsrc1);
-        // dst is vgpr, as normal
     } else if (IsVop3BEncoding(m_instruction.opcode)) {
         m_instruction.dst[1].field = OperandField::VccLo;
         m_instruction.dst[1].type = ScalarType::Uint64;
@@ -729,34 +589,28 @@ void GcnDecodeContext::decodeInstructionVINTRP(u32 hexInstruction) {
 
 void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
     u32 vdst = bit::extract(hexInstruction, 7, 0);
-    u32 sdst = bit::extract(hexInstruction, 14, 8); // For VOP3B
+    u32 sdst = bit::extract(hexInstruction, 14, 8);
     u32 op = bit::extract(hexInstruction, 25, 17);
-    u32 op_msb = bit::extract(hexInstruction, 16, 16);
-    op = op + op_msb * (1 << 9);
     u32 src0 = bit::extract(hexInstruction, 40, 32);
     u32 src1 = bit::extract(hexInstruction, 49, 41);
     u32 src2 = bit::extract(hexInstruction, 58, 50);
 
     if (op >= static_cast<u32>(OpcodeVOP3::V_CMP_F_F32) &&
         op <= static_cast<u32>(OpcodeVOP3::V_CMPX_T_U64)) {
-        // Map from VOP3 to VOPC
         u32 vopcOp = op - static_cast<u32>(OpMapVOP3VOPX::VOP3_TO_VOPC);
         m_instruction.opcode =
             static_cast<Opcode>(vopcOp + static_cast<u32>(OpcodeMap::OP_MAP_VOPC));
     } else if (op >= static_cast<u32>(OpcodeVOP3::V_CNDMASK_B32) &&
-               op <= static_cast<u32>(OpcodeVOP3::V_LDEXP_F16)) {
-        // Map from VOP3 to VOP2
+               op <= static_cast<u32>(OpcodeVOP3::V_CVT_PK_I16_I32)) {
         u32 vop2Op = op - static_cast<u32>(OpMapVOP3VOPX::VOP3_TO_VOP2);
         m_instruction.opcode =
             static_cast<Opcode>(vop2Op + static_cast<u32>(OpcodeMap::OP_MAP_VOP2));
     } else if (op >= static_cast<u32>(OpcodeVOP3::V_NOP) &&
-               op <= static_cast<u32>(OpcodeVOP3::V_SQRT_F16)) {
-        // Map from VOP3 to VOP1
+               op <= static_cast<u32>(OpcodeVOP3::V_MOVRELSD_B32)) {
         u32 vop1Op = op - static_cast<u32>(OpMapVOP3VOPX::VOP3_TO_VOP1);
         m_instruction.opcode =
             static_cast<Opcode>(vop1Op + static_cast<u32>(OpcodeMap::OP_MAP_VOP1));
     } else {
-        // VOP3 encoding, do not map.
         m_instruction.opcode = static_cast<Opcode>(op + static_cast<u32>(OpcodeMap::OP_MAP_VOP3));
     }
 
@@ -786,13 +640,11 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
                    vop3Op == OpcodeVOP3::V_READFIRSTLANE_B32) {
             m_instruction.dst[0].field = getOperandField(vdst);
             m_instruction.dst[0].type = ScalarType::Uint32;
-            // WRITELANE can be decoded like other VOP3's
         }
     }
 
     if (op >= static_cast<u32>(OpcodeVOP3::V_ADD_I32) &&
         op <= static_cast<u32>(OpcodeVOP3::V_DIV_SCALE_F64)) {
-        // VOP3B has a sdst operand.
         m_instruction.dst_count = 2;
     } else {
         m_instruction.dst_count = 1;
@@ -800,11 +652,7 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
 
     m_instruction.control.vop3 = *reinterpret_cast<InstControlVOP3*>(&hexInstruction);
 
-    // update input modifier
     auto& control = m_instruction.control.vop3;
-
-    // update output modifier
-    auto& outputMod = m_instruction.dst[0].output_modifier;
 
     if (!IsVop3BEncoding(m_instruction.opcode)) {
         for (u32 i = 0; i != 3; ++i) {
@@ -812,19 +660,16 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
                 m_instruction.src[i].input_modifier.abs = true;
             }
         }
-        outputMod.clamp = static_cast<bool>(control.clmp);
+        m_instruction.dst[0].output_modifier.clamp = static_cast<bool>(control.clmp);
     }
+
     for (u32 i = 0; i != 3; ++i) {
         if (control.neg & (1u << i)) {
             m_instruction.src[i].input_modifier.neg = true;
         }
-
-        if (control.op_sel & (1u << i)) {
-            m_instruction.src[i].op_sel.op_sel = true;
-        }
     }
 
-    m_instruction.dst[0].op_sel.op_sel = control.op_sel & (1u << 3);
+    auto& outputMod = m_instruction.dst[0].output_modifier;
 
     switch (control.omod) {
     case 0:
@@ -840,55 +685,6 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
         outputMod.multiplier = 0.5f;
         break;
     }
-}
-
-void GcnDecodeContext::decodeInstructionVOP3P(uint64_t hexInstruction) {
-    u32 vdst = bit::extract(hexInstruction, 7, 0);
-    u32 op = bit::extract(hexInstruction, 22, 16);
-    u32 src0 = bit::extract(hexInstruction, 40, 32);
-    u32 src1 = bit::extract(hexInstruction, 49, 41);
-    u32 src2 = bit::extract(hexInstruction, 58, 50);
-
-    m_instruction.opcode = static_cast<Opcode>(op + static_cast<u32>(OpcodeMap::OP_MAP_VOP3P));
-
-    m_instruction.src[0].field = getOperandField(src0);
-    m_instruction.src[0].code =
-        m_instruction.src[0].field == OperandField::VectorGPR ? src0 - VectorGPRMin : src0;
-    m_instruction.src[1].field = getOperandField(src1);
-    m_instruction.src[1].code =
-        m_instruction.src[1].field == OperandField::VectorGPR ? src1 - VectorGPRMin : src1;
-    m_instruction.src[2].field = getOperandField(src2);
-    m_instruction.src[2].code =
-        m_instruction.src[2].field == OperandField::VectorGPR ? src2 - VectorGPRMin : src2;
-    m_instruction.dst[0].field = OperandField::VectorGPR;
-    m_instruction.dst[0].code = vdst;
-
-    m_instruction.control.vop3p = *reinterpret_cast<InstControlVOP3P*>(&hexInstruction);
-
-    // update input modifier
-    auto& control = m_instruction.control.vop3p;
-    for (u32 i = 0; i != 3; ++i) {
-        if (control.neg & (1u << i)) {
-            m_instruction.src[i].input_modifier.neg = true;
-        }
-
-        if (control.neg_hi & (1u << i)) {
-            m_instruction.src[i].input_modifier.neg_hi = true;
-        }
-
-        if (control.op_sel & (1u << i)) {
-            m_instruction.src[i].op_sel.op_sel = true;
-        }
-
-        if (control.get_op_sel_hi(i)) {
-            m_instruction.src[i].op_sel.op_sel_hi = true;
-        }
-    }
-
-    // update output modifier
-    auto& outputMod = m_instruction.dst[0].output_modifier;
-
-    outputMod.clamp = static_cast<bool>(control.clamp);
 }
 
 void GcnDecodeContext::decodeInstructionMUBUF(uint64_t hexInstruction) {
@@ -1289,4 +1085,4 @@ void GcnDecodeContext::decodeInstructionEXP(uint64_t hexInstruction) {
     m_instruction.control.exp = *reinterpret_cast<InstControlEXP*>(&hexInstruction);
 }
 
-} // namespace Shader::Gcn
+}

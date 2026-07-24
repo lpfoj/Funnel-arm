@@ -22,7 +22,6 @@ const std::underlying_type_t<E> generate_full_mask() {
     const auto values = magic_enum::enum_values<E>();
     U mask = 0;
 
-    // Use index-based loop for better constexpr compatibility
     for (std::size_t i = 0; i < values.size(); ++i) {
         mask |= static_cast<U>(values[i]);
     }
@@ -33,7 +32,6 @@ const std::underlying_type_t<E> generate_full_mask() {
 enum class Error : u32 {
     OK = 0x0,
 
-    // ImeDialog library
     BUSY = 0x80bc0001,
     NOT_OPENED = 0x80bc0002,
     NO_MEMORY = 0x80bc0003,
@@ -69,7 +67,6 @@ enum class Error : u32 {
     INVALID_TIMING = 0x80bc0033,
     INTERNAL = 0x80bc00ff,
 
-    // Ime library
     DIALOG_INVALID_TITLE = 0x80bc0101,
     DIALOG_NOT_RUNNING = 0x80bc0105,
     DIALOG_NOT_FINISHED = 0x80bc0106,
@@ -114,15 +111,14 @@ enum class OrbisImeExtOption : u32 {
     HIDE_KEYPANEL_IF_EXT_KEYBOARD = 0x00000400,
     INIT_EXT_KEYBOARD_MODE = 0x00000800,
 
-    ENABLE_ACCESSIBILITY = 0x00001000,                // ImeDialog unly
-    ACCESSIBILITY_PANEL_FORCED = 0x00002000,          // ImeDialog only
-    ADDITIONAL_DICTIONARY_PRIORITY_MODE = 0x00004000, // ImeDialog only
+    ENABLE_ACCESSIBILITY = 0x00001000,
+    ACCESSIBILITY_PANEL_FORCED = 0x00002000,
+    ADDITIONAL_DICTIONARY_PRIORITY_MODE = 0x00004000,
 };
 DECLARE_ENUM_FLAG_OPERATORS(OrbisImeExtOption);
 
 constexpr u32 kValidImeExtOptionMask = static_cast<u32>(
-    OrbisImeExtOption::SET_COLOR | OrbisImeExtOption::SET_PRIORITY |
-    OrbisImeExtOption::PRIORITY_SHIFT | OrbisImeExtOption::PRIORITY_FULL_WIDTH |
+    OrbisImeExtOption::SET_PRIORITY | OrbisImeExtOption::PRIORITY_FULL_WIDTH |
     OrbisImeExtOption::PRIORITY_FIXED_PANEL | OrbisImeExtOption::DISABLE_POINTER |
     OrbisImeExtOption::ENABLE_ADDITIONAL_DICTIONARY | OrbisImeExtOption::DISABLE_STARTUP_SE |
     OrbisImeExtOption::DISABLE_LIST_FOR_EXT_KEYBOARD |
@@ -376,16 +372,6 @@ enum class OrbisImeKeyboardType : u32 {
     HUNGARIAN = 37,
 };
 
-enum class OrbisImeKeyboardDeviceType : u32 {
-    Keyboard = 0,
-    Osk = 1,
-};
-
-enum class OrbisImeKeyboardStatus : u32 {
-    Disconnected = 0,
-    Connected = 1,
-};
-
 enum class OrbisImeDeviceType : u32 {
     None = 0,
     Controller = 1,
@@ -449,16 +435,6 @@ struct OrbisImeKeyboardResourceIdArray {
     u32 resource_id[5];
 };
 
-struct OrbisImeKeyboardInfo {
-    Libraries::UserService::OrbisUserServiceUserId user_id;
-    OrbisImeKeyboardDeviceType device;
-    OrbisImeKeyboardType type;
-    u32 repeat_delay;
-    u32 repeat_rate;
-    OrbisImeKeyboardStatus status;
-    s8 reserved[12];
-};
-
 enum class OrbisImeCaretMovementDirection : u32 {
     Still = 0,
     Left = 1,
@@ -481,23 +457,6 @@ enum class OrbisImePanelType : u32 {
     Edit = 4,
     EditAndCandidate = 5,
     Accessibility = 6,
-};
-
-struct OrbisImePositionAndForm {
-    OrbisImePanelType type;
-    f32 posx;
-    f32 posy;
-    OrbisImeHorizontalAlignment horizontal_alignment;
-    OrbisImeVerticalAlignment vertical_alignment;
-    u32 width;
-    u32 height;
-};
-
-struct OrbisImeTextGeometry {
-    f32 x;
-    f32 y;
-    u32 width;
-    u32 height;
 };
 
 union OrbisImeEventParam {

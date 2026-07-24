@@ -24,4 +24,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     RegisterlibSceLibcInternalThreads(sym);
 }
 
-} // namespace Libraries::LibcInternal
+void ForceRegisterLib(Core::Loader::SymbolsResolver* sym) {
+    ForceRegisterlibSceLibcInternalIo(sym);
+}
+}

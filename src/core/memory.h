@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -30,6 +31,11 @@ namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
 
+inline constexpr VAddr EXECUTOR_LIBC_MSPACE_BASE = 0x780000000ULL;
+inline constexpr u64 EXECUTOR_LIBC_MSPACE_INITIAL_SIZE = 0x20000000ULL;
+inline constexpr u64 EXECUTOR_LIBC_MSPACE_CAPACITY = 0x60000000ULL;
+inline constexpr u64 EXECUTOR_LIBC_MSPACE_GROW_GRANULARITY = 0x10000000ULL;
+
 enum class MemoryProt : u32 {
     NoAccess = 0,
     CpuRead = 1,
@@ -52,7 +58,6 @@ enum class MemoryMapFlags : u32 {
     Stack = 0x400,
     NoSync = 0x800,
     Anon = 0x1000,
-    System = 0x2000,
     NoCore = 0x20000,
     NoCoalesce = 0x400000,
 };
@@ -101,7 +106,7 @@ enum class VMAType : u32 {
     Stack = 6,
     Code = 7,
     File = 8,
-    System = 9,
+    ExecutorHeap = 9,
 };
 
 struct VirtualMemoryArea {
@@ -119,7 +124,7 @@ struct VirtualMemoryArea {
     }
 
     bool Overlaps(VAddr addr, u64 size) const {
-        return addr < (base + this->size) && (addr + size) > base;
+        return addr <= (base + this->size) && (addr + size) >= base;
     }
 
     bool IsFree() const noexcept {
@@ -167,9 +172,9 @@ public:
     explicit MemoryManager();
     ~MemoryManager();
 
-    void SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-    }
+    void SetRasterizer(Vulkan::Rasterizer* rasterizer_);
+
+    u64 GrowExecutorLibcMspace(u64 required_size);
 
     AddressSpace& GetAddressSpace() {
         return impl;
@@ -192,46 +197,61 @@ public:
     }
 
     bool IsValidGpuMapping(VAddr virtual_addr, u64 size) {
-        // The PS4's GPU can only handle 40 bit addresses.
         const VAddr max_gpu_address{0x10000000000};
         return virtual_addr + size < max_gpu_address;
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
-        const auto end_it = std::prev(vma_map.end());
-        const VAddr end_addr = end_it->first + end_it->second.size;
-
-        // If the address fails boundary checks, return early.
-        if (virtual_addr < vma_map.begin()->first || virtual_addr >= end_addr) {
+        if (vma_map.empty()) {
             return false;
         }
 
-        // If size is zero and boundary checks succeed, then skip more robust checking
+        auto vma_handle = vma_map.upper_bound(virtual_addr);
+        if (vma_handle == vma_map.begin()) {
+            return false;
+        }
+        --vma_handle;
+        const auto& first_vma = vma_handle->second;
+        if (first_vma.size > std::numeric_limits<VAddr>::max() - first_vma.base) {
+            return false;
+        }
+        const VAddr first_end = first_vma.base + first_vma.size;
+        if (virtual_addr < first_vma.base || virtual_addr >= first_end) {
+            return false;
+        }
+
         if (size == 0) {
             return true;
         }
+        if (virtual_addr > std::numeric_limits<VAddr>::max() - size) {
+            return false;
+        }
 
-        // Now make sure the full address range is contained in vma_map.
-        auto vma_handle = FindVMA(virtual_addr);
-        auto addr_to_check = virtual_addr;
-        u64 size_to_validate = size;
-        while (vma_handle != vma_map.end() && size_to_validate > 0) {
-            const auto offset_in_vma = addr_to_check - vma_handle->second.base;
-            const auto size_in_vma =
-                std::min<u64>(vma_handle->second.size - offset_in_vma, size_to_validate);
-            size_to_validate -= size_in_vma;
-            addr_to_check += size_in_vma;
-            vma_handle++;
-
-            // Make sure there isn't any gap here
-            if (size_to_validate > 0 && vma_handle != vma_map.end() &&
-                addr_to_check != vma_handle->second.base) {
+        const VAddr range_end = virtual_addr + size;
+        VAddr cursor = virtual_addr;
+        while (cursor < range_end) {
+            if (vma_handle == vma_map.end()) {
                 return false;
+            }
+            const auto& vma = vma_handle->second;
+            if (vma.size > std::numeric_limits<VAddr>::max() - vma.base) {
+                return false;
+            }
+            const VAddr vma_end = vma.base + vma.size;
+            if (cursor < vma.base || cursor >= vma_end) {
+                return false;
+            }
+
+            cursor = std::min(range_end, vma_end);
+            if (cursor < range_end) {
+                ++vma_handle;
+                if (vma_handle == vma_map.end() || vma_handle->second.base != cursor) {
+                    return false;
+                }
             }
         }
 
-        // If we reach this point and size to validate is not positive, then this mapping is valid.
-        return size_to_validate <= 0;
+        return true;
     }
 
     u64 ClampRangeSize(VAddr virtual_addr, u64 size);
@@ -240,7 +260,28 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    bool IsReadableMapping(VAddr virtual_addr, u64 size, bool* address_managed = nullptr);
+
+    bool TryCopyReadableMemory(VAddr virtual_addr, void* dest, u64 size,
+                               bool gpu_backing_synchronized = false);
+
+    bool TryCopyBackingMemory(VAddr virtual_addr, void* dest, u64 size);
+
+    bool IsWritableMapping(VAddr virtual_addr, u64 size);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
+
+    struct ReplayRange {
+        VAddr base;
+        u64 size;
+        const u8* backing;
+    };
+    void RegisterReplayMemory(VAddr base, u64 size, const u8* backing);
+    void ClearReplayMemory();
+    const ReplayRange* FindReplayRange(VAddr addr) const;
+
+    void RegisterReplayCanary(VAddr addr, u32 expected);
+    void VerifyReplayCanaries(const char* where);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -289,7 +330,6 @@ public:
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
     void InvalidateMemory(VAddr addr, u64 size) const;
-
 private:
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
@@ -334,6 +374,12 @@ private:
     PhysMap dmem_map;
     PhysMap fmem_map;
     VMAMap vma_map;
+    std::vector<ReplayRange> replay_ranges;
+    struct ReplayCanary {
+        VAddr addr;
+        u32 expected;
+    };
+    std::vector<ReplayCanary> replay_canaries;
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};
@@ -342,6 +388,7 @@ private:
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
+    u64 executor_libc_mspace_size{};
 
     struct PrtArea {
         VAddr start;
@@ -360,4 +407,4 @@ private:
 
 using Memory = Common::Singleton<MemoryManager>;
 
-} // namespace Core
+}

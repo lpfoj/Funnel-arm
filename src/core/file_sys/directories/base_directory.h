@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <string_view>
 #include <vector>
 #include "common/types.h"
+#include "common/va_ctx.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/orbis_error.h"
 
@@ -12,7 +14,7 @@ namespace Libraries::Kernel {
 struct OrbisKernelStat;
 struct OrbisKernelIovec;
 struct OrbisKernelDirent;
-} // namespace Libraries::Kernel
+}
 
 namespace Core::Directories {
 
@@ -63,4 +65,4 @@ public:
     }
 };
 
-} // namespace Core::Directories
+}

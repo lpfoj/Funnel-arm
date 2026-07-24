@@ -9,7 +9,6 @@ static constexpr u32 SQ_SRC_LITERAL = 0xFF;
 
 void Translator::EmitScalarMemory(const GcnInst& inst) {
     switch (inst.opcode) {
-        // SMRD
     case Opcode::S_LOAD_DWORD:
         return S_LOAD_DWORD(1, inst);
     case Opcode::S_LOAD_DWORDX2:
@@ -34,8 +33,6 @@ void Translator::EmitScalarMemory(const GcnInst& inst) {
         LogMissingOpcode(inst);
     }
 }
-
-// SMRD
 
 void Translator::S_LOAD_DWORD(int num_dwords, const GcnInst& inst) {
     const auto& smrd = inst.control.smrd;
@@ -70,18 +67,14 @@ void Translator::S_BUFFER_LOAD_DWORD(int num_dwords, const GcnInst& inst) {
         }
         return ir.ShiftRightLogical(ir.GetScalarReg(IR::ScalarReg(smrd.offset)), ir.Imm32(2));
     }();
-
-    IR::BufferInstInfo buffer_info{};
-    buffer_info.pc.Assign(pc);
-
     const IR::Value vsharp =
         ir.CompositeConstruct(ir.GetScalarReg(sbase), ir.GetScalarReg(sbase + 1),
                               ir.GetScalarReg(sbase + 2), ir.GetScalarReg(sbase + 3));
     IR::ScalarReg dst_reg{inst.dst[0].code};
     for (u32 i = 0; i < num_dwords; i++) {
         const IR::U32 index = ir.IAdd(dword_offset, ir.Imm32(i));
-        ir.SetScalarReg(dst_reg + i, ir.ReadConstBuffer(vsharp, index, buffer_info));
+        ir.SetScalarReg(dst_reg + i, ir.ReadConstBuffer(vsharp, index));
     }
 }
 
-} // namespace Shader::Gcn
+}

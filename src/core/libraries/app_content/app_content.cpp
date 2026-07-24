@@ -2,17 +2,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <system_error>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "app_content.h"
 #include "common/assert.h"
-#include "common/elf_info.h"
+#include "common/config.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
-#include "core/emulator_settings.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/app_content/app_content_error.h"
-#include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/systemservice.h"
 
@@ -31,10 +36,8 @@ static std::array<AddContInfo, ORBIS_APP_CONTENT_INFO_LIST_MAX_SIZE> addcont_inf
       0x00}},
 }};
 
-static s32 sdk_ver = 0;
 static s32 addcont_count = 0;
 static std::string title_id;
-static bool is_initialized = false;
 
 int PS4_SYSV_ABI _Z5dummyv() {
     LOG_ERROR(Lib_AppContent, "(STUBBED) called");
@@ -61,10 +64,9 @@ int PS4_SYSV_ABI sceAppContentAddcontMount(u32 service_label,
                                            OrbisAppContentMountPoint* mount_point) {
     LOG_INFO(Lib_AppContent, "called");
 
-    const auto& addon_path = EmulatorSettings.GetAddonInstallDir() / title_id;
+    const auto& addon_path = Config::getAddonInstallDir() / title_id;
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
 
-    // Determine which loaded additional content this entitlement label is for.
     s32 i = 0;
     while (i < addcont_count) {
         if (strncmp(entitlement_label->data, addcont_info[i].entitlement_label,
@@ -76,45 +78,36 @@ int PS4_SYSV_ABI sceAppContentAddcontMount(u32 service_label,
     }
 
     if (i == addcont_count) {
-        // None of the loaded additional content match the entitlement label requested.
         return ORBIS_APP_CONTENT_ERROR_NOT_FOUND;
     }
 
-    // Find which directory corresponds to this entitlement
     for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
         if (!entry.is_directory()) {
             continue;
         }
 
-        // Open the param.sfo in this folder
         PSF* dlc_params = new PSF();
         const auto& param_sfo_path = entry.path() / "sce_sys/param.sfo";
         if (!std::filesystem::exists(param_sfo_path)) {
-            // This folder doesn't have a param.sfo
             continue;
         }
         dlc_params->Open(param_sfo_path);
 
-        // Validate the available params
         auto category = dlc_params->GetString("CATEGORY");
         auto content_id = dlc_params->GetString("CONTENT_ID");
         if (!category.has_value() || strncmp(category.value().data(), "ac", 2) != 0 ||
             !content_id.has_value() ||
             content_id.value().length() <= ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET) {
-            // This folder fails the error checks performed in sceAppContentInitialize.
             continue;
         }
 
         auto entitlement_id = content_id.value().substr(ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET);
         if (strncmp(entitlement_id.data(), entitlement_label->data, entitlement_id.length()) == 0) {
-            // We've located the correct folder.
             mnt->Mount(entry.path(), mount_point->data);
             return ORBIS_OK;
         }
     }
 
-    // Hitting this shouldn't be possible, as it would mean the entitlement was loaded,
-    // but the folder it was loaded from doesn't exist.
     UNREACHABLE_MSG("Folder for loaded entitlement label {} doesn't exist.",
                     entitlement_label->data);
 }
@@ -283,43 +276,62 @@ int PS4_SYSV_ABI sceAppContentGetRegion() {
 
 int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initParam,
                                          OrbisAppContentBootParam* bootParam) {
-    if (sdk_ver >= Common::ElfInfo::FW_150 && is_initialized) {
-        LOG_ERROR(Lib_AppContent, "Already initialized");
-        return ORBIS_APP_CONTENT_ERROR_BUSY;
+    LOG_INFO(Lib_AppContent, "called initParam={} bootParam={}", fmt::ptr(initParam),
+             fmt::ptr(bootParam));
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_APPCONTENT_INIT] initParam=%p bootParam=%p size=%zu",
+                        initParam, bootParam, sizeof(OrbisAppContentBootParam));
+#endif
+    if (bootParam == nullptr) {
+        return ORBIS_APP_CONTENT_ERROR_PARAMETER;
     }
 
-    LOG_WARNING(Lib_AppContent, "(DUMMY) called");
-    is_initialized = true;
+    std::memset(bootParam, 0, sizeof(*bootParam));
+    bootParam->attr = 0;
+
     auto* param_sfo = Common::Singleton<PSF>::Instance();
 
-    const auto addons_dir = EmulatorSettings.GetAddonInstallDir();
+    const auto addons_dir = Config::getAddonInstallDir();
     if (const auto value = param_sfo->GetString("TITLE_ID"); value.has_value()) {
         title_id = *value;
     } else {
-        UNREACHABLE_MSG("Failed to get TITLE_ID");
+        LOG_WARNING(Lib_AppContent, "TITLE_ID missing; continuing without add-on scan");
+        return ORBIS_OK;
     }
     const auto addon_path = addons_dir / title_id;
-    if (!std::filesystem::exists(addon_path)) {
+    std::error_code fs_ec;
+    if (addon_path.empty() || !std::filesystem::exists(addon_path, fs_ec) || fs_ec) {
         return ORBIS_OK;
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
+    std::filesystem::directory_iterator it(addon_path, fs_ec);
+    std::filesystem::directory_iterator end;
+    if (fs_ec) {
+        LOG_WARNING(Lib_AppContent, "Could not iterate add-on path {}", addon_path.string());
+        return ORBIS_OK;
+    }
+    for (; it != end; it.increment(fs_ec)) {
+        if (fs_ec) {
+            LOG_WARNING(Lib_AppContent, "Stopped add-on scan at {}: {}", addon_path.string(),
+                        fs_ec.message());
+            break;
+        }
+        const auto& entry = *it;
         if (entry.is_directory()) {
-            // Look for a param.sfo in the additional content directory.
             const auto& param_sfo_path = entry.path() / "sce_sys/param.sfo";
-            if (!std::filesystem::exists(param_sfo_path)) {
+            std::error_code sfo_ec;
+            if (!std::filesystem::exists(param_sfo_path, sfo_ec) || sfo_ec) {
                 LOG_WARNING(Lib_AppContent, "Additonal content folder {} has no param.sfo",
                             entry.path().filename().string());
                 continue;
             }
 
-            // Open the param.sfo, make sure it's actually for additional content.
             PSF* dlc_params = new PSF();
             dlc_params->Open(param_sfo_path);
 
             auto category = dlc_params->GetString("CATEGORY");
             if (category.has_value() && strncmp(category.value().data(), "ac", 2) == 0) {
-                // We've located additional content. Find the entitlement id from the content id.
                 auto content_id = dlc_params->GetString("CONTENT_ID");
                 if (!content_id.has_value()) {
                     LOG_WARNING(Lib_AppContent,
@@ -328,8 +340,6 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
                     continue;
                 }
 
-                // content id's have consistent formatting, so this will always work.
-                // They follow the format UPXXXX-CUSAXXXXX_XX-entitlement
                 if (content_id.value().length() <= ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET) {
                     LOG_WARNING(Lib_AppContent,
                                 "Additonal content {} param.sfo has malformed CONTENT_ID",
@@ -340,7 +350,6 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
                     content_id.value().substr(ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET);
                 LOG_INFO(Lib_AppContent, "Entitlement {} found", entitlement_id);
 
-                // Save the additional content info in addcont_info.
                 auto& info = addcont_info[addcont_count++];
                 entitlement_id.copy(info.entitlement_label, entitlement_id.length());
                 info.status = OrbisAppContentAddcontDownloadStatus::Installed;
@@ -412,7 +421,6 @@ int PS4_SYSV_ABI sceAppContentTemporaryDataMount2(OrbisAppContentTemporaryDataOp
     }
     static constexpr std::string_view TmpMount = "/temp0";
     TmpMount.copy(mountPoint->data, TmpMount.size());
-    mountPoint->data[TmpMount.size()] = '\0';
     LOG_INFO(Lib_AppContent, "sceAppContentTemporaryDataMount2: option = {}, mountPoint = {}",
              option, mountPoint->data);
     return ORBIS_OK;
@@ -459,9 +467,6 @@ int PS4_SYSV_ABI sceAppContentGetDownloadedStoreCountry() {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&sdk_ver) == 0,
-               "Failed to get SDK version");
-
     LIB_FUNCTION("AS45QoYHjc4", "libSceAppContent", 1, "libSceAppContentUtil", _Z5dummyv);
     LIB_FUNCTION("ZiATpP9gEkA", "libSceAppContent", 1, "libSceAppContentUtil",
                  sceAppContentAddcontDelete);
@@ -539,4 +544,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceAppContentGetDownloadedStoreCountry);
 };
 
-} // namespace Libraries::AppContent
+}

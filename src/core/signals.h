@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <set>
 #include <signal.h>
 #include "common/singleton.h"
@@ -22,26 +23,25 @@ using IllegalInstructionHandler = bool (*)(void* context);
 void SignalHandler(int sig, siginfo_t* info, void* raw_context);
 #endif
 
-/// Receives OS signals and dispatches to the appropriate handlers.
+#ifdef __ANDROID__
+extern std::atomic<int> g_executor_render_tid;
+#endif
+
 class SignalDispatch {
 public:
     SignalDispatch();
     ~SignalDispatch();
 
-    /// Registers a handler for memory access violation signals.
     void RegisterAccessViolationHandler(const AccessViolationHandler& handler, u32 priority) {
         access_violation_handlers.emplace(handler, priority);
     }
 
-    /// Registers a handler for illegal instruction signals.
     void RegisterIllegalInstructionHandler(const IllegalInstructionHandler& handler, u32 priority) {
         illegal_instruction_handlers.emplace(handler, priority);
     }
 
-    /// Dispatches an access violation signal, returning whether it was successfully handled.
     bool DispatchAccessViolation(void* context, void* fault_address) const;
 
-    /// Dispatches an illegal instruction signal, returning whether it was successfully handled.
     bool DispatchIllegalInstruction(void* context) const;
 
 private:
@@ -64,4 +64,4 @@ private:
 
 using Signals = Common::Singleton<SignalDispatch>;
 
-} // namespace Core
+}

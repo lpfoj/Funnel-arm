@@ -298,7 +298,6 @@ libusb_device_descriptor* InfinityBackend::FillDeviceDescriptor() {
 libusb_transfer_status InfinityBackend::HandleAsyncTransfer(libusb_transfer* transfer) {
     switch (transfer->endpoint) {
     case 0x81: {
-        // Respond after FF command
         std::optional<std::array<u8, 32>> response = m_infinity_base->PopAddedRemovedResponse();
         if (response) {
             memcpy(transfer->buffer, response.value().data(), 0x20);
@@ -322,12 +321,10 @@ libusb_transfer_status InfinityBackend::HandleAsyncTransfer(libusb_transfer* tra
             break;
         }
         case 0x81: {
-            // Initiate Challenge
             m_infinity_base->DescrambleAndSeed(transfer->buffer, sequence, q_result);
             break;
         }
         case 0x83: {
-            // Challenge Response
             m_infinity_base->GetNextAndScramble(sequence, q_result);
             break;
         }
@@ -336,34 +333,28 @@ libusb_transfer_status InfinityBackend::HandleAsyncTransfer(libusb_transfer* tra
         case 0x93:
         case 0x95:
         case 0x96: {
-            // Color commands
             m_infinity_base->GetBlankResponse(sequence, q_result);
             break;
         }
         case 0xA1: {
-            // Get Present Figures
             m_infinity_base->GetPresentFigures(sequence, q_result);
             break;
         }
         case 0xA2: {
-            // Read Block from Figure
             m_infinity_base->QueryBlock(transfer->buffer[4], transfer->buffer[5], q_result,
                                         sequence);
             break;
         }
         case 0xA3: {
-            // Write block to figure
             m_infinity_base->WriteBlock(transfer->buffer[4], transfer->buffer[5],
                                         &transfer->buffer[7], q_result, sequence);
             break;
         }
         case 0xB4: {
-            // Get figure ID
             m_infinity_base->GetFigureIdentifier(transfer->buffer[4], sequence, q_result);
             break;
         }
         case 0xB5: {
-            // Get status?
             m_infinity_base->GetBlankResponse(sequence, q_result);
             break;
         }
@@ -389,4 +380,4 @@ void InfinityFigure::Save() {
     infFile.Seek(0);
     infFile.Write(data);
 }
-} // namespace Libraries::Usbd
+}

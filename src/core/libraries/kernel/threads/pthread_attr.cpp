@@ -7,6 +7,12 @@
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/libraries/libs.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+
+static constexpr const char* ExecutorAndroidLogTag = "LSX4Native";
+#endif
+
 namespace Libraries::Kernel {
 
 static constexpr u32 PthreadStackMin = 16_KB;
@@ -18,9 +24,9 @@ struct PthreadPrio {
 };
 
 static constexpr std::array<PthreadPrio, 3> ThrPriorities = {{
-    {0x100, 0x2FF, 0x2BC}, // Fifo
-    {0x300, 0x3BF, 0x384}, // Other
-    {0x100, 0x2FF, 0x2BC}, // Round-Robin
+    {0x100, 0x2FF, 0x2BC},
+    {0x300, 0x3BF, 0x384},
+    {0x100, 0x2FF, 0x2BC},
 }};
 
 PthreadAttr PthreadAttrDefault = {
@@ -132,14 +138,6 @@ int PS4_SYSV_ABI posix_pthread_attr_init(PthreadAttrT* attr) {
     return 0;
 }
 
-int PS4_SYSV_ABI posix_pthread_attr_setcreatesuspend_np(PthreadAttrT* attr) {
-    if (attr == nullptr || *attr == nullptr) {
-        return POSIX_EINVAL;
-    }
-    (*attr)->suspend = 1;
-    return 0;
-}
-
 int PS4_SYSV_ABI posix_pthread_attr_setschedpolicy(PthreadAttrT* attr, SchedPolicy policy) {
     if (attr == nullptr || *attr == nullptr) {
         return POSIX_EINVAL;
@@ -148,22 +146,6 @@ int PS4_SYSV_ABI posix_pthread_attr_setschedpolicy(PthreadAttrT* attr, SchedPoli
     }
     (*attr)->sched_policy = policy;
     (*attr)->prio = ThrPriorities[u32(policy) - 1].pri_default;
-    return 0;
-}
-
-int PS4_SYSV_ABI posix_pthread_attr_setscope(PthreadAttrT* attr, PthreadAttrFlags contentionscope) {
-    if (attr == nullptr || *attr == nullptr) {
-        return POSIX_EINVAL;
-    }
-    if (contentionscope != PthreadAttrFlags::ScopeProcess ||
-        contentionscope != PthreadAttrFlags::ScopeSystem) {
-        return POSIX_EINVAL;
-    }
-    if (contentionscope == PthreadAttrFlags::ScopeSystem) {
-        (*attr)->flags |= contentionscope;
-    } else {
-        (*attr)->flags &= ~PthreadAttrFlags::ScopeSystem;
-    }
     return 0;
 }
 
@@ -237,6 +219,23 @@ int PS4_SYSV_ABI posix_pthread_attr_setinheritsched(PthreadAttrT* attr, int sche
     return 0;
 }
 
+int PS4_SYSV_ABI posix_pthread_attr_setscope(PthreadAttrT* attr,
+                                             PthreadAttrFlags contentionscope) {
+    if (attr == nullptr || *attr == nullptr) {
+        return POSIX_EINVAL;
+    }
+    if (contentionscope != PthreadAttrFlags::ScopeProcess &&
+        contentionscope != PthreadAttrFlags::ScopeSystem) {
+        return POSIX_EINVAL;
+    }
+    if (contentionscope == PthreadAttrFlags::ScopeSystem) {
+        (*attr)->flags |= PthreadAttrFlags::ScopeSystem;
+    } else {
+        (*attr)->flags &= ~PthreadAttrFlags::ScopeSystem;
+    }
+    return 0;
+}
+
 int PS4_SYSV_ABI posix_pthread_attr_setguardsize(PthreadAttrT* attr, size_t guardsize) {
     if (attr == nullptr || *attr == nullptr) {
         return POSIX_EINVAL;
@@ -245,13 +244,30 @@ int PS4_SYSV_ABI posix_pthread_attr_setguardsize(PthreadAttrT* attr, size_t guar
     return 0;
 }
 
+int PS4_SYSV_ABI posix_pthread_attr_setcreatesuspend_np(PthreadAttrT* attr) {
+    if (attr == nullptr || *attr == nullptr) {
+        return POSIX_EINVAL;
+    }
+    (*attr)->suspend = 1;
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_WARN, ExecutorAndroidLogTag,
+                        "[EXECUTOR_PTHREAD_ATTR_SET_CREATE_SUSPEND] attr=%p suspend=%d",
+                        *attr, (*attr)->suspend);
+#endif
+    return 0;
+}
+
+int PS4_SYSV_ABI scePthreadAttrSetcreatesuspend(PthreadAttrT* attr) {
+    return posix_pthread_attr_setcreatesuspend_np(attr);
+}
+
 int PS4_SYSV_ABI posix_pthread_attr_get_np(PthreadT pthread, PthreadAttrT* dstattr) {
     PthreadAttr* dst;
     if (pthread == nullptr || dstattr == nullptr || (dst = *dstattr) == nullptr) {
         return POSIX_EINVAL;
     }
     auto* thread_state = ThrState::Instance();
-    const int ret = thread_state->FindThread(pthread, /*include dead*/ false);
+    const int ret = thread_state->FindThread(pthread, false);
     if (ret != 0) {
         return ret;
     }
@@ -259,6 +275,17 @@ int PS4_SYSV_ABI posix_pthread_attr_get_np(PthreadT pthread, PthreadAttrT* dstat
     if (True(pthread->flags & ThreadFlags::Detached)) {
         attr.flags |= PthreadAttrFlags::Detached;
     }
+#ifdef __ANDROID__
+    if (attr.stackaddr_attr != nullptr && attr.guardsize_attr != 0) {
+        __android_log_print(
+            ANDROID_LOG_INFO, ExecutorAndroidLogTag,
+            "[EXECUTOR_PTHREAD_ATTR_GET_NP] thread=%p name=%s stack=%p size=0x%zx "
+            "guard=0x%zx guardReported=0 reason=usable-stack-excludes-guard",
+            pthread, pthread->name.c_str(), attr.stackaddr_attr, attr.stacksize_attr,
+            attr.guardsize_attr);
+        attr.guardsize_attr = 0;
+    }
+#endif
     pthread->lock.unlock();
     memcpy(dst, &attr, sizeof(PthreadAttr));
     return ret;
@@ -320,101 +347,109 @@ int PS4_SYSV_ABI scePthreadAttrSetaffinity(PthreadAttrT* attr, const u64 mask) {
 }
 
 void RegisterThreadAttr(Core::Loader::SymbolsResolver* sym) {
-    // Posix
     LIB_FUNCTION("wtkt-teR1so", "libScePosix", 1, "libkernel", posix_pthread_attr_init);
-    LIB_FUNCTION("wtkt-teR1so", "libScePosix", 1, "libkernel", posix_pthread_attr_init);
-    LIB_FUNCTION("Ucsu-OK+els", "libScePosix", 1, "libkernel", posix_pthread_attr_get_np);
-    LIB_FUNCTION("-wzZ7dvA7UU", "libScePosix", 1, "libkernel", posix_pthread_attr_getaffinity_np);
-    LIB_FUNCTION("VUT1ZSrHT0I", "libScePosix", 1, "libkernel", posix_pthread_attr_getdetachstate);
-    LIB_FUNCTION("JNkVVsVDmOk", "libScePosix", 1, "libkernel", posix_pthread_attr_getguardsize);
-    LIB_FUNCTION("oLjPqUKhzes", "libScePosix", 1, "libkernel", posix_pthread_attr_getinheritsched);
-    LIB_FUNCTION("qlk9pSLsUmM", "libScePosix", 1, "libkernel", posix_pthread_attr_getschedparam);
-    LIB_FUNCTION("RtLRV-pBTTY", "libScePosix", 1, "libkernel", posix_pthread_attr_getschedpolicy);
-    LIB_FUNCTION("e2G+cdEkOmU", "libScePosix", 1, "libkernel", posix_pthread_attr_getscope);
+    LIB_FUNCTION("-wzZ7dvA7UU", "libScePosix", 1, "libkernel",
+                 posix_pthread_attr_getaffinity_np);
     LIB_FUNCTION("vQm4fDEsWi8", "libScePosix", 1, "libkernel", posix_pthread_attr_getstack);
-    LIB_FUNCTION("DxmIMUQ-wXY", "libScePosix", 1, "libkernel", posix_pthread_attr_getstackaddr);
-    LIB_FUNCTION("0qOtCR-ZHck", "libScePosix", 1, "libkernel", posix_pthread_attr_getstacksize);
-    LIB_FUNCTION("o8pd4juNbgc", "libScePosix", 1, "libkernel", posix_pthread_attr_setaffinity_np);
-    LIB_FUNCTION("Q2y5IqSDZGs", "libScePosix", 1, "libkernel",
-                 posix_pthread_attr_setcreatesuspend_np);
-    LIB_FUNCTION("E+tyo3lp5Lw", "libScePosix", 1, "libkernel", posix_pthread_attr_setdetachstate);
-    LIB_FUNCTION("JKyG3SWyA10", "libScePosix", 1, "libkernel", posix_pthread_attr_setguardsize);
-    LIB_FUNCTION("7ZlAakEf0Qg", "libScePosix", 1, "libkernel", posix_pthread_attr_setinheritsched);
-    LIB_FUNCTION("euKRgm0Vn2M", "libScePosix", 1, "libkernel", posix_pthread_attr_setschedparam);
+    LIB_FUNCTION("DxmIMUQ-wXY", "libScePosix", 1, "libkernel",
+                 posix_pthread_attr_getstackaddr);
+    LIB_FUNCTION("2Q0z6rnBrTE", "libScePosix", 1, "libkernel", posix_pthread_attr_setstacksize);
+    LIB_FUNCTION("Ucsu-OK+els", "libScePosix", 1, "libkernel", posix_pthread_attr_get_np);
+    LIB_FUNCTION("RtLRV-pBTTY", "libScePosix", 1, "libkernel", posix_pthread_attr_getschedpolicy);
+    LIB_FUNCTION("oLjPqUKhzes", "libScePosix", 1, "libkernel",
+                 posix_pthread_attr_getinheritsched);
+    LIB_FUNCTION("e2G+cdEkOmU", "libScePosix", 1, "libkernel", posix_pthread_attr_getscope);
     LIB_FUNCTION("JarMIy8kKEY", "libScePosix", 1, "libkernel", posix_pthread_attr_setschedpolicy);
+    LIB_FUNCTION("o8pd4juNbgc", "libScePosix", 1, "libkernel",
+                 posix_pthread_attr_setaffinity_np);
     LIB_FUNCTION("xesmlSI-KCI", "libScePosix", 1, "libkernel", posix_pthread_attr_setscope);
     LIB_FUNCTION("-SrbXpGR1f0", "libScePosix", 1, "libkernel", posix_pthread_attr_setstack);
-    LIB_FUNCTION("suCrEbr0xIQ", "libScePosix", 1, "libkernel", posix_pthread_attr_setstackaddr);
-    LIB_FUNCTION("2Q0z6rnBrTE", "libScePosix", 1, "libkernel", posix_pthread_attr_setstacksize);
+    LIB_FUNCTION("suCrEbr0xIQ", "libScePosix", 1, "libkernel",
+                 posix_pthread_attr_setstackaddr);
+    LIB_FUNCTION("E+tyo3lp5Lw", "libScePosix", 1, "libkernel", posix_pthread_attr_setdetachstate);
     LIB_FUNCTION("zHchY8ft5pk", "libScePosix", 1, "libkernel", posix_pthread_attr_destroy);
-
-    // Posix-Kernel
-    LIB_FUNCTION("wtkt-teR1so", "libkernel", 1, "libkernel", posix_pthread_attr_init);
-    LIB_FUNCTION("Ucsu-OK+els", "libkernel", 1, "libkernel", posix_pthread_attr_get_np);
-    LIB_FUNCTION("-wzZ7dvA7UU", "libkernel", 1, "libkernel", posix_pthread_attr_getaffinity_np);
-    LIB_FUNCTION("VUT1ZSrHT0I", "libkernel", 1, "libkernel", posix_pthread_attr_getdetachstate);
-    LIB_FUNCTION("JNkVVsVDmOk", "libkernel", 1, "libkernel", posix_pthread_attr_getguardsize);
-    LIB_FUNCTION("oLjPqUKhzes", "libkernel", 1, "libkernel", posix_pthread_attr_getinheritsched);
-    LIB_FUNCTION("qlk9pSLsUmM", "libkernel", 1, "libkernel", posix_pthread_attr_getschedparam);
-    LIB_FUNCTION("RtLRV-pBTTY", "libkernel", 1, "libkernel", posix_pthread_attr_getschedpolicy);
-    LIB_FUNCTION("e2G+cdEkOmU", "libkernel", 1, "libkernel", posix_pthread_attr_getscope);
-    LIB_FUNCTION("vQm4fDEsWi8", "libkernel", 1, "libkernel", posix_pthread_attr_getstack);
-    LIB_FUNCTION("DxmIMUQ-wXY", "libkernel", 1, "libkernel", posix_pthread_attr_getstackaddr);
-    LIB_FUNCTION("0qOtCR-ZHck", "libkernel", 1, "libkernel", posix_pthread_attr_getstacksize);
-    LIB_FUNCTION("o8pd4juNbgc", "libkernel", 1, "libkernel", posix_pthread_attr_setaffinity_np);
-    LIB_FUNCTION("Q2y5IqSDZGs", "libkernel", 1, "libkernel",
+    LIB_FUNCTION("euKRgm0Vn2M", "libScePosix", 1, "libkernel", posix_pthread_attr_setschedparam);
+    LIB_FUNCTION("7ZlAakEf0Qg", "libScePosix", 1, "libkernel", posix_pthread_attr_setinheritsched);
+    LIB_FUNCTION("0qOtCR-ZHck", "libScePosix", 1, "libkernel", posix_pthread_attr_getstacksize);
+    LIB_FUNCTION("VUT1ZSrHT0I", "libScePosix", 1, "libkernel", posix_pthread_attr_getdetachstate);
+    LIB_FUNCTION("JKyG3SWyA10", "libScePosix", 1, "libkernel", posix_pthread_attr_setguardsize);
+    LIB_FUNCTION("Q2y5IqSDZGs", "libScePosix", 1, "libkernel",
                  posix_pthread_attr_setcreatesuspend_np);
+    LIB_FUNCTION("JNkVVsVDmOk", "libScePosix", 1, "libkernel", posix_pthread_attr_getguardsize);
+    LIB_FUNCTION("qlk9pSLsUmM", "libScePosix", 1, "libkernel", posix_pthread_attr_getschedparam);
+
+    LIB_FUNCTION("wtkt-teR1so", "libkernel", 1, "libkernel", posix_pthread_attr_init);
+    LIB_FUNCTION("-wzZ7dvA7UU", "libkernel", 1, "libkernel",
+                 posix_pthread_attr_getaffinity_np);
+    LIB_FUNCTION("vQm4fDEsWi8", "libkernel", 1, "libkernel", posix_pthread_attr_getstack);
+    LIB_FUNCTION("DxmIMUQ-wXY", "libkernel", 1, "libkernel",
+                 posix_pthread_attr_getstackaddr);
+    LIB_FUNCTION("2Q0z6rnBrTE", "libkernel", 1, "libkernel", posix_pthread_attr_setstacksize);
+    LIB_FUNCTION("Ucsu-OK+els", "libkernel", 1, "libkernel", posix_pthread_attr_get_np);
+    LIB_FUNCTION("RtLRV-pBTTY", "libkernel", 1, "libkernel", posix_pthread_attr_getschedpolicy);
+    LIB_FUNCTION("oLjPqUKhzes", "libkernel", 1, "libkernel",
+                 posix_pthread_attr_getinheritsched);
+    LIB_FUNCTION("e2G+cdEkOmU", "libkernel", 1, "libkernel", posix_pthread_attr_getscope);
     LIB_FUNCTION("E+tyo3lp5Lw", "libkernel", 1, "libkernel", posix_pthread_attr_setdetachstate);
-    LIB_FUNCTION("JKyG3SWyA10", "libkernel", 1, "libkernel", posix_pthread_attr_setguardsize);
-    LIB_FUNCTION("7ZlAakEf0Qg", "libkernel", 1, "libkernel", posix_pthread_attr_setinheritsched);
+    LIB_FUNCTION("zHchY8ft5pk", "libkernel", 1, "libkernel", posix_pthread_attr_destroy);
     LIB_FUNCTION("euKRgm0Vn2M", "libkernel", 1, "libkernel", posix_pthread_attr_setschedparam);
     LIB_FUNCTION("JarMIy8kKEY", "libkernel", 1, "libkernel", posix_pthread_attr_setschedpolicy);
+    LIB_FUNCTION("o8pd4juNbgc", "libkernel", 1, "libkernel",
+                 posix_pthread_attr_setaffinity_np);
     LIB_FUNCTION("xesmlSI-KCI", "libkernel", 1, "libkernel", posix_pthread_attr_setscope);
     LIB_FUNCTION("-SrbXpGR1f0", "libkernel", 1, "libkernel", posix_pthread_attr_setstack);
-    LIB_FUNCTION("suCrEbr0xIQ", "libkernel", 1, "libkernel", posix_pthread_attr_setstackaddr);
-    LIB_FUNCTION("2Q0z6rnBrTE", "libkernel", 1, "libkernel", posix_pthread_attr_setstacksize);
-    LIB_FUNCTION("zHchY8ft5pk", "libkernel", 1, "libkernel", posix_pthread_attr_destroy);
+    LIB_FUNCTION("suCrEbr0xIQ", "libkernel", 1, "libkernel",
+                 posix_pthread_attr_setstackaddr);
+    LIB_FUNCTION("7ZlAakEf0Qg", "libkernel", 1, "libkernel", posix_pthread_attr_setinheritsched);
+    LIB_FUNCTION("0qOtCR-ZHck", "libkernel", 1, "libkernel", posix_pthread_attr_getstacksize);
+    LIB_FUNCTION("VUT1ZSrHT0I", "libkernel", 1, "libkernel", posix_pthread_attr_getdetachstate);
+    LIB_FUNCTION("JKyG3SWyA10", "libkernel", 1, "libkernel", posix_pthread_attr_setguardsize);
+    LIB_FUNCTION("Q2y5IqSDZGs", "libkernel", 1, "libkernel",
+                 posix_pthread_attr_setcreatesuspend_np);
+    LIB_FUNCTION("JNkVVsVDmOk", "libkernel", 1, "libkernel", posix_pthread_attr_getguardsize);
+    LIB_FUNCTION("qlk9pSLsUmM", "libkernel", 1, "libkernel", posix_pthread_attr_getschedparam);
 
-    // Orbis
-    LIB_FUNCTION("nsYoNRywwNg", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_init));
-    LIB_FUNCTION("x1X76arYMxU", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_get_np));
-    LIB_FUNCTION("8+s5BzZjxSg", "libkernel", 1, "libkernel", ORBIS(scePthreadAttrGetaffinity));
+    LIB_FUNCTION("4+h9EzwKF4I", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_setschedpolicy));
+    LIB_FUNCTION("-Wreprtu0Qs", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_setdetachstate));
     LIB_FUNCTION("JaRMy+QcpeU", "libkernel", 1, "libkernel",
                  ORBIS(posix_pthread_attr_getdetachstate));
     LIB_FUNCTION("txHtngJ+eyc", "libkernel", 1, "libkernel",
                  ORBIS(posix_pthread_attr_getguardsize));
     LIB_FUNCTION("lpMP8HhkBbg", "libkernel", 1, "libkernel",
                  ORBIS(posix_pthread_attr_getinheritsched));
-    LIB_FUNCTION("FXPWHNk8Of0", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_getschedparam));
-    LIB_FUNCTION("NMyIQ9WgWbU", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_getschedpolicy));
-    LIB_FUNCTION("+7B2AEKKns8", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_getscope));
-    LIB_FUNCTION("-quPa4SEJUw", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_getstack));
-    LIB_FUNCTION("Ru36fiTtJzA", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_getstackaddr));
-    LIB_FUNCTION("-fA+7ZlGDQs", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_getstacksize));
-    LIB_FUNCTION("3qxgM4ezETA", "libkernel", 1, "libkernel", ORBIS(scePthreadAttrSetaffinity));
-    LIB_FUNCTION("GZSR0Ooae9Q", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_setcreatesuspend_np));
-    LIB_FUNCTION("-Wreprtu0Qs", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_setdetachstate));
-    LIB_FUNCTION("El+cQ20DynU", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_setguardsize));
     LIB_FUNCTION("eXbUSpEaTsA", "libkernel", 1, "libkernel",
                  ORBIS(posix_pthread_attr_setinheritsched));
     LIB_FUNCTION("DzES9hQF4f4", "libkernel", 1, "libkernel",
                  ORBIS(posix_pthread_attr_setschedparam));
-    LIB_FUNCTION("4+h9EzwKF4I", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_setschedpolicy));
-    LIB_FUNCTION("YdZfEZfRnPk", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_setscope));
+    LIB_FUNCTION("nsYoNRywwNg", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_init));
+    LIB_FUNCTION("62KCwEMmzcM", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_destroy));
+    LIB_FUNCTION("-quPa4SEJUw", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_getstack));
     LIB_FUNCTION("Bvn74vj6oLo", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_setstack));
-    LIB_FUNCTION("F+yfmduIBB8", "libkernel", 1, "libkernel",
-                 ORBIS(posix_pthread_attr_setstackaddr));
+    LIB_FUNCTION("Ru36fiTtJzA", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_getstackaddr));
+    LIB_FUNCTION("-fA+7ZlGDQs", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_getstacksize));
+    LIB_FUNCTION("x1X76arYMxU", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_get_np));
+    LIB_FUNCTION("FXPWHNk8Of0", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_getschedparam));
+    LIB_FUNCTION("NMyIQ9WgWbU", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_getschedpolicy));
+    LIB_FUNCTION("+7B2AEKKns8", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_getscope));
     LIB_FUNCTION("UTXzJbWhhTE", "libkernel", 1, "libkernel",
                  ORBIS(posix_pthread_attr_setstacksize));
-    LIB_FUNCTION("62KCwEMmzcM", "libkernel", 1, "libkernel", ORBIS(posix_pthread_attr_destroy));
+    LIB_FUNCTION("F+yfmduIBB8", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_setstackaddr));
+    LIB_FUNCTION("El+cQ20DynU", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_setguardsize));
+    LIB_FUNCTION("GZSR0Ooae9Q", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_setcreatesuspend_np));
+    LIB_FUNCTION("YdZfEZfRnPk", "libkernel", 1, "libkernel",
+                 ORBIS(posix_pthread_attr_setscope));
+    LIB_FUNCTION("8+s5BzZjxSg", "libkernel", 1, "libkernel", ORBIS(scePthreadAttrGetaffinity));
+    LIB_FUNCTION("3qxgM4ezETA", "libkernel", 1, "libkernel", ORBIS(scePthreadAttrSetaffinity));
 }
 
-} // namespace Libraries::Kernel
+}
