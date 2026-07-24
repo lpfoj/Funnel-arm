@@ -142,7 +142,6 @@ static ConfigEntry<string> userName("LSX4");
 static ConfigEntry<bool> isShowSplash(false);
 static ConfigEntry<string> isSideTrophy("right");
 static ConfigEntry<bool> isConnectedToNetwork(false);
-static bool enableDiscordRPC = false;
 static std::filesystem::path sys_modules_path = {};
 static std::filesystem::path fonts_path = {};
 
@@ -322,10 +321,6 @@ std::string getPresentMode() {
 
 bool getisTrophyPopupDisabled() {
     return isTrophyPopupDisabled.get();
-}
-
-bool getEnableDiscordRPC() {
-    return enableDiscordRPC;
 }
 
 s16 getCursorState() {
@@ -649,10 +644,6 @@ void setisTrophyPopupDisabled(bool disable, bool is_game_specific) {
     isTrophyPopupDisabled.set(disable, is_game_specific);
 }
 
-void setEnableDiscordRPC(bool enable) {
-    enableDiscordRPC = enable;
-}
-
 void setCursorState(s16 newCursorState, bool is_game_specific) {
     cursorState.set(newCursorState, is_game_specific);
 }
@@ -891,7 +882,6 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         isTrophyPopupDisabled.setFromToml(general, "isTrophyPopupDisabled", is_game_specific);
         trophyNotificationDuration.setFromToml(general, "trophyNotificationDuration",
                                                is_game_specific);
-        enableDiscordRPC = toml::find_or<bool>(general, "enableDiscordRPC", enableDiscordRPC);
         logFilter.setFromToml(general, "logFilter", is_game_specific);
         logType.setFromToml(general, "logType", is_game_specific);
         isIdenticalLogGrouped.setFromToml(general, "isIdenticalLogGrouped", is_game_specific);
@@ -1169,7 +1159,6 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
             install_dirs_enabled.push_back(entry.enabled);
         }
 
-        data["General"]["enableDiscordRPC"] = enableDiscordRPC;
         data["General"]["sysModulesPath"] = string{fmt::UTF(sys_modules_path.u8string()).data};
         data["General"]["fontsPath"] = string{fmt::UTF(fonts_path.u8string()).data};
         data["GUI"]["installDirs"] = install_dirs;
@@ -1262,8 +1251,6 @@ void setDefaultValues(bool is_game_specific) {
     m_language.set(1, is_game_specific);
 
     if (!is_game_specific) {
-
-        enableDiscordRPC = false;
 
         useSpecialPad.base_value = false;
         specialPadClass.base_value = 1;

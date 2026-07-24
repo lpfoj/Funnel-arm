@@ -97,8 +97,6 @@ bool getVkHostMarkersEnabled();
 void setVkHostMarkersEnabled(bool enable, bool is_game_specific = false);
 bool getVkGuestMarkersEnabled();
 void setVkGuestMarkersEnabled(bool enable, bool is_game_specific = false);
-bool getEnableDiscordRPC();
-void setEnableDiscordRPC(bool enable);
 bool isRdocEnabled();
 bool isPipelineCacheEnabled();
 bool isPipelineCacheArchived();
