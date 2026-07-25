@@ -102,4 +102,4 @@ struct LoadedImage {
 void UnloadNextGenExecutable(
     const LoaderHost& host, LoadedImage& image) noexcept;
 
-} // namespace Funnel::Ps5Desktop
+}

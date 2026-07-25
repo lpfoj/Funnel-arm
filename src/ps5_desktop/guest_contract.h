@@ -33,4 +33,4 @@ struct GuestContract {
 
 [[nodiscard]] GuestContract QueryGuestContract() noexcept;
 
-} // namespace Funnel::Ps5Desktop
+}

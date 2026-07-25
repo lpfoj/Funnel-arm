@@ -43,4 +43,4 @@ s32 GetVoicePortInfo(OrbisNgs2Handle voice_handle, u32 port,
 s32 Render(OrbisNgs2Handle system_handle, const OrbisNgs2RenderBufferInfo* buffers,
            u32 num_buffers);
 
-} // namespace Libraries::Ngs2::Runtime
+}

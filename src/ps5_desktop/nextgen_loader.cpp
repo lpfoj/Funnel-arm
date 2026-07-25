@@ -431,9 +431,6 @@ std::uint32_t LoaderFlags(const std::uint32_t elf_flags) {
         protection |= LoaderWrite;
     }
     if ((elf_flags & PfExecute) != 0) {
-        // AMD64 has no independent execute-only page permission: executable
-        // mappings are also readable for instruction fetch and RIP-relative
-        // loads. Real PS5 images commonly encode their text PT_LOAD as PF_X.
         protection |= LoaderRead | LoaderExecute;
     }
     return protection;
@@ -1137,9 +1134,6 @@ bool ApplySectionRelaFallback(
             relocation_section.size % sizeof(Rela) != 0 ||
             relocation_section.link >= header.section_count) {
             if (file.self) {
-                // Section metadata is optional in stripped fSELF images and
-                // commonly retains offsets from the pre-container ELF. The
-                // program and dynamic tables remain authoritative.
                 continue;
             }
             error = "invalid PS5 section relocation table";
@@ -1290,7 +1284,7 @@ void* AllocateImage(const std::uint64_t mapped_size,
     return MAP_FAILED;
 }
 
-} // namespace
+}
 
 bool LoadNextGenExecutable(
     const char* const path, const LoaderHost& host, LoadedImage& image,
@@ -1594,4 +1588,4 @@ void UnloadNextGenExecutable(
     image = {};
 }
 
-} // namespace Funnel::Ps5Desktop
+}

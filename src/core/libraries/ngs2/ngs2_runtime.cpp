@@ -1989,7 +1989,7 @@ private:
     bool reported_audio_{};
 };
 
-} // namespace
+}
 
 s32 CreateSystem(const OrbisNgs2SystemOption* option,
                  const OrbisNgs2ContextBufferInfo* buffer_info,
@@ -2086,4 +2086,4 @@ s32 Render(OrbisNgs2Handle system_handle, const OrbisNgs2RenderBufferInfo* buffe
     return Ngs2Runtime::Instance().Render(system_handle, buffers, num_buffers);
 }
 
-} // namespace Libraries::Ngs2::Runtime
+}
