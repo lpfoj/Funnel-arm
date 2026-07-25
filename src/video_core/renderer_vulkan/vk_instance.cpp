@@ -13,6 +13,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/content_fingerprint.h"
 #include "common/debug.h"
 #include "common/path_util.h"
@@ -79,6 +80,9 @@ namespace {
 
 bool ExecutorDisableVkRobustness() {
 #ifdef __ANDROID__
+    if (Config::managedDisableVkRobustness()) {
+        return true;
+    }
     static const bool disabled = [] {
         const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
         return std::filesystem::exists(user_dir / "run-disable-vk-robustness") ||
@@ -93,6 +97,9 @@ bool ExecutorDisableVkRobustness() {
 
 bool ExecutorEnableVkCoarseFragment() {
 #ifdef __ANDROID__
+    if (Config::managedCoarseFragmentShading()) {
+        return true;
+    }
     static const bool enabled = [] {
         const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
         return std::filesystem::exists(user_dir / "run-vk-coarse-fragment") ||
