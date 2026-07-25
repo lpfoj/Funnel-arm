@@ -1687,7 +1687,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 #ifdef __ANDROID__
-    {
+    if (!Config::managedGpuFastPath()) {
         const auto& key = pipeline->GetGraphicsKey();
         const auto& color = cb_descs[0].second.info;
         const u64 journal_sequence = ExecutorVkJournalGraphicsDraw(
@@ -1722,7 +1722,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             key.stage_hashes[u32(Shader::LogicalStage::Fragment)], pipeline->GetPipelineHash(),
             is_indexed, false);
     }
-    ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
+    if (!Config::managedGpuFastPath()) {
+        ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
+    }
     if (cb_descs[0].first) {
         texture_cache.ExecutorTrackLiveDrawnColorTarget(cb_descs[0].first);
     }
@@ -1977,7 +1979,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
 #ifdef __ANDROID__
-    {
+    if (!Config::managedGpuFastPath()) {
         const auto& key = pipeline->GetGraphicsKey();
         const auto& color = cb_descs[0].second.info;
         const u64 journal_sequence = ExecutorVkJournalGraphicsDraw(
@@ -2012,7 +2014,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             key.stage_hashes[u32(Shader::LogicalStage::Fragment)], pipeline->GetPipelineHash(),
             is_indexed, true);
     }
-    ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
+    if (!Config::managedGpuFastPath()) {
+        ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
+    }
     if (cb_descs[0].first) {
         texture_cache.ExecutorTrackLiveDrawnColorTarget(cb_descs[0].first);
     }
@@ -2056,13 +2060,15 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
 
 #ifdef __ANDROID__
-    ExecutorVkJournalComputeDispatch(
-        &scheduler, scheduler.CurrentTick(), pipeline->GetPipelineHash(),
-        ExecutorVkPipelineHandle(pipeline->Handle()), pipeline->GetPipelineHash(), false,
-        cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, 0,
-        static_cast<u32>(set_writes.size()), static_cast<u32>(buffer_infos.size()),
-        static_cast<u32>(image_infos.size()),
-        texture_cache.ExecutorGpuContentProbeEnabled());
+    if (!Config::managedGpuFastPath()) {
+        ExecutorVkJournalComputeDispatch(
+            &scheduler, scheduler.CurrentTick(), pipeline->GetPipelineHash(),
+            ExecutorVkPipelineHandle(pipeline->Handle()), pipeline->GetPipelineHash(), false,
+            cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, 0,
+            static_cast<u32>(set_writes.size()), static_cast<u32>(buffer_infos.size()),
+            static_cast<u32>(image_infos.size()),
+            texture_cache.ExecutorGpuContentProbeEnabled());
+    }
 #endif
 
     if (texture_cache.ExecutorGpuContentProbeEnabled()) {
@@ -2117,12 +2123,14 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
 
 #ifdef __ANDROID__
-    ExecutorVkJournalComputeDispatch(
-        &scheduler, scheduler.CurrentTick(), pipeline->GetPipelineHash(),
-        ExecutorVkPipelineHandle(pipeline->Handle()), pipeline->GetPipelineHash(), true, 0, 0, 0,
-        address + offset, static_cast<u32>(set_writes.size()),
-        static_cast<u32>(buffer_infos.size()), static_cast<u32>(image_infos.size()),
-        texture_cache.ExecutorGpuContentProbeEnabled());
+    if (!Config::managedGpuFastPath()) {
+        ExecutorVkJournalComputeDispatch(
+            &scheduler, scheduler.CurrentTick(), pipeline->GetPipelineHash(),
+            ExecutorVkPipelineHandle(pipeline->Handle()), pipeline->GetPipelineHash(), true, 0, 0,
+            0, address + offset, static_cast<u32>(set_writes.size()),
+            static_cast<u32>(buffer_infos.size()), static_cast<u32>(image_infos.size()),
+            texture_cache.ExecutorGpuContentProbeEnabled());
+    }
 #endif
 
     if (texture_cache.ExecutorGpuContentProbeEnabled()) {

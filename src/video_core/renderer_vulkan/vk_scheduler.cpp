@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -163,6 +164,9 @@ void ExecutorVkProbeRecord(const ExecutorVkJournalEntry& entry, u64 sequence) no
 void ExecutorVkFrameRecord(const ExecutorVkJournalEntry& entry, u64 sequence) noexcept;
 
 bool ExecutorVkJournalRecordEnabled(bool force_record) noexcept {
+    if (Config::managedGpuFastPath()) {
+        return false;
+    }
     if (force_record) {
         executor_vk_forced_session.store(true, std::memory_order_release);
         return true;
@@ -1124,12 +1128,16 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
         return;
     }
 #ifdef __ANDROID__
-    ++executor_submit_kind_counts[static_cast<std::size_t>(kind)];
-    if (kind == ExecutorSubmitKind::Finish) {
-        ++executor_finish_reason_counts[static_cast<std::size_t>(finish_reason)];
+    const bool executor_diagnostics_enabled = !Config::managedGpuFastPath();
+    if (executor_diagnostics_enabled) {
+        ++executor_submit_kind_counts[static_cast<std::size_t>(kind)];
+        if (kind == ExecutorSubmitKind::Finish) {
+            ++executor_finish_reason_counts[static_cast<std::size_t>(finish_reason)];
+        }
     }
-    const u64 executor_submit_kind_ordinal = ++executor_submit_kind_total;
-    if ((executor_submit_kind_ordinal & 255u) == 0u) {
+    const u64 executor_submit_kind_ordinal =
+        executor_diagnostics_enabled ? ++executor_submit_kind_total : 0;
+    if (executor_diagnostics_enabled && (executor_submit_kind_ordinal & 255u) == 0u) {
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_VK_SUBMIT_REASONS] scheduler=%p total=%llu flushInfo=%llu "
@@ -1230,32 +1238,38 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
 
     ImGui::Core::TextureManager::Submit();
 #ifdef __ANDROID__
-    ExecutorVkJournalSubmit(this, signal_value, false, vk::Result::eSuccess);
-    const auto executor_submit_begin = std::chrono::steady_clock::now();
+    if (executor_diagnostics_enabled) {
+        ExecutorVkJournalSubmit(this, signal_value, false, vk::Result::eSuccess);
+    }
+    const auto executor_submit_begin = executor_diagnostics_enabled
+                                           ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
 #endif
     const vk::Result submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
 #ifdef __ANDROID__
-    const u64 executor_submit_ns = static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - executor_submit_begin)
-            .count());
-    static u64 executor_submit_samples{};
-    static u64 executor_submit_total_ns{};
-    static u64 executor_submit_max_ns{};
-    ++executor_submit_samples;
-    executor_submit_total_ns += executor_submit_ns;
-    executor_submit_max_ns = std::max(executor_submit_max_ns, executor_submit_ns);
-    if ((executor_submit_samples & 1023u) == 0u) {
-        __android_log_print(
-            ANDROID_LOG_INFO, "LSX4Native",
-            "[EXECUTOR_VK_SUBMIT_LATENCY] samples=1024 totalMs=%.3f avgUs=%.3f maxMs=%.3f",
-            static_cast<double>(executor_submit_total_ns) / 1'000'000.0,
-            static_cast<double>(executor_submit_total_ns) / 1'024'000.0,
-            static_cast<double>(executor_submit_max_ns) / 1'000'000.0);
-        executor_submit_total_ns = 0;
-        executor_submit_max_ns = 0;
+    if (executor_diagnostics_enabled) {
+        const u64 executor_submit_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - executor_submit_begin)
+                .count());
+        static u64 executor_submit_samples{};
+        static u64 executor_submit_total_ns{};
+        static u64 executor_submit_max_ns{};
+        ++executor_submit_samples;
+        executor_submit_total_ns += executor_submit_ns;
+        executor_submit_max_ns = std::max(executor_submit_max_ns, executor_submit_ns);
+        if ((executor_submit_samples & 1023u) == 0u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_VK_SUBMIT_LATENCY] samples=1024 totalMs=%.3f avgUs=%.3f maxMs=%.3f",
+                static_cast<double>(executor_submit_total_ns) / 1'000'000.0,
+                static_cast<double>(executor_submit_total_ns) / 1'024'000.0,
+                static_cast<double>(executor_submit_max_ns) / 1'000'000.0);
+            executor_submit_total_ns = 0;
+            executor_submit_max_ns = 0;
+        }
+        ExecutorVkJournalSubmit(this, signal_value, true, submit_result);
     }
-    ExecutorVkJournalSubmit(this, signal_value, true, submit_result);
 #endif
     if (submit_result != vk::Result::eSuccess) [[unlikely]] {
 #ifdef __ANDROID__

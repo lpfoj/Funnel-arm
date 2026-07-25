@@ -265,7 +265,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const char* const shader_identity_cache_flag =
         std::getenv("EXECUTOR_SHADER_IDENTITY_CACHE");
     shader_identity_cache_enabled =
-        shader_identity_cache_flag == nullptr || shader_identity_cache_flag[0] == '\0' ||
+        shader_identity_cache_flag != nullptr && shader_identity_cache_flag[0] != '\0' &&
         shader_identity_cache_flag[0] != '0';
     const char* const immutable_shader_identity_cache_flag =
         std::getenv("EXECUTOR_IMMUTABLE_SHADER_IDENTITY_CACHE");

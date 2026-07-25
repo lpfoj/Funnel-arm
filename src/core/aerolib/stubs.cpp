@@ -87,6 +87,8 @@ extern "C" int executor_live_get_current_hle_call_site(std::uint64_t* guest_retu
     __attribute__((weak));
 extern "C" int executor_live_get_current_hle_guest_rsp(std::uint64_t* guest_rsp)
     __attribute__((weak));
+extern "C" int executor_live_get_current_hle_floating_arguments(
+    std::uint64_t* values, std::size_t capacity) __attribute__((weak));
 extern "C" void executor_jit_record_current_thread_state(const char* reason)
     __attribute__((weak));
 extern "C" void executor_jit_dump_thread_states(const char* reason) __attribute__((weak));
@@ -6658,6 +6660,44 @@ static u64 ExecutorCurrentGuestVarargOverflowArea() {
     return 0;
 }
 
+struct ExecutorDirectGuestVaList {
+    alignas(16) std::array<std::byte, 176> register_save{};
+    alignas(16) std::array<u64, 4> fallback_overflow{};
+    struct {
+        u32 gp_offset;
+        u32 fp_offset;
+        u64 overflow_arg_area;
+        u64 reg_save_area;
+    } descriptor{};
+};
+
+static u64 ExecutorBuildDirectGuestVaList(ExecutorDirectGuestVaList& storage,
+                                          const std::array<u64, 6>& integer_arguments,
+                                          u32 first_variadic_gp) {
+    std::memcpy(storage.register_save.data(), integer_arguments.data(),
+                integer_arguments.size() * sizeof(u64));
+#ifdef __ANDROID__
+    std::array<u64, 8> floating_arguments{};
+    if (executor_live_get_current_hle_floating_arguments != nullptr) {
+        executor_live_get_current_hle_floating_arguments(
+            floating_arguments.data(), floating_arguments.size());
+    }
+    for (std::size_t index = 0; index < floating_arguments.size(); ++index) {
+        std::memcpy(storage.register_save.data() + 48 + index * 16,
+                    &floating_arguments[index], sizeof(u64));
+    }
+#endif
+    const u64 guest_overflow = ExecutorCurrentGuestVarargOverflowArea();
+    storage.descriptor = {
+        first_variadic_gp,
+        48,
+        guest_overflow ? guest_overflow
+                       : reinterpret_cast<u64>(storage.fallback_overflow.data()),
+        reinterpret_cast<u64>(storage.register_save.data()),
+    };
+    return reinterpret_cast<u64>(&storage.descriptor);
+}
+
 static void ExecutorLogFormattedCopy(const char* tag, u64 dst, u64 size, u64 fmt_ptr, s64 len) {
 #ifdef __ANDROID__
     if (!ExecutorVerboseLibcFormattedLogsEnabled()) {
@@ -6686,18 +6726,10 @@ static void ExecutorLogFormattedCopy(const char* tag, u64 dst, u64 size, u64 fmt
 }
 
 s64 ExecutorLibcFprintf(u64 file_ptr, u64 fmt_ptr, u64 a2, u64 a3, u64 a4, u64 a5) {
-    alignas(16) u64 reg_save[6] = {file_ptr, fmt_ptr, a2, a3, a4, a5};
-    alignas(16) u64 overflow[4] = {};
-    const u64 guest_overflow = ExecutorCurrentGuestVarargOverflowArea();
-    struct GuestVaList {
-        u32 gp_offset;
-        u32 fp_offset;
-        u64 overflow_arg_area;
-        u64 reg_save_area;
-    } va{16, 48, guest_overflow ? guest_overflow : reinterpret_cast<u64>(overflow),
-         reinterpret_cast<u64>(reg_save)};
-
-    const s64 len = ExecutorLibcVfprintf(file_ptr, fmt_ptr, reinterpret_cast<u64>(&va));
+    ExecutorDirectGuestVaList va{};
+    const u64 va_ptr =
+        ExecutorBuildDirectGuestVaList(va, {file_ptr, fmt_ptr, a2, a3, a4, a5}, 16);
+    const s64 len = ExecutorLibcVfprintf(file_ptr, fmt_ptr, va_ptr);
 #ifdef __ANDROID__
     static std::atomic<int> log_budget{64};
     if (log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
@@ -6994,31 +7026,17 @@ s64 ExecutorLibcVsprintf(u64 dst, u64 fmt_ptr, u64 va_ptr) {
 }
 
 s64 ExecutorLibcSnprintf(u64 dst, u64 size, u64 fmt_ptr, u64 a3, u64 a4, u64 a5) {
-    alignas(16) u64 reg_save[6] = {dst, size, fmt_ptr, a3, a4, a5};
-    alignas(16) u64 overflow[4] = {};
-    const u64 guest_overflow = ExecutorCurrentGuestVarargOverflowArea();
-    struct GuestVaList {
-        u32 gp_offset;
-        u32 fp_offset;
-        u64 overflow_arg_area;
-        u64 reg_save_area;
-    } va{24, 48, guest_overflow ? guest_overflow : reinterpret_cast<u64>(overflow),
-         reinterpret_cast<u64>(reg_save)};
-    return ExecutorLibcVsnprintf(dst, size, fmt_ptr, reinterpret_cast<u64>(&va));
+    ExecutorDirectGuestVaList va{};
+    const u64 va_ptr =
+        ExecutorBuildDirectGuestVaList(va, {dst, size, fmt_ptr, a3, a4, a5}, 24);
+    return ExecutorLibcVsnprintf(dst, size, fmt_ptr, va_ptr);
 }
 
 s64 ExecutorLibcSprintf(u64 dst, u64 fmt_ptr, u64 a2, u64 a3, u64 a4, u64 a5) {
-    alignas(16) u64 reg_save[6] = {dst, fmt_ptr, a2, a3, a4, a5};
-    alignas(16) u64 overflow[4] = {};
-    const u64 guest_overflow = ExecutorCurrentGuestVarargOverflowArea();
-    struct GuestVaList {
-        u32 gp_offset;
-        u32 fp_offset;
-        u64 overflow_arg_area;
-        u64 reg_save_area;
-    } va{16, 48, guest_overflow ? guest_overflow : reinterpret_cast<u64>(overflow),
-         reinterpret_cast<u64>(reg_save)};
-    return ExecutorLibcVsprintf(dst, fmt_ptr, reinterpret_cast<u64>(&va));
+    ExecutorDirectGuestVaList va{};
+    const u64 va_ptr =
+        ExecutorBuildDirectGuestVaList(va, {dst, fmt_ptr, a2, a3, a4, a5}, 16);
+    return ExecutorLibcVsprintf(dst, fmt_ptr, va_ptr);
 }
 
 std::string ExecutorExtractTitleId(const std::string& path) {

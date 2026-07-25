@@ -37,7 +37,7 @@ struct OrbisNgs2CustomChorusModuleOption {
 
     u32 maxPhases;
     u32 reserved;
-} OrbisNgs2CustomChorusModuleOption;
+};
 
 struct OrbisNgs2CustomPeakMeterModuleOption {
     OrbisNgs2CustomModuleOption customModuleOption;
@@ -308,7 +308,7 @@ struct OrbisNgs2CustomVoicePeakMeterParam {
     OrbisNgs2VoiceParamHeader header;
     u32 enableFlag;
     u32 reserved;
-} OrbisNgs2CustomVoicePeakMeterParam;
+};
 
 struct OrbisNgs2CustomVoiceReverbParam {
     OrbisNgs2VoiceParamHeader header;

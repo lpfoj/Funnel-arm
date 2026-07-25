@@ -717,6 +717,46 @@ private:
 
     void ConvertToOutput(const void* ptr) {
         const float current_gain = gain.load(std::memory_order_acquire);
+        if (guest_channels == 8) {
+            constexpr float CenterMix = 0.70710678f;
+            constexpr float SurroundMix = 0.70710678f;
+            if (is_float) {
+                const float* src = static_cast<const float*>(ptr);
+                for (u32 frame = 0; frame < buffer_frames; frame++) {
+                    const u32 src_base = frame * 8;
+                    const u32 dst_base = frame * 2;
+                    const float center = src[src_base + FC] * CenterMix;
+                    output_buffer[dst_base] =
+                        (src[src_base + FL] + center +
+                         (src[src_base + SL] + src[src_base + BL]) * SurroundMix) *
+                        current_gain;
+                    output_buffer[dst_base + 1] =
+                        (src[src_base + FR] + center +
+                         (src[src_base + SR] + src[src_base + BR]) * SurroundMix) *
+                        current_gain;
+                }
+                return;
+            }
+
+            const s16* src = static_cast<const s16*>(ptr);
+            for (u32 frame = 0; frame < buffer_frames; frame++) {
+                const u32 src_base = frame * 8;
+                const u32 dst_base = frame * 2;
+                const float center = static_cast<float>(src[src_base + FC]) * CenterMix;
+                output_buffer[dst_base] =
+                    (static_cast<float>(src[src_base + FL]) + center +
+                     static_cast<float>(src[src_base + SL] + src[src_base + BL]) *
+                         SurroundMix) *
+                    INV_VOLUME_0DB * current_gain;
+                output_buffer[dst_base + 1] =
+                    (static_cast<float>(src[src_base + FR]) + center +
+                     static_cast<float>(src[src_base + SR] + src[src_base + BR]) *
+                         SurroundMix) *
+                    INV_VOLUME_0DB * current_gain;
+            }
+            return;
+        }
+
         if (is_float) {
             const float* src = static_cast<const float*>(ptr);
             for (u32 frame = 0; frame < buffer_frames; frame++) {

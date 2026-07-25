@@ -584,7 +584,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto image_view = *image.FindView(view_info).image_view;
     image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
 
-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+#ifdef __ANDROID__
+    const u32 tile_aligned_height = (attribute.attrib.height + 15u) & ~15u;
+    if (using_live_drawn_target && image_size.width == attribute.attrib.width &&
+        image_size.height == tile_aligned_height &&
+        tile_aligned_height > attribute.attrib.height) {
+        image_size.height = attribute.attrib.height;
+    }
+#endif
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},

@@ -925,6 +925,7 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
     const auto candidate_valid = [&](const ImageId id) {
         return id && slot_images.is_allocated(id);
     };
+    const u32 tile_aligned_height = (height + 15u) & ~15u;
 
     static std::atomic<bool> traced_live_candidate_set{false};
     if (std::getenv("EXECUTOR_TRACE_VIDEOOUT_SOURCE") != nullptr &&
@@ -941,6 +942,23 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
             ExecutorTraceVideoOutSource(id, 0x10000u + traced_count, 0);
             if (traced_count == traced_ids.size()) {
                 break;
+            }
+        }
+    }
+
+    if (tile_aligned_height > height) {
+        for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
+            if (!candidate_valid(*it) || *it == preferred) {
+                continue;
+            }
+            const auto& image = GetImage(*it);
+            if (!image.info.props.is_depth && image.usage.render_target &&
+                !image.usage.vo_surface && image.info.size.width == width &&
+                image.info.size.height == tile_aligned_height &&
+                (!preferred_image ||
+                 IsVulkanFormatCompatible(image.info.pixel_format,
+                                          preferred_image->info.pixel_format))) {
+                return *it;
             }
         }
     }

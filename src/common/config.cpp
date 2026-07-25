@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <map>
@@ -167,6 +168,9 @@ static ConfigEntry<bool> shouldCopyGPUBuffers(false);
 static ConfigEntry<int> readbacksMode(GpuReadbacksMode::Disabled);
 static ConfigEntry<bool> readbackLinearImagesEnabled(false);
 static ConfigEntry<bool> directMemoryAccessEnabled(false);
+static std::atomic_bool managedGpuFastPathEnabled{false};
+static std::atomic_bool managedCoarseFragmentShadingEnabled{false};
+static std::atomic_bool managedDisableVkRobustnessEnabled{false};
 static ConfigEntry<bool> shouldDumpShaders(false);
 static ConfigEntry<bool> shouldPatchShaders(false);
 static ConfigEntry<u32> vblankFrequency(60);
@@ -428,7 +432,19 @@ bool readbackLinearImages() {
 }
 
 bool directMemoryAccess() {
-    return directMemoryAccessEnabled.get();
+    return directMemoryAccessEnabled.get() || managedGpuFastPath();
+}
+
+bool managedGpuFastPath() {
+    return managedGpuFastPathEnabled.load(std::memory_order_acquire);
+}
+
+bool managedCoarseFragmentShading() {
+    return managedCoarseFragmentShadingEnabled.load(std::memory_order_acquire);
+}
+
+bool managedDisableVkRobustness() {
+    return managedDisableVkRobustnessEnabled.load(std::memory_order_acquire);
 }
 
 bool dumpShaders() {
@@ -590,6 +606,18 @@ void setReadbackLinearImages(bool enable, bool is_game_specific) {
 
 void setDirectMemoryAccess(bool enable, bool is_game_specific) {
     directMemoryAccessEnabled.set(enable, is_game_specific);
+}
+
+void setManagedGpuFastPath(bool enable) {
+    managedGpuFastPathEnabled.store(enable, std::memory_order_release);
+}
+
+void setManagedCoarseFragmentShading(bool enable) {
+    managedCoarseFragmentShadingEnabled.store(enable, std::memory_order_release);
+}
+
+void setManagedDisableVkRobustness(bool enable) {
+    managedDisableVkRobustnessEnabled.store(enable, std::memory_order_release);
 }
 
 void setDumpShaders(bool enable, bool is_game_specific) {
