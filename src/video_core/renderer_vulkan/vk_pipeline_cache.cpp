@@ -648,6 +648,9 @@ bool PipelineCache::WasCpuRangeInvalidatedSinceLocked(const VAddr range_address,
 
 bool PipelineCache::AreSrtMemoryRangesCpuStableSince(
     const std::span<const Shader::SrtMemoryRange> ranges, const u64 sequence) {
+    if (shader_identity_published_generation.load(std::memory_order_acquire) <= sequence) {
+        return true;
+    }
     std::scoped_lock lock{shader_identity_cache_mutex};
     return std::ranges::all_of(ranges, [&](const auto& range) {
         return !WasCpuRangeInvalidatedSinceLocked(range.address, range.size, sequence);
@@ -655,8 +658,7 @@ bool PipelineCache::AreSrtMemoryRangesCpuStableSince(
 }
 
 u64 PipelineCache::CaptureCpuInvalidationSequence() {
-    std::scoped_lock lock{shader_identity_cache_mutex};
-    return shader_identity_generation;
+    return shader_identity_published_generation.load(std::memory_order_acquire);
 }
 
 Shader::ShaderParams PipelineCache::GetShaderParams(const u32* user_data, const u32* code) {
@@ -728,13 +730,16 @@ void PipelineCache::InvalidateShaderIdentityRange(const VAddr address, const u64
     }
 
     std::scoped_lock lock{shader_identity_cache_mutex};
-    const u64 invalidation_sequence = ++shader_identity_generation;
+    const u64 invalidation_sequence = shader_identity_generation + 1;
     shader_identity_invalidation_history
         [(invalidation_sequence - 1) % ShaderIdentityInvalidationHistorySize] = {
             .address = address,
             .size = size,
             .sequence = invalidation_sequence,
         };
+    shader_identity_generation = invalidation_sequence;
+    shader_identity_published_generation.store(invalidation_sequence,
+                                                std::memory_order_release);
     if (address > std::numeric_limits<VAddr>::max() - size) {
         shader_identity_cpu_erases += shader_identity_cache.size();
         shader_identity_cache.clear();
@@ -835,14 +840,12 @@ const std::optional<Shader::Gcn::FetchShaderData>& PipelineCache::ResolveFetchSh
     if (snapshot.initialized && snapshot.parsed &&
         snapshot.code.size() == snapshot.parsed->size) {
         const size_t size_bytes = snapshot.code.size() * sizeof(u32);
-        {
-            std::scoped_lock lock{shader_identity_cache_mutex};
-            if (snapshot.address == address &&
-                !WasCpuRangeInvalidatedSinceLocked(address, size_bytes,
-                                                   snapshot.invalidation_sequence)) {
-                ++fetch_shader_epoch_hits;
-                return snapshot.parsed;
-            }
+        if (snapshot.address == address && AreSrtMemoryRangesCpuStableSince(
+                                               std::array{Shader::SrtMemoryRange{
+                                                   .address = address, .size = size_bytes}},
+                                               snapshot.invalidation_sequence)) {
+            ++fetch_shader_epoch_hits;
+            return snapshot.parsed;
         }
 
         const u64 validation_sequence = CaptureCpuInvalidationSequence();

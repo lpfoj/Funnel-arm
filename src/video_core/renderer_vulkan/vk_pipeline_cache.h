@@ -323,6 +323,9 @@ private:
     std::array<ShaderIdentityInvalidation, ShaderIdentityInvalidationHistorySize>
         shader_identity_invalidation_history{};
     u64 shader_identity_generation{};
+    // Lock-free publication for the overwhelmingly common "nothing changed" lookup path.
+    // The history and generation themselves remain protected by the mutex.
+    std::atomic<u64> shader_identity_published_generation{};
     u64 shader_identity_submits{};
     u64 shader_identity_lookups{};
     u64 shader_identity_hits{};
