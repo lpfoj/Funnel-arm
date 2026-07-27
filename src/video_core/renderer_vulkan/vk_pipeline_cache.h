@@ -193,6 +193,9 @@ public:
 private:
     void StartBackgroundWarmUp(std::vector<std::vector<u8>>&& pipeline_blobs);
     void StopBackgroundWarmUp();
+    void SaveHostPipelineCache(bool force = false);
+    [[nodiscard]] std::vector<u8> LoadHostPipelineCache() const;
+    [[nodiscard]] std::string HostPipelineCacheName() const;
     bool RefreshGraphicsKey(std::optional<AmdGpu::PrimitiveType> host_primitive_override);
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -236,6 +239,7 @@ private:
     VideoCore::BufferCache* buffer_cache;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
+    u32 host_pipeline_cache_saved_pipeline_count{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;

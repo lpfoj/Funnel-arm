@@ -75,7 +75,7 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
-    void CompletionWaitBarrier();
+    void CompletionWaitBarrier(u64 dependency_tick);
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -225,6 +225,7 @@ private:
     u64 executor_unpublished_actual_draws{};
     u64 executor_completion_barrier_epoch{};
     u64 executor_completion_barrier_tick{};
+    u64 executor_completion_barrier_dependency_tick{};
     u64 executor_completion_work_serial{};
     u64 executor_completion_barrier_work_serial{};
     u64 executor_completion_barrier_calls{};

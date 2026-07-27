@@ -1544,7 +1544,7 @@ void Liverpool::OrderGpuWorkAfterCompletionForExecutor(const u64 gpu_tick) {
     if (gpu_tick == 0 || rasterizer == nullptr || IsRendererTerminal()) {
         return;
     }
-    rasterizer->CompletionWaitBarrier();
+    rasterizer->CompletionWaitBarrier(gpu_tick);
 }
 
 void Liverpool::FlushGpuCompletionBatchForExecutor(bool force, bool synchronization_wait) {

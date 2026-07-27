@@ -11,6 +11,7 @@
 #endif
 
 #include "common/config.h"
+#include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -352,16 +353,107 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    const std::vector<u8> host_cache_data = LoadHostPipelineCache();
+    vk::PipelineCacheCreateInfo cache_info{};
+    cache_info.initialDataSize = host_cache_data.size();
+    cache_info.pInitialData = host_cache_data.data();
+    auto cache_result_value =
+        instance.GetDevice().createPipelineCacheUnique(cache_info);
+    auto cache_result = cache_result_value.result;
+    auto cache = std::move(cache_result_value.value);
+    if (cache_result != vk::Result::eSuccess && !host_cache_data.empty()) {
+        LOG_WARNING(Render_Vulkan,
+                    "Native Vulkan pipeline cache was rejected; rebuilding it");
+        cache_result_value = instance.GetDevice().createPipelineCacheUnique({});
+        cache_result = cache_result_value.result;
+        cache = std::move(cache_result_value.value);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_VK_PIPELINE_CACHE] loadedBytes=%zu vendor=0x%x "
+                        "device=0x%x driver=0x%x",
+                        host_cache_data.size(), instance.GetVendorID(),
+                        instance.GetDeviceID(), instance.GetDriverVersion());
+#endif
 
     WarmUp();
 }
 
 PipelineCache::~PipelineCache() {
     StopBackgroundWarmUp();
+    SaveHostPipelineCache(true);
+}
+
+std::string PipelineCache::HostPipelineCacheName() const {
+    return fmt::format("vk-native-{:08x}-{:08x}-{:08x}.bin",
+                       instance.GetVendorID(), instance.GetDeviceID(),
+                       instance.GetDriverVersion());
+}
+
+std::vector<u8> PipelineCache::LoadHostPipelineCache() const {
+    if (!Config::isPipelineCacheEnabled()) {
+        return {};
+    }
+    const auto& game_info = Common::ElfInfo::Instance();
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                      game_info.GameSerial() / HostPipelineCacheName();
+    const Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read};
+    if (!file.IsOpen() || file.GetSize() < sizeof(vk::PipelineCacheHeaderVersionOne)) {
+        return {};
+    }
+    std::vector<u8> data(file.GetSize());
+    if (file.Read(data) != data.size()) {
+        return {};
+    }
+    vk::PipelineCacheHeaderVersionOne header{};
+    std::memcpy(&header, data.data(), sizeof(header));
+    if (header.headerSize < sizeof(header) || header.headerSize > data.size() ||
+        header.headerVersion != vk::PipelineCacheHeaderVersion::eOne ||
+        header.vendorID != instance.GetVendorID() ||
+        header.deviceID != instance.GetDeviceID() ||
+        std::memcmp(header.pipelineCacheUUID.data(),
+                    instance.GetPipelineCacheUUID().data(), VK_UUID_SIZE) != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Ignoring incompatible native Vulkan pipeline cache");
+        return {};
+    }
+    return data;
+}
+
+void PipelineCache::SaveHostPipelineCache(const bool force) {
+    if ((!force &&
+         host_pipeline_cache_saved_pipeline_count == num_new_pipelines) ||
+        !pipeline_cache ||
+        !Config::isPipelineCacheEnabled()) {
+        return;
+    }
+    auto [result, data] =
+        instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty()) {
+        return;
+    }
+    const auto& game_info = Common::ElfInfo::Instance();
+    const auto directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                           game_info.GameSerial();
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) {
+        return;
+    }
+    const Common::FS::IOFile file{directory / HostPipelineCacheName(),
+                                  Common::FS::FileAccessMode::Create};
+    if (!file.IsOpen() || file.Write(data) != data.size()) {
+        return;
+    }
+    host_pipeline_cache_saved_pipeline_count = num_new_pipelines;
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                        "[EXECUTOR_VK_PIPELINE_CACHE] savedBytes=%zu", data.size());
+#endif
 }
 
 bool PipelineCache::CaptureSrtSourceBytes(
@@ -884,6 +976,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
+#ifdef __ANDROID__
+        if ((num_new_pipelines & 63u) == 0) {
+            SaveHostPipelineCache();
+        }
+#endif
 
         if (Config::collectShadersForDebug()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -925,6 +1022,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+#ifdef __ANDROID__
+        if ((num_new_pipelines & 63u) == 0) {
+            SaveHostPipelineCache();
+        }
+#endif
 
         if (Config::collectShadersForDebug()) {
             auto& m = modules[0];

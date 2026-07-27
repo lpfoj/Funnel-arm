@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <chrono>
+#include <cstdlib>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -401,7 +402,25 @@ void PipelineCache::WarmUp() {
 
     Storage::DataBase::Instance().FinishPreload();
 #ifdef __ANDROID__
+    if (num_pipelines != 0) {
+        SaveHostPipelineCache(true);
+    }
     if (!deferred_pipeline_blobs.empty()) {
+        const char* const background_warmup_flag =
+            std::getenv("EXECUTOR_BACKGROUND_PIPELINE_WARMUP");
+        const bool background_warmup_enabled =
+            background_warmup_flag != nullptr &&
+            background_warmup_flag[0] != '\0' &&
+            background_warmup_flag[0] != '0';
+        if (!background_warmup_enabled) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_PIPELINE_WARMUP_DEFERRED] disabled=1 queued=%zu "
+                "reason=foreground_compile_storm optIn="
+                "EXECUTOR_BACKGROUND_PIPELINE_WARMUP",
+                deferred_pipeline_blobs.size());
+            return;
+        }
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_PIPELINE_WARMUP_DEFERRED] queued=%zu graceMs=60000 "
@@ -501,6 +520,7 @@ void PipelineCache::StopBackgroundWarmUp() {
 
 void PipelineCache::Sync() {
     StopBackgroundWarmUp();
+    SaveHostPipelineCache(true);
     Storage::DataBase::Instance().Close();
 }
 

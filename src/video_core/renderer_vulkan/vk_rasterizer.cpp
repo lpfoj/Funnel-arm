@@ -586,8 +586,7 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
-void Rasterizer::CompletionWaitBarrier() {
-    scheduler.EndRendering();
+void Rasterizer::CompletionWaitBarrier(const u64 dependency_tick) {
 #ifdef __ANDROID__
     ++executor_completion_barrier_calls;
     const u64 current_tick = scheduler.CurrentTick();
@@ -595,8 +594,7 @@ void Rasterizer::CompletionWaitBarrier() {
     const bool barrier_is_redundant =
         executor_completion_barrier_valid &&
         executor_completion_barrier_tick == current_tick &&
-        executor_completion_barrier_epoch == current_epoch &&
-        executor_completion_barrier_work_serial == executor_completion_work_serial;
+        dependency_tick <= executor_completion_barrier_dependency_tick;
     if (barrier_is_redundant) {
         ++executor_completion_barrier_elided;
         if ((executor_completion_barrier_calls & 4095u) == 0u) {
@@ -617,6 +615,7 @@ void Rasterizer::CompletionWaitBarrier() {
         return;
     }
 #endif
+    scheduler.EndRendering();
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -638,6 +637,7 @@ void Rasterizer::CompletionWaitBarrier() {
     if (scheduler.CurrentTick() == current_tick) {
         executor_completion_barrier_tick = current_tick;
         executor_completion_barrier_epoch = barrier_epoch;
+        executor_completion_barrier_dependency_tick = dependency_tick;
         executor_completion_barrier_work_serial = executor_completion_work_serial;
         executor_completion_barrier_valid = true;
     } else {
