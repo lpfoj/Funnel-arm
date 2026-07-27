@@ -1505,6 +1505,72 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
     auto& program = it_pgm.value();
     auto& info = program->info;
+#ifdef __ANDROID__
+    struct ProgramHotEntry {
+        const PipelineCache* owner{};
+        const Program* program{};
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings binding_start{};
+        Shader::Backend::Bindings binding_end{};
+        Shader::SrtMemoryRanges srt_ranges{};
+        Result result{};
+        u64 invalidation_sequence{};
+        bool valid{};
+    };
+    static thread_local std::array<ProgramHotEntry, 64> program_hot_entries{};
+    static thread_local u64 program_hot_lookups{};
+    static thread_local u64 program_hot_hits{};
+    auto& program_hot = program_hot_entries[params.hash & (program_hot_entries.size() - 1)];
+    ++program_hot_lookups;
+    const bool program_hot_identity =
+        immutable_srt_snapshot_cache_enabled && program_hot.valid &&
+        program_hot.owner == this && program_hot.program == program.get() &&
+        program_hot.runtime_info == runtime_info && program_hot.binding_start == binding_start &&
+        std::ranges::equal(program_hot.user_data, params.user_data);
+    if (program_hot_identity &&
+        AreSrtMemoryRangesCpuStableSince(program_hot.srt_ranges,
+                                         program_hot.invalidation_sequence)) {
+        ++program_hot_hits;
+        program_hot.invalidation_sequence = CaptureCpuInvalidationSequence();
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        binding = program_hot.binding_end;
+        if ((program_hot_lookups & 65535u) == 0) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_PROGRAM_HOT_CACHE] lookups=%llu hits=%llu hitPct=%.1f",
+                static_cast<unsigned long long>(program_hot_lookups),
+                static_cast<unsigned long long>(program_hot_hits),
+                100.0 * static_cast<double>(program_hot_hits) /
+                    static_cast<double>(program_hot_lookups));
+        }
+        return program_hot.result;
+    }
+    const auto remember_program_hot = [&](const Result& result,
+                                          const Shader::SrtMemoryRanges& ranges,
+                                          const u64 invalidation_sequence) {
+        program_hot.owner = this;
+        program_hot.program = program.get();
+        std::ranges::copy(params.user_data, program_hot.user_data.begin());
+        program_hot.runtime_info = runtime_info;
+        program_hot.binding_start = binding_start;
+        program_hot.binding_end = binding;
+        program_hot.srt_ranges = ranges;
+        program_hot.result = result;
+        program_hot.invalidation_sequence = invalidation_sequence;
+        program_hot.valid = true;
+        if ((program_hot_lookups & 65535u) == 0) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_PROGRAM_HOT_CACHE] lookups=%llu hits=%llu hitPct=%.1f",
+                static_cast<unsigned long long>(program_hot_lookups),
+                static_cast<unsigned long long>(program_hot_hits),
+                100.0 * static_cast<double>(program_hot_hits) /
+                    static_cast<double>(program_hot_lookups));
+        }
+    };
+#endif
     info.pgm_base = params.Base();
     info.user_data = params.user_data;
     build_snapshot_identity(info);
@@ -1598,9 +1664,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     static_cast<unsigned long long>(srt_snapshot_victim_evictions));
             }
 #endif
-            return std::make_tuple(
+            const Result result = std::make_tuple(
                 &info, cached_module.module, cached_module.spec.fetch_shader_data,
                 HashCombine(params.hash, snapshot.module_index));
+#ifdef __ANDROID__
+            remember_program_hot(result, snapshot.srt_ranges,
+                                 CaptureCpuInvalidationSequence());
+#endif
+            return result;
         }
     }
 #ifdef __ANDROID__
@@ -1661,8 +1732,16 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         perm_hash = HashCombine(params.hash, perm_idx);
     }
     store_snapshot(*program, info, std::move(srt_ranges), perm_idx);
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    const Result result = std::make_tuple(&program->info, module,
+                                          program->modules[perm_idx].spec.fetch_shader_data,
+                                          perm_hash);
+#ifdef __ANDROID__
+    if (const auto* stored_snapshot = program->FindSpecializationSnapshot(snapshot_key)) {
+        remember_program_hot(result, stored_snapshot->srt_ranges,
+                             stored_snapshot->cpu_invalidation_sequence);
+    }
+#endif
+    return result;
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
