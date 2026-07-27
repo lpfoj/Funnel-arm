@@ -59,6 +59,14 @@ bool ExecutorReadbackContractTraceEnabled() {
     return enabled;
 }
 
+bool ExecutorFastBulkGuestWriteEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EXECUTOR_FAST_BULK_GUEST_WRITE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 bool ExecutorShouldLogReadbackOrdinal(const u64 ordinal) {
     return ordinal <= 64 || (ordinal & (ordinal - 1)) == 0;
 }
@@ -567,6 +575,16 @@ struct PageManager::Impl {
             std::scoped_lock lk{locks[page / PAGES_PER_LOCK]};
             SetBulkWriteActive(page, active);
             if (active) {
+                // The normal guest-memory case is already writable. Avoid two
+                // mprotect calls per page around every memcpy/memset; a bypass
+                // is only needed when a live watcher actually removed write
+                // permission. Keep this optional so the PS4 contract remains
+                // unchanged while the PS5 path is validated.
+                if (ExecutorFastBulkGuestWriteEnabled() &&
+                    !ActualWriteProtected(page)) {
+                    ++page;
+                    continue;
+                }
                 if (!WriteFaultBypassed(page)) {
                     SetWriteFaultBypass(page, true);
                     const Core::MemoryPermission perms =
@@ -637,12 +655,14 @@ struct PageManager::Impl {
                 __android_log_print(
                     ANDROID_LOG_INFO, "LSX4Native",
                     "[EXECUTOR_READBACK_FAULT] n=%llu typed=%llu addr=0x%llx isWrite=%u "
-                    "handled=%u guestRip=0x%llx reads=%llu writes=%llu",
+                    "handled=%u guestRip=0x%llx hostPc=0x%llx reads=%llu writes=%llu",
                     static_cast<unsigned long long>(ordinal),
                     static_cast<unsigned long long>(typed_ordinal),
                     static_cast<unsigned long long>(addr), is_write ? 1u : 0u,
                     handled ? 1u : 0u,
                     static_cast<unsigned long long>(guest_rip),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(Common::GetRip(context))),
                     static_cast<unsigned long long>(
                         executor_readback_read_fault_count.load(std::memory_order_relaxed)),
                     static_cast<unsigned long long>(

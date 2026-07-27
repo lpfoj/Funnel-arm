@@ -9,9 +9,26 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+#include <cstdlib>
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+namespace {
+
+bool ExecutorSuballocateBdaBuffers() {
+#ifdef __ANDROID__
+    static const bool enabled = [] {
+        const char* value = std::getenv("EXECUTOR_SUBALLOCATE_BDA_BUFFERS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+} // namespace
 
 std::string_view BufferTypeName(MemoryUsage type) {
     switch (type) {
@@ -72,7 +89,9 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     const VmaAllocationCreateFlags bda_flag =
-        with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+        with_bda && !ExecutorSuballocateBdaBuffers()
+            ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+            : 0;
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(usage),
         .usage = MemoryUsageVma(usage),

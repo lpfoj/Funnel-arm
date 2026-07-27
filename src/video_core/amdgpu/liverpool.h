@@ -266,7 +266,10 @@ private:
         u64 trace_semantic_sequence{};
         std::map<Pm4SnapshotKey, std::vector<u32>> submit_snapshots{};
 #ifdef __ANDROID__
-        std::vector<CompletionWrite> completion_writes{};
+        // Completion addresses are sparse and a title can publish thousands
+        // of them per frame. Index by address so replacing/consuming a fence
+        // doesn't linearly scan every other completion in the submission.
+        std::map<VAddr, std::vector<CompletionWrite>> completion_writes{};
 #endif
     };
     using Pm4SubmissionStatePtr = std::shared_ptr<Pm4SubmissionState>;

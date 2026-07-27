@@ -1049,13 +1049,26 @@ void Liverpool::InvalidateIndirectSnapshotsForWrite(const Pm4SubmissionStatePtr&
         }
     }
 #ifdef __ANDROID__
-    std::erase_if(state->completion_writes, [&](const auto& write) {
-        if (write.address > std::numeric_limits<VAddr>::max() - write.num_bytes) {
-            return true;
+    // Completion writes are restricted to 4/8 bytes. Only buckets beginning
+    // at most seven bytes before the modified range can overlap it.
+    const VAddr earliest_completion =
+        address >= (sizeof(u64) - 1) ? address - (sizeof(u64) - 1) : 0;
+    for (auto it = state->completion_writes.lower_bound(earliest_completion);
+         it != state->completion_writes.end() && it->first < write_end;) {
+        auto& writes = it->second;
+        std::erase_if(writes, [&](const auto& write) {
+            if (write.address > std::numeric_limits<VAddr>::max() - write.num_bytes) {
+                return true;
+            }
+            const VAddr completion_end = write.address + write.num_bytes;
+            return address < completion_end && write.address < write_end;
+        });
+        if (writes.empty()) {
+            it = state->completion_writes.erase(it);
+        } else {
+            ++it;
         }
-        const VAddr completion_end = write.address + write.num_bytes;
-        return address < completion_end && write.address < write_end;
-    });
+    }
 #endif
 
 }
@@ -1069,7 +1082,7 @@ void Liverpool::RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& st
         return;
     }
     InvalidateIndirectSnapshotsForWrite(state, address, num_bytes);
-    state->completion_writes.push_back(
+    state->completion_writes[address].push_back(
         Pm4SubmissionState::CompletionWrite{address, value, gpu_tick, num_bytes, engine});
     constexpr u64 PageSize = 4_KB;
     std::vector<VAddr> pages_to_track;
@@ -1146,13 +1159,19 @@ u64 Liverpool::ConsumeCompletionWaitForExecutor(const Pm4SubmissionStatePtr& sta
         return 0;
     }
     const VAddr address = reinterpret_cast<VAddr>(wait.Address<u32*>());
-    for (auto it = state->completion_writes.end(); it != state->completion_writes.begin();) {
-        --it;
-        if (it->engine == engine && it->address == address &&
-            TestWaitRegMemValue(wait, static_cast<u32>(it->value))) {
-            const u64 tick = it->gpu_tick;
-            state->completion_writes.erase(it);
-            return tick;
+    if (auto bucket = state->completion_writes.find(address);
+        bucket != state->completion_writes.end()) {
+        auto& writes = bucket->second;
+        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
+            if (it->engine == engine &&
+                TestWaitRegMemValue(wait, static_cast<u32>(it->value))) {
+                const u64 tick = it->gpu_tick;
+                writes.erase(std::next(it).base());
+                if (writes.empty()) {
+                    state->completion_writes.erase(bucket);
+                }
+                return tick;
+            }
         }
     }
 

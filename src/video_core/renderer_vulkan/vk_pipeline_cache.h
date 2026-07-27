@@ -71,6 +71,7 @@ struct Program {
         std::vector<u8> srt_source_bytes{};
         size_t module_index{};
         u64 identity_key{};
+        u64 cpu_invalidation_sequence{};
         bool valid{};
     };
     static constexpr size_t NumSpecializationSnapshotWays = 4;
@@ -220,6 +221,8 @@ private:
     Shader::ShaderParams GetShaderParams(const u32* user_data, const u32* code);
     [[nodiscard]] bool WasCpuRangeInvalidatedSinceLocked(VAddr address, u64 size,
                                                          u64 sequence) const;
+    [[nodiscard]] bool AreSrtMemoryRangesCpuStableSince(
+        std::span<const Shader::SrtMemoryRange> ranges, u64 sequence);
     [[nodiscard]] u64 CaptureCpuInvalidationSequence();
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -257,6 +260,7 @@ private:
     u64 srt_snapshot_gpu_misses{};
     u64 srt_snapshot_backing_alias_hits{};
     u64 srt_snapshot_backing_fallbacks{};
+    u64 srt_snapshot_epoch_hits{};
     u64 srt_snapshot_primary_hits{};
     u64 srt_snapshot_victim_lookups{};
     u64 srt_snapshot_victim_hits{};

@@ -554,6 +554,14 @@ bool PipelineCache::WasCpuRangeInvalidatedSinceLocked(const VAddr range_address,
     return false;
 }
 
+bool PipelineCache::AreSrtMemoryRangesCpuStableSince(
+    const std::span<const Shader::SrtMemoryRange> ranges, const u64 sequence) {
+    std::scoped_lock lock{shader_identity_cache_mutex};
+    return std::ranges::all_of(ranges, [&](const auto& range) {
+        return !WasCpuRangeInvalidatedSinceLocked(range.address, range.size, sequence);
+    });
+}
+
 u64 PipelineCache::CaptureCpuInvalidationSequence() {
     std::scoped_lock lock{shader_identity_cache_mutex};
     return shader_identity_generation;
@@ -660,6 +668,14 @@ void PipelineCache::InvalidateShaderIdentityRange(const VAddr address, const u64
 }
 
 void PipelineCache::InvalidateShaderIdentityReadbackRange(const VAddr address, const u64 size) {
+    // A GPU readback publishes the latest contents into the CPU backing store; it is not a
+    // guest CPU write. Shader programs are CPU-uploaded and immutable while referenced by a
+    // pipeline, so invalidating their identity here makes the metadata scan fault on the same
+    // GPU-protected page again on every draw. Keep this behaviour opt-in because a title which
+    // genuinely generates shader code on the GPU still needs conservative invalidation.
+    if (immutable_shader_identity_cache_enabled) {
+        return;
+    }
     InvalidateShaderIdentityRange(address, size);
 }
 
@@ -1339,11 +1355,15 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             snapshot.runtime_info = runtime_info;
             snapshot.binding_start = binding_start;
             snapshot.srt_ranges = std::move(ranges);
+            const u64 capture_sequence = CaptureCpuInvalidationSequence();
             const bool captured =
                 immutable_srt_snapshot_cache_enabled
                     ? CaptureSrtBackingBytes(snapshot.srt_ranges, snapshot.srt_source_bytes)
                     : CaptureSrtSourceBytes(snapshot.srt_ranges, snapshot.srt_source_bytes);
-            if (!captured) {
+            const bool stable_capture =
+                !immutable_srt_snapshot_cache_enabled ||
+                AreSrtMemoryRangesCpuStableSince(snapshot.srt_ranges, capture_sequence);
+            if (!captured || !stable_capture) {
                 if (primary_had_valid_snapshot) {
                     --program.specialization_snapshot_count;
                 }
@@ -1351,6 +1371,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             }
             snapshot.module_index = module_index;
             snapshot.identity_key = snapshot_key;
+            snapshot.cpu_invalidation_sequence = capture_sequence;
             snapshot.valid = true;
             if (!primary_had_valid_snapshot) {
                 ++program.specialization_snapshot_count;
@@ -1398,17 +1419,28 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             snapshot.runtime_info == runtime_info &&
             snapshot.specialization_user_data_mask == specialization_user_data_mask &&
             snapshot.specialization_user_data == specialization_user_data;
+        const bool immutable_cpu_stable =
+            identity_matches && immutable_srt_snapshot_cache_enabled &&
+            AreSrtMemoryRangesCpuStableSince(snapshot.srt_ranges,
+                                              snapshot.cpu_invalidation_sequence);
         const bool gpu_clean =
-            identity_matches && AreSrtMemoryRangesGpuClean(snapshot.srt_ranges);
+            identity_matches && !immutable_cpu_stable &&
+            AreSrtMemoryRangesGpuClean(snapshot.srt_ranges);
         bool backing_validated = false;
         bool source_matches = false;
         if (identity_matches && immutable_srt_snapshot_cache_enabled) {
-            backing_validated =
-                CaptureSrtBackingBytes(snapshot.srt_ranges, srt_backing_validation_scratch);
-            source_matches =
-                backing_validated &&
-                std::ranges::equal(srt_backing_validation_scratch,
-                                   snapshot.srt_source_bytes);
+            if (immutable_cpu_stable) {
+                backing_validated = true;
+                source_matches = true;
+                ++srt_snapshot_epoch_hits;
+            } else {
+                backing_validated =
+                    CaptureSrtBackingBytes(snapshot.srt_ranges, srt_backing_validation_scratch);
+                source_matches =
+                    backing_validated &&
+                    std::ranges::equal(srt_backing_validation_scratch,
+                                       snapshot.srt_source_bytes);
+            }
             srt_snapshot_backing_alias_hits += source_matches && !gpu_clean;
             srt_snapshot_backing_fallbacks += !backing_validated;
         }
@@ -1437,7 +1469,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     ANDROID_LOG_INFO, "LSX4Native",
                     "[EXECUTOR_SRT_CACHE] lookups=%llu hits=%llu hitPct=%.1f "
                     "contentMiss=%llu gpuMiss=%llu backingAliasHit=%llu "
-                    "backingFallback=%llu primaryHit=%llu victimLookup=%llu "
+                    "backingFallback=%llu epochHit=%llu primaryHit=%llu victimLookup=%llu "
                     "victimHit=%llu keyMiss=%llu identityMismatch=%llu "
                     "primarySnapshots=%zu victimSnapshots=%zu victimInsert=%llu "
                     "victimReplace=%llu victimEvict=%llu",
@@ -1449,6 +1481,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     static_cast<unsigned long long>(srt_snapshot_gpu_misses),
                     static_cast<unsigned long long>(srt_snapshot_backing_alias_hits),
                     static_cast<unsigned long long>(srt_snapshot_backing_fallbacks),
+                    static_cast<unsigned long long>(srt_snapshot_epoch_hits),
                     static_cast<unsigned long long>(srt_snapshot_primary_hits),
                     static_cast<unsigned long long>(srt_snapshot_victim_lookups),
                     static_cast<unsigned long long>(srt_snapshot_victim_hits),
@@ -1473,7 +1506,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_SRT_CACHE] lookups=%llu hits=%llu hitPct=%.1f "
             "contentMiss=%llu gpuMiss=%llu backingAliasHit=%llu "
-            "backingFallback=%llu primaryHit=%llu victimLookup=%llu "
+            "backingFallback=%llu epochHit=%llu primaryHit=%llu victimLookup=%llu "
             "victimHit=%llu keyMiss=%llu identityMismatch=%llu "
             "primarySnapshots=%zu victimSnapshots=%zu victimInsert=%llu "
             "victimReplace=%llu victimEvict=%llu",
@@ -1485,6 +1518,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             static_cast<unsigned long long>(srt_snapshot_gpu_misses),
             static_cast<unsigned long long>(srt_snapshot_backing_alias_hits),
             static_cast<unsigned long long>(srt_snapshot_backing_fallbacks),
+            static_cast<unsigned long long>(srt_snapshot_epoch_hits),
             static_cast<unsigned long long>(srt_snapshot_primary_hits),
             static_cast<unsigned long long>(srt_snapshot_victim_lookups),
             static_cast<unsigned long long>(srt_snapshot_victim_hits),
