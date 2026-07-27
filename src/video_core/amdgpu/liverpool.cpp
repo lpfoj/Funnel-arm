@@ -799,6 +799,15 @@ void ExecutorEopTraceSubmitDonePulse(u64 pulse) {
 }
 #endif
 
+#ifdef __ANDROID__
+// Publication callbacks are issued by guest worker threads. Only wake the GPU
+// command processor while it has a memory wait parked; otherwise notify_one()
+// enters the bionic futex path for every guest memcpy without a consumer.
+// Keep this out of Liverpool's layout because the runtime bridge and the
+// renderer are built as separate archive boundaries on Android.
+static std::atomic<u32> executor_active_parked_waits{};
+#endif
+
 static bool Pm4DescriptorCacheEnabled() {
 #ifdef __ANDROID__
     static const bool enabled = !ExecutorEnvFlag("EXECUTOR_DISABLE_PM4_DESCRIPTOR_CACHE");
@@ -1292,7 +1301,7 @@ bool Liverpool::ResolvePendingCompletionReadForExecutor(VAddr address, u64 size)
 void Liverpool::NotifyMemoryPublicationForExecutor(VAddr address, u64 size) noexcept {
 #ifdef __ANDROID__
     (void)address;
-    if (size == 0) {
+    if (size == 0 || executor_active_parked_waits.load(std::memory_order_acquire) == 0) {
         return;
     }
     executor_wait_event_generation.fetch_add(1, std::memory_order_release);
@@ -1659,6 +1668,7 @@ void Liverpool::ParkMemoryWaitForExecutor(const u32 queue_id,
     }
     if (!parked.active) {
         ++executor_parked_wait_count;
+        executor_active_parked_waits.fetch_add(1, std::memory_order_release);
     }
     if (rasterizer != nullptr) {
         rasterizer->TrackMemoryWaitWrite(address, sizeof(u32));
@@ -1681,7 +1691,11 @@ void Liverpool::ReleaseParkedMemoryWaitForExecutor(const u32 queue_id) {
     ASSERT(queue_id < NumTotalQueues);
     auto& parked = executor_parked_memory_waits[queue_id];
     const VAddr released_page = Common::AlignDown(parked.address, 4_KB);
+    const bool was_active = parked.active;
     parked.active = false;
+    if (was_active) {
+        executor_active_parked_waits.fetch_sub(1, std::memory_order_acq_rel);
+    }
     const u64 queue_bit = u64{1} << queue_id;
     executor_parked_memory_wait_mask &= ~queue_bit;
     executor_deferred_wait_flush_mask &= ~queue_bit;
