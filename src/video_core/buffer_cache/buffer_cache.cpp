@@ -556,16 +556,25 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
     download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
-    for (const WaveCopy& copy : copies) {
-        cmdbuf.copyBuffer(copy.buffer->buffer, download_buffer.Handle(), vk::BufferCopy{
-            .srcOffset = copy.source_offset,
-            .dstOffset = base_offset + copy.download_offset,
-            .size = copy.size,
-        });
+    for (size_t first = 0; first < copies.size();) {
+        const vk::Buffer source = copies[first].buffer->Handle();
+        boost::container::small_vector<vk::BufferCopy, 32> regions;
+        size_t last = first;
+        while (last < copies.size() && copies[last].buffer->Handle() == source) {
+            const WaveCopy& copy = copies[last++];
+            regions.push_back(vk::BufferCopy{
+                .srcOffset = copy.source_offset,
+                .dstOffset = base_offset + copy.download_offset,
+                .size = copy.size,
+            });
+        }
+        cmdbuf.copyBuffer(source, download_buffer.Handle(), regions);
+        first = last;
     }
     scheduler.Finish(Vulkan::Scheduler::ExecutorFinishReason::BufferReadbackWave);
 
     auto* guest_memory = Core::Memory::Instance();
+    RangeSet published_ranges;
     bool published_any = false;
     for (const WaveCopy& copy : copies) {
         if (!guest_memory->TryWriteBacking(std::bit_cast<u8*>(copy.guest_addr),
@@ -580,12 +589,15 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
             }
             continue;
         }
-        NotifyGuestReadback();
-        gpu_modified_ranges.Subtract(copy.guest_addr, copy.size);
-        memory_tracker->UnmarkRegionAsGpuModified(copy.guest_addr, copy.size);
+        published_ranges.Add(copy.guest_addr, copy.size);
         published_any = true;
     }
     if (published_any) {
+        published_ranges.ForEach([&](const VAddr begin, const VAddr end) {
+            gpu_modified_ranges.Subtract(begin, end - begin);
+            memory_tracker->UnmarkRegionAsGpuModified(begin, end - begin);
+        });
+        NotifyGuestReadback();
         liverpool->NotifyMemoryPublicationForExecutor(device_addr, size);
     }
 }

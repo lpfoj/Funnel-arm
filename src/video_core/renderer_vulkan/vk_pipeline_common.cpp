@@ -12,6 +12,10 @@
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 namespace Vulkan {
 namespace {
 
@@ -54,6 +58,14 @@ struct DescriptorBindCache {
     bool valid{};
 };
 
+struct PushConstantBindCache {
+    const Pipeline* pipeline{};
+    u64 cmdbuf{};
+    u64 recording_tick{};
+    u64 signature{};
+    bool valid{};
+};
+
 }
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
@@ -81,7 +93,46 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    const u64 raw_cmdbuf =
+        std::bit_cast<u64>(static_cast<VkCommandBuffer>(cmdbuf));
+    const u64 recording_tick = scheduler.CurrentTick();
+    Common::ContentFingerprint64 push_fingerprint{
+        Common::FingerprintDomain::DescriptorWrites};
+    push_fingerprint.Update(
+        std::span{reinterpret_cast<const u8*>(&push_data), sizeof(push_data)});
+    const u64 push_signature = push_fingerprint.Finish();
+    static thread_local std::array<PushConstantBindCache, 2> push_caches{};
+    auto& push_cache = push_caches[IsCompute() ? 1u : 0u];
+    const bool push_hit =
+        push_cache.valid && push_cache.pipeline == this &&
+        push_cache.cmdbuf == raw_cmdbuf &&
+        push_cache.recording_tick == recording_tick &&
+        push_cache.signature == push_signature;
+    if (!push_hit) {
+        cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+        push_cache = {
+            .pipeline = this,
+            .cmdbuf = raw_cmdbuf,
+            .recording_tick = recording_tick,
+            .signature = push_signature,
+            .valid = true,
+        };
+    }
+#ifdef __ANDROID__
+    static thread_local u64 push_attempts{};
+    static thread_local u64 push_hits{};
+    ++push_attempts;
+    push_hits += static_cast<u64>(push_hit);
+    if ((push_attempts & 8191u) == 0) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_VK_STATE_DEDUP] kind=pushConstants attempts=%llu hits=%llu hitPct=%.1f",
+            static_cast<unsigned long long>(push_attempts),
+            static_cast<unsigned long long>(push_hits),
+            100.0 * static_cast<double>(push_hits) /
+                static_cast<double>(push_attempts));
+    }
+#endif
 
     if (set_writes.empty()) {
         return;
@@ -89,9 +140,6 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
 
     static thread_local std::array<DescriptorBindCache, 2> bind_caches{};
     auto& bind_cache = bind_caches[IsCompute() ? 1u : 0u];
-    const u64 raw_cmdbuf =
-        std::bit_cast<u64>(static_cast<VkCommandBuffer>(cmdbuf));
-    const u64 recording_tick = scheduler.CurrentTick();
     const u64 descriptor_signature = DescriptorWritesSignature(set_writes);
     if (bind_cache.valid && bind_cache.pipeline == this &&
         bind_cache.cmdbuf == raw_cmdbuf &&

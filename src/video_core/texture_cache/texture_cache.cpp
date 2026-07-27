@@ -194,13 +194,17 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         return true;
     }
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                              image.info.resources.layers * (image.info.num_bits / 8);
-    ASSERT(download_size <= image.info.guest_size);
+    const u32 linear_download_size =
+        image.info.pitch * image.info.size.height * image.info.size.depth *
+        image.info.resources.layers * (image.info.num_bits / 8);
+    ASSERT(linear_download_size <= image.info.guest_size);
+    const u32 download_size =
+        image.info.IsTiled() ? image.info.guest_size : linear_download_size;
     const auto [download, offset] = download_buffer.Map(download_size);
     download_buffer.Commit();
-    const vk::BufferImageCopy image_download = {
-        .bufferOffset = offset,
+    std::array<vk::BufferImageCopy, 1> image_downloads{{
+        {
+        .bufferOffset = 0,
         .bufferRowLength = image.info.pitch,
         .bufferImageHeight = image.info.size.height,
         .imageSubresource =
@@ -213,12 +217,11 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
             },
         .imageOffset = {0, 0, 0},
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
-    };
+        },
+    }};
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-    image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
-    cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                             download_buffer.Handle(), image_download);
+    tile_manager.TileImage(image, image_downloads, download_buffer.Handle(), offset,
+                           linear_download_size);
 
     if (sync) {
         scheduler.Finish(Vulkan::Scheduler::ExecutorFinishReason::TextureReadback);
@@ -2170,19 +2173,35 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_device_memory) {
+    std::scoped_lock lock{mutex};
+    u64 estimated_image_memory = 0;
+    for (const Image& image : slot_images) {
+        if (False(image.flags & ImageFlagBits::Registered)) {
+            continue;
+        }
+        const u64 backing_count =
+            std::max<u64>(image.backing_images.size(), 1);
+        const u64 allocation_floor =
+            Common::AlignUp(std::max<u64>(image.info.guest_size, 1), 64_KB);
+        estimated_image_memory += allocation_floor * backing_count;
+    }
     if (sampled_device_memory) {
-        total_used_memory = *sampled_device_memory;
+        total_used_memory =
+            std::max<u64>(*sampled_device_memory, estimated_image_memory);
     } else if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        total_used_memory = std::max<u64>(
+            instance.GetDeviceMemoryUsage(), estimated_image_memory);
+    } else {
+        total_used_memory = estimated_image_memory;
     }
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
-    std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
+    size_t deleted_images = 0;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
@@ -2202,10 +2221,6 @@ void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_devi
         }
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
-        const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            return false;
-        }
         if (download && !pressured) {
             return false;
         }
@@ -2213,6 +2228,7 @@ void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_devi
             DownloadImageMemory(image_id);
         }
         --num_deletions;
+        ++deleted_images;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -2234,6 +2250,13 @@ void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_devi
     if (total_used_memory >= critical_gc_memory) {
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        if (deleted_images != 0) {
+            // Destruction is deferred until the owning submit retires. Drain
+            // it under critical pressure so KGSL cannot retain several GiB
+            // of already-evicted images behind a slow loading frame.
+            scheduler.Finish(
+                Vulkan::Scheduler::ExecutorFinishReason::TextureReadback);
+        }
     }
 }
 

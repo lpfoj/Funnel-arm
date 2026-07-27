@@ -404,8 +404,10 @@ void PipelineCache::WarmUp() {
     if (!deferred_pipeline_blobs.empty()) {
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
-            "[EXECUTOR_PIPELINE_WARMUP_DEFERRED] skipped=%zu reason=live_title_android",
+            "[EXECUTOR_PIPELINE_WARMUP_DEFERRED] queued=%zu graceMs=60000 "
+            "foregroundPriority=1 throttleMs=150",
             deferred_pipeline_blobs.size());
+        StartBackgroundWarmUp(std::move(deferred_pipeline_blobs));
     }
 #endif
 }
@@ -419,6 +421,7 @@ void PipelineCache::StartBackgroundWarmUp(
         [this, blobs = std::move(pipeline_blobs)](const std::stop_token stop_token) mutable {
             (void)::setpriority(PRIO_PROCESS, 0, 8);
             constexpr auto kFirstFrameGrace = std::chrono::seconds{60};
+            constexpr auto kPipelineThrottle = std::chrono::milliseconds{150};
             const auto grace_deadline = std::chrono::steady_clock::now() + kFirstFrameGrace;
             while (!stop_token.stop_requested() &&
                    std::chrono::steady_clock::now() < grace_deadline) {
@@ -465,6 +468,8 @@ void PipelineCache::StartBackgroundWarmUp(
                 const bool result = is_compute ? LoadComputePipeline(ar)
                                                : LoadGraphicsPipeline(ar);
                 loaded += result ? 1u : 0u;
+                background_lock.unlock();
+                std::this_thread::sleep_for(kPipelineThrottle);
             }
             background_warmup_active.store(false, std::memory_order_release);
             const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
