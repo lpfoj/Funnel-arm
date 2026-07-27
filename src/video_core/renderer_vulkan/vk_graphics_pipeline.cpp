@@ -530,13 +530,15 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage);
-            bindings.push_back({
-                .binding = binding++,
-                .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
-                                                          : vk::DescriptorType::eUniformBuffer,
-                .descriptorCount = 1,
-                .stageFlags = stage_bit,
-            });
+            for (u32 alias = 0; alias < buffer.NumBindings(); ++alias) {
+                bindings.push_back({
+                    .binding = binding++,
+                    .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
+                                                              : vk::DescriptorType::eUniformBuffer,
+                    .descriptorCount = 1,
+                    .stageFlags = stage_bit,
+                });
+            }
         }
         for (const auto& image : stage->images) {
             const u32 num_bindings = image.NumBindings(*stage);

@@ -35,13 +35,15 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     for (const auto& buffer : info->buffers) {
         const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
-        bindings.push_back({
-            .binding = binding++,
-            .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
-                                                      : vk::DescriptorType::eUniformBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
+        for (u32 alias = 0; alias < buffer.NumBindings(); ++alias) {
+            bindings.push_back({
+                .binding = binding++,
+                .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
+                                                          : vk::DescriptorType::eUniformBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            });
+        }
     }
     for (const auto& image : info->images) {
         const u32 num_bindings = image.NumBindings(*info);

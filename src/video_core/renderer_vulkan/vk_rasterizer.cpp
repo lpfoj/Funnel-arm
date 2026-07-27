@@ -2591,15 +2591,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
-        set_writes.push_back({
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = binding.unified++,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = is_storage ? vk::DescriptorType::eStorageBuffer
-                                         : vk::DescriptorType::eUniformBuffer,
-            .pBufferInfo = &buffer_infos.back(),
-        });
+        for (u32 alias = 0; alias < desc.NumBindings(); ++alias) {
+            set_writes.push_back({
+                .dstSet = VK_NULL_HANDLE,
+                .dstBinding = binding.unified++,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = is_storage ? vk::DescriptorType::eStorageBuffer
+                                             : vk::DescriptorType::eUniformBuffer,
+                .pBufferInfo = &buffer_infos.back(),
+            });
+        }
         ++binding.buffer;
     }
 }

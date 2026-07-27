@@ -882,24 +882,28 @@ void EmitContext::DefineBuffers() {
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(is_storage, desc.is_written, 3, desc.buffer_type, U64);
+            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::U32)) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, U32[1]);
+            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =
                 DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, F32[1]);
+            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::U16)) {
             spv_buffer.Alias(PointerType::U16) =
                 DefineBuffer(is_storage, desc.is_written, 1, desc.buffer_type, U16);
+            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
                 DefineBuffer(is_storage, desc.is_written, 0, desc.buffer_type, U8);
+            ++binding.unified;
         }
-        ++binding.unified;
     }
 }
 

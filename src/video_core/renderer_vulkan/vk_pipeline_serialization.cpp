@@ -18,7 +18,7 @@
 #endif
 
 namespace Serialization {
-static constexpr u32 ShaderBinaryVersion = 22u;
+static constexpr u32 ShaderBinaryVersion = 23u;
 static constexpr u32 ShaderMetaVersion = 1u;
 static constexpr u32 PipelineKeyVersion = 1u;
 }

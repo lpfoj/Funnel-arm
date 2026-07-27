@@ -7,6 +7,7 @@
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
 
+#include <bit>
 #include <boost/container/static_vector.hpp>
 
 namespace Shader {
@@ -43,6 +44,12 @@ struct BufferResource {
 
     bool IsStorage([[maybe_unused]] const AmdGpu::Buffer buffer) const noexcept {
         return true;
+    }
+
+    u32 NumBindings() const noexcept {
+        constexpr auto BindingTypes =
+            IR::Type::U64 | IR::Type::U32 | IR::Type::F32 | IR::Type::U16 | IR::Type::U8;
+        return std::popcount(static_cast<u32>(used_types & BindingTypes));
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
