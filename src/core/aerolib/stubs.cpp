@@ -3937,7 +3937,21 @@ u64 ExecutorLibcMemcpy(u64 dest, u64 src, u64 size) {
     }
 #endif
     VideoCore::PageManager::PrepareBulkGuestRead(src, size);
-    VideoCore::PageManager::PrepareBulkGuestWrite(dest, size);
+    const bool backing_write =
+        VideoCore::PageManager::PrepareBulkGuestBackingWrite(dest, size);
+    if (backing_write &&
+        Core::Memory::Instance()->TryWriteBacking(reinterpret_cast<void*>(dest),
+                                                  reinterpret_cast<const void*>(src), size)) {
+        ExecutorWatchGateWrite("memcpy", dest, size,
+                               size >= 8 ? *reinterpret_cast<const u64*>(src) : 0);
+        ExecutorMaybeLogLibcCopy("memcpy", dest, src, size);
+        return dest;
+    }
+    if (backing_write) {
+        VideoCore::PageManager::ReleaseBulkGuestBackingWrite(dest, size);
+    } else {
+        VideoCore::PageManager::PrepareBulkGuestWrite(dest, size);
+    }
     VideoCore::PageManager::EnterBulkGuestWrite(dest, size);
     VideoCore::BeginBulkGuestWrite(dest, size);
     std::memcpy(reinterpret_cast<void*>(dest), reinterpret_cast<const void*>(src),

@@ -29,6 +29,8 @@ public:
 
     static void PrepareBulkGuestRead(VAddr address, u64 size);
     static void PrepareBulkGuestWrite(VAddr address, u64 size);
+    [[nodiscard]] static bool PrepareBulkGuestBackingWrite(VAddr address, u64 size);
+    static void ReleaseBulkGuestBackingWrite(VAddr address, u64 size);
     static void EnterBulkGuestWrite(VAddr address, u64 size);
     static void LeaveBulkGuestWrite(VAddr address, u64 size);
 

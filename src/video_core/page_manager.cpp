@@ -87,6 +87,7 @@ thread_local bool executor_handling_guest_fault = false;
 thread_local VAddr executor_bulk_write_begin = 0;
 thread_local VAddr executor_bulk_write_end = 0;
 thread_local bool executor_bulk_write_consumed = false;
+thread_local bool executor_defer_bulk_write_unprotect = false;
 #endif
 
 void BeginBulkGuestWrite(const VAddr address, const u64 size) noexcept {
@@ -453,6 +454,17 @@ struct PageManager::Impl {
     template <bool track, bool is_read>
     void ApplyWatcherProtection(const VAddr address, const u64 size,
                                 const Core::MemoryPermission perms) {
+#ifdef __ANDROID__
+        if constexpr (!track && !is_read) {
+            // A known bulk write can update the physical backing alias while
+            // the guest mapping remains protected. Keep the logical watcher
+            // state exact and defer the permission release until a direct
+            // guest write actually faults.
+            if (executor_defer_bulk_write_unprotect) {
+                return;
+            }
+        }
+#endif
         Protect(address, size, perms);
     }
 
@@ -546,6 +558,33 @@ struct PageManager::Impl {
         const VAddr page_limit = Common::AlignUp(address + bounded_size, PAGE_SIZE);
         rasterizer->InvalidateMemory(page_begin, page_limit - page_begin);
         ReleaseDeferredWriteProtectionRange(page_begin, page_limit - page_begin);
+    }
+
+    bool PrepareBulkGuestBackingWrite(const VAddr address, const u64 size) {
+        if (size == 0 || address >= (u64{1} << ADDRESS_BITS)) {
+            return false;
+        }
+        const u64 bounded_size = std::min(size, (u64{1} << ADDRESS_BITS) - address);
+        size_t page = address >> PAGE_BITS;
+        const size_t page_end = Common::DivCeil(address + bounded_size, PAGE_SIZE);
+        while (page < page_end && !ActualWriteProtected(page)) {
+            ++page;
+        }
+        if (page == page_end) {
+            return false;
+        }
+
+        const VAddr page_begin = Common::AlignDown(address, PAGE_SIZE);
+        const VAddr page_limit = Common::AlignUp(address + bounded_size, PAGE_SIZE);
+#ifdef __ANDROID__
+        const bool previous_defer = executor_defer_bulk_write_unprotect;
+        executor_defer_bulk_write_unprotect = true;
+#endif
+        const bool invalidated = rasterizer->InvalidateMemory(page_begin, page_limit - page_begin);
+#ifdef __ANDROID__
+        executor_defer_bulk_write_unprotect = previous_defer;
+#endif
+        return invalidated;
     }
 
     void PrepareBulkGuestRead(const VAddr address, const u64 size) {
@@ -896,6 +935,16 @@ void PageManager::PrepareBulkGuestRead(const VAddr address, const u64 size) {
 void PageManager::PrepareBulkGuestWrite(const VAddr address, const u64 size) {
     if (Impl::owner != nullptr) {
         Impl::owner->PrepareBulkGuestWrite(address, size);
+    }
+}
+
+bool PageManager::PrepareBulkGuestBackingWrite(const VAddr address, const u64 size) {
+    return Impl::owner != nullptr && Impl::owner->PrepareBulkGuestBackingWrite(address, size);
+}
+
+void PageManager::ReleaseBulkGuestBackingWrite(const VAddr address, const u64 size) {
+    if (Impl::owner != nullptr) {
+        Impl::owner->ReleaseDeferredWriteProtectionRange(address, size);
     }
 }
 
