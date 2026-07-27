@@ -2170,6 +2170,7 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
 #ifdef __ANDROID__
+    buffer_cache.PrefetchReadbackWindows();
     if (Libraries::GnmDriver::ExecutorReplayActive() &&
         texture_cache.executor_replay_color_target) {
         texture_cache.ExecutorReplayReadbackColorTarget();
