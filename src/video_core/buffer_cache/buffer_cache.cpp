@@ -2526,13 +2526,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer> transient_upload_buffer;
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
-        [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+        [&] {
+            src_buffer = UploadCopies(
+                buffer, copies, total_size_bytes, transient_upload_buffer);
+        });
 
     if (src_buffer) {
         ASSERT(!copies.empty());
@@ -2547,6 +2551,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             scheduler.QueueBufferUploadCopies(
                 src_buffer, buffer.buffer, copies,
                 buffer_start + upload_begin, upload_end - upload_begin);
+            if (transient_upload_buffer) {
+                scheduler.FlushPendingBufferTransfers();
+            }
         } else
 #endif
         {
@@ -2588,6 +2595,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 .pBufferMemoryBarriers = &post_barrier,
             });
         }
+        if (transient_upload_buffer) {
+            scheduler.DeferOperation(
+                [upload = std::move(transient_upload_buffer)]() mutable {
+                    upload.reset();
+                });
+        }
         TouchBuffer(buffer);
     }
     if (is_texel_buffer && !is_written) {
@@ -2596,8 +2609,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     return false;
 }
 
-vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     size_t total_size_bytes) {
+vk::Buffer BufferCache::UploadCopies(
+    Buffer& buffer, std::span<vk::BufferCopy> copies,
+    size_t total_size_bytes, std::unique_ptr<Buffer>& transient_buffer) {
     if (copies.empty()) {
         return VK_NULL_HANDLE;
     }
@@ -2619,11 +2633,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         staging_buffer.Commit();
         return staging_buffer.Handle();
     } else {
-        auto temp_buffer =
+        transient_buffer =
             std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
                                      vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
-        const vk::Buffer src_buffer = temp_buffer->Handle();
-        u8* const staging = temp_buffer->mapped_data.data();
+        const vk::Buffer src_buffer = transient_buffer->Handle();
+        u8* const staging = transient_buffer->mapped_data.data();
         for (const auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
@@ -2631,7 +2645,6 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                 memory->CopySparseMemory(device_addr, src_pointer, copy.size);
             }
         }
-        scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;
     }
 }
@@ -2701,19 +2714,19 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .size = num_bytes,
     };
     vk::Buffer src_buffer = staging_buffer.Handle();
+    std::unique_ptr<Buffer> transient_upload_buffer;
     if (num_bytes < StagingBufferSize) {
         const auto [staging, offset] = staging_buffer.Map(num_bytes);
         std::memcpy(staging, value, num_bytes);
         copy.srcOffset = offset;
         staging_buffer.Commit();
     } else {
-        Buffer temp_buffer{
+        transient_upload_buffer = std::make_unique<Buffer>(
             instance, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eTransferSrc,
-            num_bytes};
-        src_buffer = temp_buffer.Handle();
-        u8* const staging = temp_buffer.mapped_data.data();
+            num_bytes);
+        src_buffer = transient_upload_buffer->Handle();
+        u8* const staging = transient_upload_buffer->mapped_data.data();
         std::memcpy(staging, value, num_bytes);
-        scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
     }
 #ifdef __ANDROID__
     if (IsManagedVulkanTransferCoalescing()) {
@@ -2721,6 +2734,9 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         scheduler.QueueBufferUploadCopies(
             src_buffer, buffer.Handle(), std::span{&copy, 1},
             has_guest_range ? address : 0, has_guest_range ? num_bytes : 0);
+        if (transient_upload_buffer) {
+            scheduler.FlushPendingBufferTransfers();
+        }
     } else
 #endif
     {
@@ -2757,6 +2773,12 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &post_barrier,
         });
+    }
+    if (transient_upload_buffer) {
+        scheduler.DeferOperation(
+            [upload = std::move(transient_upload_buffer)]() mutable {
+                upload.reset();
+            });
     }
 }
 

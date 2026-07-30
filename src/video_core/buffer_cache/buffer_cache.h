@@ -284,7 +284,8 @@ private:
                            bool is_texel_buffer);
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                            size_t total_size_bytes);
+                            size_t total_size_bytes,
+                            std::unique_ptr<Buffer>& transient_buffer);
 
     bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
 
