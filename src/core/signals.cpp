@@ -491,8 +491,10 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                         static_cast<unsigned long long>(active_rip));
                 }
 #endif
-                (void)DeferJitSynchronousGuestFault(
-                    sig, info, is_write, raw_context);
+                if (DeferJitSynchronousGuestFault(
+                        sig, info, is_write, raw_context)) {
+                    return;
+                }
                 UNREACHABLE_MSG(
                     "JIT synchronous guest access fault could not be deferred");
             }
