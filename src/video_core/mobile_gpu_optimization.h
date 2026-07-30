@@ -60,6 +60,7 @@ void SetMobileGpuCoarseShadingAvailable(bool available) noexcept;
 /// while preserving the canonical guest image and resolving it before any
 /// guest-visible hazard.
 void SetMobileGpuPhysicalDrsAvailable(bool available) noexcept;
+void SetMobileGpuPhysicalDrsResolutionFloor(bool active) noexcept;
 
 /// Feed one presented-frame sample to the hysteretic controller. Timeline
 /// backlog is used to avoid reducing quality for CPU-bound frames.

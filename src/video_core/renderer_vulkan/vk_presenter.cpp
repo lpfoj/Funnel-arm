@@ -611,6 +611,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
 #ifdef __ANDROID__
+    // The configured 960x544 mobile baseline is already the final internal
+    // resolution. Do not let adaptive DRS halve the complete VideoOut image
+    // (including UI and font glyphs) a second time.
+    constexpr u64 MobileBaselinePixels = 960ull * 544ull;
+    VideoCore::SetMobileGpuPhysicalDrsResolutionFloor(
+        static_cast<u64>(image_size.width) * image_size.height <=
+        MobileBaselinePixels);
     // A physically scaled render target remains available after its
     // guest-visible canonical resolve.  Feed that smaller source directly to
     // FSR so dynamic resolution saves fragment work and does not get expanded

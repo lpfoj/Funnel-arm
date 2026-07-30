@@ -14,6 +14,7 @@ struct AtomicMobileGpuState {
     std::atomic_bool enabled{false};
     std::atomic_bool coarse_shading_available{false};
     std::atomic_bool physical_drs_available{false};
+    std::atomic_bool physical_drs_resolution_floor{false};
     std::atomic<u32> scale_percent{100};
     std::atomic<u32> overload_streak{0};
     std::atomic<u32> recovery_streak{0};
@@ -114,6 +115,8 @@ void SetManagedMobileGpuOptimization(const bool enabled) noexcept {
     state.frame_interval_ema_ns.store(0, std::memory_order_relaxed);
     state.memory_used_bytes.store(0, std::memory_order_relaxed);
     state.memory_budget_bytes.store(0, std::memory_order_relaxed);
+    state.physical_drs_resolution_floor.store(false,
+                                              std::memory_order_relaxed);
     state.submitted_ticks.store(0, std::memory_order_relaxed);
     state.completed_ticks.store(0, std::memory_order_relaxed);
     state.scale_percent.store(100, std::memory_order_release);
@@ -158,6 +161,16 @@ void SetMobileGpuPhysicalDrsAvailable(const bool available) noexcept {
     }
 }
 
+void SetMobileGpuPhysicalDrsResolutionFloor(const bool active) noexcept {
+    state.physical_drs_resolution_floor.store(active,
+                                              std::memory_order_release);
+    if (active) {
+        state.scale_percent.store(100, std::memory_order_release);
+        state.overload_streak.store(0, std::memory_order_relaxed);
+        state.recovery_streak.store(0, std::memory_order_relaxed);
+    }
+}
+
 void ObserveMobileGpuFrame(const u64 interval_nanoseconds, const u64 submitted_tick,
                            const u64 completed_tick) noexcept {
     if (!IsManagedMobileGpuOptimization()) {
@@ -173,20 +186,25 @@ void ObserveMobileGpuFrame(const u64 interval_nanoseconds, const u64 submitted_t
         interval_nanoseconds == 0
             ? state.frame_interval_ema_ns.load(std::memory_order_relaxed)
             : UpdateEma(state.frame_interval_ema_ns, interval_nanoseconds);
+    if (state.physical_drs_resolution_floor.load(
+            std::memory_order_acquire)) {
+        state.scale_percent.store(100, std::memory_order_release);
+        state.overload_streak.store(0, std::memory_order_relaxed);
+        state.recovery_streak.store(0, std::memory_order_relaxed);
+        return;
+    }
 
-    // Mobile drivers commonly serialize queue progress behind a single
-    // in-flight frame, so backlog alone is not a reliable GPU-pressure signal.
-    // A sustained missed-frame interval is also actionable: physical DRS
-    // reduces attachment, depth and fragment traffic while leaving the
-    // configured guest/output resolution unchanged.
+    // A slow presented-frame interval by itself is not GPU pressure: emulated
+    // games frequently miss their frame target on the CPU while the graphics
+    // timeline is already caught up. Treating that case as overload reduced
+    // the complete render target (including text and HUD) to 50% without
+    // improving frame rate. Scale only when timeline or memory pressure proves
+    // that reducing attachment/depth/fragment work can help.
     const bool severely_slow =
         interval_ema >= 50'000'000ULL;
     const bool overloaded =
         backlog >= 3 || MemoryPressureAtLeast(9, 10) ||
-        (backlog >= 2 && interval_ema >= 36'000'000ULL) ||
-        (severely_slow &&
-         (state.physical_drs_available.load(std::memory_order_acquire) ||
-          state.coarse_shading_available.load(std::memory_order_acquire)));
+        (backlog >= 2 && interval_ema >= 36'000'000ULL);
     const bool recovered =
         backlog <= 1 && !MemoryPressureAtLeast(3, 4) &&
         (interval_ema == 0 || interval_ema <= 29'000'000ULL);
