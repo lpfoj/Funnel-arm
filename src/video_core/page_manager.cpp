@@ -169,6 +169,18 @@ struct PageManager::Impl {
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
+    static constexpr size_t NUM_ADDRESS_CHUNKS =
+        NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
+    static constexpr size_t WORDS_PER_CHUNK = PAGES_PER_LOCK / 64;
+
+    struct PageChunk {
+        std::array<PageState, PAGES_PER_LOCK> pages{};
+        std::array<u64, WORDS_PER_CHUNK> actual_read_protection{};
+        std::array<u64, WORDS_PER_CHUNK> actual_write_protection{};
+        std::array<u64, WORDS_PER_CHUNK> write_fault_bypass{};
+        std::array<u64, WORDS_PER_CHUNK> active_bulk_write{};
+    };
+
     inline static Vulkan::Rasterizer* rasterizer;
     inline static Impl* owner;
 #ifdef ENABLE_USERFAULTFD
@@ -264,6 +276,9 @@ struct PageManager::Impl {
     Impl(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
         owner = this;
+        for (auto& chunk : page_chunks) {
+            chunk.store(nullptr, std::memory_order_relaxed);
+        }
 
         constexpr auto priority = std::numeric_limits<u32>::min();
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
@@ -280,6 +295,7 @@ struct PageManager::Impl {
     }
 
     void OnMap(VAddr address, size_t size) {
+        EnsureChunks(address, size);
         FillActualWriteProtection(address, size, false);
         FillActualReadProtection(address, size, false);
     }
@@ -289,84 +305,34 @@ struct PageManager::Impl {
         FillActualReadProtection(address, size, false);
     }
 
-    bool ActualReadProtected(const size_t page) const noexcept {
-        const u64 word = actual_read_protection[page >> 6];
-        return ((word >> (page & 63)) & 1u) != 0;
+    PageChunk* FindChunk(const size_t page) const noexcept {
+        if (page >= NUM_ADDRESS_PAGES) {
+            return nullptr;
+        }
+        return page_chunks[page / PAGES_PER_LOCK].load(
+            std::memory_order_acquire);
     }
 
-    bool ActualWriteProtected(const size_t page) const noexcept {
-        const u64 word = actual_write_protection[page >> 6];
-        return ((word >> (page & 63)) & 1u) != 0;
-    }
-
-    bool WriteFaultBypassed(const size_t page) const noexcept {
-        const u64 word = write_fault_bypass[page >> 6];
-        return ((word >> (page & 63)) & 1u) != 0;
-    }
-
-    bool BulkWriteActive(const size_t page) const noexcept {
-        const u64 word = active_bulk_write[page >> 6];
-        return ((word >> (page & 63)) & 1u) != 0;
-    }
-
-    void SetBulkWriteActive(const size_t page, const bool enabled) noexcept {
-        const u64 mask = u64{1} << (page & 63);
-        if (enabled) {
-            active_bulk_write[page >> 6] |= mask;
+    PageChunk& EnsureChunk(const size_t page) {
+        ASSERT(page < NUM_ADDRESS_PAGES);
+        auto& slot = page_chunks[page / PAGES_PER_LOCK];
+        PageChunk* chunk = slot.load(std::memory_order_acquire);
+        if (chunk != nullptr) {
+            return *chunk;
+        }
+        auto candidate = std::make_unique<PageChunk>();
+        PageChunk* expected = nullptr;
+        if (slot.compare_exchange_strong(expected, candidate.get(),
+                                         std::memory_order_release,
+                                         std::memory_order_acquire)) {
+            chunk = candidate.release();
         } else {
-            active_bulk_write[page >> 6] &= ~mask;
+            chunk = expected;
         }
+        return *chunk;
     }
 
-    void SetWriteFaultBypass(const size_t page, const bool enabled) noexcept {
-        const u64 mask = u64{1} << (page & 63);
-        if (enabled) {
-            write_fault_bypass[page >> 6] |= mask;
-        } else {
-            write_fault_bypass[page >> 6] &= ~mask;
-        }
-    }
-
-    void FillActualReadProtection(const VAddr address, const u64 size,
-                                  const bool protected_state) noexcept {
-        if (size == 0 || address >= (u64{1} << ADDRESS_BITS)) {
-            return;
-        }
-        const u64 bounded_size = std::min(size, (u64{1} << ADDRESS_BITS) - address);
-        const size_t first_page = address >> PAGE_BITS;
-        const size_t end_page = Common::DivCeil(address + bounded_size, PAGE_SIZE);
-        if (first_page >= end_page) {
-            return;
-        }
-        const size_t first_word = first_page >> 6;
-        const size_t last_word = (end_page - 1) >> 6;
-        const u64 first_mask = ~u64{0} << (first_page & 63);
-        const u64 last_mask =
-            (end_page & 63) == 0 ? ~u64{0} : (u64{1} << (end_page & 63)) - 1;
-        if (first_word == last_word) {
-            const u64 mask = first_mask & last_mask;
-            if (protected_state) {
-                actual_read_protection[first_word] |= mask;
-            } else {
-                actual_read_protection[first_word] &= ~mask;
-            }
-            return;
-        }
-        if (protected_state) {
-            actual_read_protection[first_word] |= first_mask;
-            std::fill(actual_read_protection.begin() + first_word + 1,
-                      actual_read_protection.begin() + last_word, ~u64{0});
-            actual_read_protection[last_word] |= last_mask;
-        } else {
-            actual_read_protection[first_word] &= ~first_mask;
-            std::fill(actual_read_protection.begin() + first_word + 1,
-                      actual_read_protection.begin() + last_word, u64{0});
-            actual_read_protection[last_word] &= ~last_mask;
-        }
-    }
-
-    void FillActualWriteProtection(const VAddr address, const u64 size,
-                                   const bool protected_state) noexcept {
+    void EnsureChunks(const VAddr address, const u64 size) {
         if (size == 0 || address >= (u64{1} << ADDRESS_BITS)) {
             return;
         }
@@ -375,36 +341,153 @@ struct PageManager::Impl {
         const size_t first_page = address >> PAGE_BITS;
         const size_t end_page =
             Common::DivCeil(address + bounded_size, PAGE_SIZE);
-        if (first_page >= end_page) {
+        for (size_t page = first_page; page < end_page;
+             page = std::min(end_page,
+                             Common::AlignUp(page + 1, PAGES_PER_LOCK))) {
+            (void)EnsureChunk(page);
+        }
+    }
+
+    PageState& State(const size_t page) {
+        return EnsureChunk(page).pages[page % PAGES_PER_LOCK];
+    }
+
+    const PageState* FindState(const size_t page) const noexcept {
+        const PageChunk* chunk = FindChunk(page);
+        return chunk != nullptr ? &chunk->pages[page % PAGES_PER_LOCK]
+                                : nullptr;
+    }
+
+    bool ActualReadProtected(const size_t page) const noexcept {
+        const PageChunk* chunk = FindChunk(page);
+        if (chunk == nullptr) {
+            return false;
+        }
+        const size_t local_page = page % PAGES_PER_LOCK;
+        const u64 word = chunk->actual_read_protection[local_page >> 6];
+        return ((word >> (local_page & 63)) & 1u) != 0;
+    }
+
+    bool ActualWriteProtected(const size_t page) const noexcept {
+        const PageChunk* chunk = FindChunk(page);
+        if (chunk == nullptr) {
+            return false;
+        }
+        const size_t local_page = page % PAGES_PER_LOCK;
+        const u64 word = chunk->actual_write_protection[local_page >> 6];
+        return ((word >> (local_page & 63)) & 1u) != 0;
+    }
+
+    bool WriteFaultBypassed(const size_t page) const noexcept {
+        const PageChunk* chunk = FindChunk(page);
+        if (chunk == nullptr) {
+            return false;
+        }
+        const size_t local_page = page % PAGES_PER_LOCK;
+        const u64 word = chunk->write_fault_bypass[local_page >> 6];
+        return ((word >> (local_page & 63)) & 1u) != 0;
+    }
+
+    bool BulkWriteActive(const size_t page) const noexcept {
+        const PageChunk* chunk = FindChunk(page);
+        if (chunk == nullptr) {
+            return false;
+        }
+        const size_t local_page = page % PAGES_PER_LOCK;
+        const u64 word = chunk->active_bulk_write[local_page >> 6];
+        return ((word >> (local_page & 63)) & 1u) != 0;
+    }
+
+    void SetBulkWriteActive(const size_t page, const bool enabled) noexcept {
+        PageChunk* chunk = enabled ? &EnsureChunk(page) : FindChunk(page);
+        if (chunk == nullptr) {
             return;
         }
-
-        const size_t first_word = first_page >> 6;
-        const size_t last_word = (end_page - 1) >> 6;
-        const u64 first_mask = ~u64{0} << (first_page & 63);
-        const u64 last_mask =
-            (end_page & 63) == 0 ? ~u64{0} : (u64{1} << (end_page & 63)) - 1;
-        if (first_word == last_word) {
-            const u64 mask = first_mask & last_mask;
-            if (protected_state) {
-                actual_write_protection[first_word] |= mask;
-            } else {
-                actual_write_protection[first_word] &= ~mask;
-            }
-            return;
-        }
-
-        if (protected_state) {
-            actual_write_protection[first_word] |= first_mask;
-            std::fill(actual_write_protection.begin() + first_word + 1,
-                      actual_write_protection.begin() + last_word, ~u64{0});
-            actual_write_protection[last_word] |= last_mask;
+        const size_t local_page = page % PAGES_PER_LOCK;
+        const u64 mask = u64{1} << (local_page & 63);
+        if (enabled) {
+            chunk->active_bulk_write[local_page >> 6] |= mask;
         } else {
-            actual_write_protection[first_word] &= ~first_mask;
-            std::fill(actual_write_protection.begin() + first_word + 1,
-                      actual_write_protection.begin() + last_word, u64{0});
-            actual_write_protection[last_word] &= ~last_mask;
+            chunk->active_bulk_write[local_page >> 6] &= ~mask;
         }
+    }
+
+    void SetWriteFaultBypass(const size_t page, const bool enabled) noexcept {
+        PageChunk* chunk = enabled ? &EnsureChunk(page) : FindChunk(page);
+        if (chunk == nullptr) {
+            return;
+        }
+        const size_t local_page = page % PAGES_PER_LOCK;
+        const u64 mask = u64{1} << (local_page & 63);
+        if (enabled) {
+            chunk->write_fault_bypass[local_page >> 6] |= mask;
+        } else {
+            chunk->write_fault_bypass[local_page >> 6] &= ~mask;
+        }
+    }
+
+    template <auto Member>
+    void FillProtection(const VAddr address, const u64 size,
+                        const bool protected_state) noexcept {
+        if (size == 0 || address >= (u64{1} << ADDRESS_BITS)) {
+            return;
+        }
+        const u64 bounded_size =
+            std::min(size, (u64{1} << ADDRESS_BITS) - address);
+        size_t page = address >> PAGE_BITS;
+        const size_t end_page =
+            Common::DivCeil(address + bounded_size, PAGE_SIZE);
+        while (page < end_page) {
+            const size_t chunk_end =
+                std::min(end_page, Common::AlignUp(page + 1, PAGES_PER_LOCK));
+            PageChunk* chunk =
+                protected_state ? &EnsureChunk(page) : FindChunk(page);
+            if (chunk == nullptr) {
+                page = chunk_end;
+                continue;
+            }
+            auto& bits = chunk->*Member;
+            const size_t local_begin = page % PAGES_PER_LOCK;
+            const size_t local_end = local_begin + (chunk_end - page);
+            const size_t first_word = local_begin >> 6;
+            const size_t last_word = (local_end - 1) >> 6;
+            const u64 first_mask = ~u64{0} << (local_begin & 63);
+            const u64 last_mask =
+                (local_end & 63) == 0
+                    ? ~u64{0}
+                    : (u64{1} << (local_end & 63)) - 1;
+            if (first_word == last_word) {
+                const u64 mask = first_mask & last_mask;
+                if (protected_state) {
+                    bits[first_word] |= mask;
+                } else {
+                    bits[first_word] &= ~mask;
+                }
+            } else if (protected_state) {
+                bits[first_word] |= first_mask;
+                std::fill(bits.begin() + first_word + 1,
+                          bits.begin() + last_word, ~u64{0});
+                bits[last_word] |= last_mask;
+            } else {
+                bits[first_word] &= ~first_mask;
+                std::fill(bits.begin() + first_word + 1,
+                          bits.begin() + last_word, u64{0});
+                bits[last_word] &= ~last_mask;
+            }
+            page = chunk_end;
+        }
+    }
+
+    void FillActualReadProtection(const VAddr address, const u64 size,
+                                  const bool protected_state) noexcept {
+        FillProtection<&PageChunk::actual_read_protection>(
+            address, size, protected_state);
+    }
+
+    void FillActualWriteProtection(const VAddr address, const u64 size,
+                                   const bool protected_state) noexcept {
+        FillProtection<&PageChunk::actual_write_protection>(
+            address, size, protected_state);
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
@@ -511,7 +594,7 @@ struct PageManager::Impl {
         }
         const size_t page = address >> PAGE_BITS;
         std::scoped_lock lk{locks[page / PAGES_PER_LOCK]};
-        PageState& state = cached_pages[page];
+        PageState& state = State(page);
         if (!True(state.WritePerm() & Core::MemoryPermission::Write)) {
             return false;
         }
@@ -529,7 +612,11 @@ struct PageManager::Impl {
         if (!ActualWriteProtected(page)) {
             return true;
         }
-        const Core::MemoryPermission perms = cached_pages[page].Perms();
+        const PageState* state = FindState(page);
+        if (state == nullptr) {
+            return false;
+        }
+        const Core::MemoryPermission perms = state->Perms();
         if (!True(perms & Core::MemoryPermission::Write)) {
             return false;
         }
@@ -551,18 +638,18 @@ struct PageManager::Impl {
             while (page < lock_end) {
                 while (page < lock_end &&
                        (!ActualWriteProtected(page) ||
-                        !True(cached_pages[page].WritePerm() &
+                        !True(State(page).WritePerm() &
                               Core::MemoryPermission::Write))) {
                     ++page;
                 }
                 const size_t first = page;
                 const Core::MemoryPermission perms =
-                    first < lock_end ? cached_pages[first].Perms()
+                    first < lock_end ? State(first).Perms()
                                      : Core::MemoryPermission::None;
                 while (page < lock_end && ActualWriteProtected(page) &&
-                       True(cached_pages[page].WritePerm() &
+                       True(State(page).WritePerm() &
                             Core::MemoryPermission::Write) &&
-                       cached_pages[page].Perms() == perms) {
+                       State(page).Perms() == perms) {
                     ++page;
                 }
                 if (first != page) {
@@ -637,7 +724,7 @@ struct PageManager::Impl {
                 if (!WriteFaultBypassed(page)) {
                     SetWriteFaultBypass(page, true);
                     const Core::MemoryPermission perms =
-                        cached_pages[page].ReadPerm() |
+                        State(page).ReadPerm() |
                         Core::MemoryPermission::Write;
                     Protect(static_cast<VAddr>(page) << PAGE_BITS, PAGE_SIZE,
                             perms);
@@ -645,7 +732,7 @@ struct PageManager::Impl {
             } else if (WriteFaultBypassed(page)) {
                 SetWriteFaultBypass(page, false);
                 Protect(static_cast<VAddr>(page) << PAGE_BITS, PAGE_SIZE,
-                        cached_pages[page].Perms());
+                        State(page).Perms());
             }
             ++page;
         }
@@ -732,6 +819,9 @@ struct PageManager::Impl {
         if (owner == this) {
             owner = nullptr;
         }
+        for (auto& slot : page_chunks) {
+            delete slot.load(std::memory_order_relaxed);
+        }
     }
 
     template <bool track, bool is_read>
@@ -745,7 +835,7 @@ struct PageManager::Impl {
         const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
         Common::RangeLockGuard lk(lock_start, lock_end);
 
-        auto perms = cached_pages[page].Perms();
+        auto perms = State(page).Perms();
         u64 range_begin = 0;
         u64 range_bytes = 0;
         u64 potential_range_bytes = 0;
@@ -769,7 +859,7 @@ struct PageManager::Impl {
         }
 
         for (; page != page_end; ++page) {
-            PageState& state = cached_pages[page];
+            PageState& state = State(page);
 
             const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>();
             if constexpr (track && !is_read) {
@@ -813,7 +903,7 @@ struct PageManager::Impl {
         size_t base_page = (base_addr >> PAGE_BITS);
         ASSERT(base_page % PAGES_PER_LOCK == 0);
         std::scoped_lock lk(locks[base_page / PAGES_PER_LOCK]);
-        auto perms = cached_pages[base_page + start_range.first].Perms();
+        auto perms = State(base_page + start_range.first).Perms();
         u64 range_begin = 0;
         u64 range_bytes = 0;
         u64 potential_range_bytes = 0;
@@ -829,7 +919,7 @@ struct PageManager::Impl {
         };
 
         for (size_t page = start_range.first; page < end_range.second; ++page) {
-            PageState& state = cached_pages[base_page + page];
+            PageState& state = State(base_page + page);
             const bool update = mask.Get(page);
 
             const u8 new_count =
@@ -879,7 +969,7 @@ struct PageManager::Impl {
         Common::RangeLockGuard lk(lock_start, lock_end);
 
         for (; page != page_end; ++page) {
-            PageState& state = cached_pages[page];
+            PageState& state = State(page);
             const auto old_perms = state.Perms();
             const u8 desired = track ? 1u : 0u;
             if (state.memory_wait_write_watcher == desired) {
@@ -906,7 +996,7 @@ struct PageManager::Impl {
         }
         const size_t page = addr >> PAGE_BITS;
         std::scoped_lock lk{locks[page / PAGES_PER_LOCK]};
-        PageState& state = cached_pages[page];
+        PageState& state = State(page);
         if (state.memory_wait_write_watcher == 0) {
             return false;
         }
@@ -921,11 +1011,7 @@ struct PageManager::Impl {
     }
 
     std::atomic<u32> active_memory_wait_write_watchers{0};
-    std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
-    std::array<u64, NUM_ADDRESS_PAGES / 64> actual_read_protection{};
-    std::array<u64, NUM_ADDRESS_PAGES / 64> actual_write_protection{};
-    std::array<u64, NUM_ADDRESS_PAGES / 64> write_fault_bypass{};
-    std::array<u64, NUM_ADDRESS_PAGES / 64> active_bulk_write{};
+    std::array<std::atomic<PageChunk*>, NUM_ADDRESS_CHUNKS> page_chunks{};
 #ifdef __ANDROID__
     using LockType = Common::ParkingMutex;
 #elif defined(PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP)

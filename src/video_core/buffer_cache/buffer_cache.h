@@ -158,7 +158,8 @@ public:
 
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
-                                                       BufferId buffer_id = {});
+                                                       BufferId buffer_id = {},
+                                                       bool transfer_range_checked = false);
 
     [[nodiscard]] std::pair<Buffer*, u32> ObtainReadOnlyBuffer(
         VAddr gpu_addr, u32 size, ReadOnlyBufferUsage usage, BufferId fallback_buffer_id = {});
@@ -192,7 +193,8 @@ public:
                                      u64 bound_offset, const char* role, u64 sequence, u32 slot);
 #endif
 
-    BufferId FindBuffer(VAddr device_addr, u32 size);
+    BufferId FindBuffer(VAddr device_addr, u32 size,
+                        bool transfer_range_checked = false);
 
     void ProcessFaultBuffer();
 

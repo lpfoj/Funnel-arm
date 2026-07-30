@@ -206,13 +206,9 @@ bool IsManagedVulkanTransferCoalescing() noexcept {
 
 bool IsManagedVulkanSubmitCoalescing() noexcept {
 #ifdef __ANDROID__
-    // Do not defer primary command-buffer submission on Android. Adreno can
-    // retain driver-side recording state for a queued command buffer while
-    // the scheduler starts recording the next buffer from the same pool; the
-    // resulting race surfaced as a null dereference in vkCmdDispatch during
-    // texture detiling. Real Bloodborne telemetry also showed maxBatch=1 and
-    // callsSaved=0, so this path added latency without reducing driver calls.
-    return false;
+    static const bool allowed =
+        BisectionMarkerAbsent("run-bisect-disable-vk-submit-coalescing");
+    return IsManagedVulkanDriverOptimization() && allowed;
 #else
     return IsManagedVulkanDriverOptimization();
 #endif

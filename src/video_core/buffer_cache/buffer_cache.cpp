@@ -1824,8 +1824,11 @@ static void ExecutorFlagSuspectGpuDescriptor(const char* site, VAddr addr, u64 s
 #endif
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
-                                                  bool is_texel_buffer, BufferId buffer_id) {
-    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
+                                                  bool is_texel_buffer, BufferId buffer_id,
+                                                  const bool transfer_range_checked) {
+    if (!transfer_range_checked) {
+        scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
+    }
 #ifdef __ANDROID__
     ExecutorFlagSuspectGpuDescriptor("ObtainBuffer", device_addr, size);
 #endif
@@ -1834,7 +1837,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     Libraries::GnmDriver::ExecutorReplayCheckAddr(3u, device_addr, size);
     if (IsBufferInvalid(buffer_id)) {
-        buffer_id = FindBuffer(device_addr, size);
+        buffer_id = FindBuffer(device_addr, size, true);
     }
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
@@ -1861,6 +1864,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadOnlyBuffer(
     ++read_only_rename_attempts;
     ++read_only_rename_usage_counts[static_cast<std::size_t>(usage)];
     const auto maybe_log = [&] {
+        if (Config::managedGpuFastPath()) {
+            return;
+        }
         if (read_only_rename_attempts != 256 &&
             (read_only_rename_attempts & 4095u) != 0u) {
             return;
@@ -1924,11 +1930,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainReadOnlyBuffer(
     const auto fallback = [&](const ReadOnlyRenameFallback reason) {
         ++read_only_rename_fallback_counts[static_cast<std::size_t>(reason)];
         maybe_log();
-        return ObtainBuffer(device_addr, size, false, false, fallback_buffer_id);
+        return ObtainBuffer(device_addr, size, false, false,
+                            fallback_buffer_id, true);
     };
 
     if (!ExecutorReadOnlyRenameUsageEnabled(usage)) {
-        return ObtainBuffer(device_addr, size, false, false, fallback_buffer_id);
+        return ObtainBuffer(device_addr, size, false, false,
+                            fallback_buffer_id, true);
     }
 
     if (device_addr == 0 || size == 0) {
@@ -2292,11 +2300,14 @@ void BufferCache::ExecutorProbeBoundGpuBuffer(VAddr guest_addr, u32 size, vk::Bu
 }
 #endif
 
-BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
+BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size,
+                                 const bool transfer_range_checked) {
     if (device_addr == 0) {
         return NULL_BUFFER_ID;
     }
-    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
+    if (!transfer_range_checked) {
+        scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
+    }
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {

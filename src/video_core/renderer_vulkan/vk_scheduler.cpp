@@ -2208,23 +2208,14 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
     ImGui::Core::TextureManager::Submit();
 #ifdef __ANDROID__
     if (can_defer_internal_submit) {
-        if (!pending_submit_thread.joinable()) {
-            pending_submit_thread =
-                std::jthread(std::bind_front(&Scheduler::PendingSubmitThread,
-                                             this));
-        }
-        constexpr std::size_t MaxCoalescedCommandBuffers = 8;
-        // FlushPlain packets arrive in short GNM bursts. A 250 us deadline
-        // expired before the next packet on mobile and produced a measured
-        // maxBatch=1/callsSaved=0. Wait/retirement paths explicitly publish a
-        // pending batch, so a bounded 1.5 ms window preserves dependencies
-        // while amortizing queue-submit driver overhead.
-        constexpr auto MaxCoalescingLatency =
-            std::chrono::microseconds{1500};
-        if (pending_submit_command_buffers.empty()) {
-            pending_submit_deadline =
-                std::chrono::steady_clock::now() + MaxCoalescingLatency;
-        }
+        constexpr std::size_t MaxCoalescedCommandBuffers = 16;
+        // Keep collection and vkQueueSubmit on this scheduler thread.  The
+        // former timer thread could submit one command buffer while Adreno
+        // was recording the next buffer from the same pool, which triggered
+        // a driver race in texture detiling and normally expired at batch=1.
+        // A synchronous frame/boundary batch has no concurrent queue call;
+        // explicit waits, external sync and presentation publish it through
+        // the existing forced-boundary path.
         pending_submit_command_buffers.push_back(current_cmdbuf);
         pending_submit_ticks.push_back(signal_value);
         pending_submit_last_tick.store(signal_value,
@@ -2237,8 +2228,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
         if (pending_submit_command_buffers.size() >=
             MaxCoalescedCommandBuffers) {
             success = SubmitPendingBatchLocked();
-        } else {
-            pending_submit_cv.notify_one();
         }
         if (!success || master_semaphore.IsDeviceLost()) {
             return;
