@@ -12,6 +12,11 @@ namespace Shader {
 struct Profile;
 struct RuntimeInfo;
 
+enum class TranslationTier : u8 {
+    Fast,
+    Optimized,
+};
+
 struct Pools {
     static constexpr u32 InstPoolSize = 8192;
     static constexpr u32 BlockPoolSize = 32;
@@ -29,6 +34,11 @@ struct Pools {
 
 [[nodiscard]] IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools,
                                            Info& info, RuntimeInfo& runtime_info,
-                                           const Profile& profile);
+                                           const Profile& profile,
+                                           TranslationTier tier = TranslationTier::Optimized);
+
+// Completes the expensive, semantics-preserving cleanup of a fast-tier program.
+// The program and its Pools must remain alive for the duration of this call.
+void OptimizeProgram(IR::Program& program);
 
 }

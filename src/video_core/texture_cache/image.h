@@ -59,6 +59,7 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+    [[nodiscard]] vk::Result TryCreate(const vk::ImageCreateInfo& image_ci) noexcept;
 
     operator vk::Image() const {
         return image;

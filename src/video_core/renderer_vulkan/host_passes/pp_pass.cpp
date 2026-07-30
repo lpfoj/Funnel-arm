@@ -9,6 +9,7 @@
 #include "video_core/host_shaders/post_process_frag.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <boost/container/static_vector.hpp>
@@ -184,8 +185,9 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     sampler = Check<"create pp sampler">(device.createSamplerUnique(sampler_ci));
 }
 
-void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
+void PostProcessingPass::Render(Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                                vk::ImageView input, vk::Extent2D input_size, Frame& frame,
+                                Settings settings) {
     if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -235,6 +237,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     };
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eGraphics);
 
     const std::array viewports = {
         vk::Viewport{
@@ -254,8 +257,10 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
+    scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eGraphics);
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
                          &settings);
+    scheduler.MarkPushConstants(vk::PipelineBindPoint::eGraphics);
 
     cmdbuf.beginRendering(rendering_info);
     cmdbuf.draw(3, 1, 0, 0);

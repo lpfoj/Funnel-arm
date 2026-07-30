@@ -206,10 +206,7 @@ struct Info : InfoPersistent {
 
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        for (const auto& buffer : buffers) {
-            bnd.unified += buffer.NumBindings();
-        }
-        bnd.unified += images.size() + samplers.size();
+        bnd.unified += buffers.size() + images.size() + samplers.size();
         bnd.user_data += ud_mask.NumRegs();
     }
 

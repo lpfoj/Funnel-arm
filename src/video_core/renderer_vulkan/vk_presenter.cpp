@@ -16,6 +16,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/mobile_gpu_optimization.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image.h"
@@ -211,6 +212,18 @@ Presenter::~Presenter() {
     ImGui::Core::Shutdown(device);
 }
 
+VideoCore::Image& Presenter::RegisterVideoOutSurface(
+    const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
+    vo_buffers_addr.emplace_back(cpu_address);
+    auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+    const auto image_id = texture_cache.FindImage(desc);
+    auto& image = texture_cache.GetImage(image_id);
+    image.usage.vo_surface = 1u;
+    executor_videoout_width.store(image.info.size.width, std::memory_order_release);
+    executor_videoout_height.store(image.info.size.height, std::memory_order_release);
+    return image;
+}
+
 bool Presenter::IsDeviceLost() const noexcept {
     return device_lost.load(std::memory_order_acquire) || draw_scheduler.IsDeviceLost() ||
            present_scheduler.IsDeviceLost() || flip_scheduler.IsDeviceLost();
@@ -381,7 +394,7 @@ Frame* Presenter::PrepareLastFrame() {
     }
 
     auto& scheduler = flip_scheduler;
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::EndRenderingReason::Presenter);
     const auto cmdbuf = scheduler.CommandBuffer();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
@@ -441,6 +454,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         MarkDeviceLost(vk::Result::eErrorDeviceLost, "prepare_frame");
         return nullptr;
     }
+#ifdef __ANDROID__
+    const u64 mobile_gpu_now_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const u64 mobile_gpu_interval_ns =
+        mobile_gpu_last_frame_ns == 0 ? 0 : mobile_gpu_now_ns - mobile_gpu_last_frame_ns;
+    mobile_gpu_last_frame_ns = mobile_gpu_now_ns;
+    VideoCore::ObserveMobileGpuFrame(
+        mobile_gpu_interval_ns, draw_scheduler.CurrentTick(),
+        draw_scheduler.KnownGpuTick());
+#endif
 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     auto image_id = texture_cache.FindImage(desc);
@@ -559,7 +584,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         .subresourceRange{frame_subresources},
     };
 
-    draw_scheduler.EndRendering();
+    draw_scheduler.EndRendering(Scheduler::EndRenderingReason::Presenter);
     const auto cmdbuf = draw_scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
@@ -586,8 +611,22 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
 #ifdef __ANDROID__
+    // A physically scaled render target remains available after its
+    // guest-visible canonical resolve.  Feed that smaller source directly to
+    // FSR so dynamic resolution saves fragment work and does not get expanded
+    // once by a nearest blit before the real upscaler sees it.
+    vk::ImageView physical_drs_view{};
+    vk::Extent2D physical_drs_extent{};
+    const bool using_physical_drs_source =
+        rasterizer->ExecutorAcquirePhysicalDrsPresentationSource(
+            image_id, physical_drs_view, physical_drs_extent);
+    if (using_physical_drs_source) {
+        image_view = physical_drs_view;
+        image_size = physical_drs_extent;
+    }
     const u32 tile_aligned_height = (attribute.attrib.height + 15u) & ~15u;
-    if (using_live_drawn_target && image_size.width == attribute.attrib.width &&
+    if (!using_physical_drs_source && using_live_drawn_target &&
+        image_size.width == attribute.attrib.width &&
         image_size.height == tile_aligned_height &&
         tile_aligned_height > attribute.attrib.height) {
         image_size.height = attribute.attrib.height;
@@ -595,9 +634,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 #endif
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    auto effective_fsr_settings = fsr_settings;
+    effective_fsr_settings.enable =
+        effective_fsr_settings.enable ||
+        VideoCore::MobileGpuWantsFsr(image_size.width, image_size.height,
+                                     frame->width, frame->height);
+    image_view = fsr_pass.Render(draw_scheduler, cmdbuf, image_view, image_size,
+                                 {frame->width, frame->height}, effective_fsr_settings,
+                                 frame->is_hdr);
+    pp_pass.Render(draw_scheduler, cmdbuf, image_view, image_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -620,7 +665,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     }
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::EndRenderingReason::Presenter);
 
     const auto cmdbuf = scheduler.CommandBuffer();
 
@@ -741,7 +786,7 @@ bool Presenter::ExecutorPresentReplayRT() {
         }
 
         auto& scheduler = draw_scheduler;
-        scheduler.EndRendering();
+        scheduler.EndRendering(Scheduler::EndRenderingReason::Presenter);
         const auto cmdbuf = scheduler.CommandBuffer();
         const vk::Image swapchain_image = swapchain.Image();
         constexpr vk::ImageSubresourceRange subresource{
@@ -821,7 +866,7 @@ bool Presenter::ExecutorPresentReplayRT() {
         return false;
     }
 
-    draw_scheduler.EndRendering();
+    draw_scheduler.EndRendering(Scheduler::EndRenderingReason::Presenter);
     const auto cmdbuf = draw_scheduler.CommandBuffer();
 
     constexpr vk::ImageSubresourceRange frame_subresources{
@@ -861,7 +906,7 @@ bool Presenter::ExecutorPresentReplayRT() {
 
     const vk::Extent2D image_size = {src.info.size.width, src.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(draw_scheduler, cmdbuf, image_view, image_size, *frame, pp_settings);
 
     frame->ready_semaphore = draw_scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();

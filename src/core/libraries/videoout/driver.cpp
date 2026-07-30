@@ -428,6 +428,12 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 #ifdef __ANDROID__
     ExecutorLogVideoOutPortState("submit_after_pending", port, requested_index, index, flip_arg,
                                  is_eop);
+    if (liverpool != nullptr && presenter != nullptr) {
+        // Presentation is the externally visible frame boundary. Publish all
+        // guest graphics before the presenter transitions/reads the selected
+        // VideoOut image; intermediate guest submits remain coalesced.
+        liverpool->FlushForPresentationForExecutor();
+    }
 #endif
 
     if (!is_eop && liverpool) {

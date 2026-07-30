@@ -49,7 +49,10 @@ struct SrtMemoryRange {
     VAddr address{};
     u64 size{};
 };
-using SrtMemoryRanges = boost::container::small_vector<SrtMemoryRange, 16>;
+// Complex GNM programs regularly expose more than sixteen SRT nodes. Keep
+// their per-draw range list inline so the GPU command thread never enters
+// Scudo merely to refresh shader user data.
+using SrtMemoryRanges = boost::container::small_vector<SrtMemoryRange, 32>;
 
 void RunPortableSrtWalker(const u32* user_data, u32* flat, const PersistentSrtInfo& srt,
                            u32 stage, u64 pgm_hash,

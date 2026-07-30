@@ -30,6 +30,26 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+struct ScopedAuxiliaryShaderModules {
+    explicit ScopedAuxiliaryShaderModules(vk::Device device_) : device{device_} {}
+
+    ~ScopedAuxiliaryShaderModules() {
+        for (const auto module : modules) {
+            if (module) {
+                device.destroyShaderModule(module);
+            }
+        }
+    }
+
+    vk::ShaderModule Add(vk::ShaderModule module) {
+        modules.push_back(module);
+        return module;
+    }
+
+    vk::Device device;
+    std::vector<vk::ShaderModule> modules;
+};
+
 static bool IsPrimitiveTopologyList(const vk::PrimitiveTopology topology) {
     return topology == vk::PrimitiveTopology::ePointList ||
            topology == vk::PrimitiveTopology::eLineList ||
@@ -45,13 +65,20 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    vk::PipelineCreateFlags build_flags)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
     const vk::Device device = instance.GetDevice();
+    ScopedAuxiliaryShaderModules auxiliary_modules{device};
     std::ranges::copy(infos, stages.begin());
-    BuildDescSetLayout(preloading);
+    if (!preloading) {
+        PrepareSerializationSupport(instance, key, infos, runtime_infos, fetch_shader, sdata);
+    }
+    if (!BuildDescSetLayout(sdata, preloading)) {
+        return;
+    }
     const auto debug_str = GetDebugString();
 
     const vk::PushConstantRange push_constants = {
@@ -68,19 +95,14 @@ GraphicsPipeline::GraphicsPipeline(
         .pPushConstantRanges = &push_constants,
     };
     auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
+    if (layout_result != vk::Result::eSuccess) {
+        build_result = layout_result;
+        LOG_ERROR(Render_Vulkan, "Failed to create graphics pipeline layout: {}",
+                  vk::to_string(layout_result));
+        return;
+    }
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
-
-    if (!preloading) {
-        VertexInputs<AmdGpu::Buffer> guest_buffers;
-        if (!instance.IsVertexInputDynamicState()) {
-            const auto& vs_info = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
-            GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
-                            guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
-        }
-    }
 
     const vk::PipelineVertexInputDivisorStateCreateInfo divisor_state = {
         .vertexBindingDivisorCount = static_cast<u32>(sdata.divisors.size()),
@@ -144,16 +166,6 @@ GraphicsPipeline::GraphicsPipeline(
     }
     if (!instance.IsDepthClipEnableSupported()) {
         raster_chain.unlink<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>();
-    }
-
-    if (!preloading) {
-        const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-        sdata.multisampling = {
-            .rasterizationSamples = LiverpoolToVK::NumSamples(
-                key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
-            .sampleShadingEnable =
-                fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
-        };
     }
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
@@ -228,13 +240,10 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
-        if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
-        }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
-            .module = CompileSPV(sdata.tcs, instance.GetDevice()),
+            .module = auxiliary_modules.Add(
+                CompileSPV(sdata.tcs, instance.GetDevice())),
             .pName = "main",
         });
     }
@@ -246,14 +255,10 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (is_rect_list || is_quad_list) {
-        if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-            sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                AuxShaderType::PassthroughTES, fs_info);
-        }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
-            .module = CompileSPV(sdata.tes, instance.GetDevice()),
+            .module = auxiliary_modules.Add(
+                CompileSPV(sdata.tes, instance.GetDevice())),
             .pName = "main",
         });
     }
@@ -391,6 +396,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        .flags = build_flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -446,13 +452,117 @@ GraphicsPipeline::GraphicsPipeline(
 #endif
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
+    build_result = pipeline_result;
+    if (pipeline_result != vk::Result::eSuccess) {
+        if (pipeline_result != vk::Result::ePipelineCompileRequired) {
+            LOG_ERROR(Render_Vulkan, "Failed to create graphics pipeline: {}",
+                      vk::to_string(pipeline_result));
+        }
+        return;
+    }
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
+
+void GraphicsPipeline::PrepareSerializationSupport(
+    const Instance& instance, const GraphicsPipelineKey& key,
+    const std::span<const Shader::Info*, MaxShaderStages> infos,
+    const std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
+    SerializationSupport& sdata) {
+    sdata.vertex_attributes.clear();
+    sdata.vertex_bindings.clear();
+    sdata.divisors.clear();
+    sdata.storage_buffers.clear();
+    sdata.image_bindings.clear();
+    sdata.tcs.clear();
+    sdata.tes.clear();
+
+    const auto* const vertex_info = infos[u32(Shader::LogicalStage::Vertex)];
+    if (!instance.IsVertexInputDynamicState() && vertex_info && fetch_shader) {
+        const auto& vs_runtime = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
+        for (const auto& attrib : fetch_shader->attributes) {
+            if (sdata.vertex_attributes.size() >= MaxVertexBufferCount ||
+                sdata.vertex_bindings.size() >= MaxVertexBufferCount) {
+                break;
+            }
+            using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+            const auto step_rate = attrib.GetStepRate();
+            const auto buffer = attrib.GetSharp(*vertex_info);
+            sdata.vertex_attributes.push_back({
+                .location = attrib.semantic,
+                .binding = attrib.semantic,
+                .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(),
+                                                        buffer.GetNumberFmt()),
+                .offset = 0,
+            });
+            sdata.vertex_bindings.push_back({
+                .binding = attrib.semantic,
+                .stride = buffer.GetStride(),
+                .inputRate = step_rate == InstanceIdType::None
+                                 ? vk::VertexInputRate::eVertex
+                                 : vk::VertexInputRate::eInstance,
+            });
+            const u32 divisor =
+                step_rate == InstanceIdType::OverStepRate0
+                    ? vs_runtime.step_rate_0
+                    : (step_rate == InstanceIdType::OverStepRate1
+                           ? vs_runtime.step_rate_1
+                           : 1);
+            if (step_rate != InstanceIdType::None) {
+                sdata.divisors.push_back({
+                    .binding = attrib.semantic,
+                    .divisor = divisor,
+                });
+            }
+        }
+    }
+
+    const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
+    sdata.multisampling = {
+        .rasterizationSamples = LiverpoolToVK::NumSamples(
+            key.num_samples,
+            instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
+        .sampleShadingEnable =
+            fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
+    };
+
+#ifdef __ANDROID__
+    static const bool kBisectSkipTess = std::getenv("EXECUTOR_BISECT_SKIP_TESS") != nullptr;
+#else
+    constexpr bool kBisectSkipTess = false;
+#endif
+    const bool is_rect_list =
+        !kBisectSkipTess && key.prim_type == AmdGpu::PrimitiveType::RectList;
+    const bool is_quad_list =
+        !kBisectSkipTess && key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    if ((is_rect_list || is_quad_list) &&
+        infos[u32(Shader::LogicalStage::TessellationControl)] == nullptr) {
+        const auto type =
+            is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
+        sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+    }
+    if ((is_rect_list || is_quad_list) &&
+        infos[u32(Shader::LogicalStage::TessellationEval)] == nullptr) {
+        sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
+            AuxShaderType::PassthroughTES, fs_info);
+    }
+
+    for (const auto* stage : infos) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& buffer : stage->buffers) {
+            sdata.storage_buffers.push_back(
+                buffer.IsStorage(buffer.GetSharp(*stage)) ? 1u : 0u);
+        }
+        for (const auto& image : stage->images) {
+            sdata.image_bindings.push_back(image.NumBindings(*stage));
+        }
+    }
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(
@@ -517,9 +627,11 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
 
-void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
+bool GraphicsPipeline::BuildDescSetLayout(SerializationSupport& sdata, bool preloading) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     u32 binding{};
+    size_t storage_buffer_index{};
+    size_t image_binding_index{};
 
     for (const auto* stage : stages) {
         if (!stage) {
@@ -530,18 +642,28 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage);
-            for (u32 alias = 0; alias < buffer.NumBindings(); ++alias) {
-                bindings.push_back({
-                    .binding = binding++,
-                    .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
-                                                              : vk::DescriptorType::eUniformBuffer,
-                    .descriptorCount = 1,
-                    .stageFlags = stage_bit,
-                });
-            }
+            const bool is_storage =
+                preloading
+                    ? storage_buffer_index < sdata.storage_buffers.size() &&
+                          sdata.storage_buffers[storage_buffer_index] != 0
+                    : buffer.IsStorage(sharp);
+            ++storage_buffer_index;
+            bindings.push_back({
+                .binding = binding++,
+                .descriptorType = is_storage ? vk::DescriptorType::eStorageBuffer
+                                             : vk::DescriptorType::eUniformBuffer,
+                .descriptorCount = 1,
+                .stageFlags = stage_bit,
+            });
         }
         for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
+            const u32 num_bindings =
+                preloading
+                    ? (image_binding_index < sdata.image_bindings.size()
+                           ? sdata.image_bindings[image_binding_index]
+                           : 1u)
+                    : image.NumBindings(*stage);
+            ++image_binding_index;
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
@@ -571,9 +693,14 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     };
     auto [layout_result, layout] =
         instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics descriptor set layout: {}", vk::to_string(layout_result));
+    if (layout_result != vk::Result::eSuccess) {
+        build_result = layout_result;
+        LOG_ERROR(Render_Vulkan, "Failed to create graphics descriptor set layout: {}",
+                  vk::to_string(layout_result));
+        return false;
+    }
     desc_layout = std::move(layout);
+    return true;
 }
 
 }

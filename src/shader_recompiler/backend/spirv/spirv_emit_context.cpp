@@ -882,28 +882,28 @@ void EmitContext::DefineBuffers() {
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(is_storage, desc.is_written, 3, desc.buffer_type, U64);
-            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::U32)) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, U32[1]);
-            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::F32)) {
             spv_buffer.Alias(PointerType::F32) =
                 DefineBuffer(is_storage, desc.is_written, 2, desc.buffer_type, F32[1]);
-            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::U16)) {
             spv_buffer.Alias(PointerType::U16) =
                 DefineBuffer(is_storage, desc.is_written, 1, desc.buffer_type, U16);
-            ++binding.unified;
         }
         if (True(desc.used_types & IR::Type::U8)) {
             spv_buffer.Alias(PointerType::U8) =
                 DefineBuffer(is_storage, desc.is_written, 0, desc.buffer_type, U8);
-            ++binding.unified;
         }
+        // All typed views alias the same guest buffer descriptor. Expanding
+        // them into separate descriptor bindings can push descriptor-heavy
+        // shaders off Qualcomm's push-descriptor path and exposed transient
+        // descriptor-set reuse as missing meshes and white frame regions.
+        ++binding.unified;
     }
 }
 
@@ -1242,9 +1242,8 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};
     const auto fault_ptr{
         OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32)};
-    const auto fault_value{OpLoad(U32[1], fault_ptr)};
-    const auto fault_value_masked{OpBitwiseOr(U32[1], fault_value, page_mask)};
-    OpStore(fault_ptr, fault_value_masked);
+    const auto device_scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+    OpAtomicOr(U32[1], fault_ptr, device_scope, u32_zero_value, page_mask);
 
     const auto fallback_result{u64_zero_value};
     OpBranch(merge_label);

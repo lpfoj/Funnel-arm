@@ -3,7 +3,9 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include <atomic>
 #include <bit>
+#include <optional>
 
 #include "common/content_fingerprint.h"
 #include "shader_recompiler/resource.h"
@@ -11,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vulkan_driver_optimization.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -19,13 +22,29 @@
 namespace Vulkan {
 namespace {
 
-u64 DescriptorWritesSignature(const Pipeline::DescriptorWrites& writes) {
+std::atomic<u64> next_pipeline_identity{};
+
+u64 AllocatePipelineIdentity() noexcept {
+    return next_pipeline_identity.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+std::optional<u64> DescriptorWritesSignature(const Pipeline::DescriptorWrites& writes) {
     Common::ContentFingerprint64 fingerprint{Common::FingerprintDomain::DescriptorWrites};
     const auto mix = [&fingerprint](const u64 value) {
         fingerprint.UpdateLittleEndian(value);
     };
     mix(writes.size());
     for (const auto& write : writes) {
+        const u32 pointer_sources =
+            static_cast<u32>(write.pBufferInfo != nullptr) +
+            static_cast<u32>(write.pImageInfo != nullptr) +
+            static_cast<u32>(write.pTexelBufferView != nullptr);
+        // Extension descriptors carry their payload in pNext. Never elide a
+        // bind unless all semantic descriptor bytes are represented here.
+        if (write.pNext != nullptr || write.descriptorCount == 0 ||
+            pointer_sources != 1) {
+            return std::nullopt;
+        }
         mix(write.dstBinding);
         mix(write.dstArrayElement);
         mix(write.descriptorCount);
@@ -51,17 +70,19 @@ u64 DescriptorWritesSignature(const Pipeline::DescriptorWrites& writes) {
 }
 
 struct DescriptorBindCache {
-    const Pipeline* pipeline{};
+    u64 pipeline_identity{};
     u64 cmdbuf{};
     u64 recording_tick{};
+    u64 state_epoch{};
     u64 signature{};
     bool valid{};
 };
 
 struct PushConstantBindCache {
-    const Pipeline* pipeline{};
+    u64 pipeline_identity{};
     u64 cmdbuf{};
     u64 recording_tick{};
+    u64 state_epoch{};
     u64 signature{};
     bool valid{};
 };
@@ -72,7 +93,7 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
                    bool is_compute_)
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
-      is_compute{is_compute_} {}
+      identity{AllocatePipelineIdentity()}, is_compute{is_compute_} {}
 
 Pipeline::~Pipeline() = default;
 
@@ -88,7 +109,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             .bufferMemoryBarrierCount = u32(buffer_barriers.size()),
             .pBufferMemoryBarriers = buffer_barriers.data(),
         };
-        scheduler.EndRendering();
+        scheduler.EndRendering(Scheduler::EndRenderingReason::PipelineResourceBarrier);
         cmdbuf.pipelineBarrier2(dependencies);
     }
 
@@ -96,28 +117,39 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     const u64 raw_cmdbuf =
         std::bit_cast<u64>(static_cast<VkCommandBuffer>(cmdbuf));
     const u64 recording_tick = scheduler.CurrentTick();
-    Common::ContentFingerprint64 push_fingerprint{
-        Common::FingerprintDomain::DescriptorWrites};
-    push_fingerprint.Update(
-        std::span{reinterpret_cast<const u8*>(&push_data), sizeof(push_data)});
-    const u64 push_signature = push_fingerprint.Finish();
+    const bool dedup_enabled =
+        VideoCore::IsManagedVulkanDescriptorDeduplication();
+    u64 push_signature{};
+    if (dedup_enabled) {
+        Common::ContentFingerprint64 push_fingerprint{
+            Common::FingerprintDomain::DescriptorWrites};
+        push_fingerprint.Update(
+            std::span{reinterpret_cast<const u8*>(&push_data), sizeof(push_data)});
+        push_signature = push_fingerprint.Finish();
+    }
     static thread_local std::array<PushConstantBindCache, 2> push_caches{};
     auto& push_cache = push_caches[IsCompute() ? 1u : 0u];
+    const u64 push_epoch = scheduler.PushConstantEpoch(bind_point);
     const bool push_hit =
-        push_cache.valid && push_cache.pipeline == this &&
+        dedup_enabled &&
+        push_cache.valid && push_cache.pipeline_identity == identity &&
         push_cache.cmdbuf == raw_cmdbuf &&
         push_cache.recording_tick == recording_tick &&
+        push_cache.state_epoch == push_epoch &&
         push_cache.signature == push_signature;
     if (!push_hit) {
         cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+        const u64 post_push_epoch = scheduler.MarkPushConstants(bind_point);
         push_cache = {
-            .pipeline = this,
+            .pipeline_identity = identity,
             .cmdbuf = raw_cmdbuf,
             .recording_tick = recording_tick,
+            .state_epoch = post_push_epoch,
             .signature = push_signature,
             .valid = true,
         };
     }
+    VideoCore::RecordVulkanPushConstants(push_hit);
 #ifdef __ANDROID__
     static thread_local u64 push_attempts{};
     static thread_local u64 push_hits{};
@@ -140,21 +172,31 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
 
     static thread_local std::array<DescriptorBindCache, 2> bind_caches{};
     auto& bind_cache = bind_caches[IsCompute() ? 1u : 0u];
-    const u64 descriptor_signature = DescriptorWritesSignature(set_writes);
-    if (bind_cache.valid && bind_cache.pipeline == this &&
+    const std::optional<u64> descriptor_signature =
+        dedup_enabled ? DescriptorWritesSignature(set_writes) : std::nullopt;
+    const u64 descriptor_epoch = scheduler.DescriptorBindEpoch(bind_point);
+    const bool descriptor_hit =
+        dedup_enabled &&
+        descriptor_signature.has_value() &&
+        bind_cache.valid && bind_cache.pipeline_identity == identity &&
         bind_cache.cmdbuf == raw_cmdbuf &&
         bind_cache.recording_tick == recording_tick &&
-        bind_cache.signature == descriptor_signature) {
+        bind_cache.state_epoch == descriptor_epoch &&
+        bind_cache.signature == *descriptor_signature;
+    VideoCore::RecordVulkanDescriptorBind(descriptor_hit);
+    if (descriptor_hit) {
         return;
     }
 
     if (uses_push_descriptors) {
         cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        const u64 post_descriptor_epoch = scheduler.MarkDescriptorBind(bind_point);
         bind_cache = {
-            .pipeline = this,
+            .pipeline_identity = identity,
             .cmdbuf = raw_cmdbuf,
             .recording_tick = recording_tick,
-            .signature = descriptor_signature,
+            .state_epoch = post_descriptor_epoch,
+            .signature = descriptor_signature.value_or(0),
             .valid = true,
         };
         return;
@@ -166,11 +208,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    const u64 post_descriptor_epoch = scheduler.MarkDescriptorBind(bind_point);
     bind_cache = {
-        .pipeline = this,
+        .pipeline_identity = identity,
         .cmdbuf = raw_cmdbuf,
         .recording_tick = recording_tick,
-        .signature = descriptor_signature,
+        .state_epoch = post_descriptor_epoch,
+        .signature = descriptor_signature.value_or(0),
         .valid = true,
     };
 }

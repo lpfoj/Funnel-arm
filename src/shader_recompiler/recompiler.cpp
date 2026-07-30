@@ -37,7 +37,8 @@ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
 }
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
-                             RuntimeInfo& runtime_info, const Profile& profile) {
+                             RuntimeInfo& runtime_info, const Profile& profile,
+                             const TranslationTier tier) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {
         LOG_WARNING(Render_Recompiler, "First instruction is not s_mov_b32 vcc_hi, #imm");
@@ -116,12 +117,24 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
     Shader::Optimization::IdentityRemovalPass(program.blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
-    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    if (tier == TranslationTier::Optimized) {
+        Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    }
     Shader::Optimization::CollectShaderInfoPass(program, profile);
 
     Shader::IR::DumpProgram(program, info);
 
     return program;
+}
+
+void OptimizeProgram(IR::Program& program) {
+    // Fast tier already ran every correctness/resource pass and one DCE.  This
+    // background tier only performs cleanup passes, so it cannot change the
+    // descriptor contract collected for the foreground module.
+    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    Shader::Optimization::IdentityRemovalPass(program.blocks);
+    Shader::Optimization::DeadCodeEliminationPass(program);
+    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
 }
 
 }

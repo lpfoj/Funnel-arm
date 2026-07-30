@@ -21,6 +21,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/mobile_gpu_optimization.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -97,7 +98,8 @@ bool ExecutorDisableVkRobustness() {
 
 bool ExecutorEnableVkCoarseFragment() {
 #ifdef __ANDROID__
-    if (Config::managedCoarseFragmentShading()) {
+    if (Config::managedCoarseFragmentShading() ||
+        VideoCore::IsManagedMobileGpuOptimization()) {
         return true;
     }
     static const bool enabled = [] {
@@ -347,6 +349,7 @@ bool Instance::CreateDevice() {
                           vk::PhysicalDeviceFaultFeaturesEXT,
                           vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
                           vk::PhysicalDeviceFragmentShadingRateFeaturesKHR,
+                          vk::PhysicalDeviceDynamicRenderingLocalReadFeatures,
                           vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
                           vk::PhysicalDevicePortabilitySubsetFeaturesKHR,
                           vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
@@ -404,6 +407,13 @@ bool Instance::CreateDevice() {
         promoted_13 || add_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
     const bool maintenance4_extension =
         promoted_13 || add_extension(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
+    const bool pipeline_creation_cache_control_extension =
+        promoted_13 ||
+        add_extension(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
+    pipeline_creation_cache_control =
+        pipeline_creation_cache_control_extension &&
+        feature_chain.get<vk::PhysicalDeviceVulkan13Features>()
+            .pipelineCreationCacheControl;
 #endif
 
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
@@ -414,6 +424,20 @@ bool Instance::CreateDevice() {
         if (!attachment_feedback_loop) {
             enabled_extensions.pop_back();
         }
+    }
+    dynamic_rendering_local_read =
+        add_extension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+    if (dynamic_rendering_local_read) {
+        dynamic_rendering_local_read_features =
+            feature_chain.get<vk::PhysicalDeviceDynamicRenderingLocalReadFeatures>();
+        dynamic_rendering_local_read =
+            dynamic_rendering_local_read_features.dynamicRenderingLocalRead;
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_VK_DYNAMIC_RENDERING_LOCAL_READ] enabled=%u",
+            dynamic_rendering_local_read ? 1u : 0u);
+#endif
     }
     depth_range_unrestricted = add_extension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     dynamic_state_3 = add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
@@ -445,21 +469,36 @@ bool Instance::CreateDevice() {
             if (supports_rate(2, 2)) {
                 coarse_fragment_size = {2, 2};
             }
+            if (supports_rate(2, 1)) {
+                mobile_fragment_size = {2, 1};
+            } else if (supports_rate(1, 2)) {
+                mobile_fragment_size = {1, 2};
+            }
         }
         fragment_shading_rate =
-            coarse_fragment_size.width > 1 && coarse_fragment_size.height > 1;
+            coarse_fragment_size.width > 1 ||
+            coarse_fragment_size.height > 1 ||
+            mobile_fragment_size.width > 1 ||
+            mobile_fragment_size.height > 1;
     }
     LOG_INFO(Render_Vulkan,
-             "EXECUTOR_VK_COARSE_FRAGMENT requested={} enabled={} pipelineFeature={} rate={}x{}",
+             "EXECUTOR_VK_COARSE_FRAGMENT requested={} enabled={} pipelineFeature={} "
+             "coarse={}x{} mobile={}x{}",
              coarse_fragment_requested, fragment_shading_rate,
              fragment_shading_rate_features.pipelineFragmentShadingRate,
-             coarse_fragment_size.width, coarse_fragment_size.height);
+             coarse_fragment_size.width, coarse_fragment_size.height,
+             mobile_fragment_size.width, mobile_fragment_size.height);
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4Native",
-        "[EXECUTOR_VK_COARSE_FRAGMENT] requested=%u enabled=%u pipelineFeature=%u rate=%ux%u",
+        "[EXECUTOR_VK_COARSE_FRAGMENT] requested=%u enabled=%u pipelineFeature=%u "
+        "coarse=%ux%u mobile=%ux%u",
         coarse_fragment_requested ? 1u : 0u, fragment_shading_rate ? 1u : 0u,
         fragment_shading_rate_features.pipelineFragmentShadingRate ? 1u : 0u,
-        coarse_fragment_size.width, coarse_fragment_size.height);
+        coarse_fragment_size.width, coarse_fragment_size.height,
+        mobile_fragment_size.width, mobile_fragment_size.height);
+    VideoCore::SetMobileGpuCoarseShadingAvailable(
+        mobile_fragment_size.width > 1 ||
+        mobile_fragment_size.height > 1);
 #endif
     robustness2 = add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (robustness2) {
@@ -588,6 +627,10 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+#if !defined(ANDROID)
+    pipeline_creation_cache_control =
+        vk13_features.pipelineCreationCacheControl;
+#endif
 #if defined(ANDROID)
     const auto log_feature_fallback = [&](std::string_view feature, bool available,
                                           std::string_view action) {
@@ -696,6 +739,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess =
                 disable_robustness ? false : vk13_features.robustImageAccess,
+            .pipelineCreationCacheControl = pipeline_creation_cache_control,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
@@ -713,6 +757,10 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceFragmentShadingRateFeaturesKHR{
             .pipelineFragmentShadingRate =
                 fragment_shading_rate_features.pipelineFragmentShadingRate,
+        },
+        vk::PhysicalDeviceDynamicRenderingLocalReadFeatures{
+            .dynamicRenderingLocalRead =
+                dynamic_rendering_local_read_features.dynamicRenderingLocalRead,
         },
         vk::PhysicalDeviceDepthClipControlFeaturesEXT{
             .depthClipControl = true,
@@ -810,6 +858,9 @@ bool Instance::CreateDevice() {
     }
     if (!fragment_shading_rate) {
         device_chain.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
+    }
+    if (!dynamic_rendering_local_read) {
+        device_chain.unlink<vk::PhysicalDeviceDynamicRenderingLocalReadFeatures>();
     }
     if (!depth_clip_control) {
         device_chain.unlink<vk::PhysicalDeviceDepthClipControlFeaturesEXT>();

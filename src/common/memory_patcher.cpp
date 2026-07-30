@@ -58,8 +58,6 @@ struct EffectToggleSpec {
 
 enum class PatchValueSource : u8 {
     Literal,
-    TargetWidthU32,
-    TargetHeightU32,
     TargetWidthMovEax,
     TargetHeightMovEax,
     TargetHeightMovEcx,
@@ -81,7 +79,9 @@ struct ResolutionGuardSpec {
 
 struct TitlePatchProfile {
     std::string_view serial;
-    std::string_view version;
+    // Verified executable-layout version. Depending on the dump/update layout,
+    // the matching value can be exposed through PSF APP_VER or VERSION.
+    std::string_view patch_version;
     uintptr_t guest_image_base;
     std::span<const EffectFlagSite> effect_flag_sites;
     std::span<const EffectToggleSpec> effect_toggles;
@@ -98,6 +98,8 @@ struct TitlePatchProfile {
     uintptr_t height_site;
     std::array<uintptr_t, 2> internal_width_sites;
     std::array<uintptr_t, 2> internal_height_sites;
+    u32 patched_coordinate_width;
+    u32 patched_coordinate_height;
     u32 native_width;
     u32 native_height;
 };
@@ -136,8 +138,10 @@ bool ExecutorRuntimeFlagExists(const std::filesystem::path& user_dir,
 }
 
 constexpr std::array kVerifiedResolutionWrites{
-    PatchWriteSpec{"0x055289f8", "00000280", true, PatchValueSource::TargetWidthU32},
-    PatchWriteSpec{"0x055289fc", "00000168", true, PatchValueSource::TargetHeightU32},
+    // Bloodborne's official 1.09 resolution patches keep this screen-space
+    // coordinate base at 640x360 for every internal render resolution.
+    PatchWriteSpec{"0x055289f8", "00000280", true},
+    PatchWriteSpec{"0x055289fc", "00000168", true},
     PatchWriteSpec{"0x0183A35D", "398EE33F", false},
     PatchWriteSpec{"0x02196A6B", "000280B8", true, PatchValueSource::TargetWidthMovEax},
     PatchWriteSpec{"0x02196A6F", "401F0F00", true},
@@ -213,7 +217,7 @@ constexpr std::array<ResolutionGuardSpec, 4> kVerifiedResolutionGuards{{
 
 constexpr TitlePatchProfile kVerifiedRenderProfile{
     .serial = "CUSA03173",
-    .version = "01.09",
+    .patch_version = "01.09",
     .guest_image_base = 0x00400000,
     .effect_flag_sites = std::span<const EffectFlagSite>{kVerifiedEffectFlagSites},
     .effect_toggles = std::span<const EffectToggleSpec>{kVerifiedEffectToggles},
@@ -232,6 +236,8 @@ constexpr TitlePatchProfile kVerifiedRenderProfile{
     .height_site = 0x055289FC,
     .internal_width_sites = {0x02196A6C, 0x02358555},
     .internal_height_sites = {0x02196A7B, 0x0235855E},
+    .patched_coordinate_width = 640,
+    .patched_coordinate_height = 360,
     .native_width = 1920,
     .native_height = 1080,
 };
@@ -251,14 +257,6 @@ std::string FormatResolutionPatchValue(const PatchWriteSpec& line,
                                        const u32 target_height) {
     char value[9]{};
     switch (line.value_source) {
-    case PatchValueSource::TargetWidthU32:
-        std::snprintf(value, sizeof(value), "%08X",
-                      static_cast<unsigned int>(target_width));
-        return value;
-    case PatchValueSource::TargetHeightU32:
-        std::snprintf(value, sizeof(value), "%08X",
-                      static_cast<unsigned int>(target_height));
-        return value;
     case PatchValueSource::TargetWidthMovEax:
         std::snprintf(value, sizeof(value), "%06XB8",
                       static_cast<unsigned int>(target_width));
@@ -304,8 +302,16 @@ void ApplyConfiguredTitleEffectOverrides() {
         ExecutorRuntimeFlagExists(user_dir, marker_profile.chromatic_aberration_marker);
 
     auto* param_sfo = Common::Singleton<PSF>::Instance();
-    const std::string game_version{
+    const std::string app_version{
+        param_sfo->GetString("APP_VER").value_or(std::string_view{})};
+    const std::string content_version{
         param_sfo->GetString("VERSION").value_or(std::string_view{})};
+    const std::string game_version =
+        profile != nullptr && app_version == profile->patch_version
+            ? app_version
+            : profile != nullptr && content_version == profile->patch_version
+                  ? content_version
+                  : !app_version.empty() ? app_version : content_version;
     const std::string profile_serial =
         profile != nullptr ? std::string{profile->serial} : g_game_serial;
 
@@ -354,7 +360,8 @@ void ApplyConfiguredTitleEffectOverrides() {
         return;
     }
 
-    const bool version_valid = game_version == profile->version;
+    const bool version_valid = app_version == profile->patch_version ||
+                               content_version == profile->patch_version;
     const auto range_in_image = [profile](const uintptr_t guest_address,
                                           const std::size_t size) {
         if (guest_address < profile->guest_image_base) {
@@ -379,17 +386,19 @@ void ApplyConfiguredTitleEffectOverrides() {
                     [](const u8 valid) { return valid != 0; });
 
     LOG_INFO(Loader,
-             "EXECUTOR_TITLE_PROFILE_EFFECT_LAYOUT serial={} version={} requested={} valid={} "
-             "imageSize={:#x} flags={}",
-             profile->serial, game_version,
+             "EXECUTOR_TITLE_PROFILE_EFFECT_LAYOUT serial={} version={} appVersion={} "
+             "contentVersion={} "
+             "requested={} valid={} imageSize={:#x} flags={}",
+             profile->serial, game_version, app_version, content_version,
              bundle_requested || any_independent_requested || dof_requested ||
                  chromatic_aberration_requested,
              bundle_layout_valid, g_eboot_image_size, values.size());
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4Native",
-        "[EXECUTOR_TITLE_PROFILE_EFFECT_LAYOUT] serial=%s version=%s requested=%u valid=%u "
-        "imageSize=0x%llx flags=%zu",
-        profile_serial.c_str(), game_version.c_str(),
+        "[EXECUTOR_TITLE_PROFILE_EFFECT_LAYOUT] serial=%s version=%s appVersion=%s "
+        "contentVersion=%s requested=%u valid=%u imageSize=0x%llx flags=%zu",
+        profile_serial.c_str(), game_version.c_str(), app_version.c_str(),
+        content_version.c_str(),
         (bundle_requested || any_independent_requested || dof_requested ||
          chromatic_aberration_requested)
             ? 1u
@@ -552,15 +561,29 @@ void ApplyConfiguredTitleResolutionOverride() {
     const bool target_is_16_9 =
         target_width != 0 && target_height != 0 &&
         static_cast<u64>(target_width) * 9 == static_cast<u64>(target_height) * 16;
+    const bool target_is_aligned_960x544 =
+        target_width == 960 && target_height == 544;
+    const bool target_has_supported_geometry =
+        target_is_16_9 || target_is_aligned_960x544;
     const bool target_is_downscale =
         target_width >= 320 && target_height >= 180 && target_width < profile->native_width &&
         target_height < profile->native_height;
-    const bool requested = force_360 || (target_is_16_9 && target_is_downscale);
+    const bool requested = force_360 || (target_has_supported_geometry && target_is_downscale);
     auto* param_sfo = Common::Singleton<PSF>::Instance();
-    const std::string game_version{
+    const std::string app_version{
+        param_sfo->GetString("APP_VER").value_or(std::string_view{})};
+    const std::string content_version{
         param_sfo->GetString("VERSION").value_or(std::string_view{})};
     const std::string profile_serial{profile->serial};
-    const std::string expected_version{profile->version};
+    const std::string expected_version{profile->patch_version};
+    const bool version_valid = app_version == expected_version ||
+                               content_version == expected_version;
+    const std::string game_version =
+        app_version == expected_version
+            ? app_version
+            : content_version == expected_version
+                  ? content_version
+                  : !app_version.empty() ? app_version : content_version;
     const auto range_in_image = [profile](const uintptr_t guest_address, const std::size_t size) {
         if (guest_address < profile->guest_image_base) {
             return false;
@@ -602,8 +625,8 @@ void ApplyConfiguredTitleResolutionOverride() {
     }
     const u32 width = bounds_valid ? read_u32(profile->width_site) : 0;
     const u32 height = bounds_valid ? read_u32(profile->height_site) : 0;
-    bool layout_valid = requested && target_is_16_9 && target_is_downscale &&
-                        game_version == profile->version && bounds_valid &&
+    bool layout_valid = requested && target_has_supported_geometry && target_is_downscale &&
+                        version_valid && bounds_valid &&
                         width == profile->native_width && height == profile->native_height &&
                         opcode_layout_valid;
     for (const EffectFlagSite& site : profile->effect_flag_sites) {
@@ -617,10 +640,12 @@ void ApplyConfiguredTitleResolutionOverride() {
     }
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4Native",
-        "[EXECUTOR_TITLE_PROFILE_RESOLUTION_LAYOUT] serial=%s version=%s expectedVersion=%s "
-        "requested=%u valid=%u bounds=%u opcodes=%u imageSize=0x%llx width=%u height=%u "
-        "target=%ux%u source=%s lines=%zu",
-        profile_serial.c_str(), game_version.c_str(), expected_version.c_str(),
+        "[EXECUTOR_TITLE_PROFILE_RESOLUTION_LAYOUT] serial=%s version=%s appVersion=%s "
+        "contentVersion=%s expectedVersion=%s requested=%u valid=%u bounds=%u "
+        "opcodes=%u imageSize=0x%llx width=%u height=%u target=%ux%u source=%s lines=%zu",
+        profile_serial.c_str(), game_version.c_str(), app_version.c_str(),
+        content_version.c_str(),
+        expected_version.c_str(),
         requested ? 1u : 0u, layout_valid ? 1u : 0u,
         bounds_valid ? 1u : 0u, opcode_layout_valid ? 1u : 0u,
         static_cast<unsigned long long>(g_eboot_image_size), width, height, target_width,
@@ -643,20 +668,23 @@ void ApplyConfiguredTitleResolutionOverride() {
     const u32 internal_width_b = read_u32(profile->internal_width_sites[1]);
     const u32 internal_height_a = read_u32(profile->internal_height_sites[0]);
     const u32 internal_height_b = read_u32(profile->internal_height_sites[1]);
+    const bool coordinate_base_applied =
+        patched_width == profile->patched_coordinate_width &&
+        patched_height == profile->patched_coordinate_height;
     const bool internal_target_applied =
         internal_width_a == target_width && internal_width_b == target_width &&
         internal_height_a == target_height && internal_height_b == target_height;
     __android_log_print(
-        patched_width == target_width && patched_height == target_height &&
-                internal_target_applied
+        coordinate_base_applied && internal_target_applied
             ? ANDROID_LOG_INFO
             : ANDROID_LOG_ERROR,
         "LSX4Native",
-        "[EXECUTOR_TITLE_PROFILE_RESOLUTION_APPLIED] serial=%s version=%s width=%u height=%u "
-        "expected=%ux%u internal=%u internalWidths=%u,%u internalHeights=%u,%u "
-        "source=%s lines=%zu",
+        "[EXECUTOR_TITLE_PROFILE_RESOLUTION_APPLIED] serial=%s version=%s "
+        "coordinateBase=%ux%u expectedCoordinateBase=%ux%u target=%ux%u "
+        "internal=%u internalWidths=%u,%u internalHeights=%u,%u source=%s lines=%zu",
         profile_serial.c_str(), game_version.c_str(), patched_width, patched_height,
-        target_width, target_height,
+        profile->patched_coordinate_width, profile->patched_coordinate_height, target_width,
+        target_height,
         internal_target_applied ? 1u : 0u, internal_width_a, internal_width_b,
         internal_height_a, internal_height_b, force_360 ? "marker" : "config",
         profile->resolution_writes.size());

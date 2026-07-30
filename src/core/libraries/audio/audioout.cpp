@@ -1,14 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <mutex>
-#include <cstdarg>
-#include <atomic>
-#include <cstdlib>
 #include <shared_mutex>
+#include <span>
 #include <stop_token>
 #include <thread>
+#include <utility>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 #define SDL_MAIN_HANDLED 1
 #ifdef __ANDROID__
@@ -93,6 +101,9 @@ public:
     void Output(void*) override {
         ExecutorLiveNullAudioPace(buffer_frames, sample_rate);
     }
+    void OutputFloat(const float*, u32, u32) override {
+        ExecutorLiveNullAudioPace(buffer_frames, sample_rate);
+    }
     void SetVolume(const std::array<int, 8>&) override {}
 
 private:
@@ -114,15 +125,7 @@ constexpr struct PortRange {
         return end - start + 1;
     }
 } port_ranges[] = {
-    {0, 7},
-    {8, 8},
-    {9, 12},
-    {13, 16},
-    {17, 20},
-    {21, 21},
-    {22, 22},
-    {23, 23},
-    {24, 24},
+    {0, 7}, {8, 8}, {9, 12}, {13, 16}, {17, 20}, {21, 21}, {22, 22}, {23, 23}, {24, 24},
 };
 
 static AudioFormatInfo GetFormatInfo(const OrbisAudioOutParamFormat format) {
@@ -220,52 +223,321 @@ void AdjustVol() {
         if (auto port = port_table[i]) {
             std::unique_lock lock{port->mutex, std::try_to_lock};
             if (lock.owns_lock()) {
-                port->impl->SetVolume(port->volume);
+                std::scoped_lock backend_lock{port->backend_mutex};
+                if (port->impl) {
+                    port->impl->SetVolume(port->volume);
+                }
             }
         }
     }
 }
 
-static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_token& stop) {
-    {
-        const auto thread_name = fmt::format("shadPS4:AudioOutputThread:{}", fmt::ptr(port.get()));
-        Common::SetCurrentThreadName(thread_name.c_str());
+class SharedAudioOutputScheduler {
+public:
+    SharedAudioOutputScheduler() = default;
+
+    ~SharedAudioOutputScheduler() {
+        Stop();
     }
-#ifdef __ANDROID__
-    AndroidAudioOutLog("[EXECUTOR_AUDIO_THREAD] started port=%p frames=%u rate=%u",
-                       port.get(), port->buffer_frames, port->sample_rate);
-#endif
 
-    Common::AccurateTimer timer(
-        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+    void EnsureStarted() {
+        std::scoped_lock lock{worker_mutex};
+        if (worker.joinable()) {
+            return;
+        }
+        worker = std::jthread([this](const std::stop_token stop) { WorkerLoop(stop); });
+    }
 
-    while (true) {
-        timer.Start();
+    void NotifyReady(const u32 count = 1) {
+        pending_ready.fetch_add(count, std::memory_order_release);
+        ready_cv.notify_one();
+    }
 
+private:
+    struct BatchItem {
+        std::shared_ptr<PortOut> port;
+        u8 slot{};
+        u64 sequence{};
+        u64 submit_timestamp_ns{};
+        u64 deadline_ns{};
+        float mix_gain{1.0f};
+        bool mixed_to_main{};
+        bool has_normalized_output{};
+
+        [[nodiscard]] void* Data() const {
+            return port->output_buffers[slot].data();
+        }
+
+        [[nodiscard]] const float* NormalizedData() const {
+            return port->normalized_output_buffer.data();
+        }
+    };
+
+    static AudioBufferFormat MixFormat(const PortOut& port) {
+        return {
+            .sample_type =
+                port.format_info.is_float ? AudioSampleType::Float32 : AudioSampleType::S16,
+            .channels = port.format_info.num_channels,
+            .standard_8ch = port.format_info.is_std,
+        };
+    }
+
+    static bool CanMixToMain(const BatchItem& source, const BatchItem& destination) {
+        const auto& src = *source.port;
+        const auto& dst = *destination.port;
+        return src.is_mix_to_main && dst.type == OrbisAudioOutPort::Main &&
+               src.buffer_frames == dst.buffer_frames && src.sample_rate == dst.sample_rate;
+    }
+
+    static float PortMixGain(const PortOut& port) {
+        const u32 channels = std::min<u32>(port.format_info.num_channels, 8);
+        s32 volume{};
+        for (u32 channel = 0; channel < channels; ++channel) {
+            volume = std::max(volume, port.volume[channel]);
+        }
+        return std::clamp(static_cast<float>(volume) /
+                              static_cast<float>(ORBIS_AUDIO_OUT_VOLUME_0DB),
+                          0.0f, 1.0f);
+    }
+
+    void AcquireBatch(std::vector<BatchItem>& batch) {
+        std::array<std::shared_ptr<PortOut>, ORBIS_AUDIO_OUT_NUM_PORTS> snapshot{};
         {
-            std::unique_lock lock{port->mutex};
-            if (!port->impl || stop.stop_requested()) {
+            std::shared_lock table_lock{port_table_mutex};
+            snapshot = port_table;
+        }
+
+        batch.clear();
+        for (auto& port : snapshot) {
+            if (!port) {
+                continue;
+            }
+            std::unique_lock port_lock{port->mutex, std::try_to_lock};
+            if (!port_lock.owns_lock()) {
+                continue;
+            }
+            if (port->ready_slot < 0) {
+                continue;
+            }
+            const u8 slot = static_cast<u8>(port->ready_slot);
+            batch.push_back({
+                .port = port,
+                .slot = slot,
+                .sequence = port->ready_sequence,
+                .submit_timestamp_ns = port->ready_timestamp_ns,
+                .deadline_ns = port->next_output_deadline_ns,
+                .mix_gain = PortMixGain(*port),
+            });
+            port->processing_slot = static_cast<s8>(slot);
+            port->ready_slot = -1;
+            pending_ready.fetch_sub(1, std::memory_order_acq_rel);
+            RecordAudioZeroCopyHandoff();
+            port_lock.unlock();
+            port->output_cv.notify_all();
+        }
+    }
+
+    static void PaceBatch(const std::span<const BatchItem> batch) {
+        u64 target_deadline = std::numeric_limits<u64>::max();
+        for (const auto& item : batch) {
+            if (item.deadline_ns == 0) {
+                return;
+            }
+            target_deadline = std::min(target_deadline, item.deadline_ns);
+        }
+        const u64 now = AudioMonotonicNanoseconds();
+        if (target_deadline > now) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(target_deadline - now));
+        }
+    }
+
+    static u32 MixBatch(const std::span<BatchItem> batch) {
+        u32 mixed_ports{};
+        for (auto& source : batch) {
+            if (!source.port->is_mix_to_main || source.mixed_to_main) {
+                continue;
+            }
+            auto destination = std::ranges::find_if(batch, [&](const BatchItem& candidate) {
+                return &candidate != &source && !candidate.mixed_to_main &&
+                       CanMixToMain(source, candidate);
+            });
+            if (destination == batch.end()) {
+                continue;
+            }
+
+            const u32 frames = destination->port->buffer_frames;
+            const u32 destination_channels = destination->port->format_info.num_channels;
+            const size_t sample_count = static_cast<size_t>(frames) * destination_channels;
+            if (!destination->has_normalized_output) {
+                (void)ConvertAudioBufferToFloat(
+                    destination->Data(), frames, MixFormat(*destination->port),
+                    destination_channels, 1.0f,
+                    std::span<float>{destination->port->normalized_output_buffer.data(),
+                                     sample_count},
+                    destination->port->normalize_guard);
+                destination->has_normalized_output = true;
+            }
+
+            (void)ConvertAudioBufferToFloat(
+                source.Data(), frames, MixFormat(*source.port), destination_channels,
+                source.mix_gain,
+                std::span<float>{source.port->mix_scratch_buffer.data(), sample_count},
+                source.port->normalize_guard);
+            const AudioBufferFormat normalized_format{
+                .sample_type = AudioSampleType::Float32,
+                .channels = static_cast<u8>(destination_channels),
+                .standard_8ch = false,
+            };
+            (void)MixAudioBufferInPlace(destination->port->normalized_output_buffer.data(),
+                                        source.port->mix_scratch_buffer.data(), frames,
+                                        normalized_format, 1.0f, destination->port->mix_guard);
+            source.mixed_to_main = true;
+            ++mixed_ports;
+        }
+        return mixed_ports;
+    }
+
+    static void OutputBatch(const std::span<BatchItem> batch) {
+        if (!IsHostOutputEnabled()) {
+            u64 longest_period_ns{};
+            for (const auto& item : batch) {
+                if (item.port->sample_rate != 0) {
+                    longest_period_ns = std::max(longest_period_ns, UINT64_C(1000000000) *
+                                                                        item.port->buffer_frames /
+                                                                        item.port->sample_rate);
+                }
+            }
+            if (longest_period_ns != 0) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(longest_period_ns));
+            }
+            return;
+        }
+
+        for (auto& item : batch) {
+            if (item.mixed_to_main) {
+                continue;
+            }
+            try {
+                std::scoped_lock backend_lock{item.port->backend_mutex};
+                if (item.port->impl) {
+                    if (item.has_normalized_output) {
+                        item.port->impl->OutputFloat(item.NormalizedData(),
+                                                     item.port->buffer_frames,
+                                                     item.port->format_info.num_channels);
+                    } else {
+                        item.port->impl->Output(item.Data());
+                    }
+                }
+            } catch (const std::exception& exception) {
+                LOG_ERROR(Lib_AudioOut, "Shared audio scheduler output failed: {}",
+                          exception.what());
+            } catch (...) {
+                LOG_ERROR(Lib_AudioOut, "Shared audio scheduler output failed with unknown error");
+            }
+        }
+    }
+
+    static void CompleteBatch(const std::span<BatchItem> batch, const u64 scheduled_at_ns) {
+        const u64 completed_at_ns = AudioMonotonicNanoseconds();
+        const u64 process_time = Kernel::sceKernelGetProcessTime();
+        for (auto& item : batch) {
+            auto& port = *item.port;
+            const u64 period_ns = port.sample_rate == 0 ? 0
+                                                        : UINT64_C(1000000000) *
+                                                              port.buffer_frames / port.sample_rate;
+            std::unique_lock port_lock{port.mutex};
+            const auto observation =
+                ObserveAudioStreamConsume(port.stream_guard, item.sequence,
+                                          item.submit_timestamp_ns, completed_at_ns, period_ns);
+            (void)observation;
+            port.processing_slot = -1;
+            port.last_output_time = process_time;
+            if (period_ns == 0 || item.deadline_ns == 0 ||
+                scheduled_at_ns > item.deadline_ns + period_ns * UINT64_C(4)) {
+                port.next_output_deadline_ns = scheduled_at_ns + period_ns;
+            } else {
+                port.next_output_deadline_ns = item.deadline_ns + period_ns;
+            }
+            port_lock.unlock();
+            port.output_cv.notify_all();
+        }
+    }
+
+    void WorkerLoop(const std::stop_token stop) {
+        Common::SetCurrentThreadName("shadPS4:AudioBatch");
+#ifdef __ANDROID__
+        AndroidAudioOutLog("[EXECUTOR_AUDIO_SCHEDULER] started mode=shared-batch");
+#endif
+        std::vector<BatchItem> batch;
+        batch.reserve(ORBIS_AUDIO_OUT_NUM_PORTS);
+        while (!stop.stop_requested()) {
+            {
+                std::unique_lock ready_lock{ready_mutex};
+                ready_cv.wait(ready_lock, stop, [this] {
+                    return pending_ready.load(std::memory_order_acquire) != 0;
+                });
+            }
+            if (stop.stop_requested()) {
                 break;
             }
 
-            if (port->output_ready) {
-                if (IsHostOutputEnabled()) {
-                    port->impl->Output(port->output_buffer);
+            AcquireBatch(batch);
+            if (batch.empty()) {
+                std::this_thread::yield();
+                continue;
+            }
+            RecordAudioSchedulerWakeup();
+            std::ranges::sort(batch, {}, [](const BatchItem& item) {
+                return std::pair{item.port->sample_rate, item.port->buffer_frames};
+            });
+            for (size_t first = 0; first < batch.size();) {
+                size_t last = first + 1;
+                while (last < batch.size() &&
+                       batch[last].port->sample_rate == batch[first].port->sample_rate &&
+                       batch[last].port->buffer_frames == batch[first].port->buffer_frames) {
+                    ++last;
                 }
-                port->output_ready = false;
-                port->last_output_time =
-                    Kernel::sceKernelGetProcessTime();
+                const std::span<BatchItem> cadence_group{batch.data() + first, last - first};
+                const auto batch_started = std::chrono::steady_clock::now();
+                PaceBatch(cadence_group);
+                const u64 scheduled_at_ns = AudioMonotonicNanoseconds();
+                const u32 mixed_ports = MixBatch(cadence_group);
+                OutputBatch(cadence_group);
+                CompleteBatch(cadence_group, scheduled_at_ns);
+                RecordAudioSchedulerBatch(
+                    static_cast<u32>(cadence_group.size()), mixed_ports,
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - batch_started)
+                                         .count()));
+                first = last;
             }
         }
-
-        port->output_cv.notify_one();
-
-        if (stop.stop_requested()) {
-            break;
-        }
-
-        timer.End();
     }
+
+    void Stop() {
+        std::jthread local;
+        {
+            std::scoped_lock lock{worker_mutex};
+            if (!worker.joinable()) {
+                return;
+            }
+            worker.request_stop();
+            ready_cv.notify_all();
+            local = std::move(worker);
+        }
+        local.join();
+    }
+
+    std::mutex worker_mutex;
+    std::mutex ready_mutex;
+    std::condition_variable_any ready_cv;
+    std::jthread worker;
+    std::atomic<u32> pending_ready{};
+};
+
+SharedAudioOutputScheduler& AudioScheduler() {
+    static SharedAudioOutputScheduler scheduler;
+    return scheduler;
 }
 
 s32 PS4_SYSV_ABI sceAudioOutInit() {
@@ -280,6 +552,7 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
                 audio = std::make_unique<SDLAudioOut>();
             }
         }
+        AudioScheduler().EnsureStarted();
 #ifdef __ANDROID__
         AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=init repeated=1 backend=%s",
                            ExecutorLiveNullAudioEnabled() ? "null" : "sdl");
@@ -301,6 +574,7 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
     } else {
         audio = std::make_unique<SDLAudioOut>();
     }
+    AudioScheduler().EnsureStarted();
 
 #ifdef __ANDROID__
     AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=init repeated=0 backend=%s sdl_audio=%d",
@@ -411,29 +685,30 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
             throw std::runtime_error("Failed to create audio backend");
         }
 
-        port->output_buffer = std::malloc(port->BufferSize());
-        if (!port->output_buffer) {
-            throw std::bad_alloc();
+        for (auto& output_buffer : port->output_buffers) {
+            output_buffer.resize(port->BufferSize());
+        }
+        port->normalized_output_buffer.resize(static_cast<size_t>(port->buffer_frames) *
+                                              port->format_info.num_channels);
+        if (port->is_mix_to_main) {
+            port->mix_scratch_buffer.resize(static_cast<size_t>(port->buffer_frames) * 8);
         }
 
 #ifdef __ANDROID__
         if (ExecutorLiveNullAudioEnabled()) {
-            AndroidAudioOutLog(
-                "[EXECUTOR_LIVE_AUDIO_NULL] op=open backend=threaded port=%p frames=%u rate=%u channels=%u "
-                "format=%u",
-                port.get(), port->buffer_frames, port->sample_rate, port->format_info.num_channels,
-                static_cast<u32>(param_type.data_format.Value()));
+            AndroidAudioOutLog("[EXECUTOR_LIVE_AUDIO_NULL] op=open backend=threaded port=%p "
+                               "frames=%u rate=%u channels=%u "
+                               "format=%u",
+                               port.get(), port->buffer_frames, port->sample_rate,
+                               port->format_info.num_channels,
+                               static_cast<u32>(param_type.data_format.Value()));
         }
-        port->output_thread_host =
-            std::jthread([port](std::stop_token stop) { AudioOutputThread(port, stop); });
-        AndroidAudioOutLog("[EXECUTOR_AUDIO_THREAD] host_jthread_created port=%p null=%d",
-                           port.get(), ExecutorLiveNullAudioEnabled() ? 1 : 0);
-#else
-        port->output_thread.Run(
-            [port](const std::stop_token& stop) { AudioOutputThread(port, stop); });
 #endif
 
-        port->impl->SetVolume(port->volume);
+        {
+            std::scoped_lock backend_lock{port->backend_mutex};
+            port->impl->SetVolume(port->volume);
+        }
 
     } catch (const std::bad_alloc&) {
         return ORBIS_AUDIO_OUT_ERROR_OUT_OF_MEMORY;
@@ -489,9 +764,8 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
 
     std::shared_ptr<PortOut> port;
     {
-        std::unique_lock write_lock{port_table_mutex};
-        port = std::move(port_table[port_id]);
-        port_table[port_id].reset();
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
     }
 
     if (!port) {
@@ -499,17 +773,21 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
         return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
     }
 
-#ifdef __ANDROID__
-    if (port->output_thread_host.joinable()) {
-        port->output_thread_host.request_stop();
-        port->output_cv.notify_all();
-        port->output_thread_host.join();
+    {
+        std::unique_lock port_lock{port->mutex};
+        port->closing = true;
+        port->output_cv.wait(port_lock, [&] { return port->IsIdle(); });
     }
-#else
-    port->output_thread.Stop();
-#endif
-
-    std::free(port->output_buffer);
+    {
+        std::unique_lock write_lock{port_table_mutex};
+        if (port_table[port_id] == port) {
+            port_table[port_id].reset();
+        }
+    }
+    {
+        std::scoped_lock backend_lock{port->backend_mutex};
+        port->impl.reset();
+    }
 
     LOG_DEBUG(Lib_AudioOut, "Closed audio port {}", port_id);
     return ORBIS_OK;
@@ -668,25 +946,41 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         static std::atomic<u32> null_output_log_count{0};
         const u32 count = null_output_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (count <= 8 || (count & 0x3ff) == 0) {
-            AndroidAudioOutLog(
-                "[EXECUTOR_LIVE_AUDIO_NULL] op=output handle=0x%x ptr=%p samples=%d "
-                "frames=%u rate=%u count=%u",
-                handle, ptr, samples_sent, port->buffer_frames, port->sample_rate, count);
+            AndroidAudioOutLog("[EXECUTOR_LIVE_AUDIO_NULL] op=output handle=0x%x ptr=%p samples=%d "
+                               "frames=%u rate=%u count=%u",
+                               handle, ptr, samples_sent, port->buffer_frames, port->sample_rate,
+                               count);
         }
 #endif
         return samples_sent;
     }
 
+    const u64 wait_started_ns = AudioMonotonicNanoseconds();
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
-        port->output_cv.wait(lock, [&] { return !port->output_ready; });
+        port->output_cv.wait(lock, [&] { return port->CanAcceptBuffer() || port->closing; });
+        if (port->closing) {
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        }
 
         if (ptr != nullptr) {
-            std::memcpy(port->output_buffer, ptr, port->BufferSize());
-            port->output_ready = true;
+            const u8 slot = port->next_write_slot;
+            auto& output_buffer = port->output_buffers[slot];
+            std::memcpy(output_buffer.data(), ptr, port->BufferSize());
+            const u64 sequence = ++port->submitted_sequence;
+            const u64 timestamp_ns = AudioMonotonicNanoseconds();
+            ObserveAudioStreamSubmit(port->stream_guard, sequence, timestamp_ns);
+            port->ready_slot = static_cast<s8>(slot);
+            port->ready_sequence = sequence;
+            port->ready_timestamp_ns = timestamp_ns;
+            port->next_write_slot ^= 1;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
+            AudioScheduler().NotifyReady();
         }
+    }
+    if (ptr != nullptr) {
+        RecordAudioGuestCopy(port->BufferSize(), AudioMonotonicNanoseconds() - wait_started_ns);
     }
 
     return samples_sent;
@@ -718,9 +1012,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
     }
 
     std::vector<std::shared_ptr<PortOut>> ports;
-    std::vector<std::unique_lock<std::mutex>> locks;
     ports.reserve(num);
-    locks.reserve(num);
 
     u32 buffer_frames = 0;
 
@@ -760,7 +1052,6 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
             }
 
             ports.push_back(port);
-            locks.emplace_back(port->mutex);
 
             if (i == 0) {
                 buffer_frames = port->buffer_frames;
@@ -780,35 +1071,63 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
                 sample_rate = port->sample_rate;
             }
         }
-        for (auto& lock : locks) {
-            if (lock.owns_lock()) {
-                lock.unlock();
-            }
-        }
         ExecutorLiveNullAudioPace(buffer_frames, sample_rate);
 #ifdef __ANDROID__
         static std::atomic<u32> null_outputs_log_count{0};
         const u32 count = null_outputs_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (count <= 8 || (count & 0x3ff) == 0) {
             AndroidAudioOutLog(
-                "[EXECUTOR_LIVE_AUDIO_NULL] op=outputs num=%u frames=%u rate=%u count=%u",
-                num, buffer_frames, sample_rate, count);
+                "[EXECUTOR_LIVE_AUDIO_NULL] op=outputs num=%u frames=%u rate=%u count=%u", num,
+                buffer_frames, sample_rate, count);
         }
 #endif
         return buffer_frames;
     }
 
-    for (u32 i = 0; i < num; i++) {
-        ports[i]->output_cv.wait(locks[i], [&] { return !ports[i]->output_ready; });
-    }
-
-    for (u32 i = 0; i < num; i++) {
-        if (param[i].ptr != nullptr) {
-            std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
-            ports[i]->output_ready = true;
+    const u64 wait_started_ns = AudioMonotonicNanoseconds();
+    std::vector<std::shared_ptr<PortOut>> lock_order = ports;
+    std::ranges::sort(lock_order, {}, [](const auto& port) {
+        return reinterpret_cast<std::uintptr_t>(port.get());
+    });
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(num);
+    for (const auto& port : lock_order) {
+        locks.emplace_back(port->mutex);
+        port->output_cv.wait(locks.back(),
+                             [&] { return port->CanAcceptBuffer() || port->closing; });
+        if (port->closing) {
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
         }
     }
 
+    u32 ready_count{};
+    for (u32 i = 0; i < num; ++i) {
+        auto& port = *ports[i];
+        if (param[i].ptr != nullptr) {
+            const u8 slot = port.next_write_slot;
+            auto& output_buffer = port.output_buffers[slot];
+            std::memcpy(output_buffer.data(), param[i].ptr, port.BufferSize());
+            const u64 sequence = ++port.submitted_sequence;
+            const u64 timestamp_ns = AudioMonotonicNanoseconds();
+            ObserveAudioStreamSubmit(port.stream_guard, sequence, timestamp_ns);
+            port.ready_slot = static_cast<s8>(slot);
+            port.ready_sequence = sequence;
+            port.ready_timestamp_ns = timestamp_ns;
+            port.next_write_slot ^= 1;
+            ++ready_count;
+        }
+    }
+    if (ready_count != 0) {
+        AudioScheduler().NotifyReady(ready_count);
+    }
+    locks.clear();
+
+    const u64 copy_wait_ns = AudioMonotonicNanoseconds() - wait_started_ns;
+    for (u32 i = 0; i < num; ++i) {
+        if (param[i].ptr != nullptr) {
+            RecordAudioGuestCopy(ports[i]->BufferSize(), copy_wait_ns);
+        }
+    }
     return buffer_frames;
 }
 
@@ -887,7 +1206,12 @@ s32 PS4_SYSV_ABI sceAudioOutSetVolume(s32 handle, s32 flag, s32* vol) {
     if (flag & ORBIS_AUDIO_VOLUME_FLAG_RE_CH)
         port->volume[7] = *vol;
 
-    port->impl->SetVolume(port->volume);
+    {
+        std::scoped_lock backend_lock{port->backend_mutex};
+        if (port->impl) {
+            port->impl->SetVolume(port->volume);
+        }
+    }
 
     return ORBIS_OK;
 }
@@ -1358,4 +1682,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceAudioOutSetSystemDebugState);
 };
 
-}
+} // namespace Libraries::AudioOut

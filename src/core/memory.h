@@ -29,6 +29,10 @@ class MemoryMapViewer;
 
 namespace Core {
 
+#ifdef __ANDROID__
+u64 ExecutorCopySparseCaller() noexcept;
+#endif
+
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
 
 inline constexpr VAddr EXECUTOR_LIBC_MSPACE_BASE = 0x780000000ULL;

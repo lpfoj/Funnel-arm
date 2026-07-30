@@ -3,6 +3,7 @@
 
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image.h"
@@ -20,6 +21,15 @@
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
 
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 namespace VideoCore {
 
 struct TilingInfo {
@@ -29,9 +39,285 @@ struct TilingInfo {
     std::array<ImageInfo::MipInfo, 16> mips;
 };
 
+namespace {
+
+constexpr u64 ScratchPoolMaximumBudgetBytes = 128ull * 1024ull * 1024ull;
+constexpr u64 ScratchPoolMinimumBucketBytes = 4ull * 1024ull;
+
+u64 ScratchBucketSize(const u32 requested_size, const u64 budget_bytes) noexcept {
+    if (requested_size == 0) {
+        return 0;
+    }
+    const u64 normalized =
+        std::max<u64>(requested_size, ScratchPoolMinimumBucketBytes);
+    const u64 bucket = std::bit_ceil(normalized);
+    return bucket <= budget_bytes ? bucket : 0;
+}
+
+} // namespace
+
+struct TileManager::ScratchPoolState {
+    struct IdleEntry {
+        VkBuffer buffer{VK_NULL_HANDLE};
+        VmaAllocation allocation{};
+        u64 bucket{};
+        size_t bucket_slot{};
+    };
+
+    using IdleIterator = std::list<IdleEntry>::iterator;
+
+    struct BucketState {
+        std::vector<IdleIterator> entries;
+        u32 miss_pressure{};
+    };
+
+    struct ReleasedEntry {
+        VkBuffer buffer{VK_NULL_HANDLE};
+        VmaAllocation allocation{};
+    };
+
+    ScratchPoolState(const VmaAllocator allocator_, const u64 budget_bytes_)
+        : allocator{allocator_}, budget_bytes{budget_bytes_} {}
+
+    u64 BucketSize(const u32 requested_size) const noexcept {
+        return ScratchBucketSize(requested_size, budget_bytes);
+    }
+
+    bool TryAcquire(const u64 bucket, ScratchBuffer& scratch) {
+        if (bucket == 0) {
+            return false;
+        }
+        {
+            std::scoped_lock lock{mutex};
+            if (stopping) {
+                return false;
+            }
+            auto& state = buckets[bucket];
+            if (state.entries.empty()) {
+                state.miss_pressure =
+                    std::min(state.miss_pressure + 1, MaximumMissPressure);
+                misses.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            const IdleIterator idle = state.entries.back();
+            state.entries.pop_back();
+            scratch = {
+                .buffer = vk::Buffer{idle->buffer},
+                .allocation = idle->allocation,
+                .bucket = bucket,
+                .reused = true,
+            };
+            idle_buffers.erase(idle);
+            pooled_bytes.fetch_sub(bucket, std::memory_order_relaxed);
+            pooled_buffers.fetch_sub(1, std::memory_order_relaxed);
+            if (state.miss_pressure != 0) {
+                --state.miss_pressure;
+            }
+        }
+        reused.fetch_add(1, std::memory_order_relaxed);
+        MaybeLog("reuse");
+        return true;
+    }
+
+    bool TryPool(const ScratchBuffer& scratch) {
+        const u64 bucket = scratch.bucket;
+        if (bucket == 0 || bucket > budget_bytes) {
+            rejected.fetch_add(1, std::memory_order_relaxed);
+            MaybeLog("destroy_unpooled");
+            return false;
+        }
+
+        std::vector<ReleasedEntry> evicted_entries;
+        bool admitted = false;
+        try {
+            std::scoped_lock lock{mutex};
+            if (!stopping) {
+                auto& target = buckets[bucket];
+                u64 current_bytes = pooled_bytes.load(std::memory_order_relaxed);
+                bool may_admit = true;
+
+                if (current_bytes > budget_bytes - bucket) {
+                    const u64 bytes_needed = current_bytes - (budget_bytes - bucket);
+                    const u64 same_bucket_bytes =
+                        static_cast<u64>(target.entries.size()) * bucket;
+                    const u64 evictable_bytes = current_bytes - same_bucket_bytes;
+                    const u32 admission_misses = RequiredAdmissionMisses(bucket);
+
+                    // Do not let a one-shot large texture flush a warmed cache. A
+                    // buffer acquired from this pool always gets its slot back;
+                    // newly created size classes must demonstrate repeated misses.
+                    may_admit =
+                        evictable_bytes >= bytes_needed &&
+                        (scratch.reused || target.miss_pressure >= admission_misses);
+
+                    if (may_admit) {
+                        evicted_entries.reserve(8);
+                        while (current_bytes > budget_bytes - bucket) {
+                            const auto oldest = std::ranges::find_if(
+                                idle_buffers,
+                                [bucket](const IdleEntry& entry) {
+                                    return entry.bucket != bucket;
+                                });
+                            if (oldest == idle_buffers.end()) {
+                                may_admit = false;
+                                break;
+                            }
+
+                            const u64 evicted_bucket = oldest->bucket;
+                            evicted_entries.push_back(
+                                {oldest->buffer, oldest->allocation});
+                            RemoveIdle(oldest);
+                            current_bytes -= evicted_bucket;
+                            pooled_bytes.store(current_bytes,
+                                               std::memory_order_relaxed);
+                            pooled_buffers.fetch_sub(1,
+                                                     std::memory_order_relaxed);
+                        }
+                        if (may_admit && !scratch.reused) {
+                            target.miss_pressure -= admission_misses;
+                        }
+                    }
+                }
+
+                if (may_admit) {
+                    idle_buffers.push_back({
+                        .buffer = static_cast<VkBuffer>(scratch.buffer),
+                        .allocation = scratch.allocation,
+                        .bucket = bucket,
+                        .bucket_slot = target.entries.size(),
+                    });
+                    auto idle = idle_buffers.end();
+                    --idle;
+                    try {
+                        target.entries.push_back(idle);
+                    } catch (...) {
+                        idle_buffers.erase(idle);
+                        throw;
+                    }
+                    pooled_bytes.store(current_bytes + bucket,
+                                       std::memory_order_relaxed);
+                    pooled_buffers.fetch_add(1, std::memory_order_relaxed);
+                    admitted = true;
+                }
+            }
+        } catch (...) {
+        }
+
+        for (const ReleasedEntry& entry : evicted_entries) {
+            vmaDestroyBuffer(allocator, entry.buffer, entry.allocation);
+        }
+        if (!evicted_entries.empty()) {
+            evicted.fetch_add(evicted_entries.size(), std::memory_order_relaxed);
+        }
+        if (!admitted) {
+            rejected.fetch_add(1, std::memory_order_relaxed);
+        }
+        MaybeLog(admitted ? (evicted_entries.empty() ? "retire_to_pool"
+                                                     : "retire_with_evict")
+                          : "destroy_rejected");
+        return admitted;
+    }
+
+    void NoteCreated() {
+        created.fetch_add(1, std::memory_order_relaxed);
+        MaybeLog("create");
+    }
+
+    void StopAndDestroy() {
+        std::list<IdleEntry> retired_entries;
+        {
+            std::scoped_lock lock{mutex};
+            stopping = true;
+            retired_entries.splice(retired_entries.end(), idle_buffers);
+            buckets.clear();
+            pooled_bytes.store(0, std::memory_order_relaxed);
+            pooled_buffers.store(0, std::memory_order_relaxed);
+        }
+        for (const IdleEntry& entry : retired_entries) {
+            vmaDestroyBuffer(allocator, entry.buffer, entry.allocation);
+        }
+    }
+
+    void MaybeLog(const char* event) {
+#ifdef __ANDROID__
+        const u64 sequence = log_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (sequence != 1 && (sequence & 255u) != 0) {
+            return;
+        }
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_TILE_SCRATCH_POOL] event=%s created=%llu reused=%llu "
+            "pooledBytes=%llu budgetBytes=%llu misses=%llu evicted=%llu "
+            "rejected=%llu pooledBuffers=%llu",
+            event,
+            static_cast<unsigned long long>(created.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(reused.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(pooled_bytes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(budget_bytes),
+            static_cast<unsigned long long>(misses.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(evicted.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(rejected.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                pooled_buffers.load(std::memory_order_relaxed)));
+#else
+        (void)event;
+#endif
+    }
+
+    u32 RequiredAdmissionMisses(const u64 bucket) const noexcept {
+        const u64 admission_unit =
+            std::max(budget_bytes / 8, ScratchPoolMinimumBucketBytes);
+        const u64 proportional_misses =
+            (bucket + admission_unit - 1) / admission_unit;
+        return static_cast<u32>(std::clamp<u64>(proportional_misses, 2, 8));
+    }
+
+    void RemoveIdle(const IdleIterator idle) {
+        auto& state = buckets.at(idle->bucket);
+        const size_t slot = idle->bucket_slot;
+        const size_t last_slot = state.entries.size() - 1;
+        if (slot != last_slot) {
+            state.entries[slot] = state.entries[last_slot];
+            state.entries[slot]->bucket_slot = slot;
+        }
+        state.entries.pop_back();
+        idle_buffers.erase(idle);
+    }
+
+    static constexpr u32 MaximumMissPressure = 255;
+
+    VmaAllocator allocator{};
+    u64 budget_bytes{};
+    std::mutex mutex;
+    std::list<IdleEntry> idle_buffers;
+    std::unordered_map<u64, BucketState> buckets;
+    std::atomic<u64> created{};
+    std::atomic<u64> reused{};
+    std::atomic<u64> misses{};
+    std::atomic<u64> evicted{};
+    std::atomic<u64> rejected{};
+    std::atomic<u64> pooled_buffers{};
+    std::atomic<u64> pooled_bytes{};
+    std::atomic<u64> log_sequence{};
+    bool stopping{};
+};
+
 TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          StreamBuffer& stream_buffer_)
-    : instance{instance}, scheduler{scheduler}, stream_buffer{stream_buffer_} {
+    : instance{instance}, scheduler{scheduler}, stream_buffer{stream_buffer_},
+      scratch_pool{std::make_shared<ScratchPoolState>(
+          instance.GetAllocator(),
+          std::min(ScratchPoolMaximumBudgetBytes,
+                   std::max(ScratchPoolMinimumBucketBytes,
+                            instance.GetTotalMemoryBudget() / 32)))}
+#ifdef __ANDROID__
+      ,
+      detile_command_pool{std::make_unique<Vulkan::CommandPool>(
+          instance, scheduler.GetMasterSemaphore(),
+          vk::CommandBufferLevel::eSecondary)}
+#endif
+{
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -78,15 +364,23 @@ TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& sc
     pl_layout = std::move(layout);
 }
 
-TileManager::~TileManager() = default;
+TileManager::~TileManager() {
+    scratch_pool->StopAndDestroy();
+}
 
 TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
+    const u64 bucket = scratch_pool->BucketSize(size);
+    ScratchBuffer scratch{};
+    if (bucket != 0 && scratch_pool->TryAcquire(bucket, scratch)) {
+        return scratch;
+    }
+
     constexpr auto usage =
         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
         vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
 
     const vk::BufferCreateInfo buffer_ci = {
-        .size = size,
+        .size = bucket != 0 ? bucket : size,
         .usage = usage,
     };
 
@@ -100,7 +394,28 @@ TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
     const auto result = vmaCreateBuffer(instance.GetAllocator(), &buffer_ci_unsafe, &alloc_info,
                                         &buffer, &allocation, nullptr);
     ASSERT(result == VK_SUCCESS);
-    return {buffer, allocation};
+    scratch_pool->NoteCreated();
+    return {
+        .buffer = vk::Buffer{buffer},
+        .allocation = allocation,
+        .bucket = bucket,
+        .reused = false,
+    };
+}
+
+void TileManager::RetireScratchBuffer(ScratchBuffer scratch) {
+    const std::shared_ptr<ScratchPoolState> pool = scratch_pool;
+    const VmaAllocator allocator = instance.GetAllocator();
+    // Return the allocation only after its command buffer retires. Pool hits
+    // avoid both VMA allocation and Adreno object destruction in the hot
+    // detile path; rejected entries retain the original deferred-destruction
+    // lifetime.
+    scheduler.DeferOperation([pool, allocator, scratch] {
+        if (!pool->TryPool(scratch)) {
+            vmaDestroyBuffer(allocator, static_cast<VkBuffer>(scratch.buffer),
+                             scratch.allocation);
+        }
+    });
 }
 
 vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
@@ -200,7 +515,7 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
 TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset,
                                              const ImageInfo& info) {
     if (!info.props.is_tiled) {
-        return {in_buffer, in_offset};
+        return {.buffer = in_buffer, .offset = in_offset};
     }
 
     TilingInfo params{};
@@ -222,15 +537,32 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
         .range = sizeof(params),
     };
 
-    const auto [out_buffer, out_allocation] = GetScratchBuffer(info.guest_size);
-    scheduler.DeferOperation([this, out_buffer, out_allocation]() {
-        vmaDestroyBuffer(instance.GetAllocator(), out_buffer, out_allocation);
-    });
+    const ScratchBuffer scratch = GetScratchBuffer(info.guest_size);
+    const vk::Buffer out_buffer = scratch.buffer;
 
-    scheduler.EndRendering();
-
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::TileCompute);
+#ifdef __ANDROID__
+    // Keep Qualcomm's compute state isolated without splitting the queue
+    // epoch. The primary retains all barriers and ordering, while the
+    // secondary starts from clean Vulkan command state.
+    const auto primary_cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = detile_command_pool->Commit();
+    const vk::CommandBufferInheritanceInfo inheritance_info{};
+    const vk::CommandBufferBeginInfo begin_info{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        .pInheritanceInfo = &inheritance_info,
+    };
+    const vk::Result begin_result = cmdbuf.begin(begin_info);
+    ASSERT_MSG(begin_result == vk::Result::eSuccess,
+               "Failed to begin isolated detile command buffer: {}",
+               vk::to_string(begin_result));
+#else
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
+#endif
+
+    const vk::Pipeline detile_pipeline = GetTilingPipeline(info, false);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, detile_pipeline);
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer,
@@ -272,10 +604,32 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     }};
     EXEC_TL_MARK("before_pushdesc");
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eCompute);
     EXEC_TL_MARK("after_pushdesc");
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
 #ifdef __ANDROID__
+    static std::atomic<u32> detile_dispatch_sequence{};
+    const u32 dispatch_sequence =
+        detile_dispatch_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (dispatch_sequence <= 8) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_DETILE_DISPATCH] n=%u scheduler=%p recording=%d "
+            "tick=%llu gpuTick=%llu cmdbuf=%p pipeline=%p layout=%p "
+            "in=%p out=%p params=%p guestSize=%u bits=%u dimX=%u",
+            dispatch_sequence, &scheduler,
+            scheduler.HasRecordingCommandBuffer() ? 1 : 0,
+            static_cast<unsigned long long>(scheduler.CurrentTick()),
+            static_cast<unsigned long long>(scheduler.KnownGpuTick()),
+            static_cast<void*>(static_cast<VkCommandBuffer>(cmdbuf)),
+            static_cast<void*>(static_cast<VkPipeline>(detile_pipeline)),
+            static_cast<void*>(static_cast<VkPipelineLayout>(*pl_layout)),
+            static_cast<void*>(static_cast<VkBuffer>(in_buffer)),
+            static_cast<void*>(static_cast<VkBuffer>(out_buffer)),
+            static_cast<void*>(static_cast<VkBuffer>(params_buffer_info.buffer)),
+            info.guest_size, info.num_bits, dim_x);
+    }
     if (Libraries::GnmDriver::ExecutorReplayActive()) {
         Core::Memory::Instance()->VerifyReplayCanaries("before_detile_dispatch");
         __android_log_print(ANDROID_LOG_INFO, "EXECUTOR",
@@ -299,8 +653,25 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &detile_to_upload,
     });
+#ifdef __ANDROID__
+    const vk::Result end_result = cmdbuf.end();
+    ASSERT_MSG(end_result == vk::Result::eSuccess,
+               "Failed to end isolated detile command buffer: {}",
+               vk::to_string(end_result));
+    primary_cmdbuf.executeCommands(cmdbuf);
+#endif
     EXEC_TL_MARK("after_dispatch");
-    return {out_buffer, 0};
+    // The caller still records copyBufferToImage from this buffer. Hand
+    // ownership back with the result and retire it only after that final use
+    // has been recorded, so its timeline tick cannot precede its last Vulkan
+    // command.
+    return {.buffer = out_buffer, .offset = 0, .scratch = scratch};
+}
+
+void TileManager::RetireDetileResult(Result result) {
+    if (result.scratch.buffer) {
+        RetireScratchBuffer(result.scratch);
+    }
 }
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
@@ -333,10 +704,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto [temp_buffer, temp_allocation] = GetScratchBuffer(info.guest_size);
-    scheduler.DeferOperation([this, temp_buffer, temp_allocation]() {
-        vmaDestroyBuffer(instance.GetAllocator(), temp_buffer, temp_allocation);
-    });
+    const ScratchBuffer scratch = GetScratchBuffer(info.guest_size);
+    const vk::Buffer temp_buffer = scratch.buffer;
 
     const auto cmdbuf = scheduler.CommandBuffer();
     in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
@@ -358,6 +727,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     });
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer,
@@ -398,6 +768,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         },
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eCompute);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
@@ -417,6 +788,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &tiler_to_consumers,
     });
+    RetireScratchBuffer(scratch);
 }
 
 }

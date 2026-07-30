@@ -117,6 +117,11 @@ public:
         return attachment_feedback_loop;
     }
 
+    bool IsDynamicRenderingLocalReadSupported() const {
+        return dynamic_rendering_local_read &&
+               dynamic_rendering_local_read_features.dynamicRenderingLocalRead;
+    }
+
     bool IsCustomBorderColorSupported() const {
         return custom_border_color;
     }
@@ -146,12 +151,15 @@ public:
     }
 
     bool IsCoarseFragmentShadingSupported() const {
-        return fragment_shading_rate && coarse_fragment_size.width > 1 &&
-               coarse_fragment_size.height > 1;
+        return fragment_shading_rate;
     }
 
     vk::Extent2D GetCoarseFragmentSize() const {
         return coarse_fragment_size;
+    }
+
+    vk::Extent2D GetMobileFragmentSize() const {
+        return mobile_fragment_size;
     }
 
     bool IsVertexInputDynamicState() const {
@@ -233,6 +241,10 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
+    bool IsPipelineCreationCacheControlSupported() const {
+        return pipeline_creation_cache_control;
+    }
+
     bool IsWorkgroupMemoryExplicitLayoutSupported() const {
         return workgroup_memory_explicit_layout &&
                workgroup_memory_explicit_layout_features.workgroupMemoryExplicitLayout16BitAccess;
@@ -280,6 +292,10 @@ public:
 
     u32 ApiVersion() const {
         return properties.apiVersion;
+    }
+
+    bool IsMaintenance4Supported() const {
+        return vk13_features.maintenance4;
     }
 
     std::string_view GetVendorName() const {
@@ -435,6 +451,8 @@ private:
     vk::PhysicalDevicePortabilitySubsetFeaturesKHR portability_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;
     vk::PhysicalDeviceFragmentShadingRateFeaturesKHR fragment_shading_rate_features;
+    vk::PhysicalDeviceDynamicRenderingLocalReadFeatures
+        dynamic_rendering_local_read_features;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2_features;
     vk::PhysicalDeviceFaultFeaturesEXT device_fault_features;
     vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;
@@ -454,6 +472,7 @@ private:
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
     vk::Extent2D coarse_fragment_size{1, 1};
+    vk::Extent2D mobile_fragment_size{1, 1};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
@@ -481,8 +500,10 @@ private:
     bool portability_subset{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
+    bool dynamic_rendering_local_read{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool pipeline_creation_cache_control{};
     mutable std::atomic_flag device_fault_dumped = ATOMIC_FLAG_INIT;
     mutable std::atomic<u64> memory_usage_cache{};
     mutable std::atomic<u64> memory_usage_sample_time_ns{};

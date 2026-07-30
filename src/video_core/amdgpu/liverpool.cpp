@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/preprocessor/stringize.hpp>
-#include <xxhash.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -33,8 +32,11 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/render_wave_trace.h"
 #include "video_core/renderdoc.h"
+#include "video_core/vulkan_driver_optimization.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef __ANDROID__
+#include "video_core/page_manager.h"
+#include "video_core/readback_optimization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #endif
 
@@ -72,6 +74,30 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
 namespace {
+#ifdef __ANDROID__
+void ExecutorPrepareGuestPm4Read(const std::span<const u32> words) {
+    if (words.empty() ||
+        words.size() > std::numeric_limits<u64>::max() / sizeof(u32)) {
+        return;
+    }
+
+    const VAddr address = reinterpret_cast<VAddr>(words.data());
+    const u64 size = static_cast<u64>(words.size()) * sizeof(u32);
+    if (address == 0 || address > std::numeric_limits<VAddr>::max() - size) {
+        return;
+    }
+
+    auto* memory = Core::Memory::Instance();
+    bool address_managed = false;
+    if (!memory || !memory->IsReadableMapping(address, size, &address_managed) ||
+        !address_managed) {
+        return;
+    }
+
+    VideoCore::PageManager::PrepareBulkGuestRead(address, size);
+}
+#endif
+
 bool ExecutorSafeRegArrayWrite(u32* reg_array, u32 capacity, u32 reg_addr, const void* payload,
                                u32 words, const char* which) {
     if (reg_addr >= capacity) {
@@ -106,6 +132,60 @@ bool ExecutorSafeRegArrayWrite(u32* reg_array, u32 capacity, u32 reg_addr, const
 #endif
     return changed;
 }
+
+#ifdef __ANDROID__
+u32 ExecutorGraphicsShDirtySources(const u32* reg_array, u32 capacity, u32 reg_addr,
+                                   u32 sh_reg_offset, const u32* payload, u32 words) {
+    if (reg_addr >= capacity) {
+        return Liverpool::GraphicsDirtyOther;
+    }
+
+    static constexpr std::array<u32, 6> GraphicsProgramBases{
+        0x08u, 0x48u, 0x88u, 0xc8u, 0x108u, 0x148u,
+    };
+    // SPI_SHADER_PGM_LO/HI and both PGM_RSRC words precede USER_DATA_0.
+    // Treating RSRC2 as user data makes runtime-info changes indistinguishable
+    // from descriptor updates and defeats the pipeline-state fast path.
+    constexpr u32 ProgramWords = offsetof(ShaderProgram, user_data) / sizeof(u32);
+    constexpr u32 UserDataWords = NUM_USER_DATA;
+
+    u32 sources{};
+    const u32 clamped = std::min(words, capacity - reg_addr);
+    constexpr u32 GraphicsShRegLimit = 0x200u;
+    const u32 classified_words =
+        sh_reg_offset < GraphicsShRegLimit
+            ? std::min(clamped, GraphicsShRegLimit - sh_reg_offset)
+            : 0u;
+    for (u32 index = 0; index < classified_words; ++index) {
+        if (reg_array[reg_addr + index] == payload[index]) {
+            continue;
+        }
+
+        const u32 relative_reg = sh_reg_offset + index;
+        bool classified = false;
+        for (const u32 base : GraphicsProgramBases) {
+            if (relative_reg >= base && relative_reg < base + ProgramWords) {
+                sources |= Liverpool::GraphicsDirtyShaderProgram;
+                classified = true;
+                break;
+            }
+            if (relative_reg >= base + ProgramWords &&
+                relative_reg < base + ProgramWords + UserDataWords) {
+                sources |= Liverpool::GraphicsDirtyShaderUserData;
+                classified = true;
+                break;
+            }
+        }
+        if (!classified) {
+            sources |= Liverpool::GraphicsDirtyOther;
+        }
+    }
+    if (classified_words != clamped) {
+        sources |= Liverpool::GraphicsDirtyOther;
+    }
+    return sources != 0 ? sources : Liverpool::GraphicsDirtyOther;
+}
+#endif
 }
 
 #ifdef __ANDROID__
@@ -136,13 +216,16 @@ bool ExecutorSkipRasterizerFinish() {
 bool ExecutorBoundedRasterizerPipeline() {
     static const bool enabled =
         !ExecutorEnvFlag("EXECUTOR_DISABLE_BOUNDED_RASTERIZER_PIPELINE");
-    return enabled;
+    // Deferred EOP/EOS/RELEASE_MEM publication is the CPU-side readback
+    // sidecar.  It must follow the readback toggle, not the unrelated Vulkan
+    // state/driver-call optimization toggle.
+    return enabled && Config::managedReadbackBatching();
 }
 
 bool ExecutorEopWaitBatchingV2() {
     static const bool enabled =
         !ExecutorEnvFlag("EXECUTOR_DISABLE_EOP_WAIT_BATCHING_V2");
-    return enabled;
+    return enabled && Config::managedReadbackBatching();
 }
 
 bool ExecutorShouldLogWaitYield(u32 yields) {
@@ -810,7 +893,11 @@ static std::atomic<u32> executor_active_parked_waits{};
 
 static bool Pm4DescriptorCacheEnabled() {
 #ifdef __ANDROID__
-    static const bool enabled = !ExecutorEnvFlag("EXECUTOR_DISABLE_PM4_DESCRIPTOR_CACHE");
+    static const bool enabled =
+        !ExecutorEnvFlag("EXECUTOR_DISABLE_PM4_DESCRIPTOR_CACHE") &&
+        ::access("/data/data/app.lsx4.android/files/lsx4-home/"
+                 "run-bisect-disable-pm4-descriptor-cache",
+                 F_OK) != 0;
     return enabled;
 #else
     return true;
@@ -830,28 +917,62 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
-Liverpool::Pm4StreamFingerprint Liverpool::FingerprintPm4Stream(
+Liverpool::Pm4LayoutKey Liverpool::MakePm4LayoutKey(
     Pm4Engine engine, std::span<const u32> stream) noexcept {
-    constexpr u64 FormatTag = 0x504d3402ULL;
-    const u64 seed = FormatTag ^ (static_cast<u64>(engine) << 48) ^ stream.size();
-    const XXH128_hash_t digest = XXH3_128bits_withSeed(stream.data(), stream.size_bytes(), seed);
-    return {.primary = digest.low64,
-            .verifier = digest.high64,
+    // Only packet layout participates in this coarse key. Dynamic command
+    // payload must not turn an otherwise reusable descriptor plan into a
+    // cache miss. The key is deliberately not trusted: every header in a
+    // candidate plan is validated before the plan can be used.
+    const auto mix = [](u64 value) noexcept {
+        value ^= value >> 30;
+        value *= 0xbf58476d1ce4e5b9ULL;
+        value ^= value >> 27;
+        value *= 0x94d049bb133111ebULL;
+        return value ^ (value >> 31);
+    };
+    const auto header_shape = [](const PM4Header& header) noexcept {
+        const u32 type = header.type;
+        if (type == 3) {
+            return static_cast<u64>(type) | (static_cast<u64>(header.type3.opcode.Value()) << 8) |
+                   (static_cast<u64>(header.type3.NumWords()) << 24);
+        }
+        return static_cast<u64>(type);
+    };
+
+    constexpr u64 FormatTag = 0x504d344c41594f55ULL; // "PM4LAYOU"
+    u64 coarse = mix(FormatTag ^ (static_cast<u64>(engine) << 56) ^
+                     static_cast<u64>(stream.size()));
+    if (!stream.empty()) {
+        const auto& first = *reinterpret_cast<const PM4Header*>(stream.data());
+        coarse ^= std::rotl(mix(header_shape(first)), 17);
+
+        size_t second_offset = 1;
+        if (first.type == 3) {
+            const size_t packet_words = static_cast<size_t>(first.type3.NumWords()) + 1;
+            second_offset = packet_words <= stream.size() ? packet_words : stream.size();
+        }
+        if (second_offset < stream.size()) {
+            const auto& second =
+                *reinterpret_cast<const PM4Header*>(stream.data() + second_offset);
+            coarse ^= std::rotl(mix(header_shape(second)), 41);
+        }
+    }
+    return {.coarse = coarse,
             .words = static_cast<u32>(stream.size()),
             .engine = engine};
 }
 
 std::shared_ptr<const Liverpool::Pm4DescriptorPlan> Liverpool::BuildPm4DescriptorPlan(
-    const Pm4StreamFingerprint& fingerprint, std::span<const u32> stream) {
+    const Pm4LayoutKey& key, std::span<const u32> stream) {
     constexpr u32 MaxCacheableWords = 64 * 1024;
     constexpr u32 MaxCacheablePackets = 4096;
-    if (stream.empty() || stream.size() != fingerprint.words ||
+    if (stream.empty() || stream.size() != key.words ||
         stream.size() > MaxCacheableWords) {
         return {};
     }
 
     auto plan = std::make_shared<Pm4DescriptorPlan>();
-    plan->fingerprint = fingerprint;
+    plan->key = key;
     plan->packets.reserve(std::min<std::size_t>(stream.size() / 2 + 1, 512));
     std::size_t offset = 0;
     while (offset < stream.size()) {
@@ -881,72 +1002,132 @@ std::shared_ptr<const Liverpool::Pm4DescriptorPlan> Liverpool::BuildPm4Descripto
     return plan;
 }
 
+bool Liverpool::ValidatePm4PacketDescriptor(
+    const Pm4PacketDescriptor& descriptor, const std::size_t offset_words,
+    const std::span<const u32> remaining_stream) noexcept {
+    if (descriptor.offset_words != offset_words || remaining_stream.empty()) {
+        return false;
+    }
+
+    const auto* header = reinterpret_cast<const PM4Header*>(remaining_stream.data());
+    const u32 type = header->type;
+    if (type != descriptor.type) {
+        return false;
+    }
+    if (type == 2) {
+        return descriptor.packet_words == 1 && descriptor.opcode == 0;
+    }
+    if (type != 3) {
+        return false;
+    }
+
+    const u64 expanded_words = static_cast<u64>(header->type3.NumWords()) + 1;
+    if (expanded_words > remaining_stream.size() ||
+        descriptor.packet_words != expanded_words) {
+        return false;
+    }
+    return descriptor.opcode ==
+           static_cast<u16>(static_cast<PM4ItOpcode>(header->type3.opcode));
+}
+
 std::shared_ptr<const Liverpool::Pm4DescriptorPlan> Liverpool::FindPm4DescriptorPlan(
-    const Pm4StreamFingerprint& fingerprint) {
-    const u32 set = static_cast<u32>(fingerprint.primary) & (Pm4DescriptorCacheSets - 1);
+    const Pm4LayoutKey& key, std::span<const u32> stream) {
+    if (!VideoCore::IsManagedVulkanDriverOptimization()) {
+        return {};
+    }
+    const u32 set = static_cast<u32>(key.coarse) & (Pm4DescriptorCacheSets - 1);
     const u32 first = set * Pm4DescriptorCacheWays;
     ++pm4_descriptor_cache_clock_;
+    pm4_descriptor_cache_bytes_not_hashed_ += static_cast<u64>(stream.size_bytes());
     const auto log_metrics = [&] {
 #ifdef __ANDROID__
         const u64 lookups = pm4_descriptor_cache_hits_ + pm4_descriptor_cache_misses_;
         if ((lookups & 4095) == 0 && lookups != 0) {
-            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
-                                "[EXECUTOR_PM4_DESCRIPTOR_CACHE] lookups=%llu hits=%llu "
-                                "misses=%llu inserts=%llu hitPct=%.1f",
-                                static_cast<unsigned long long>(lookups),
-                                static_cast<unsigned long long>(pm4_descriptor_cache_hits_),
-                                static_cast<unsigned long long>(pm4_descriptor_cache_misses_),
-                                static_cast<unsigned long long>(pm4_descriptor_cache_inserts_),
-                                100.0 * static_cast<double>(pm4_descriptor_cache_hits_) /
-                                    static_cast<double>(lookups));
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_PM4_DESCRIPTOR_CACHE] mode=layout-inline-v2 lookups=%llu "
+                "candidateHits=%llu misses=%llu inserts=%llu inlineMismatches=%llu "
+                "lookupBytes=%llu candidatePct=%.1f",
+                static_cast<unsigned long long>(lookups),
+                static_cast<unsigned long long>(pm4_descriptor_cache_hits_),
+                static_cast<unsigned long long>(pm4_descriptor_cache_misses_),
+                static_cast<unsigned long long>(pm4_descriptor_cache_inserts_),
+                static_cast<unsigned long long>(pm4_descriptor_cache_layout_mismatches_),
+                static_cast<unsigned long long>(pm4_descriptor_cache_bytes_not_hashed_),
+                100.0 * static_cast<double>(pm4_descriptor_cache_hits_) /
+                    static_cast<double>(lookups));
         }
 #endif
     };
     for (u32 way = 0; way < Pm4DescriptorCacheWays; ++way) {
         auto& line = pm4_descriptor_cache_[first + way];
-        if (line.plan && line.fingerprint == fingerprint) {
-            line.last_use = pm4_descriptor_cache_clock_;
-            ++pm4_descriptor_cache_hits_;
-            log_metrics();
-            return line.plan;
+        if (!line.plan || line.key != key || line.plan->key != key) {
+            continue;
         }
+        // The coarse key is only an O(1) candidate lookup. Its packet layout is
+        // intentionally not trusted here: each descriptor is checked against
+        // the actual immutable packet immediately before the cached metadata is
+        // consumed by the CE, graphics, or compute parser.
+        line.last_use = pm4_descriptor_cache_clock_;
+        ++pm4_descriptor_cache_hits_;
+        VideoCore::RecordVulkanPm4Plan(true);
+        log_metrics();
+        return line.plan;
     }
     ++pm4_descriptor_cache_misses_;
+    VideoCore::RecordVulkanPm4Plan(false);
     log_metrics();
     return {};
 }
 
 bool Liverpool::AdmitPm4DescriptorPlanBuild(
-    const Pm4StreamFingerprint& fingerprint) noexcept {
-    const u32 index = static_cast<u32>(fingerprint.primary ^ (fingerprint.verifier >> 32)) &
+    const Pm4LayoutKey& key) noexcept {
+    if (!VideoCore::IsManagedVulkanDriverOptimization()) {
+        return false;
+    }
+    const u32 index = static_cast<u32>(key.coarse ^ (key.coarse >> 32) ^ key.words ^
+                                       (static_cast<u64>(key.engine) << 24)) &
                       (Pm4DescriptorAdmissionLines - 1);
     auto& line = pm4_descriptor_admission_[index];
-    if (line.occupied && line.fingerprint == fingerprint) {
+    if (line.occupied && line.key == key) {
         return true;
     }
-    line.fingerprint = fingerprint;
+    line.key = key;
     line.occupied = true;
     return false;
 }
 
 void Liverpool::RememberPm4DescriptorPlan(std::shared_ptr<const Pm4DescriptorPlan> plan) {
-    if (!plan || plan->packets.empty()) {
+    if (!VideoCore::IsManagedVulkanDriverOptimization() ||
+        !plan || plan->packets.empty()) {
         return;
     }
-    const auto& fingerprint = plan->fingerprint;
-    const u32 set = static_cast<u32>(fingerprint.primary) & (Pm4DescriptorCacheSets - 1);
+    const auto& key = plan->key;
+    const u32 set = static_cast<u32>(key.coarse) & (Pm4DescriptorCacheSets - 1);
     const u32 first = set * Pm4DescriptorCacheWays;
     Pm4DescriptorCacheLine* victim = &pm4_descriptor_cache_[first];
     for (u32 way = 0; way < Pm4DescriptorCacheWays; ++way) {
         auto& line = pm4_descriptor_cache_[first + way];
-        if (line.plan && line.fingerprint == fingerprint) {
-            return;
+        if (line.plan && line.key == key &&
+            line.plan->packets.size() == plan->packets.size()) {
+            const bool same_layout =
+                std::equal(line.plan->packets.begin(), line.plan->packets.end(),
+                           plan->packets.begin(), [](const Pm4PacketDescriptor& lhs,
+                                                    const Pm4PacketDescriptor& rhs) {
+                               return lhs.offset_words == rhs.offset_words &&
+                                      lhs.packet_words == rhs.packet_words &&
+                                      lhs.opcode == rhs.opcode && lhs.type == rhs.type;
+                           });
+            if (same_layout) {
+                line.last_use = ++pm4_descriptor_cache_clock_;
+                return;
+            }
         }
         if (!line.plan || line.last_use < victim->last_use) {
             victim = &line;
         }
     }
-    victim->fingerprint = fingerprint;
+    victim->key = key;
     victim->plan = std::move(plan);
     victim->last_use = ++pm4_descriptor_cache_clock_;
     ++pm4_descriptor_cache_inserts_;
@@ -1013,11 +1194,7 @@ bool Liverpool::CopyIndirectAtEncounter(Pm4Engine engine, VAddr address, u32 num
         return fail("submission-budget");
     }
 
-    const bool gpu_backing_synchronized = rasterizer && rasterizer->ReadMemory(address, num_bytes);
-    auto* memory = Core::Memory::Instance();
-    owned.resize(num_words);
-    if (!memory || !memory->TryCopyReadableMemory(address, owned.data(), num_bytes,
-                                                   gpu_backing_synchronized)) {
+    if (!CopyGuestPm4Words(address, num_words, owned)) {
         return fail("unreadable");
     }
     if (!already_accounted) {
@@ -1028,6 +1205,66 @@ bool Liverpool::CopyIndirectAtEncounter(Pm4Engine engine, VAddr address, u32 num
         submit_snapshot->second = owned;
     }
     return true;
+}
+
+bool Liverpool::CopyGuestPm4Words(const VAddr address, const u32 num_words,
+                                  std::vector<u32>& owned) const {
+    if (address == 0 || num_words == 0) {
+        owned.clear();
+        return false;
+    }
+    const u64 num_bytes = u64{num_words} * sizeof(u32);
+    if (address > std::numeric_limits<VAddr>::max() - num_bytes) {
+        owned.clear();
+        return false;
+    }
+
+    auto* const memory = Core::Memory::Instance();
+    if (memory == nullptr) {
+        owned.clear();
+        return false;
+    }
+
+    // Guest command buffers commonly share a 4-KiB host page with an
+    // unrelated GPU-written range. Reading the guest VA directly then faults
+    // the whole page and turns every sceGnmSubmit into a GPU->CPU readback.
+    // Synchronize only the exact PM4 range, then copy through the physical
+    // backing alias, which is not covered by the guest page protection.
+    const bool gpu_modified =
+        rasterizer != nullptr && rasterizer->IsMemoryGpuModified(address, num_bytes);
+    const bool gpu_backing_synchronized =
+        gpu_modified && rasterizer->ReadMemory(address, num_bytes);
+
+    owned.resize(num_words);
+#ifdef __ANDROID__
+    if (memory->TryCopyBackingMemory(address, owned.data(), num_bytes)) {
+        static std::atomic<u64> backing_hits{0};
+        const u64 hits = backing_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((hits & 4095u) == 0u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_PM4_BACKING_SNAPSHOT] hits=%llu addr=0x%llx bytes=%llu "
+                "gpuSynchronized=%u",
+                static_cast<unsigned long long>(hits),
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(num_bytes),
+                gpu_backing_synchronized ? 1u : 0u);
+        }
+        return true;
+    }
+
+    // Executor-heap and sparse mappings do not expose a physical backing
+    // alias. Preserve the original protected-VA path for those uncommon
+    // command buffers.
+    ExecutorPrepareGuestPm4Read(
+        std::span<const u32>{reinterpret_cast<const u32*>(address), num_words});
+#endif
+    if (memory->TryCopyReadableMemory(address, owned.data(), num_bytes,
+                                      gpu_backing_synchronized)) {
+        return true;
+    }
+    owned.clear();
+    return false;
 }
 
 static bool TestWaitRegMemValue(const PM4CmdWaitRegMem& wait_reg_mem, u32 value);
@@ -1093,8 +1330,9 @@ void Liverpool::RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& st
     InvalidateIndirectSnapshotsForWrite(state, address, num_bytes);
     state->completion_writes[address].push_back(
         Pm4SubmissionState::CompletionWrite{address, value, gpu_tick, num_bytes, engine});
+    VideoCore::AccumulateReadbackOptimizationStats(
+        VideoCore::ReadbackOptimizationStats{.sidecar_labels = 1});
     constexpr u64 PageSize = 4_KB;
-    std::vector<VAddr> pages_to_track;
     {
         std::scoped_lock lock{executor_pending_completion_mutex};
         ++executor_pending_completion_writes[ExecutorPendingCompletionWrite{
@@ -1105,7 +1343,11 @@ void Liverpool::RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& st
             if (rasterizer->IsMapped(page, PageSize)) {
                 auto& refs = executor_pending_completion_page_refs[page];
                 if (refs++ == 0) {
-                    pages_to_track.push_back(page);
+                    // Publish the page protection while the sidecar reference
+                    // is still serialized. A fast GPU retirement must not be
+                    // able to untrack this page before the first track reaches
+                    // PageManager.
+                    rasterizer->TrackPendingCompletionRead(page, PageSize);
                 }
             }
             if (page == last_page) {
@@ -1113,15 +1355,15 @@ void Liverpool::RecordCompletionWriteForExecutor(const Pm4SubmissionStatePtr& st
             }
         }
     }
-    for (const VAddr page : pages_to_track) {
-        rasterizer->TrackPendingCompletionRead(page, PageSize);
-    }
 }
 
 void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u64 value,
                                                           Pm4Engine engine, u32 num_bytes,
                                                           u64 gpu_tick) {
-    if (!ExecutorEopWaitBatchingV2() || address == 0 || gpu_tick == 0) {
+    // A managed toggle may be switched off while an already queued retirement
+    // callback is in flight. Always drain recorded sidecar state so watched
+    // pages and completion references cannot leak across the A/B transition.
+    if (address == 0 || gpu_tick == 0) {
         return;
     }
     constexpr u64 PageSize = 4_KB;
@@ -1163,7 +1405,7 @@ void Liverpool::CompletePendingCompletionWriteForExecutor(VAddr address, u64 val
 u64 Liverpool::ConsumeCompletionWaitForExecutor(const Pm4SubmissionStatePtr& state,
                                                  Pm4Engine engine,
                                                  const PM4CmdWaitRegMem& wait) {
-    if (!ExecutorEopWaitBatchingV2() || !state ||
+    if (!state ||
         wait.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
         return 0;
     }
@@ -1242,7 +1484,7 @@ bool Liverpool::SynchronizeUntrackedMemoryWaitForExecutor(
 
 bool Liverpool::ResolvePendingCompletionReadForExecutor(VAddr address, u64 size) {
 #ifdef __ANDROID__
-    if (!ExecutorEopWaitBatchingV2() || size == 0 ||
+    if (size == 0 ||
         address > std::numeric_limits<VAddr>::max() - size) {
         return false;
     }
@@ -1277,8 +1519,19 @@ bool Liverpool::ResolvePendingCompletionReadForExecutor(VAddr address, u64 size)
         }
         auto& scheduler = rasterizer->GetScheduler();
         FlushGpuCompletionBatchForExecutor(true, true);
-        scheduler.Wait(dependency_tick);
+        const auto wait_start = std::chrono::steady_clock::now();
+        // The retirement runner performs the only Vulkan timeline wait and
+        // publishes the CPU-side label before this condition is released.
         scheduler.WaitRetirement(dependency_tick);
+        const u64 wait_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count());
+        VideoCore::AccumulateReadbackOptimizationStats(
+            VideoCore::ReadbackOptimizationStats{
+                .cpu_wait_ns = wait_ns,
+                .sidecar_waits = 1,
+            });
     });
     const u64 read_flush_ordinal =
         executor_pending_read_flushes.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1364,10 +1617,8 @@ void Liverpool::SnapshotCpuIndirectGraph(Pm4Engine engine, std::span<const u32> 
                 if (!state->submit_snapshots.contains(key) &&
                     !gpu_modified_at_submit && state->copied_nodes < MaxSnapshotNodes &&
                     state->copied_words <= MaxSnapshotWords - num_words) {
-                    std::vector<u32> child(num_words);
-                    auto* memory = Core::Memory::Instance();
-                    if (memory && memory->TryCopyReadableMemory(address, child.data(), num_bytes,
-                                                               false)) {
+                    std::vector<u32> child;
+                    if (CopyGuestPm4Words(address, num_words, child)) {
                         state->copied_words += num_words;
                         ++state->copied_nodes;
                         auto [it, inserted] =
@@ -1541,8 +1792,17 @@ void Liverpool::PublishGpuCompletionBatchForExecutor() {
     auto completions = std::move(executor_completion_batch);
     executor_completion_batch.clear();
     executor_completion_batch_tick = 0;
+    const auto queued_at = std::chrono::steady_clock::now();
     rasterizer->GetScheduler().DeferPriorityOperationAt(
-        gpu_tick, [completions = std::move(completions)]() mutable {
+        gpu_tick, [gpu_tick, queued_at, completions = std::move(completions)]() mutable {
+            VideoCore::RecordReadbackTimelineRetirement(gpu_tick);
+            VideoCore::AccumulateReadbackOptimizationStats(
+                VideoCore::ReadbackOptimizationStats{
+                    .gpu_completion_ns = static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - queued_at)
+                            .count()),
+                });
             for (auto& completion : completions) {
                 completion();
             }
@@ -1577,8 +1837,20 @@ void Liverpool::FlushGpuCompletionBatchForExecutor(bool force, bool synchronizat
     }
     rasterizer->Flush();
     executor_completion_flush_pending = false;
+    executor_deferred_submit_boundaries = 0;
 }
 #endif
+
+void Liverpool::FlushForPresentationForExecutor() {
+#ifdef __ANDROID__
+    SendCommand<true>([this] {
+        if (rasterizer == nullptr || IsRendererTerminal()) {
+            return;
+        }
+        FlushGpuCompletionBatchForExecutor(true, false);
+    });
+#endif
+}
 
 void Liverpool::WaitRasterizerIdleForExecutor() {
     {
@@ -1624,6 +1896,11 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+#ifdef __ANDROID__
+        if (rasterizer) {
+            rasterizer->FlushPendingGnmDmaTransfers();
+        }
+#endif
         callback();
     }
 }
@@ -1808,6 +2085,10 @@ u32 Liverpool::RecountQueuedSubmits() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifdef __ANDROID__
+    (void)Common::ApplyCurrentThreadAffinity(
+        Common::ThreadAffinityClass::GraphicsDriver);
+#endif
     gpu_id = std::this_thread::get_id();
     std::array<Task::Handle, NumTotalQueues> active_tasks{};
 #ifdef __ANDROID__
@@ -2111,7 +2392,27 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
                 rasterizer->OnSubmit();
 #ifdef __ANDROID__
-                FlushGpuCompletionBatchForExecutor(true, false);
+                if (ExecutorBoundedRasterizerPipeline()) {
+                    // A guest GNM submit is not a Vulkan publication boundary.
+                    // Keep the current command buffer/render scope alive until
+                    // a real dependency, presentation, or a bounded backlog
+                    // requires publication. This mirrors the command-list
+                    // batching used by mature Vulkan emulators and avoids
+                    // beginning a fresh command buffer for every guest packet.
+                    // Presentation and real dependency waits force
+                    // publication. Keep intermediate guest command lists in
+                    // the same primary command buffer so a 10-15-submit frame
+                    // no longer incurs an extra vkEnd/vkBegin/queue-submit in
+                    // its middle.
+                    constexpr u32 MaxDeferredSubmitBoundaries = 64;
+                    ++executor_deferred_submit_boundaries;
+                    if (executor_deferred_submit_boundaries >=
+                        MaxDeferredSubmitBoundaries) {
+                        FlushGpuCompletionBatchForExecutor(true, false);
+                    }
+                } else {
+                    FlushGpuCompletionBatchForExecutor(true, false);
+                }
 #endif
 #ifdef __ANDROID__
                 const bool bounded_pipeline = ExecutorBoundedRasterizerPipeline();
@@ -2303,14 +2604,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
         descriptor_cursor = 0;
         const bool immutable_stream = !owned_ccb.empty() && ccb.data() == owned_ccb.data() &&
                                       ccb.size() == owned_ccb.size();
-        if (!Pm4DescriptorCacheEnabled() || !immutable_stream || ccb.empty() ||
+        if (!VideoCore::IsManagedVulkanDriverOptimization() ||
+            !Pm4DescriptorCacheEnabled() || !immutable_stream || ccb.empty() ||
             ccb.size() > std::numeric_limits<u32>::max()) {
             return;
         }
-        const auto fingerprint = FingerprintPm4Stream(Pm4Engine::Constant, ccb);
-        descriptor_plan = FindPm4DescriptorPlan(fingerprint);
-        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(fingerprint)) {
-            descriptor_candidate = BuildPm4DescriptorPlan(fingerprint, ccb);
+        const auto layout_key = MakePm4LayoutKey(Pm4Engine::Constant, ccb);
+        descriptor_plan = FindPm4DescriptorPlan(layout_key, ccb);
+        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(layout_key)) {
+            descriptor_candidate = BuildPm4DescriptorPlan(layout_key, ccb);
         }
     };
     bind_descriptor_plan();
@@ -2327,9 +2629,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb,
                 ++descriptor_cursor;
             }
             if (descriptor_cursor < descriptor_plan->packets.size() &&
-                descriptor_plan->packets[descriptor_cursor].offset_words == offset_words) {
+                ValidatePm4PacketDescriptor(descriptor_plan->packets[descriptor_cursor],
+                                            offset_words, ccb)) {
                 cached_descriptor = &descriptor_plan->packets[descriptor_cursor];
             } else {
+                ++pm4_descriptor_cache_layout_mismatches_;
                 descriptor_plan.reset();
             }
         }
@@ -2540,18 +2844,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         descriptor_cursor = 0;
         const bool immutable_stream = !owned_dcb.empty() && dcb.data() == owned_dcb.data() &&
                                       dcb.size() == owned_dcb.size();
-        if (!Pm4DescriptorCacheEnabled() || !immutable_stream || dcb.empty() ||
+        if (!VideoCore::IsManagedVulkanDriverOptimization() ||
+            !Pm4DescriptorCacheEnabled() || !immutable_stream || dcb.empty() ||
             dcb.size() > std::numeric_limits<u32>::max()) {
             return;
         }
-        const auto fingerprint = FingerprintPm4Stream(Pm4Engine::Graphics, dcb);
-        descriptor_plan = FindPm4DescriptorPlan(fingerprint);
-        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(fingerprint)) {
-            descriptor_candidate = BuildPm4DescriptorPlan(fingerprint, dcb);
+        const auto layout_key = MakePm4LayoutKey(Pm4Engine::Graphics, dcb);
+        descriptor_plan = FindPm4DescriptorPlan(layout_key, dcb);
+        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(layout_key)) {
+            descriptor_candidate = BuildPm4DescriptorPlan(layout_key, dcb);
         }
     };
     bind_descriptor_plan();
 #ifdef __ANDROID__
+    bool gnm_dma_batch_open = false;
+    const auto flush_gnm_dma_batch = [&] {
+        if (!gnm_dma_batch_open) {
+            return;
+        }
+        if (rasterizer) {
+            rasterizer->FlushPendingGnmDmaTransfers();
+        }
+        gnm_dma_batch_open = false;
+    };
     u32 eop_trace_dcb_dw = static_cast<u32>(dcb.size());
     ExecutorEopTraceParserBegin(base_addr, eop_trace_dcb_dw);
 #endif
@@ -2568,9 +2883,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ++descriptor_cursor;
             }
             if (descriptor_cursor < descriptor_plan->packets.size() &&
-                descriptor_plan->packets[descriptor_cursor].offset_words == offset_words) {
+                ValidatePm4PacketDescriptor(descriptor_plan->packets[descriptor_cursor],
+                                            offset_words, dcb)) {
                 cached_descriptor = &descriptor_plan->packets[descriptor_cursor];
             } else {
+                ++pm4_descriptor_cache_layout_mismatches_;
                 descriptor_plan.reset();
             }
         }
@@ -2627,6 +2944,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                       header->type0.base.Value(), header->type0.NumWords());
             break;
         case 2:
+#ifdef __ANDROID__
+            flush_gnm_dma_batch();
+#endif
             dcb = NextPacket(dcb, 1);
             continue;
         case 3:
@@ -2635,6 +2955,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                            ? static_cast<PM4ItOpcode>(cached_descriptor->opcode)
                                            : header->type3.opcode;
 #ifdef __ANDROID__
+            if (opcode == PM4ItOpcode::DmaData) {
+                gnm_dma_batch_open = true;
+            } else {
+                flush_gnm_dma_batch();
+            }
             if (kLiveChecks) {
                 ++exec_live_summary.packets;
                 exec_live_summary.last_opcode = static_cast<u32>(opcode);
@@ -2887,11 +3212,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                  (set_data->reg_offset - 0x200);
                     std::memcpy(addr, header + 2, set_size);
                 } else {
+#ifdef __ANDROID__
+                    const u32 dirty_sources = ExecutorGraphicsShDirtySources(
+                        regs.reg_array.data(), Regs::NumRegs,
+                        Regs::ShRegWordOffset + set_data->reg_offset, set_data->reg_offset,
+                        reinterpret_cast<const u32*>(header + 2), count - 1);
+#endif
                     if (ExecutorSafeRegArrayWrite(
                             regs.reg_array.data(), Regs::NumRegs,
                             Regs::ShRegWordOffset + set_data->reg_offset, header + 2, count - 1,
                             "sh")) {
+#ifdef __ANDROID__
+                        NotifyGraphicsStateChanged(dirty_sources);
+#else
                         NotifyGraphicsStateChanged();
+#endif
                     }
                 }
 #ifdef __ANDROID__
@@ -3520,7 +3855,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                            dma_data->dst_sel == DmaDataDst::Gds) {
                     rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
+                                           dma_data->NumBytes(), true, false, true);
                 } else if (dma_data->src_sel == DmaDataSrc::Data &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
@@ -3530,14 +3865,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                     rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
+                                           dma_data->NumBytes(), false, true, true);
                 } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                     rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
                                            dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
+                                           false, false, true);
                 } else {
                     UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
                                     u32(dma_data->src_sel.Value()), u32(dma_data->dst_sel.Value()));
@@ -3757,6 +4092,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                         (unsigned long long)reinterpret_cast<uintptr_t>(wait_addr),
                                         wait_reg_mem->ref, wait_reg_mem->mask);
                 }
+                // Consult the completion sidecar before touching the watched guest page.
+                // Reading the page first turns every already-known EOP/EOS dependency into
+                // a synchronous 4 KiB GPU->CPU download and timeline wait.  The recorded
+                // completion tick carries the same ordering contract entirely on the GPU.
+                const u64 sidecar_dependency_tick = ConsumeCompletionWaitForExecutor(
+                    state, Pm4Engine::Graphics, *wait_reg_mem);
+                if (sidecar_dependency_tick != 0) {
+                    OrderGpuWorkAfterCompletionForExecutor(sidecar_dependency_tick);
+                    ++executor_logical_wait_count;
+                    break;
+                }
 #endif
                 u32 wait_value{};
 #ifdef __ANDROID__
@@ -3773,15 +4119,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const char* wait_source = "";
 #endif
 #ifdef __ANDROID__
-                if (!TestWaitRegMemValue(*wait_reg_mem, wait_value)) {
-                    const u64 dependency_tick = ConsumeCompletionWaitForExecutor(
-                        state, Pm4Engine::Graphics, *wait_reg_mem);
-                    if (dependency_tick != 0) {
-                        OrderGpuWorkAfterCompletionForExecutor(dependency_tick);
-                        ++executor_logical_wait_count;
-                        break;
-                    }
-                }
                 const bool untracked_wait_pending =
                     !TestWaitRegMemValue(*wait_reg_mem, wait_value);
                 bool untracked_gpu_publication_deferred = false;
@@ -4069,6 +4406,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
     }
 
+#ifdef __ANDROID__
+    flush_gnm_dma_batch();
+#endif
     if (owns_ce_context && ce_task.handle && !ce_task.handle.done()) {
         while (!ce_task.handle.done() && !state->abort) {
             RESUME_GFX(ce_task);
@@ -4154,17 +4494,31 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
         descriptor_cursor = 0;
         const bool immutable_stream = !owned_acb.empty() && acb.data() == owned_acb.data() &&
                                       acb.size() == owned_acb.size();
-        if (!Pm4DescriptorCacheEnabled() || !immutable_stream || queue.tmp_dwords != 0 ||
-            acb.empty() || acb.size() > std::numeric_limits<u32>::max()) {
+        if (!VideoCore::IsManagedVulkanDriverOptimization() ||
+            !Pm4DescriptorCacheEnabled() || !immutable_stream ||
+            queue.tmp_dwords != 0 || acb.empty() ||
+            acb.size() > std::numeric_limits<u32>::max()) {
             return;
         }
-        const auto fingerprint = FingerprintPm4Stream(Pm4Engine::Compute, acb);
-        descriptor_plan = FindPm4DescriptorPlan(fingerprint);
-        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(fingerprint)) {
-            descriptor_candidate = BuildPm4DescriptorPlan(fingerprint, acb);
+        const auto layout_key = MakePm4LayoutKey(Pm4Engine::Compute, acb);
+        descriptor_plan = FindPm4DescriptorPlan(layout_key, acb);
+        if (!descriptor_plan && AdmitPm4DescriptorPlanBuild(layout_key)) {
+            descriptor_candidate = BuildPm4DescriptorPlan(layout_key, acb);
         }
     };
     bind_descriptor_plan();
+#ifdef __ANDROID__
+    bool gnm_dma_batch_open = false;
+    const auto flush_gnm_dma_batch = [&] {
+        if (!gnm_dma_batch_open) {
+            return;
+        }
+        if (rasterizer) {
+            rasterizer->FlushPendingGnmDmaTransfers();
+        }
+        gnm_dma_batch_open = false;
+    };
+#endif
     while (!acb.empty() && !state->abort) {
         ProcessCommands();
 
@@ -4179,9 +4533,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                 ++descriptor_cursor;
             }
             if (descriptor_cursor < descriptor_plan->packets.size() &&
-                descriptor_plan->packets[descriptor_cursor].offset_words == offset_words) {
+                ValidatePm4PacketDescriptor(descriptor_plan->packets[descriptor_cursor],
+                                            offset_words, acb)) {
                 cached_descriptor = &descriptor_plan->packets[descriptor_cursor];
             } else {
+                ++pm4_descriptor_cache_layout_mismatches_;
                 descriptor_plan.reset();
             }
         }
@@ -4220,6 +4576,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                         next_dw_off * sizeof(u32));
             queue.tmp_dwords = 0;
         } else if (packet_type == 2) {
+#ifdef __ANDROID__
+            flush_gnm_dma_batch();
+#endif
             acb = NextPacket(acb, next_dw_off);
             if (advances_ring) {
                 *queue.read_addr += next_dw_off;
@@ -4252,6 +4611,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                                        ? static_cast<PM4ItOpcode>(cached_descriptor->opcode)
                                        : header->type3.opcode;
 
+#ifdef __ANDROID__
+        if (opcode == PM4ItOpcode::DmaData) {
+            gnm_dma_batch_open = true;
+        } else {
+            flush_gnm_dma_batch();
+        }
+#endif
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -4334,7 +4700,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma_data->dst_sel == DmaDataDst::Gds) {
                 rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                       dma_data->NumBytes(), true, false);
+                                       dma_data->NumBytes(), true, false, true);
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
@@ -4344,7 +4710,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                 rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                       dma_data->NumBytes(), false, true);
+                                       dma_data->NumBytes(), false, true, true);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -4372,7 +4738,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                     patched_header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(patched_header, src_addr);
                 } else {
-                    rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
+                    rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false, true);
                 }
             } else {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
@@ -4593,17 +4959,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
             }
 #ifdef __ANDROID__
             {
+                const u64 sidecar_dependency_tick = ConsumeCompletionWaitForExecutor(
+                    state, Pm4Engine::Compute, *wait_reg_mem);
+                if (sidecar_dependency_tick != 0) {
+                    OrderGpuWorkAfterCompletionForExecutor(sidecar_dependency_tick);
+                    ++executor_logical_wait_count;
+                    break;
+                }
                 u32 current_value{};
                 ExecutorReadWaitRegMemValue(*wait_reg_mem, regs.reg_array, &current_value);
-                if (!TestWaitRegMemValue(*wait_reg_mem, current_value)) {
-                    const u64 dependency_tick = ConsumeCompletionWaitForExecutor(
-                        state, Pm4Engine::Compute, *wait_reg_mem);
-                    if (dependency_tick != 0) {
-                        OrderGpuWorkAfterCompletionForExecutor(dependency_tick);
-                        ++executor_logical_wait_count;
-                        break;
-                    }
-                }
                 const bool untracked_wait_pending =
                     !TestWaitRegMemValue(*wait_reg_mem, current_value);
                 bool untracked_gpu_publication_deferred = false;
@@ -4787,6 +5151,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
         }
     }
 
+#ifdef __ANDROID__
+    flush_gnm_dma_batch();
+#endif
     if (state->abort && advances_ring) {
         queue.tmp_dwords = 0;
     }
@@ -4844,8 +5211,22 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     own_submitted_buffers = true;
 #endif
     if (own_submitted_buffers) {
-        owned_dcb.assign(dcb.begin(), dcb.end());
-        owned_ccb.assign(ccb.begin(), ccb.end());
+        const bool copied_dcb =
+            dcb.empty() ||
+            CopyGuestPm4Words(reinterpret_cast<VAddr>(dcb.data()),
+                              static_cast<u32>(dcb.size()), owned_dcb);
+        const bool copied_ccb =
+            ccb.empty() ||
+            CopyGuestPm4Words(reinterpret_cast<VAddr>(ccb.data()),
+                              static_cast<u32>(ccb.size()), owned_ccb);
+        if (!copied_dcb || !copied_ccb) {
+#ifdef __ANDROID__
+            ExecutorPrepareGuestPm4Read(dcb);
+            ExecutorPrepareGuestPm4Read(ccb);
+#endif
+            owned_dcb.assign(dcb.begin(), dcb.end());
+            owned_ccb.assign(ccb.begin(), ccb.end());
+        }
     }
 
     const VAddr logical_dcb_base = reinterpret_cast<VAddr>(dcb.data());
@@ -4983,7 +5364,14 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     const auto vqid = gnm_vqid - 1;
     const VAddr logical_acb_base = reinterpret_cast<VAddr>(acb.data());
-    std::vector<u32> owned_acb{acb.begin(), acb.end()};
+    std::vector<u32> owned_acb;
+    if (!acb.empty() &&
+        !CopyGuestPm4Words(logical_acb_base, static_cast<u32>(acb.size()), owned_acb)) {
+#ifdef __ANDROID__
+        ExecutorPrepareGuestPm4Read(acb);
+#endif
+        owned_acb.assign(acb.begin(), acb.end());
+    }
     auto state = std::make_shared<Pm4SubmissionState>();
     SnapshotCpuIndirectGraph(Pm4Engine::Compute, owned_acb, state);
     auto task = ProcessCompute(acb, vqid, std::move(owned_acb), std::move(state), 0,

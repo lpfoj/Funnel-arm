@@ -14,7 +14,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading)
+                                 SerializationSupport& sdata, bool preloading,
+                                 vk::PipelineCreateFlags build_flags)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::LogicalStage::Compute)];
@@ -32,21 +33,45 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
 
     u32 binding{};
+    size_t storage_buffer_index{};
+    if (!preloading) {
+        sdata.storage_buffers.clear();
+        sdata.storage_buffers.reserve(info->buffers.size());
+        sdata.image_bindings.clear();
+        sdata.image_bindings.reserve(info->images.size());
+    }
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     for (const auto& buffer : info->buffers) {
         const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
-        for (u32 alias = 0; alias < buffer.NumBindings(); ++alias) {
-            bindings.push_back({
-                .binding = binding++,
-                .descriptorType = buffer.IsStorage(sharp) ? vk::DescriptorType::eStorageBuffer
-                                                          : vk::DescriptorType::eUniformBuffer,
-                .descriptorCount = 1,
-                .stageFlags = vk::ShaderStageFlagBits::eCompute,
-            });
+        const bool is_storage =
+            preloading
+                ? storage_buffer_index < sdata.storage_buffers.size() &&
+                      sdata.storage_buffers[storage_buffer_index] != 0
+                : buffer.IsStorage(sharp);
+        if (!preloading) {
+            sdata.storage_buffers.push_back(is_storage ? 1u : 0u);
         }
+        ++storage_buffer_index;
+        bindings.push_back({
+            .binding = binding++,
+            .descriptorType = is_storage ? vk::DescriptorType::eStorageBuffer
+                                         : vk::DescriptorType::eUniformBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        });
     }
+    size_t image_binding_index{};
     for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
+        const u32 num_bindings =
+            preloading
+                ? (image_binding_index < sdata.image_bindings.size()
+                       ? sdata.image_bindings[image_binding_index]
+                       : 1u)
+                : image.NumBindings(*info);
+        if (!preloading) {
+            sdata.image_bindings.push_back(num_bindings);
+        }
+        ++image_binding_index;
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
@@ -83,9 +108,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const auto device = instance.GetDevice();
     auto [descriptor_set_result, descriptor_set] =
         device.createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(descriptor_set_result == vk::Result::eSuccess,
-               "Failed to create compute descriptor set layout: {}",
-               vk::to_string(descriptor_set_result));
+    if (descriptor_set_result != vk::Result::eSuccess) {
+        build_result = descriptor_set_result;
+        LOG_ERROR(Render_Vulkan, "Failed to create compute descriptor set layout: {}",
+                  vk::to_string(descriptor_set_result));
+        return;
+    }
     desc_layout = std::move(descriptor_set);
 
     const vk::DescriptorSetLayout set_layout = *desc_layout;
@@ -96,19 +124,30 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .pPushConstantRanges = &push_constants,
     };
     auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create compute pipeline layout: {}", vk::to_string(layout_result));
+    if (layout_result != vk::Result::eSuccess) {
+        build_result = layout_result;
+        LOG_ERROR(Render_Vulkan, "Failed to create compute pipeline layout: {}",
+                  vk::to_string(layout_result));
+        return;
+    }
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = build_flags,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
-               vk::to_string(pipeline_result));
+    build_result = pipeline_result;
+    if (pipeline_result != vk::Result::eSuccess) {
+        if (pipeline_result != vk::Result::ePipelineCompileRequired) {
+            LOG_ERROR(Render_Vulkan, "Failed to create compute pipeline: {}",
+                      vk::to_string(pipeline_result));
+        }
+        return;
+    }
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
 }

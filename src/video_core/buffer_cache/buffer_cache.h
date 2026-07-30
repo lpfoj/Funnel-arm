@@ -41,11 +41,23 @@ class PageManager;
 
 class BufferCache {
 public:
+    enum class ReadOnlyBufferUsage : u8 {
+        Vertex,
+        Index,
+        Uniform,
+        Storage,
+        Count,
+    };
+
     static constexpr u32 CACHING_PAGEBITS = 14;
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
     static constexpr u64 CACHING_NUMPAGES = u64{1} << (40 - CACHING_PAGEBITS);
     static constexpr u64 BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+    static constexpr u64 FAULT_WORDS = CACHING_NUMPAGES / 32;
+    static constexpr u64 FAULT_SUMMARY_WORDS = (FAULT_WORDS + 31) / 32;
+    static constexpr u64 FAULT_SUMMARY_OFFSET = FAULT_WORDS;
+    static constexpr u64 FAULT_BUFFER_WORDS = FAULT_WORDS + FAULT_SUMMARY_WORDS;
 
     static constexpr s64 DEFAULT_TRIGGER_GC_MEMORY = 1_GB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 2_GB;
@@ -141,11 +153,15 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
 
-    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds,
+                    bool defer_gnm_dma);
 
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
                                                        BufferId buffer_id = {});
+
+    [[nodiscard]] std::pair<Buffer*, u32> ObtainReadOnlyBuffer(
+        VAddr gpu_addr, u32 size, ReadOnlyBufferUsage usage, BufferId fallback_buffer_id = {});
 
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
 
@@ -187,6 +203,23 @@ public:
     void RunGarbageCollector(std::optional<size_t> sampled_device_memory = std::nullopt);
 
 private:
+#ifdef __ANDROID__
+    void ExecutorMaybeLogBindDedup();
+#endif
+
+    enum class ReadOnlyRenameFallback : u8 {
+        GpuModified,
+        ImageAlias,
+        NotCpuDirty,
+        NotReadable,
+        TooLarge,
+        StreamNotCoherent,
+        TickBudget,
+        RingBusy,
+        CopyFailed,
+        Count,
+    };
+
     template <typename Func>
     void ForEachBufferInRange(VAddr device_addr, u64 size, Func&& func) {
         buffer_ranges.ForEachInRange(device_addr, size,
@@ -221,11 +254,13 @@ private:
         u64 tick = 0;
     };
 
-    void DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_addr, u64 size);
+    void DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_addr, u64 size,
+                                  bool is_write);
     void WaitForPendingReadback(VAddr device_addr, u64 size);
 
-    std::array<RecentReadbackWindow, 32> recent_readback_windows{};
+    std::array<RecentReadbackWindow, 64> recent_readback_windows{};
     u32 recent_readback_window_count = 0;
+    u64 last_submit_readback_snapshot_tick = 0;
     std::mutex pending_readback_mutex;
     std::vector<PendingReadbackRange> pending_readback_ranges;
 #endif
@@ -278,6 +313,40 @@ private:
     u64 gc_tick = 0;
     std::atomic<bool> guest_readback_generation_tracking{false};
     std::atomic<u64> guest_readback_generation{0};
+#ifdef __ANDROID__
+    vk::CommandBuffer executor_vertex_bind_cmdbuf{};
+    u64 executor_vertex_bind_recording_tick{};
+    u64 executor_vertex_bind_graphics_pipeline_epoch{};
+    u64 executor_vertex_input_bind_epoch{};
+    u64 executor_vertex_buffer_bind_epoch{};
+    PreparedVertexBuffers executor_bound_vertex_state{};
+    bool executor_vertex_input_bind_valid{};
+    bool executor_vertex_buffer_bind_valid{};
+    vk::CommandBuffer executor_index_bind_cmdbuf{};
+    u64 executor_index_bind_recording_tick{};
+    u64 executor_index_bind_graphics_pipeline_epoch{};
+    u64 executor_index_buffer_bind_epoch{};
+    PreparedIndexBuffer executor_bound_index_state{};
+    bool executor_index_buffer_bind_valid{};
+    u64 executor_vertex_input_bind_attempts{};
+    u64 executor_vertex_input_bind_hits{};
+    u64 executor_vertex_buffer_bind_attempts{};
+    u64 executor_vertex_buffer_bind_hits{};
+    u64 executor_index_buffer_bind_attempts{};
+    u64 executor_index_buffer_bind_hits{};
+    u64 executor_bind_dedup_next_log{16384};
+    std::array<u64, static_cast<std::size_t>(ReadOnlyBufferUsage::Count)>
+        read_only_rename_usage_counts{};
+    std::array<u64, static_cast<std::size_t>(ReadOnlyBufferUsage::Count)>
+        read_only_rename_success_usage_counts{};
+    std::array<u64, static_cast<std::size_t>(ReadOnlyRenameFallback::Count)>
+        read_only_rename_fallback_counts{};
+    u64 read_only_rename_attempts{};
+    u64 read_only_rename_ranges{};
+    u64 read_only_rename_bytes{};
+    u64 read_only_rename_tick{};
+    u64 read_only_rename_tick_bytes{};
+#endif
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;

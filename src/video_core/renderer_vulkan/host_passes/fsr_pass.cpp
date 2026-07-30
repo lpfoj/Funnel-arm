@@ -6,6 +6,7 @@
 #include "video_core/host_shaders/fsr_comp.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #define A_CPU
@@ -136,9 +137,9 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
     }
 }
 
-vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                              vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
-                              bool hdr) {
+vk::ImageView FsrPass::Render(Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                              vk::ImageView input, vk::Extent2D input_size,
+                              vk::Extent2D output_size, Settings settings, bool hdr) {
     if (!settings.enable) {
         DebugState.is_using_fsr = false;
         return input;
@@ -243,10 +244,13 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             }};
 
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, easu_pipeline.get());
+            scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
                                         set_writes);
+            scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eCompute);
             cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
                                  sizeof(FSRConstants), &consts);
+            scheduler.MarkPushConstants(vk::PipelineBindPoint::eCompute);
             cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
         }
 
@@ -318,10 +322,13 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             }};
 
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, rcas_pipeline.get());
+            scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
                                         set_writes);
+            scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eCompute);
             cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
                                  sizeof(FSRConstants), &consts);
+            scheduler.MarkPushConstants(vk::PipelineBindPoint::eCompute);
             cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
         }
 
@@ -362,10 +369,13 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         }};
 
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, easu_pipeline.get());
+        scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
                                     set_writes);
+        scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eCompute);
         cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(FSRConstants), &consts);
+        scheduler.MarkPushConstants(vk::PipelineBindPoint::eCompute);
         cmdbuf.dispatch(dispatch_x, dispatch_y, 1);
     }
 

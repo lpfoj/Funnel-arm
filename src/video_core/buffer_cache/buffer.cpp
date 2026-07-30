@@ -87,6 +87,12 @@ UniqueBuffer::~UniqueBuffer() {
 
 void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,
                           VmaAllocationInfo* out_alloc_info) {
+    const bool created = TryCreate(buffer_ci, usage, out_alloc_info);
+    ASSERT_MSG(created, "Failed allocating buffer");
+}
+
+bool UniqueBuffer::TryCreate(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,
+                             VmaAllocationInfo* out_alloc_info) noexcept {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     const VmaAllocationCreateFlags bda_flag =
         with_bda && !ExecutorSuballocateBdaBuffers()
@@ -105,8 +111,11 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     VkBuffer unsafe_buffer{};
     VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                       &allocation, out_alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
-               vk::to_string(vk::Result{result}));
+    if (result != VK_SUCCESS) {
+        allocation = VK_NULL_HANDLE;
+        buffer = VK_NULL_HANDLE;
+        return false;
+    }
     buffer = vk::Buffer{unsafe_buffer};
 
     if (with_bda) {
@@ -114,9 +123,15 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
             .buffer = buffer,
         };
         auto bda_result = device.getBufferAddress(bda_info);
-        ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
+        if (bda_result == 0) {
+            vmaDestroyBuffer(allocator, unsafe_buffer, allocation);
+            allocation = VK_NULL_HANDLE;
+            buffer = VK_NULL_HANDLE;
+            return false;
+        }
         bda_addr = bda_result;
     }
+    return true;
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
@@ -141,8 +156,47 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 }
 
+Buffer::Buffer(std::nothrow_t, const Vulkan::Instance& instance_,
+               Vulkan::Scheduler& scheduler_, MemoryUsage usage_, VAddr cpu_addr_,
+               vk::BufferUsageFlags flags, u64 size_bytes_) noexcept
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_},
+      scheduler{&scheduler_}, usage{usage_},
+      buffer{instance->GetDevice(), instance->GetAllocator()} {
+    const vk::BufferCreateInfo buffer_ci = {
+        .size = size_bytes,
+        .usage = flags,
+    };
+    VmaAllocationInfo alloc_info{};
+    if (!buffer.TryCreate(buffer_ci, usage, &alloc_info)) {
+        size_bytes = 0;
+        return;
+    }
+
+    Vulkan::SetObjectName(instance->GetDevice(), Handle(),
+                          "Best-effort buffer {:#x}:{:#x}", cpu_addr, size_bytes);
+    VkMemoryPropertyFlags property_flags{};
+    vmaGetAllocationMemoryProperties(instance->GetAllocator(), buffer.allocation,
+                                     &property_flags);
+    if (alloc_info.pMappedData) {
+        mapped_data =
+            std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+    }
+    is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+}
+
+void Buffer::InvalidateMappedRange(const u64 offset, const u64 size) const noexcept {
+    if (!IsValid() || is_coherent || mapped_data.empty() || size == 0 ||
+        offset > size_bytes || size > size_bytes - offset) {
+        return;
+    }
+    vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset, size);
+}
+
 void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
-    scheduler->EndRendering();
+    if (num_bytes == 0) {
+        return;
+    }
+    scheduler->EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferFill);
     ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer size must be a multiple of 4 bytes");
     const auto cmdbuf = scheduler->CommandBuffer();

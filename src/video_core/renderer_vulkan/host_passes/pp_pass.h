@@ -8,6 +8,7 @@
 
 namespace Vulkan {
 class Frame;
+class Scheduler;
 }
 
 namespace Vulkan::HostPasses {
@@ -21,8 +22,8 @@ public:
 
     void Create(vk::Device device, vk::Format surface_format);
 
-    void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
-                Frame& output, Settings settings);
+    void Render(Scheduler& scheduler, vk::CommandBuffer cmdbuf, vk::ImageView input,
+                vk::Extent2D input_size, Frame& output, Settings settings);
 
 private:
     vk::UniquePipeline pipeline{};

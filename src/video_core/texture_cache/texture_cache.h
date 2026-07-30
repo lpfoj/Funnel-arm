@@ -218,6 +218,13 @@ public:
 
     void RunGarbageCollector(std::optional<size_t> sampled_device_memory = std::nullopt);
 
+    /// Device-local residency threshold shared with small renderer-owned
+    /// auxiliary pools. This keeps those pools inside the same mobile memory
+    /// policy instead of each inventing an unrelated absolute limit.
+    [[nodiscard]] u64 ManagedResidencyTriggerBytes() const noexcept {
+        return trigger_gc_memory;
+    }
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -309,6 +316,7 @@ private:
 
     void GarbageCollectImages(std::optional<size_t> sampled_device_memory);
     void GarbageCollectSamplers();
+    void RefreshManagedResidencyPolicy(bool force = false);
 
 private:
     const Vulkan::Instance& instance;
@@ -334,9 +342,12 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
+    tsl::robin_map<u64, ImageIds> exact_surface_index;
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;
+    bool residency_policy_initialized = false;
+    bool residency_policy_mobile = false;
     struct MetaDataInfo {
         enum class Type {
             CMask,

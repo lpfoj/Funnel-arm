@@ -55,8 +55,10 @@ std::size_t ResourcePool::ManageOverflow() {
 
 constexpr std::size_t COMMAND_BUFFER_POOL_SIZE = 4;
 
-CommandPool::CommandPool(const Instance& instance, MasterSemaphore* master_semaphore)
-    : ResourcePool{master_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance} {
+CommandPool::CommandPool(const Instance& instance, MasterSemaphore* master_semaphore,
+                         const vk::CommandBufferLevel level_)
+    : ResourcePool{master_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance},
+      level{level_} {
     const vk::CommandPoolCreateInfo pool_create_info = {
         .flags = vk::CommandPoolCreateFlagBits::eTransient |
                  vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -77,7 +79,7 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
 
     const vk::CommandBufferAllocateInfo buffer_alloc_info = {
         .commandPool = *cmd_pool,
-        .level = vk::CommandBufferLevel::ePrimary,
+        .level = level,
         .commandBufferCount = COMMAND_BUFFER_POOL_SIZE,
     };
 

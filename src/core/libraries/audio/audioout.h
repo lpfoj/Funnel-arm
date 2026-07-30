@@ -3,12 +3,14 @@
 
 #pragma once
 
+#include <array>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <thread>
+#include <vector>
 
 #include "common/bit_field.h"
+#include "core/libraries/audio/audio_mix.h"
 #include "core/libraries/kernel/threads.h"
 #include "core/libraries/system/userservice.h"
 
@@ -117,16 +119,24 @@ struct AudioFormatInfo {
 
 struct PortOut {
     std::mutex mutex;
+    std::mutex backend_mutex;
     std::unique_ptr<PortBackend> impl{};
 
-    void* output_buffer = nullptr;
+    std::array<std::vector<u8>, 2> output_buffers{};
+    std::vector<float> normalized_output_buffer{};
+    std::vector<float> mix_scratch_buffer{};
     std::condition_variable_any output_cv;
-    bool output_ready = false;
-#ifdef __ANDROID__
-    std::jthread output_thread_host{};
-#else
-    Kernel::Thread output_thread{};
-#endif
+    s8 ready_slot{-1};
+    s8 processing_slot{-1};
+    u8 next_write_slot{};
+    bool closing{};
+    u64 submitted_sequence{};
+    u64 ready_sequence{};
+    u64 ready_timestamp_ns{};
+    u64 next_output_deadline_ns{};
+    AudioStreamGuard stream_guard{};
+    AudioConversionGuard normalize_guard{};
+    AudioConversionGuard mix_guard{};
 
     OrbisAudioOutPort type;
     AudioFormatInfo format_info;
@@ -141,6 +151,14 @@ struct PortOut {
 
     [[nodiscard]] u32 BufferSize() const {
         return buffer_frames * format_info.FrameSize();
+    }
+
+    [[nodiscard]] bool CanAcceptBuffer() const {
+        return ready_slot < 0;
+    }
+
+    [[nodiscard]] bool IsIdle() const {
+        return ready_slot < 0 && processing_slot < 0;
     }
 };
 
@@ -220,4 +238,4 @@ s32 PS4_SYSV_ABI sceAudioOutSetSystemDebugState();
 
 void AdjustVol();
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
-}
+} // namespace Libraries::AudioOut

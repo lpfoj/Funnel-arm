@@ -76,6 +76,8 @@ public:
         VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors{};
         vk::PipelineMultisampleStateCreateInfo multisampling{};
+        std::vector<u8> storage_buffers{};
+        std::vector<u32> image_bindings{};
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
 
@@ -90,8 +92,15 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, vk::PipelineCreateFlags build_flags = {});
     ~GraphicsPipeline();
+
+    static void PrepareSerializationSupport(
+        const Instance& instance, const GraphicsPipelineKey& key,
+        std::span<const Shader::Info*, MaxShaderStages> stages,
+        std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+        std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
+        SerializationSupport& sdata);
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -120,7 +129,7 @@ public:
                          u32 step_rate_1) const;
 
 private:
-    void BuildDescSetLayout(bool preloading);
+    bool BuildDescSetLayout(SerializationSupport& sdata, bool preloading);
 
 private:
     GraphicsPipelineKey key;

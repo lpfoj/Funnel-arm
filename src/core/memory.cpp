@@ -11,6 +11,7 @@
 #include "common/config.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/scope_exit.h"
 #include "core/aerolib/stubs.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -20,6 +21,14 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
+
+#ifdef __ANDROID__
+thread_local u64 executor_copy_sparse_caller{};
+
+u64 ExecutorCopySparseCaller() noexcept {
+    return executor_copy_sparse_caller;
+}
+#endif
 
 MemoryManager::MemoryManager() {
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
@@ -268,6 +277,14 @@ const MemoryManager::ReplayRange* MemoryManager::FindReplayRange(VAddr addr) con
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+#ifdef __ANDROID__
+    const u64 previous_copy_sparse_caller = executor_copy_sparse_caller;
+    executor_copy_sparse_caller =
+        reinterpret_cast<u64>(__builtin_return_address(0));
+    SCOPE_EXIT {
+        executor_copy_sparse_caller = previous_copy_sparse_caller;
+    };
+#endif
     std::shared_lock lk{mutex};
     if (!replay_ranges.empty()) {
         while (size) {

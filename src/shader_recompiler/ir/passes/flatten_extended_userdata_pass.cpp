@@ -399,7 +399,8 @@ void RunPortableSrtWalker(const u32* user_data, u32* flat, const PersistentSrtIn
             return;
         }
     }
-    boost::container::small_vector<u32, 32> node_span_dw;
+    static thread_local boost::container::small_vector<u32, 32> node_span_dw;
+    node_span_dw.clear();
     if (capture || memory_ranges) {
         node_span_dw.resize(srt.portable_nodes.size(), 0);
         for (const auto& c : srt.portable_copies) {
@@ -413,8 +414,12 @@ void RunPortableSrtWalker(const u32* user_data, u32* flat, const PersistentSrtIn
     }
     const bool bulk_reader_requested = !replay && memory_reader != nullptr && memory_ranges != nullptr;
     bool bulk_reader_enabled = bulk_reader_requested;
-    boost::container::small_vector<size_t, 32> node_bulk_offsets(srt.portable_nodes.size(), 0);
-    boost::container::small_vector<u8, 32> node_bulk_valid(srt.portable_nodes.size(), 0);
+    static thread_local boost::container::small_vector<size_t, 32>
+        node_bulk_offsets;
+    static thread_local boost::container::small_vector<u8, 32>
+        node_bulk_valid;
+    node_bulk_offsets.assign(srt.portable_nodes.size(), 0);
+    node_bulk_valid.assign(srt.portable_nodes.size(), 0);
     size_t total_bulk_dwords = 0;
     constexpr size_t kMaxBulkSrtDwords = 64u * 1024u;
     if (bulk_reader_enabled) {
@@ -427,11 +432,14 @@ void RunPortableSrtWalker(const u32* user_data, u32* flat, const PersistentSrtIn
             total_bulk_dwords += node_span_dw[i];
         }
     }
-    boost::container::small_vector<u32, 256> bulk_node_words;
+    static thread_local boost::container::small_vector<u32, 256>
+        bulk_node_words;
+    bulk_node_words.clear();
     if (bulk_reader_enabled) {
         bulk_node_words.resize(total_bulk_dwords);
     }
-    boost::container::small_vector<VAddr, 32> bases(srt.portable_nodes.size(), 0);
+    static thread_local boost::container::small_vector<VAddr, 32> bases;
+    bases.assign(srt.portable_nodes.size(), 0);
     for (size_t i = 0; i < srt.portable_nodes.size(); ++i) {
         const auto& n = srt.portable_nodes[i];
         u64 ptr{};

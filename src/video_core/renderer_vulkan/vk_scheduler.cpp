@@ -9,12 +9,14 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vulkan_driver_optimization.h"
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <vector>
 
 #ifdef __ANDROID__
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -837,6 +839,69 @@ void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept {
 }
 #endif
 
+#ifdef __ANDROID__
+namespace {
+
+struct ExecutorRenderScopeTelemetry {
+    const Scheduler* owner{};
+    std::array<u64, static_cast<std::size_t>(Scheduler::EndRenderingReason::Count)>
+        end_reason_counts{};
+    std::array<u64, static_cast<std::size_t>(Scheduler::EndRenderingReason::Count)>
+        same_state_reopen_counts{};
+    RenderState last_ended_render_state{};
+    Scheduler::EndRenderingReason last_end_reason{Scheduler::EndRenderingReason::Unknown};
+    u64 begin_count{};
+    u64 end_count{};
+    u64 same_state_reopen_count{};
+    u64 consumed_clear_reuse_count{};
+    bool has_last_ended_render_state{};
+};
+
+bool HasRenderClear(const RenderState& state) noexcept {
+    for (u32 index = 0; index < state.num_color_attachments; ++index) {
+        if (state.color_attachments[index].is_clear != 0) {
+            return true;
+        }
+    }
+    return state.depth_stencil_attachment.depth_clear ||
+           state.depth_stencil_attachment.stencil_clear;
+}
+
+bool CanReuseAfterConsumedClear(const RenderState& active,
+                                const RenderState& requested) noexcept {
+    if (!HasRenderClear(active) || HasRenderClear(requested)) {
+        return false;
+    }
+
+    RenderState normalized_active = active;
+    RenderState normalized_requested = requested;
+    for (u32 index = 0; index < normalized_active.color_attachments.size(); ++index) {
+        normalized_active.color_attachments[index].is_clear = 0;
+        normalized_active.color_attachments[index].clear_value = {};
+        normalized_requested.color_attachments[index].is_clear = 0;
+        normalized_requested.color_attachments[index].clear_value = {};
+    }
+    normalized_active.depth_stencil_attachment.depth_clear = false;
+    normalized_active.depth_stencil_attachment.stencil_clear = false;
+    normalized_active.depth_stencil_attachment.clear_value = {};
+    normalized_requested.depth_stencil_attachment.depth_clear = false;
+    normalized_requested.depth_stencil_attachment.stencil_clear = false;
+    normalized_requested.depth_stencil_attachment.clear_value = {};
+    return normalized_active == normalized_requested;
+}
+
+ExecutorRenderScopeTelemetry& RenderScopeTelemetryFor(const Scheduler* owner) {
+    static thread_local ExecutorRenderScopeTelemetry telemetry{};
+    if (telemetry.owner != owner) {
+        telemetry = {};
+        telemetry.owner = owner;
+    }
+    return telemetry;
+}
+
+} // namespace
+#endif
+
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance)
@@ -852,6 +917,21 @@ Scheduler::Scheduler(const Instance& instance)
 }
 
 Scheduler::~Scheduler() {
+#ifdef __ANDROID__
+    if (pending_submit_thread.joinable()) {
+        pending_submit_thread.request_stop();
+        pending_submit_cv.notify_all();
+        pending_submit_thread.join();
+    }
+    {
+        std::scoped_lock lk{submit_mutex};
+        SubmitPendingBatchLocked(nullptr, {}, 0, true);
+    }
+    const u64 current_tick = master_semaphore.CurrentTick();
+    if (current_tick > 1 && !master_semaphore.IsDeviceLost()) {
+        master_semaphore.Wait(current_tick - 1);
+    }
+#endif
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -893,6 +973,7 @@ void Scheduler::DeferPriorityOperationAt(u64 gpu_tick, Common::UniqueFunction<vo
         notify_retirement_worker = retirement_pending_ops.empty();
         retirement_pending_ops[gpu_tick].emplace(std::move(func), gpu_tick);
         ++retirement_outstanding_ops[gpu_tick];
+        retirement_outstanding_count.fetch_add(1, std::memory_order_release);
     }
     if (notify_retirement_worker) {
         retirement_pending_ops_cv.notify_one();
@@ -901,6 +982,9 @@ void Scheduler::DeferPriorityOperationAt(u64 gpu_tick, Common::UniqueFunction<vo
 
 void Scheduler::MarkTerminal(vk::Result result, const char* where) noexcept {
     master_semaphore.MarkTerminal(result, where);
+#ifdef __ANDROID__
+    pending_submit_cv.notify_all();
+#endif
     priority_pending_ops_cv.notify_all();
     retirement_pending_ops_cv.notify_all();
     event_cv.notify_all();
@@ -913,7 +997,108 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
-    EndRendering();
+#ifdef __ANDROID__
+    auto& telemetry = RenderScopeTelemetryFor(this);
+    const bool managed_render_scope_reuse =
+        VideoCore::IsManagedVulkanRenderScopeReuse();
+    if (is_rendering && managed_render_scope_reuse &&
+        CanReuseAfterConsumedClear(render_state, new_state)) {
+        render_state = new_state;
+        ++telemetry.consumed_clear_reuse_count;
+        VideoCore::RecordVulkanRenderScopeReuse();
+        return;
+    }
+    if (managed_render_scope_reuse) {
+        ++telemetry.begin_count;
+        if (!is_rendering && telemetry.has_last_ended_render_state &&
+            telemetry.last_ended_render_state == new_state) {
+            ++telemetry.same_state_reopen_count;
+            ++telemetry.same_state_reopen_counts[static_cast<std::size_t>(
+                telemetry.last_end_reason)];
+        }
+    }
+    if (managed_render_scope_reuse &&
+        (telemetry.begin_count == 256 ||
+         (telemetry.begin_count & 4095u) == 0)) {
+        const auto reason_count = [&](const EndRenderingReason reason) {
+            return telemetry.end_reason_counts[static_cast<std::size_t>(reason)];
+        };
+        const auto reopen_count = [&](const EndRenderingReason reason) {
+            return telemetry.same_state_reopen_counts[static_cast<std::size_t>(reason)];
+        };
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_RENDER_SCOPE_TELEMETRY] begins=%llu ends=%llu sameStateReopen=%llu "
+            "consumedClearReuse=%llu "
+            "reasonEndReopen=unknown:%llu/%llu,state:%llu/%llu,pipeline:%llu/%llu,"
+            "rastBarrier:%llu/%llu,draw:%llu/%llu,clear:%llu/%llu,copy:%llu/%llu,"
+            "dispatch:%llu/%llu,upload:%llu/%llu,download:%llu/%llu,transit:%llu/%llu,"
+            "refresh:%llu/%llu,bufFill:%llu/%llu,bufRead:%llu/%llu,"
+            "bufCopy:%llu/%llu,bufProbe:%llu/%llu,bufUpload:%llu/%llu,"
+            "faultCompute:%llu/%llu,tileCompute:%llu/%llu,blit:%llu/%llu,"
+            "shaderHle:%llu/%llu,presenter:%llu/%llu,flush:%llu/%llu,submit:%llu/%llu",
+            static_cast<unsigned long long>(telemetry.begin_count),
+            static_cast<unsigned long long>(telemetry.end_count),
+            static_cast<unsigned long long>(telemetry.same_state_reopen_count),
+            static_cast<unsigned long long>(telemetry.consumed_clear_reuse_count),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::Unknown)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::Unknown)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BeginStateChange)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BeginStateChange)),
+            static_cast<unsigned long long>(
+                reason_count(EndRenderingReason::PipelineResourceBarrier)),
+            static_cast<unsigned long long>(
+                reopen_count(EndRenderingReason::PipelineResourceBarrier)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::RasterizerBarrier)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::RasterizerBarrier)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::RasterizerDraw)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::RasterizerDraw)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::RasterizerClear)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::RasterizerClear)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::RasterizerCopy)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::RasterizerCopy)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::RasterizerDispatch)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::RasterizerDispatch)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::ImageUpload)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::ImageUpload)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::ImageDownload)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::ImageDownload)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::ImageTransit)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::ImageTransit)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::TextureCacheRefresh)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::TextureCacheRefresh)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BufferFill)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BufferFill)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BufferReadback)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BufferReadback)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BufferCopy)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BufferCopy)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BufferProbe)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BufferProbe)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BufferUpload)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BufferUpload)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::FaultCompute)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::FaultCompute)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::TileCompute)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::TileCompute)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::BlitHelper)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::BlitHelper)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::ShaderHleCopy)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::ShaderHleCopy)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::Presenter)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::Presenter)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::Flush)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::Flush)),
+            static_cast<unsigned long long>(reason_count(EndRenderingReason::Submit)),
+            static_cast<unsigned long long>(reopen_count(EndRenderingReason::Submit)));
+    }
+#endif
+    EndRendering(EndRenderingReason::BeginStateChange);
+#ifdef __ANDROID__
+    if (managed_render_scope_reuse) {
+        telemetry.has_last_ended_render_state = false;
+    }
+#endif
     is_rendering = true;
     render_state = new_state;
 
@@ -967,16 +1152,543 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     current_cmdbuf.beginRendering(rendering_info);
 }
 
-void Scheduler::EndRendering() {
+void Scheduler::EndRendering(const EndRenderingReason reason) {
     if (master_semaphore.IsDeviceLost()) {
         is_rendering = false;
+#ifdef __ANDROID__
+        RenderScopeTelemetryFor(this).has_last_ended_render_state = false;
+#endif
         return;
     }
     if (!is_rendering) {
         return;
     }
+#ifdef __ANDROID__
+    if (VideoCore::IsManagedVulkanRenderScopeReuse()) {
+        auto& telemetry = RenderScopeTelemetryFor(this);
+        ++telemetry.end_count;
+        ++telemetry.end_reason_counts[static_cast<std::size_t>(reason)];
+        telemetry.last_ended_render_state = render_state;
+        telemetry.last_end_reason = reason;
+        telemetry.has_last_ended_render_state = true;
+    }
+#endif
     is_rendering = false;
     current_cmdbuf.endRendering();
+}
+
+bool Scheduler::TryCompletionBarrierInsideRendering() {
+#ifdef __ANDROID__
+    // Adreno's dynamic-rendering local-read implementation can corrupt the
+    // command-buffer state after an in-rendering pipelineBarrier2 sequence.
+    // The failure surfaces later in an unrelated barrier, so keep the normal
+    // end-rendering dependency path on Qualcomm.
+    constexpr u32 QualcommVendorId = 0x5143;
+    if (!is_rendering || !VideoCore::IsManagedVulkanDriverOptimization() ||
+        instance.GetVendorID() == QualcommVendorId ||
+        !instance.IsDynamicRenderingLocalReadSupported() ||
+        !pending_buffer_transfers.empty() || master_semaphore.IsDeviceLost()) {
+        return false;
+    }
+
+    // While dynamic rendering is active, all compute, transfer, layout
+    // transition and attachment-replacement paths have already ended the
+    // scope. The remaining producer work is therefore graphics-shader work.
+    // Keep framebuffer-space stages out of this dependency so the Vulkan
+    // in-rendering synchronization rules remain satisfied.
+    constexpr vk::PipelineStageFlags2 ShaderStages =
+        vk::PipelineStageFlagBits2::eVertexShader |
+        vk::PipelineStageFlagBits2::eTessellationControlShader |
+        vk::PipelineStageFlagBits2::eTessellationEvaluationShader |
+        vk::PipelineStageFlagBits2::eGeometryShader |
+        vk::PipelineStageFlagBits2::eFragmentShader;
+    constexpr vk::PipelineStageFlags2 ConsumerStages =
+        ShaderStages | vk::PipelineStageFlagBits2::eDrawIndirect |
+        vk::PipelineStageFlagBits2::eVertexInput;
+    constexpr vk::MemoryBarrier2 shader_barrier{
+        .srcStageMask = ShaderStages,
+        .srcAccessMask =
+            vk::AccessFlagBits2::eShaderWrite |
+            vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = ConsumerStages,
+        .dstAccessMask =
+            vk::AccessFlagBits2::eShaderRead |
+            vk::AccessFlagBits2::eShaderWrite |
+            vk::AccessFlagBits2::eMemoryRead |
+            vk::AccessFlagBits2::eMemoryWrite,
+    };
+    current_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &shader_barrier,
+    });
+
+    // EOP/EOS completion also covers attachment writes. Keep that dependency
+    // separate because Vulkan requires a barrier whose source includes a
+    // framebuffer-space stage to target framebuffer-space stages only while
+    // inside a rendering instance.
+    constexpr vk::PipelineStageFlags2 FramebufferStages =
+        vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+        vk::PipelineStageFlagBits2::eLateFragmentTests |
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    constexpr vk::MemoryBarrier2 framebuffer_barrier{
+        .srcStageMask = FramebufferStages,
+        .srcAccessMask =
+            vk::AccessFlagBits2::eColorAttachmentWrite |
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        .dstStageMask = FramebufferStages,
+        .dstAccessMask =
+            vk::AccessFlagBits2::eColorAttachmentRead |
+            vk::AccessFlagBits2::eColorAttachmentWrite |
+            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+    };
+    current_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &framebuffer_barrier,
+    });
+    command_buffer_used = true;
+    command_recording_epoch.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Scheduler::QueueBufferCopies(const vk::Buffer source, const vk::Buffer destination,
+                                  const std::span<const vk::BufferCopy> regions,
+                                  const VAddr source_guest_address, const u64 source_size,
+                                  const VAddr destination_guest_address,
+                                  const u64 destination_size,
+                                  const BufferTransferOrigin origin) {
+    if (regions.empty() || master_semaphore.IsDeviceLost()) {
+        return;
+    }
+    ASSERT(origin < BufferTransferOrigin::Count);
+    VideoCore::RecordVulkanTransferRequest(regions.size());
+    static constexpr u64 MaxPendingRegions = 4096;
+    static constexpr std::size_t MaxPendingGroups = 256;
+    if (!pending_buffer_transfers.empty() &&
+        (pending_buffer_transfers.size() >= MaxPendingGroups ||
+         regions.size() > MaxPendingRegions - std::min(pending_buffer_transfer_regions,
+                                                        MaxPendingRegions))) {
+        FlushPendingBufferTransfers();
+    }
+
+    const auto range_end = [](const VAddr begin, const u64 size) {
+        return size > std::numeric_limits<VAddr>::max() - begin
+                   ? std::numeric_limits<VAddr>::max()
+                   : begin + size;
+    };
+    const VAddr source_end = range_end(source_guest_address, source_size);
+    const VAddr destination_end = range_end(destination_guest_address, destination_size);
+    const auto overlaps = [](const VAddr lhs_begin, const VAddr lhs_end,
+                             const VAddr rhs_begin, const VAddr rhs_end) {
+        return lhs_begin < lhs_end && rhs_begin < rhs_end &&
+               lhs_begin < rhs_end && rhs_begin < lhs_end;
+    };
+    vk::DeviceSize source_offset_begin = std::numeric_limits<vk::DeviceSize>::max();
+    vk::DeviceSize source_offset_end = 0;
+    vk::DeviceSize destination_offset_begin =
+        std::numeric_limits<vk::DeviceSize>::max();
+    vk::DeviceSize destination_offset_end = 0;
+    for (const auto& region : regions) {
+        source_offset_begin = std::min(source_offset_begin, region.srcOffset);
+        source_offset_end = std::max(source_offset_end,
+                                     region.srcOffset + region.size);
+        destination_offset_begin =
+            std::min(destination_offset_begin, region.dstOffset);
+        destination_offset_end = std::max(destination_offset_end,
+                                          region.dstOffset + region.size);
+    }
+    const auto offset_overlaps = [](const vk::DeviceSize lhs_begin,
+                                    const vk::DeviceSize lhs_end,
+                                    const vk::DeviceSize rhs_begin,
+                                    const vk::DeviceSize rhs_end) {
+        return lhs_begin < lhs_end && rhs_begin < rhs_end &&
+               lhs_begin < rhs_end && rhs_begin < lhs_end;
+    };
+    const bool dependency_barrier_before = std::ranges::any_of(
+        pending_buffer_transfers, [&](const PendingBufferTransfer& previous) {
+            // Preserve RAW, WAR and WAW ordering while still allowing disjoint
+            // transfer groups to share one render-scope break and barrier pair.
+            const bool guest_hazard =
+                overlaps(source_guest_address, source_end,
+                         previous.destination_begin, previous.destination_end) ||
+                overlaps(destination_guest_address, destination_end,
+                         previous.source_begin, previous.source_end) ||
+                overlaps(destination_guest_address, destination_end,
+                         previous.destination_begin, previous.destination_end);
+            const bool buffer_hazard =
+                (source == previous.destination &&
+                 offset_overlaps(source_offset_begin, source_offset_end,
+                                 previous.destination_offset_begin,
+                                 previous.destination_offset_end)) ||
+                (destination == previous.source &&
+                 offset_overlaps(destination_offset_begin,
+                                 destination_offset_end,
+                                 previous.source_offset_begin,
+                                 previous.source_offset_end)) ||
+                (destination == previous.destination &&
+                 offset_overlaps(destination_offset_begin,
+                                 destination_offset_end,
+                                 previous.destination_offset_begin,
+                                 previous.destination_offset_end));
+            return guest_hazard || buffer_hazard;
+        });
+
+    PendingBufferTransfer* transfer = nullptr;
+    if (!dependency_barrier_before && !pending_buffer_transfers.empty()) {
+        for (auto candidate = pending_buffer_transfers.rbegin();
+             candidate != pending_buffer_transfers.rend(); ++candidate) {
+            if (candidate->source != source ||
+                candidate->destination != destination) {
+                continue;
+            }
+            transfer = &*candidate;
+            candidate->source_begin =
+                std::min(candidate->source_begin, source_guest_address);
+            candidate->source_end = std::max(candidate->source_end, source_end);
+            candidate->destination_begin =
+                std::min(candidate->destination_begin,
+                         destination_guest_address);
+            candidate->destination_end =
+                std::max(candidate->destination_end, destination_end);
+            candidate->source_offset_begin =
+                std::min(candidate->source_offset_begin, source_offset_begin);
+            candidate->source_offset_end =
+                std::max(candidate->source_offset_end, source_offset_end);
+            candidate->destination_offset_begin =
+                std::min(candidate->destination_offset_begin,
+                         destination_offset_begin);
+            candidate->destination_offset_end =
+                std::max(candidate->destination_offset_end,
+                         destination_offset_end);
+            break;
+        }
+    }
+    if (transfer == nullptr) {
+        transfer = &pending_buffer_transfers.emplace_back(PendingBufferTransfer{
+            .source = source,
+            .destination = destination,
+            .source_begin = source_guest_address,
+            .source_end = source_end,
+            .destination_begin = destination_guest_address,
+            .destination_end = destination_end,
+            .source_offset_begin = source_offset_begin,
+            .source_offset_end = source_offset_end,
+            .destination_offset_begin = destination_offset_begin,
+            .destination_offset_end = destination_offset_end,
+            .dependency_barrier_before = dependency_barrier_before,
+        });
+    }
+    for (const vk::BufferCopy& region : regions) {
+        bool coalesced = false;
+        for (vk::BufferCopy& pending_region : transfer->regions) {
+            if (pending_region.srcOffset + pending_region.size == region.srcOffset &&
+                pending_region.dstOffset + pending_region.size == region.dstOffset) {
+                pending_region.size += region.size;
+                coalesced = true;
+                break;
+            }
+            if (region.srcOffset + region.size == pending_region.srcOffset &&
+                region.dstOffset + region.size == pending_region.dstOffset) {
+                pending_region.srcOffset = region.srcOffset;
+                pending_region.dstOffset = region.dstOffset;
+                pending_region.size += region.size;
+                coalesced = true;
+                break;
+            }
+        }
+        if (!coalesced) {
+            transfer->regions.push_back(region);
+        }
+    }
+    ++pending_buffer_transfer_requests;
+    ++pending_buffer_transfer_request_epoch;
+    pending_buffer_transfer_regions += regions.size();
+    pending_buffer_transfer_origins |= u32{1} << static_cast<u32>(origin);
+    pending_gnm_dma_transfers += origin == BufferTransferOrigin::GnmDma;
+
+#ifdef __ANDROID__
+    ++executor_buffer_transfers_queued;
+    executor_buffer_transfer_regions_queued += regions.size();
+    executor_buffer_transfer_max_queued =
+        std::max<u64>(executor_buffer_transfer_max_queued, pending_buffer_transfers.size());
+    switch (origin) {
+    case BufferTransferOrigin::Hle:
+        ++executor_hle_buffer_transfers_queued;
+        break;
+    case BufferTransferOrigin::Upload:
+        ++executor_buffer_uploads_queued;
+        break;
+    case BufferTransferOrigin::GnmDma:
+        ++executor_gnm_dma_transfers_queued;
+        executor_gnm_dma_regions_queued += regions.size();
+        break;
+    case BufferTransferOrigin::Count:
+        break;
+    }
+#endif
+    if (!VideoCore::IsManagedVulkanTransferCoalescing()) {
+        // A/B baseline: materialize every request immediately with the
+        // conservative barrier path so no transfer calls are coalesced.
+        FlushPendingBufferTransfers();
+    }
+}
+
+void Scheduler::QueueBufferUploadCopies(const vk::Buffer source,
+                                        const vk::Buffer destination,
+                                        const std::span<const vk::BufferCopy> regions,
+                                        const VAddr destination_guest_address,
+                                        const u64 destination_size) {
+    QueueBufferCopies(source, destination, regions, 0, 0,
+                      destination_guest_address, destination_size,
+                      BufferTransferOrigin::Upload);
+}
+
+void Scheduler::FlushPendingBufferTransfersForRange(const VAddr guest_address, const u64 size) {
+    if (pending_buffer_transfers.empty() || size == 0) {
+        return;
+    }
+    const VAddr guest_end =
+        size > std::numeric_limits<VAddr>::max() - guest_address
+            ? std::numeric_limits<VAddr>::max()
+            : guest_address + size;
+    const auto overlaps = [guest_address, guest_end](const VAddr begin, const VAddr end) {
+        return guest_address < end && begin < guest_end;
+    };
+    const bool has_conflict = std::ranges::any_of(
+        pending_buffer_transfers, [&](const PendingBufferTransfer& transfer) {
+            return overlaps(transfer.source_begin, transfer.source_end) ||
+                   overlaps(transfer.destination_begin, transfer.destination_end);
+        });
+    if (has_conflict) {
+        FlushPendingBufferTransfers();
+    }
+}
+
+void Scheduler::FlushPendingGnmDmaTransfers() {
+    if (pending_gnm_dma_transfers != 0) {
+        FlushPendingBufferTransfers();
+    }
+}
+
+void Scheduler::FlushPendingBufferTransfers() {
+    if (pending_buffer_transfers.empty() || flushing_buffer_transfers) {
+        return;
+    }
+    if (master_semaphore.IsDeviceLost()) {
+        pending_buffer_transfers.clear();
+        pending_buffer_transfer_requests = 0;
+        pending_buffer_transfer_regions = 0;
+        pending_gnm_dma_transfers = 0;
+        pending_buffer_transfer_origins = 0;
+        return;
+    }
+
+    flushing_buffer_transfers = true;
+    SCOPE_EXIT {
+        flushing_buffer_transfers = false;
+    };
+    const bool has_gnm_dma =
+        (pending_buffer_transfer_origins &
+         (u32{1} << static_cast<u32>(BufferTransferOrigin::GnmDma))) != 0;
+    EndRendering(has_gnm_dma ? EndRenderingReason::BufferCopy
+                             : EndRenderingReason::ShaderHleCopy);
+    const bool use_buffer_local_barriers =
+        VideoCore::IsManagedVulkanTransferCoalescing();
+    static constexpr vk::MemoryBarrier ReadBarrier{
+        .srcAccessMask = vk::AccessFlagBits::eMemoryRead |
+                         vk::AccessFlagBits::eMemoryWrite |
+                         vk::AccessFlagBits::eTransferRead |
+                         vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferRead |
+                         vk::AccessFlagBits::eTransferWrite,
+    };
+    static constexpr vk::MemoryBarrier WriteBarrier{
+        .srcAccessMask = vk::AccessFlagBits::eTransferRead |
+                         vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eMemoryRead |
+                         vk::AccessFlagBits::eMemoryWrite,
+    };
+    static constexpr vk::MemoryBarrier DependencyBarrier{
+        .srcAccessMask = vk::AccessFlagBits::eTransferRead |
+                         vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferRead |
+                         vk::AccessFlagBits::eTransferWrite,
+    };
+    struct BufferTransferRange {
+        vk::Buffer buffer;
+        vk::DeviceSize begin;
+        vk::DeviceSize end;
+        vk::AccessFlags2 transfer_access;
+    };
+    boost::container::small_vector<BufferTransferRange, 32> pre_ranges;
+    boost::container::small_vector<BufferTransferRange, 32> post_ranges;
+    const auto merge_range =
+        [](auto& ranges, const vk::Buffer buffer, const vk::DeviceSize begin,
+           const vk::DeviceSize end, const vk::AccessFlags2 transfer_access) {
+            if (!buffer || begin >= end) {
+                return;
+            }
+            const auto existing = std::ranges::find(ranges, buffer,
+                                                     &BufferTransferRange::buffer);
+            if (existing == ranges.end()) {
+                ranges.emplace_back(BufferTransferRange{
+                    .buffer = buffer,
+                    .begin = begin,
+                    .end = end,
+                    .transfer_access = transfer_access,
+                });
+                return;
+            }
+            existing->begin = std::min(existing->begin, begin);
+            existing->end = std::max(existing->end, end);
+            existing->transfer_access |= transfer_access;
+        };
+    if (use_buffer_local_barriers) {
+        for (const PendingBufferTransfer& transfer : pending_buffer_transfers) {
+            merge_range(pre_ranges, transfer.source, transfer.source_offset_begin,
+                        transfer.source_offset_end,
+                        vk::AccessFlagBits2::eTransferRead);
+            merge_range(pre_ranges, transfer.destination,
+                        transfer.destination_offset_begin,
+                        transfer.destination_offset_end,
+                        vk::AccessFlagBits2::eTransferWrite);
+            merge_range(post_ranges, transfer.destination,
+                        transfer.destination_offset_begin,
+                        transfer.destination_offset_end,
+                        vk::AccessFlagBits2::eTransferWrite);
+        }
+    }
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 32> pre_barriers;
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 32> post_barriers;
+    if (use_buffer_local_barriers) {
+        pre_barriers.reserve(pre_ranges.size());
+        for (const BufferTransferRange& range : pre_ranges) {
+            pre_barriers.emplace_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryRead |
+                                 vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = range.transfer_access,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = range.buffer,
+                .offset = range.begin,
+                .size = range.end - range.begin,
+            });
+        }
+        post_barriers.reserve(post_ranges.size());
+        for (const BufferTransferRange& range : post_ranges) {
+            post_barriers.emplace_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead |
+                                 vk::AccessFlagBits2::eMemoryWrite,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = range.buffer,
+                .offset = range.begin,
+                .size = range.end - range.begin,
+            });
+        }
+    }
+
+    const auto cmdbuf = CommandBuffer();
+    if (use_buffer_local_barriers) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+            .pBufferMemoryBarriers = pre_barriers.data(),
+        });
+    } else {
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, ReadBarrier, {}, {});
+    }
+    for (const auto& transfer : pending_buffer_transfers) {
+        if (transfer.dependency_barrier_before) {
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                   vk::PipelineStageFlagBits::eTransfer,
+                                   vk::DependencyFlagBits::eByRegion,
+                                   DependencyBarrier, {}, {});
+#ifdef __ANDROID__
+            ++executor_buffer_transfer_dependency_barriers;
+#endif
+        }
+        cmdbuf.copyBuffer(transfer.source, transfer.destination, transfer.regions);
+    }
+    if (use_buffer_local_barriers) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = static_cast<u32>(post_barriers.size()),
+            .pBufferMemoryBarriers = post_barriers.data(),
+        });
+    } else {
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eAllCommands,
+                               vk::DependencyFlagBits::eByRegion, WriteBarrier, {}, {});
+    }
+
+    const u64 dependency_barriers = std::ranges::count_if(
+        pending_buffer_transfers, [](const PendingBufferTransfer& transfer) {
+            return transfer.dependency_barrier_before;
+        });
+    u64 emitted_copy_regions = 0;
+    for (const PendingBufferTransfer& transfer : pending_buffer_transfers) {
+        emitted_copy_regions += transfer.regions.size();
+    }
+    const u64 requested_barriers =
+        pending_buffer_transfer_requests * 2 + dependency_barriers;
+    const u64 emitted_barriers = 2 + dependency_barriers;
+    VideoCore::RecordVulkanTransferFlush(
+        pending_buffer_transfer_regions, pending_buffer_transfers.size());
+    VideoCore::RecordVulkanBarrierBatch(
+        requested_barriers, emitted_barriers);
+
+#ifdef __ANDROID__
+    ++executor_buffer_transfer_flushes;
+    executor_buffer_transfer_copy_calls += pending_buffer_transfers.size();
+    executor_buffer_transfer_copy_regions_emitted += emitted_copy_regions;
+    executor_buffer_transfer_barriers_requested += requested_barriers;
+    executor_buffer_transfer_barriers_emitted += emitted_barriers;
+    if (executor_buffer_transfer_flushes == 1 ||
+        (executor_buffer_transfer_flushes & 4095u) == 0u) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_BUFFER_TRANSFER_BATCH] queued=%llu flushes=%llu copyCalls=%llu "
+            "regions=requested:%llu,emitted:%llu pendingGroups=%zu maxGroups=%llu "
+            "barriers=requested:%llu,emitted:%llu dependencyBarriers=%llu "
+            "origin=h:%llu,u:%llu,g:%llu gnmRegions=%llu",
+            static_cast<unsigned long long>(executor_buffer_transfers_queued),
+            static_cast<unsigned long long>(executor_buffer_transfer_flushes),
+            static_cast<unsigned long long>(executor_buffer_transfer_copy_calls),
+            static_cast<unsigned long long>(executor_buffer_transfer_regions_queued),
+            static_cast<unsigned long long>(
+                executor_buffer_transfer_copy_regions_emitted),
+            pending_buffer_transfers.size(),
+            static_cast<unsigned long long>(executor_buffer_transfer_max_queued),
+            static_cast<unsigned long long>(
+                executor_buffer_transfer_barriers_requested),
+            static_cast<unsigned long long>(
+                executor_buffer_transfer_barriers_emitted),
+            static_cast<unsigned long long>(
+                executor_buffer_transfer_dependency_barriers),
+            static_cast<unsigned long long>(executor_hle_buffer_transfers_queued),
+            static_cast<unsigned long long>(executor_buffer_uploads_queued),
+            static_cast<unsigned long long>(executor_gnm_dma_transfers_queued),
+            static_cast<unsigned long long>(executor_gnm_dma_regions_queued));
+    }
+#endif
+    pending_buffer_transfers.clear();
+    pending_buffer_transfer_requests = 0;
+    pending_buffer_transfer_regions = 0;
+    pending_gnm_dma_transfers = 0;
+    pending_buffer_transfer_origins = 0;
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -984,8 +1696,13 @@ void Scheduler::Flush(SubmitInfo& info) {
 }
 
 void Scheduler::Flush() {
-    if (!command_buffer_used &&
+    if (!command_buffer_used && pending_buffer_transfers.empty() &&
         pending_ops_count.load(std::memory_order_acquire) == 0) [[likely]] {
+#ifdef __ANDROID__
+        if (pending_submit_count.load(std::memory_order_acquire) != 0) {
+            PublishPendingSubmitBatch();
+        }
+#endif
         return;
     }
     SubmitInfo info{};
@@ -1027,8 +1744,17 @@ void Scheduler::Finish(const ExecutorFinishReason reason) {
         }
     };
 #endif
-    if (!command_buffer_used &&
+    if (!command_buffer_used && pending_buffer_transfers.empty() &&
         pending_ops_count.load(std::memory_order_acquire) == 0) [[likely]] {
+#ifdef __ANDROID__
+        const u64 pending_tick =
+            pending_submit_last_tick.load(std::memory_order_acquire);
+        if (pending_tick != 0) {
+            PublishPendingSubmitBatch();
+            master_semaphore.Wait(pending_tick);
+            return;
+        }
+#endif
         const u64 current_tick = CurrentTick();
         if (current_tick > 1) {
             Wait(current_tick - 1);
@@ -1045,6 +1771,15 @@ void Scheduler::Wait(u64 tick) {
     if (master_semaphore.IsDeviceLost()) {
         return;
     }
+#ifdef __ANDROID__
+    if (pending_submit_count.load(std::memory_order_acquire) != 0 &&
+        tick <= pending_submit_last_tick.load(std::memory_order_acquire)) {
+        PublishPendingSubmitBatch();
+        if (master_semaphore.IsDeviceLost()) {
+            return;
+        }
+    }
+#endif
     if (tick >= master_semaphore.CurrentTick()) {
         SubmitInfo info{};
         SubmitExecution(info, ExecutorSubmitKind::WaitCurrent);
@@ -1056,6 +1791,15 @@ void Scheduler::WaitRetirement(u64 tick) {
     if (tick == 0 || master_semaphore.IsDeviceLost()) {
         return;
     }
+#ifdef __ANDROID__
+    if (pending_submit_count.load(std::memory_order_acquire) != 0 &&
+        tick <= pending_submit_last_tick.load(std::memory_order_acquire)) {
+        PublishPendingSubmitBatch();
+        if (master_semaphore.IsDeviceLost()) {
+            return;
+        }
+    }
+#endif
     std::unique_lock lk(retirement_pending_ops_mutex);
     retirement_pending_ops_cv.wait(lk, [&] {
         if (master_semaphore.IsDeviceLost()) {
@@ -1107,6 +1851,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    command_buffer_recording = true;
     command_buffer_used = false;
 
     dynamic_state.Invalidate();
@@ -1121,12 +1866,220 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
+#ifdef __ANDROID__
+bool Scheduler::QueueSubmitLocked(
+    const vk::ArrayProxy<const vk::SubmitInfo> submits, const vk::Fence fence,
+    const std::span<const u64> logical_ticks, const u64 command_buffer_count,
+    const bool forced_boundary) {
+    ASSERT(!logical_ticks.empty());
+
+    const bool executor_diagnostics_enabled = !Config::managedGpuFastPath();
+    if (executor_diagnostics_enabled) {
+        for (const u64 tick : logical_ticks) {
+            ExecutorVkJournalSubmit(this, tick, false, vk::Result::eSuccess);
+        }
+    }
+    const auto executor_submit_begin =
+        executor_diagnostics_enabled ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+
+    const vk::Result submit_result =
+        instance.GetGraphicsQueue().submit(submits, fence);
+    VideoCore::RecordVulkanQueueSubmit(logical_ticks.size(), command_buffer_count,
+                                       forced_boundary);
+
+    ++executor_submit_batches;
+    executor_submit_logical_packets += logical_ticks.size();
+    executor_submit_command_buffers += command_buffer_count;
+    executor_submit_calls_saved +=
+        logical_ticks.size() > 1 ? logical_ticks.size() - 1 : 0;
+    executor_submit_forced_boundaries += forced_boundary ? 1 : 0;
+    executor_submit_max_batch =
+        std::max(executor_submit_max_batch,
+                 static_cast<u64>(logical_ticks.size()));
+    if (executor_submit_batches == 1 ||
+        (executor_submit_batches & 255u) == 0u) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_VK_SUBMIT_COALESCING] physical=%llu logical=%llu "
+            "commandBuffers=%llu callsSaved=%llu forced=%llu timer=%llu "
+            "maxBatch=%llu currentBatch=%zu currentSubmitInfos=%u",
+            static_cast<unsigned long long>(executor_submit_batches),
+            static_cast<unsigned long long>(executor_submit_logical_packets),
+            static_cast<unsigned long long>(executor_submit_command_buffers),
+            static_cast<unsigned long long>(executor_submit_calls_saved),
+            static_cast<unsigned long long>(executor_submit_forced_boundaries),
+            static_cast<unsigned long long>(executor_submit_timer_flushes),
+            static_cast<unsigned long long>(executor_submit_max_batch),
+            logical_ticks.size(), static_cast<u32>(submits.size()));
+    }
+
+    if (executor_diagnostics_enabled) {
+        const u64 executor_submit_ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - executor_submit_begin)
+                .count());
+        static u64 executor_submit_samples{};
+        static u64 executor_submit_total_ns{};
+        static u64 executor_submit_max_ns{};
+        ++executor_submit_samples;
+        executor_submit_total_ns += executor_submit_ns;
+        executor_submit_max_ns =
+            std::max(executor_submit_max_ns, executor_submit_ns);
+        if ((executor_submit_samples & 1023u) == 0u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_VK_SUBMIT_LATENCY] samples=1024 totalMs=%.3f "
+                "avgUs=%.3f maxMs=%.3f",
+                static_cast<double>(executor_submit_total_ns) / 1'000'000.0,
+                static_cast<double>(executor_submit_total_ns) / 1'024'000.0,
+                static_cast<double>(executor_submit_max_ns) / 1'000'000.0);
+            executor_submit_total_ns = 0;
+            executor_submit_max_ns = 0;
+        }
+        for (const u64 tick : logical_ticks) {
+            ExecutorVkJournalSubmit(this, tick, true, submit_result);
+        }
+    }
+
+    const u64 final_tick = logical_ticks.back();
+    if (submit_result != vk::Result::eSuccess) [[unlikely]] {
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.DumpDeviceFaultInfo("queue_submit", final_tick);
+        }
+        ExecutorVkJournalDump("queue_submit", final_tick);
+        MarkTerminal(submit_result, "queue_submit");
+        if (submit_result != vk::Result::eErrorDeviceLost) {
+            LOG_ERROR(Render_Vulkan,
+                      "Failed to submit Vulkan command buffer batch: {}",
+                      vk::to_string(submit_result));
+        }
+        return false;
+    }
+
+    static const bool serialize_gnm_submits =
+        std::getenv("EXECUTOR_ANDROID_SERIALIZE_GNM_SUBMITS") != nullptr;
+    if (serialize_gnm_submits) {
+        master_semaphore.Wait(final_tick);
+        if (master_semaphore.IsDeviceLost()) {
+            return false;
+        }
+    }
+
+    master_semaphore.Refresh();
+    if (master_semaphore.IsDeviceLost()) {
+        return false;
+    }
+    return true;
+}
+
+bool Scheduler::SubmitPendingBatchLocked(
+    const vk::SubmitInfo* trailing_submit, const vk::Fence trailing_fence,
+    const u64 trailing_tick, const bool forced_boundary) {
+    const bool has_pending = !pending_submit_command_buffers.empty();
+    if (!has_pending && trailing_submit == nullptr) {
+        return true;
+    }
+    if (master_semaphore.IsDeviceLost()) {
+        pending_submit_command_buffers.clear();
+        pending_submit_ticks.clear();
+        pending_submit_count.store(0, std::memory_order_release);
+        pending_submit_last_tick.store(0, std::memory_order_release);
+        pending_submit_deadline = {};
+        return false;
+    }
+
+    if (!has_pending) {
+        const std::array<u64, 1> ticks{trailing_tick};
+        return QueueSubmitLocked(
+            vk::ArrayProxy<const vk::SubmitInfo>{1, trailing_submit},
+            trailing_fence, ticks, 1, forced_boundary);
+    }
+
+    const vk::Semaphore timeline = master_semaphore.Handle();
+    const std::array<vk::Semaphore, 1> signal_semas{timeline};
+    const std::array<u64, 1> signal_ticks{pending_submit_ticks.back()};
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = signal_ticks.data(),
+    };
+    const vk::SubmitInfo pending_submit = {
+        .pNext = &timeline_info,
+        .commandBufferCount =
+            static_cast<u32>(pending_submit_command_buffers.size()),
+        .pCommandBuffers = pending_submit_command_buffers.data(),
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = signal_semas.data(),
+    };
+
+    boost::container::small_vector<u64, 9> logical_ticks{
+        pending_submit_ticks.begin(), pending_submit_ticks.end()};
+    const u64 pending_command_buffers =
+        pending_submit_command_buffers.size();
+    bool success = false;
+    if (trailing_submit != nullptr) {
+        logical_ticks.push_back(trailing_tick);
+        const std::array<vk::SubmitInfo, 2> submits{
+            pending_submit, *trailing_submit};
+        success = QueueSubmitLocked(submits, trailing_fence, logical_ticks,
+                                    pending_command_buffers + 1,
+                                    forced_boundary);
+    } else {
+        success = QueueSubmitLocked(
+            vk::ArrayProxy<const vk::SubmitInfo>{1, &pending_submit}, {},
+            logical_ticks, pending_command_buffers, forced_boundary);
+    }
+
+    pending_submit_command_buffers.clear();
+    pending_submit_ticks.clear();
+    pending_submit_count.store(0, std::memory_order_release);
+    pending_submit_last_tick.store(0, std::memory_order_release);
+    pending_submit_deadline = {};
+    pending_submit_cv.notify_all();
+    return success;
+}
+
+void Scheduler::PublishPendingSubmitBatch() {
+    std::scoped_lock lk{submit_mutex};
+    if (SubmitPendingBatchLocked(nullptr, {}, 0, true)) {
+        PopPendingOperations(true, true);
+    }
+}
+
+void Scheduler::PendingSubmitThread(const std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:VkSubmitCoalescer");
+    std::unique_lock lk{submit_mutex};
+    while (!stoken.stop_requested() && !master_semaphore.IsDeviceLost()) {
+        if (pending_submit_command_buffers.empty()) {
+            pending_submit_cv.wait(
+                lk, stoken,
+                [this] {
+                    return master_semaphore.IsDeviceLost() ||
+                           !pending_submit_command_buffers.empty();
+                });
+            continue;
+        }
+        const auto deadline = pending_submit_deadline;
+        if (std::chrono::steady_clock::now() < deadline) {
+            pending_submit_cv.wait_until(lk, deadline);
+            continue;
+        }
+        ++executor_submit_timer_flushes;
+        // Deferred-operation callbacks historically run on the scheduler's
+        // caller thread. The timer only publishes GPU work; the next owner
+        // interaction drains callbacks after observing timeline retirement.
+        SubmitPendingBatchLocked();
+    }
+}
+#endif
+
 void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
                                 const ExecutorFinishReason finish_reason) {
     std::scoped_lock lk{submit_mutex};
     if (master_semaphore.IsDeviceLost()) {
         return;
     }
+    FlushPendingBufferTransfers();
 #ifdef __ANDROID__
     const bool executor_diagnostics_enabled = !Config::managedGpuFastPath();
     if (executor_diagnostics_enabled) {
@@ -1184,6 +2137,18 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
                     ExecutorFinishReason::PresenterShutdown)]));
     }
 #endif
+#ifdef __ANDROID__
+    const bool managed_submit_coalescing =
+        VideoCore::IsManagedVulkanSubmitCoalescing();
+    static const bool serialize_gnm_submits =
+        std::getenv("EXECUTOR_ANDROID_SERIALIZE_GNM_SUBMITS") != nullptr;
+    const bool has_external_sync =
+        info.num_wait_semas != 0 || info.num_signal_semas != 0 ||
+        static_cast<VkFence>(info.fence) != VK_NULL_HANDLE;
+    const bool can_defer_internal_submit =
+        managed_submit_coalescing && !serialize_gnm_submits &&
+        kind == ExecutorSubmitKind::FlushPlain && !has_external_sync;
+#endif
     const u64 signal_value = master_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -1194,12 +2159,16 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
     }
 #endif
 
-    EndRendering();
+    EndRendering(kind == ExecutorSubmitKind::FlushInfo ||
+                         kind == ExecutorSubmitKind::FlushPlain
+                     ? EndRenderingReason::Flush
+                     : EndRenderingReason::Submit);
     Check(current_cmdbuf.end());
+    command_buffer_recording = false;
 
     const vk::Semaphore timeline = master_semaphore.Handle();
 #ifdef __ANDROID__
-    if (signal_value > 1) {
+    if (signal_value > 1 && !managed_submit_coalescing) {
         const u64 preceding_signal = signal_value - 1;
         bool merged_wait = false;
         for (u32 index = 0; index < info.num_wait_semas; ++index) {
@@ -1238,48 +2207,67 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
 
     ImGui::Core::TextureManager::Submit();
 #ifdef __ANDROID__
-    if (executor_diagnostics_enabled) {
-        ExecutorVkJournalSubmit(this, signal_value, false, vk::Result::eSuccess);
-    }
-    const auto executor_submit_begin = executor_diagnostics_enabled
-                                           ? std::chrono::steady_clock::now()
-                                           : std::chrono::steady_clock::time_point{};
-#endif
-    const vk::Result submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-#ifdef __ANDROID__
-    if (executor_diagnostics_enabled) {
-        const u64 executor_submit_ns = static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - executor_submit_begin)
-                .count());
-        static u64 executor_submit_samples{};
-        static u64 executor_submit_total_ns{};
-        static u64 executor_submit_max_ns{};
-        ++executor_submit_samples;
-        executor_submit_total_ns += executor_submit_ns;
-        executor_submit_max_ns = std::max(executor_submit_max_ns, executor_submit_ns);
-        if ((executor_submit_samples & 1023u) == 0u) {
-            __android_log_print(
-                ANDROID_LOG_INFO, "LSX4Native",
-                "[EXECUTOR_VK_SUBMIT_LATENCY] samples=1024 totalMs=%.3f avgUs=%.3f maxMs=%.3f",
-                static_cast<double>(executor_submit_total_ns) / 1'000'000.0,
-                static_cast<double>(executor_submit_total_ns) / 1'024'000.0,
-                static_cast<double>(executor_submit_max_ns) / 1'000'000.0);
-            executor_submit_total_ns = 0;
-            executor_submit_max_ns = 0;
+    if (can_defer_internal_submit) {
+        if (!pending_submit_thread.joinable()) {
+            pending_submit_thread =
+                std::jthread(std::bind_front(&Scheduler::PendingSubmitThread,
+                                             this));
         }
-        ExecutorVkJournalSubmit(this, signal_value, true, submit_result);
+        constexpr std::size_t MaxCoalescedCommandBuffers = 8;
+        // FlushPlain packets arrive in short GNM bursts. A 250 us deadline
+        // expired before the next packet on mobile and produced a measured
+        // maxBatch=1/callsSaved=0. Wait/retirement paths explicitly publish a
+        // pending batch, so a bounded 1.5 ms window preserves dependencies
+        // while amortizing queue-submit driver overhead.
+        constexpr auto MaxCoalescingLatency =
+            std::chrono::microseconds{1500};
+        if (pending_submit_command_buffers.empty()) {
+            pending_submit_deadline =
+                std::chrono::steady_clock::now() + MaxCoalescingLatency;
+        }
+        pending_submit_command_buffers.push_back(current_cmdbuf);
+        pending_submit_ticks.push_back(signal_value);
+        pending_submit_last_tick.store(signal_value,
+                                       std::memory_order_release);
+        pending_submit_count.store(
+            static_cast<u32>(pending_submit_command_buffers.size()),
+            std::memory_order_release);
+
+        bool success = true;
+        if (pending_submit_command_buffers.size() >=
+            MaxCoalescedCommandBuffers) {
+            success = SubmitPendingBatchLocked();
+        } else {
+            pending_submit_cv.notify_one();
+        }
+        if (!success || master_semaphore.IsDeviceLost()) {
+            return;
+        }
+        AllocateWorkerCommandBuffers();
+        if (pending_submit_command_buffers.empty()) {
+            PopPendingOperations(true, true);
+        }
+        return;
     }
-#endif
+
+    const std::array<u64, 1> logical_ticks{signal_value};
+    const bool success =
+        pending_submit_command_buffers.empty()
+            ? QueueSubmitLocked(
+                  vk::ArrayProxy<const vk::SubmitInfo>{1, &submit_info},
+                  info.fence, logical_ticks, 1, false)
+            : SubmitPendingBatchLocked(&submit_info, info.fence, signal_value,
+                                       true);
+    if (!success || master_semaphore.IsDeviceLost()) {
+        return;
+    }
+    AllocateWorkerCommandBuffers();
+    PopPendingOperations(true, true);
+#else
+    const vk::Result submit_result =
+        instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    VideoCore::RecordVulkanQueueSubmit();
     if (submit_result != vk::Result::eSuccess) [[unlikely]] {
-#ifdef __ANDROID__
-        if (submit_result == vk::Result::eErrorDeviceLost) {
-            instance.DumpDeviceFaultInfo("queue_submit", signal_value);
-        }
-#endif
-#ifdef __ANDROID__
-        ExecutorVkJournalDump("queue_submit", signal_value);
-#endif
         MarkTerminal(submit_result, "queue_submit");
         if (submit_result != vk::Result::eErrorDeviceLost) {
             LOG_ERROR(Render_Vulkan, "Failed to submit Vulkan command buffer: {}",
@@ -1287,18 +2275,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
         }
         return;
     }
-
-#ifdef __ANDROID__
-    static const bool serialize_gnm_submits =
-        std::getenv("EXECUTOR_ANDROID_SERIALIZE_GNM_SUBMITS") != nullptr;
-    if (serialize_gnm_submits) {
-        master_semaphore.Wait(signal_value);
-        if (master_semaphore.IsDeviceLost()) {
-            return;
-        }
-    }
-#endif
-
     master_semaphore.Refresh();
     if (master_semaphore.IsDeviceLost()) {
         return;
@@ -1306,6 +2282,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
     AllocateWorkerCommandBuffers();
 
     PopPendingOperations(true, true);
+#endif
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
@@ -1379,6 +2356,12 @@ void Scheduler::RetirementPendingOpsThread(std::stop_token stoken) {
             ASSERT_MSG(outstanding != retirement_outstanding_ops.end() &&
                            outstanding->second >= batch.size(),
                        "Retirement callback accounting underflow at tick {}", gpu_tick);
+            const u64 previous_outstanding =
+                retirement_outstanding_count.fetch_sub(batch.size(),
+                                                       std::memory_order_acq_rel);
+            ASSERT_MSG(previous_outstanding >= batch.size(),
+                       "Global retirement callback accounting underflow at tick {}",
+                       gpu_tick);
             outstanding->second -= batch.size();
             if (outstanding->second == 0) {
                 retirement_outstanding_ops.erase(outstanding);
@@ -1561,7 +2544,7 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
                 vk::FragmentShadingRateCombinerOpKHR::eKeep,
                 vk::FragmentShadingRateCombinerOpKHR::eKeep,
             };
-            cmdbuf.setFragmentShadingRateKHR(instance.GetCoarseFragmentSize(),
+            cmdbuf.setFragmentShadingRateKHR(fragment_shading_rate,
                                              combiners.data());
         }
     }

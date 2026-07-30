@@ -20,12 +20,16 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/mobile_gpu_optimization.h"
+#include "video_core/vulkan_driver_optimization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -72,30 +76,106 @@ static void ExecutorLogQualcommPostBindDynamicState() noexcept {
 
 void Rasterizer::ExecutorBindGuestGraphicsPipeline(const GraphicsPipeline* pipeline,
                                                    const vk::CommandBuffer cmdbuf) {
-    if (!ExecutorNeedsQualcommPostBindDynamicState(instance)) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-        return;
-    }
-
+    const bool needs_post_bind_dynamic = ExecutorNeedsQualcommPostBindDynamicState(instance);
     auto& dynamic_state = scheduler.GetDynamicState();
     const auto handle = pipeline->Handle();
-    const u64 epoch = dynamic_state.InvalidationEpoch();
-    const u64 rendering_epoch = scheduler.RenderingEpoch();
-    const bool needs_bind = executor_guest_graphics_cmdbuf != cmdbuf ||
-                            executor_guest_graphics_pipeline != handle ||
-                            executor_guest_dynamic_epoch != epoch ||
-                            executor_guest_rendering_epoch != rendering_epoch;
-    if (!needs_bind) {
-        return;
+    const u64 recording_tick = scheduler.CurrentTick();
+    const u64 pipeline_epoch =
+        scheduler.PipelineBindEpoch(vk::PipelineBindPoint::eGraphics);
+    const bool dedup_enabled =
+        VideoCore::IsManagedVulkanPipelineBindDeduplication();
+    const bool needs_bind = !dedup_enabled ||
+                            !executor_guest_graphics_pipeline_valid ||
+                            executor_guest_graphics_cmdbuf != cmdbuf ||
+                            executor_guest_graphics_pipeline_identity != pipeline->Identity() ||
+                            executor_guest_graphics_recording_tick != recording_tick ||
+                            executor_guest_graphics_pipeline_epoch != pipeline_epoch;
+    u64 post_pipeline_epoch = pipeline_epoch;
+    if (needs_bind) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        post_pipeline_epoch =
+            scheduler.MarkPipelineBind(vk::PipelineBindPoint::eGraphics);
+        if (needs_post_bind_dynamic) {
+            dynamic_state.Invalidate();
+            ExecutorLogQualcommPostBindDynamicState();
+        }
     }
+    VideoCore::RecordVulkanPipelineBind(!needs_bind);
 
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-    dynamic_state.Invalidate();
     executor_guest_graphics_cmdbuf = cmdbuf;
-    executor_guest_graphics_pipeline = handle;
-    executor_guest_dynamic_epoch = dynamic_state.InvalidationEpoch();
-    executor_guest_rendering_epoch = rendering_epoch;
-    ExecutorLogQualcommPostBindDynamicState();
+    executor_guest_graphics_pipeline_identity = pipeline->Identity();
+    executor_guest_graphics_recording_tick = recording_tick;
+    executor_guest_graphics_pipeline_epoch = post_pipeline_epoch;
+    executor_guest_graphics_pipeline_valid = true;
+
+    static thread_local u64 attempts{};
+    static thread_local u64 hits{};
+    ++attempts;
+    hits += static_cast<u64>(!needs_bind);
+    if ((attempts & 16383u) == 0) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_VK_BIND_DEDUP] kind=graphicsPipeline attempts=%llu hits=%llu "
+            "hitPct=%.1f",
+            static_cast<unsigned long long>(attempts),
+            static_cast<unsigned long long>(hits),
+            100.0 * static_cast<double>(hits) / static_cast<double>(attempts));
+    }
+}
+
+void Rasterizer::ExecutorSealGuestGraphicsPipelineState(
+    const GraphicsPipeline* pipeline, const vk::CommandBuffer cmdbuf) {
+    if (!executor_guest_graphics_pipeline_valid ||
+        executor_guest_graphics_cmdbuf != cmdbuf ||
+        executor_guest_graphics_pipeline_identity != pipeline->Identity() ||
+        executor_guest_graphics_recording_tick != scheduler.CurrentTick() ||
+        executor_guest_graphics_pipeline_epoch !=
+            scheduler.PipelineBindEpoch(vk::PipelineBindPoint::eGraphics)) {
+        executor_guest_graphics_pipeline_valid = false;
+    }
+}
+
+void Rasterizer::ExecutorBindGuestComputePipeline(const ComputePipeline* pipeline,
+                                                  const vk::CommandBuffer cmdbuf) {
+    const auto handle = pipeline->Handle();
+    const u64 recording_tick = scheduler.CurrentTick();
+    const u64 pipeline_epoch =
+        scheduler.PipelineBindEpoch(vk::PipelineBindPoint::eCompute);
+    const bool dedup_enabled =
+        VideoCore::IsManagedVulkanPipelineBindDeduplication();
+    const bool needs_bind = !dedup_enabled ||
+                            !executor_guest_compute_pipeline_valid ||
+                            executor_guest_compute_cmdbuf != cmdbuf ||
+                            executor_guest_compute_pipeline_identity != pipeline->Identity() ||
+                            executor_guest_compute_recording_tick != recording_tick ||
+                            executor_guest_compute_pipeline_epoch != pipeline_epoch;
+    u64 post_pipeline_epoch = pipeline_epoch;
+    if (needs_bind) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        post_pipeline_epoch =
+            scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
+    }
+    VideoCore::RecordVulkanPipelineBind(!needs_bind);
+
+    executor_guest_compute_cmdbuf = cmdbuf;
+    executor_guest_compute_pipeline_identity = pipeline->Identity();
+    executor_guest_compute_recording_tick = recording_tick;
+    executor_guest_compute_pipeline_epoch = post_pipeline_epoch;
+    executor_guest_compute_pipeline_valid = true;
+
+    static thread_local u64 attempts{};
+    static thread_local u64 hits{};
+    ++attempts;
+    hits += static_cast<u64>(!needs_bind);
+    if ((attempts & 16383u) == 0) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_VK_BIND_DEDUP] kind=computePipeline attempts=%llu hits=%llu "
+            "hitPct=%.1f",
+            static_cast<unsigned long long>(attempts),
+            static_cast<unsigned long long>(hits),
+            100.0 * static_cast<double>(hits) / static_cast<double>(attempts));
+    }
 }
 
 struct ExecutorDepthWriteOracleRuntime {
@@ -344,6 +424,13 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+#ifdef __ANDROID__
+struct Rasterizer::ExecutorPhysicalDrsCleanupControl {
+    std::mutex mutex;
+    Rasterizer* owner{};
+};
+#endif
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -355,15 +442,1560 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+#ifdef __ANDROID__
+    executor_physical_drs_cleanup_control =
+        std::make_shared<ExecutorPhysicalDrsCleanupControl>();
+    executor_physical_drs_cleanup_control->owner = this;
+    VideoCore::SetManagedMobileGpuOptimizationTransitionCallback(
+        &Rasterizer::ExecutorManagedMobileGpuTransition, this);
+    // Qualcomm's mobile driver serializes frequent scaled-target resolves and
+    // Bloodborne invalidates its main target between passes. Prefer native
+    // 2x2 fragment shading there: it removes 75% of fragment invocations
+    // without scratch images, blits, or driver-visible attachment churn.
+    VideoCore::SetMobileGpuPhysicalDrsAvailable(
+        instance.GetDriverID() != vk::DriverId::eQualcommProprietary);
+#endif
 }
 
 Rasterizer::~Rasterizer() {
+#ifdef __ANDROID__
+    VideoCore::SetManagedMobileGpuOptimizationTransitionCallback(nullptr,
+                                                                 nullptr);
+    if (executor_physical_drs_cleanup_control != nullptr) {
+        std::scoped_lock control_lock{
+            executor_physical_drs_cleanup_control->mutex};
+        executor_physical_drs_cleanup_control->owner = nullptr;
+    }
+    executor_physical_drs_shutting_down = true;
+    ExecutorResolvePhysicalDrs("shutdown");
+    VideoCore::SetMobileGpuPhysicalDrsAvailable(false);
+#endif
+    if (scheduler.HasPendingBufferTransfers()
+#ifdef __ANDROID__
+        || !executor_physical_drs_surfaces.empty() ||
+           !executor_physical_drs_depth_surfaces.empty()
+#endif
+    ) {
+        scheduler.Finish(Scheduler::ExecutorFinishReason::Rasterizer);
+    }
     if (liverpool != nullptr) {
         liverpool->BindRasterizer(nullptr);
     }
 }
 
 #ifdef __ANDROID__
+void Rasterizer::ExecutorTouchPhysicalDrsSurface(
+    ExecutorPhysicalDrsSurface& surface) noexcept {
+    surface.last_used_generation = executor_physical_drs_generation;
+    surface.last_use_tick =
+        std::max(surface.last_use_tick, scheduler.CurrentTick());
+}
+
+void Rasterizer::ExecutorTouchPhysicalDrsDepthSurface(
+    ExecutorPhysicalDrsDepthSurface& surface) noexcept {
+    surface.last_used_generation = executor_physical_drs_generation;
+    surface.last_use_tick =
+        std::max(surface.last_use_tick, scheduler.CurrentTick());
+}
+
+u64 Rasterizer::ExecutorPhysicalDrsImageAllocationBytes(
+    const vk::ImageCreateInfo& image_ci) const noexcept {
+    const vk::Device device = instance.GetDevice();
+    if (instance.IsMaintenance4Supported()) {
+        const vk::MemoryRequirements2 requirements =
+            device.getImageMemoryRequirements(
+            vk::DeviceImageMemoryRequirements{
+                .pCreateInfo = &image_ci,
+                .planeAspect = vk::ImageAspectFlagBits::eNone,
+            });
+        return static_cast<u64>(requirements.memoryRequirements.size);
+    }
+
+    // Maintenance4 is optional on the degraded Android path. An unbound image
+    // object provides the same exact requirements without allocating device
+    // memory, so admission still happens before VMA can consume the budget.
+    vk::Image probe_image{};
+    const vk::Result probe_result =
+        device.createImage(&image_ci, nullptr, &probe_image);
+    if (probe_result != vk::Result::eSuccess) {
+        return 0;
+    }
+    const vk::MemoryRequirements requirements =
+        device.getImageMemoryRequirements(probe_image);
+    device.destroyImage(probe_image);
+    return static_cast<u64>(requirements.size);
+}
+
+bool Rasterizer::ExecutorTryCreatePhysicalDrsImage(
+    VideoCore::UniqueImage& image, const vk::ImageCreateInfo& image_ci,
+    u64& allocation_bytes) {
+    allocation_bytes = ExecutorPhysicalDrsImageAllocationBytes(image_ci);
+    if (allocation_bytes == 0 ||
+        !ExecutorRunPhysicalDrsResidencyGc(allocation_bytes)) {
+        return false;
+    }
+
+    const vk::Result result = image.TryCreate(image_ci);
+    if (result == vk::Result::eSuccess) {
+        return true;
+    }
+
+    static std::atomic<u32> allocation_failure_logs{0};
+    const u32 log_index =
+        allocation_failure_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_index < 16) {
+        __android_log_print(
+            ANDROID_LOG_WARN, "LSX4Native",
+            "[EXECUTOR_PHYSICAL_DRS_ALLOC] result=fallback error=%s bytes=%llu",
+            vk::to_string(result).c_str(),
+            static_cast<unsigned long long>(allocation_bytes));
+    }
+    return false;
+}
+
+void Rasterizer::ExecutorManagedMobileGpuTransition(
+    void* const context, const bool enabled) noexcept {
+    if (context != nullptr) {
+        static_cast<Rasterizer*>(context)
+            ->ExecutorNotifyManagedMobileGpuTransition(enabled);
+    }
+}
+
+void Rasterizer::ExecutorNotifyManagedMobileGpuTransition(
+    const bool enabled) noexcept {
+    {
+        std::scoped_lock drs_lock{executor_physical_drs_mutex};
+        if (enabled || executor_physical_drs_shutting_down) {
+            return;
+        }
+    }
+
+    // The option setter may run without another guest submit. Reclaim
+    // already-retired scratch immediately and schedule the rest against the
+    // exact timeline tick that last referenced it.
+    (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+    ExecutorSchedulePhysicalDrsOffCleanup();
+}
+
+void Rasterizer::ExecutorSchedulePhysicalDrsOffCleanup() {
+    std::scoped_lock drs_lock{executor_physical_drs_mutex};
+    if (executor_physical_drs_shutting_down ||
+        VideoCore::IsManagedMobileGpuOptimization() ||
+        executor_physical_drs_off_cleanup_scheduled ||
+        (executor_physical_drs_surfaces.empty() &&
+         executor_physical_drs_depth_surfaces.empty()) ||
+        executor_physical_drs_active ||
+        executor_physical_drs_building) {
+        return;
+    }
+
+    u64 retire_tick{};
+    for (const auto& surface : executor_physical_drs_surfaces) {
+        retire_tick = std::max(retire_tick, surface.last_use_tick);
+    }
+    for (const auto& surface : executor_physical_drs_depth_surfaces) {
+        retire_tick = std::max(retire_tick, surface.last_use_tick);
+    }
+
+    if (retire_tick == 0 || scheduler.IsFree(retire_tick)) {
+        (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+        if (executor_physical_drs_surfaces.empty() &&
+            executor_physical_drs_depth_surfaces.empty()) {
+            return;
+        }
+        retire_tick = 0;
+        for (const auto& surface : executor_physical_drs_surfaces) {
+            retire_tick = std::max(retire_tick, surface.last_use_tick);
+        }
+        for (const auto& surface : executor_physical_drs_depth_surfaces) {
+            retire_tick = std::max(retire_tick, surface.last_use_tick);
+        }
+        if (retire_tick == 0 || scheduler.IsFree(retire_tick)) {
+            return;
+        }
+    }
+
+    const auto control = executor_physical_drs_cleanup_control;
+    if (control == nullptr) {
+        return;
+    }
+    executor_physical_drs_off_cleanup_scheduled = true;
+    scheduler.DeferPriorityOperationAt(
+        retire_tick, [control] {
+            std::scoped_lock control_lock{control->mutex};
+            if (control->owner != nullptr) {
+                control->owner->ExecutorCompletePhysicalDrsOffCleanup();
+            }
+        });
+}
+
+void Rasterizer::ExecutorCompletePhysicalDrsOffCleanup() {
+    {
+        std::scoped_lock drs_lock{executor_physical_drs_mutex};
+        executor_physical_drs_off_cleanup_scheduled = false;
+        if (executor_physical_drs_shutting_down ||
+            VideoCore::IsManagedMobileGpuOptimization()) {
+            return;
+        }
+    }
+    (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+    ExecutorSchedulePhysicalDrsOffCleanup();
+}
+
+u64 Rasterizer::ExecutorPhysicalDrsResidencyBudgetBytes() const noexcept {
+    constexpr u64 FallbackBudget = 64_MB;
+    constexpr u64 MaximumBudget = 192_MB;
+    const auto mobile = VideoCore::GetMobileGpuOptimizationStats();
+    const u64 device_budget =
+        mobile.memory_budget_bytes != 0
+            ? mobile.memory_budget_bytes
+            : (instance.CanReportMemoryUsage()
+                   ? static_cast<u64>(instance.GetTotalMemoryBudget())
+                   : 0);
+    if (device_budget == 0) {
+        return FallbackBudget;
+    }
+
+    // The mobile texture cache starts collection at its managed residency
+    // threshold. Scratch receives at most one quarter of that threshold and
+    // is additionally capped to one eighth of the physical device budget.
+    const u64 texture_trigger =
+        texture_cache.ManagedResidencyTriggerBytes();
+    const u64 proportional =
+        texture_trigger != 0 ? texture_trigger / 4
+                             : device_budget / 16;
+    const u64 floor = std::min<u64>(
+        32_MB, std::max<u64>(8_MB, device_budget / 64));
+    const u64 ceiling = std::max(
+        floor,
+        std::min<u64>(MaximumBudget, device_budget / 8));
+    u64 budget = std::clamp(proportional, floor, ceiling);
+
+    // Yield scratch residency before the canonical texture pool reaches its
+    // own pressure/critical thresholds.
+    if (mobile.memory_used_bytes >=
+        device_budget - device_budget / 10) {
+        budget = std::max(floor, budget / 2);
+    }
+    if (mobile.memory_used_bytes >=
+        device_budget - device_budget / 32) {
+        budget = floor;
+    }
+    return budget;
+}
+
+void Rasterizer::ExecutorResetPhysicalDrsTransientBindings() noexcept {
+    executor_physical_drs_active = false;
+    executor_physical_drs_draw_active = false;
+    executor_physical_drs_building = false;
+    executor_physical_drs_surface = nullptr;
+    executor_physical_drs_depth_surface = nullptr;
+    executor_physical_drs_color_surfaces.fill(nullptr);
+    executor_physical_drs_color_image_ids.fill({});
+    executor_physical_drs_color_image_uids.fill(0);
+    executor_physical_drs_color_guest_addresses.fill(0);
+    executor_physical_drs_color_mask = 0;
+    executor_physical_drs_image_id = {};
+    executor_physical_drs_image_uid = 0;
+    executor_physical_drs_depth_image_id = {};
+    executor_physical_drs_depth_image_uid = 0;
+    executor_physical_drs_guest_address = 0;
+    executor_physical_drs_depth_guest_address = 0;
+    executor_physical_drs_scale_percent = 100;
+}
+
+bool Rasterizer::ExecutorRunPhysicalDrsResidencyGc(
+    const u64 reserve_bytes, const bool force_cleanup) {
+    std::scoped_lock drs_lock{executor_physical_drs_mutex};
+    if (force_cleanup) {
+        // OFF is a true baseline: the resolved presentation alias must not pin
+        // a scratch image after managed mobile rendering is disabled.
+        executor_physical_drs_present_surface = nullptr;
+        executor_physical_drs_present_image_id = {};
+        executor_physical_drs_present_image_uid = 0;
+    }
+
+    const u64 budget =
+        force_cleanup ? 0 : ExecutorPhysicalDrsResidencyBudgetBytes();
+    executor_physical_drs_budget_bytes = budget;
+    if (reserve_bytes > budget) {
+        return false;
+    }
+    const u64 target_bytes = budget - reserve_bytes;
+    if (executor_physical_drs_resident_bytes <= target_bytes &&
+        !force_cleanup) {
+        return true;
+    }
+
+    ++executor_physical_drs_gc_passes;
+    u64 evictions{};
+    bool blocked_by_gpu{};
+    const bool selected_surfaces_are_live =
+        executor_physical_drs_active ||
+        executor_physical_drs_building;
+    const auto color_protected =
+        [&](const ExecutorPhysicalDrsSurface& surface) {
+            if (executor_physical_drs_present_surface == &surface) {
+                return true;
+            }
+            if (!selected_surfaces_are_live) {
+                return false;
+            }
+            if (executor_physical_drs_surface == &surface) {
+                return true;
+            }
+            return std::ranges::find(
+                       executor_physical_drs_color_surfaces,
+                       &surface) !=
+                   executor_physical_drs_color_surfaces.end();
+        };
+    const auto depth_protected =
+        [&](const ExecutorPhysicalDrsDepthSurface& surface) {
+            return selected_surfaces_are_live &&
+                   executor_physical_drs_depth_surface == &surface;
+        };
+    const auto old_enough =
+        [&](const u64 generation, const u64 tick) {
+            if (tick != 0 && !scheduler.IsFree(tick)) {
+                blocked_by_gpu = true;
+                return false;
+            }
+            // Reserve pressure may reuse any retired inactive node. Routine
+            // aging waits two submits to avoid immediate scale-thrash.
+            return force_cleanup || reserve_bytes != 0 ||
+                   executor_physical_drs_generation - generation >= 2;
+        };
+
+    while (executor_physical_drs_resident_bytes > target_bytes) {
+        auto color_candidate =
+            executor_physical_drs_surfaces.end();
+        auto depth_candidate =
+            executor_physical_drs_depth_surfaces.end();
+        u64 oldest_generation =
+            std::numeric_limits<u64>::max();
+        u64 oldest_tick = std::numeric_limits<u64>::max();
+
+        for (auto iterator =
+                 executor_physical_drs_surfaces.begin();
+             iterator != executor_physical_drs_surfaces.end();
+             ++iterator) {
+            if (color_protected(*iterator) ||
+                !old_enough(iterator->last_used_generation,
+                            iterator->last_use_tick)) {
+                continue;
+            }
+            if (std::pair{iterator->last_used_generation,
+                          iterator->last_use_tick} <
+                std::pair{oldest_generation, oldest_tick}) {
+                oldest_generation = iterator->last_used_generation;
+                oldest_tick = iterator->last_use_tick;
+                color_candidate = iterator;
+                depth_candidate =
+                    executor_physical_drs_depth_surfaces.end();
+            }
+        }
+        for (auto iterator =
+                 executor_physical_drs_depth_surfaces.begin();
+             iterator !=
+                 executor_physical_drs_depth_surfaces.end();
+             ++iterator) {
+            if (depth_protected(*iterator) ||
+                !old_enough(iterator->last_used_generation,
+                            iterator->last_use_tick)) {
+                continue;
+            }
+            if (std::pair{iterator->last_used_generation,
+                          iterator->last_use_tick} <
+                std::pair{oldest_generation, oldest_tick}) {
+                oldest_generation = iterator->last_used_generation;
+                oldest_tick = iterator->last_use_tick;
+                depth_candidate = iterator;
+                color_candidate =
+                    executor_physical_drs_surfaces.end();
+            }
+        }
+
+        if (color_candidate !=
+            executor_physical_drs_surfaces.end()) {
+            auto* const victim = &*color_candidate;
+            if (executor_physical_drs_surface == victim) {
+                executor_physical_drs_surface = nullptr;
+            }
+            if (executor_physical_drs_present_surface == victim) {
+                executor_physical_drs_present_surface = nullptr;
+                executor_physical_drs_present_image_id = {};
+                executor_physical_drs_present_image_uid = 0;
+            }
+            for (auto*& selected :
+                 executor_physical_drs_color_surfaces) {
+                if (selected == victim) {
+                    selected = nullptr;
+                }
+            }
+            executor_physical_drs_resident_bytes -=
+                std::min(
+                    executor_physical_drs_resident_bytes,
+                    color_candidate->allocation_bytes);
+            executor_physical_drs_surfaces.erase(
+                color_candidate);
+            ++evictions;
+            continue;
+        }
+        if (depth_candidate !=
+            executor_physical_drs_depth_surfaces.end()) {
+            if (executor_physical_drs_depth_surface ==
+                &*depth_candidate) {
+                executor_physical_drs_depth_surface = nullptr;
+            }
+            executor_physical_drs_resident_bytes -=
+                std::min(
+                    executor_physical_drs_resident_bytes,
+                    depth_candidate->allocation_bytes);
+            executor_physical_drs_depth_surfaces.erase(
+                depth_candidate);
+            ++evictions;
+            continue;
+        }
+        break;
+    }
+
+    executor_physical_drs_gc_evictions += evictions;
+    if (blocked_by_gpu &&
+        executor_physical_drs_resident_bytes > target_bytes) {
+        ++executor_physical_drs_gc_blocked;
+    }
+    VideoCore::RecordMobileGpuResidencyGc(evictions);
+
+    const bool within_budget =
+        executor_physical_drs_resident_bytes <= target_bytes;
+    if (evictions != 0 || !within_budget ||
+        executor_physical_drs_gc_passes <= 8 ||
+        (executor_physical_drs_gc_passes & 127u) == 0u) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_PHYSICAL_DRS_RESIDENCY] budgetMiB=%llu "
+            "residentMiB=%llu peakMiB=%llu reserveMiB=%llu "
+            "colors=%zu depths=%zu evicted=%llu totalEvicted=%llu "
+            "blocked=%u force=%u generation=%llu",
+            static_cast<unsigned long long>(budget / 1_MB),
+            static_cast<unsigned long long>(
+                executor_physical_drs_resident_bytes / 1_MB),
+            static_cast<unsigned long long>(
+                executor_physical_drs_peak_bytes / 1_MB),
+            static_cast<unsigned long long>(reserve_bytes / 1_MB),
+            executor_physical_drs_surfaces.size(),
+            executor_physical_drs_depth_surfaces.size(),
+            static_cast<unsigned long long>(evictions),
+            static_cast<unsigned long long>(
+                executor_physical_drs_gc_evictions),
+            blocked_by_gpu ? 1u : 0u,
+            force_cleanup ? 1u : 0u,
+            static_cast<unsigned long long>(
+                executor_physical_drs_generation));
+    }
+    return within_budget;
+}
+
+bool Rasterizer::ExecutorPhysicalDrsPipelineCompatible(
+    const GraphicsPipeline* pipeline) const {
+    if (pipeline == nullptr || !pipeline->IsValid() ||
+        !VideoCore::MobileGpuWantsPhysicalDrs() || attachment_feedback_loop ||
+        Libraries::GnmDriver::ExecutorReplayActive() ||
+        texture_cache.ExecutorGpuContentProbeEnabled() ||
+        AmdGpu::RenderWaveTrace::LateFrameCaptureActive()) {
+        return false;
+    }
+
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto* fragment = pipeline->TryGetStage(Shader::LogicalStage::Fragment);
+    if (fragment == nullptr || key.num_samples != 1 ||
+        fragment->has_storage_images || fragment->has_image_query ||
+        fragment->loads.GetAny(Shader::IR::Attribute::FragCoord) ||
+        fragment->uses_buffer_atomic_float_min_max ||
+        fragment->uses_image_atomic_float_min_max ||
+        fragment->uses_buffer_int64_atomics) {
+        return false;
+    }
+    for (const auto& buffer : fragment->buffers) {
+        if (buffer.is_written) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Rasterizer::ExecutorPreparePhysicalDrsDraw(const GraphicsPipeline* pipeline) {
+    std::scoped_lock drs_lock{executor_physical_drs_mutex};
+    executor_physical_drs_draw_active = false;
+    if (!VideoCore::IsManagedMobileGpuOptimization()) {
+        if (executor_physical_drs_active) {
+            ExecutorResolvePhysicalDrs("option_off");
+        }
+        (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+        ExecutorSchedulePhysicalDrsOffCleanup();
+        return;
+    }
+    if (!executor_physical_drs_active) {
+        return;
+    }
+
+    bool keep_scaled_target = ExecutorPhysicalDrsPipelineCompatible(pipeline);
+    if (keep_scaled_target) {
+        const auto& key = pipeline->GetGraphicsKey();
+        u32 current_color_mask = 0;
+        for (u32 index = 0; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+            if ((key.mrt_mask & (1u << index)) == 0 ||
+                liverpool->regs.color_buffers[index].Address() == 0) {
+                continue;
+            }
+            current_color_mask |= 1u << index;
+            if ((executor_physical_drs_color_mask & (1u << index)) == 0 ||
+                liverpool->regs.color_buffers[index].Address() !=
+                    executor_physical_drs_color_guest_addresses[index]) {
+                keep_scaled_target = false;
+                break;
+            }
+        }
+        keep_scaled_target &=
+            current_color_mask == executor_physical_drs_color_mask;
+    }
+    if (keep_scaled_target) {
+        const bool has_depth = liverpool->regs.depth_buffer.DepthValid() ||
+                               liverpool->regs.depth_buffer.StencilValid();
+        keep_scaled_target =
+            has_depth == static_cast<bool>(executor_physical_drs_depth_image_id) &&
+            (!has_depth ||
+             liverpool->regs.depth_buffer.DepthAddress() ==
+                 executor_physical_drs_depth_guest_address);
+    }
+    if (!keep_scaled_target) {
+        ExecutorResolvePhysicalDrs("draw_hazard");
+    }
+}
+
+void Rasterizer::ExecutorTransitionPhysicalDrsSurface(
+    const vk::ImageLayout layout, const vk::AccessFlags2 access,
+    const vk::PipelineStageFlags2 stage) {
+    auto* surface = executor_physical_drs_surface;
+    if (surface == nullptr) {
+        return;
+    }
+    ExecutorTouchPhysicalDrsSurface(*surface);
+    if (surface->layout == layout && surface->access == access &&
+        surface->stage == stage) {
+        return;
+    }
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerBarrier);
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = surface->layout == vk::ImageLayout::eUndefined
+                            ? vk::PipelineStageFlagBits2::eTopOfPipe
+                            : surface->stage,
+        .srcAccessMask = surface->layout == vk::ImageLayout::eUndefined
+                             ? vk::AccessFlags2{}
+                             : surface->access,
+        .dstStageMask = stage,
+        .dstAccessMask = access,
+        .oldLayout = surface->layout,
+        .newLayout = layout,
+        .image = surface->image.image,
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                           .pImageMemoryBarriers = &barrier});
+    surface->layout = layout;
+    surface->access = access;
+    surface->stage = stage;
+}
+
+void Rasterizer::ExecutorTransitionPhysicalDrsDepthSurface(
+    const vk::ImageLayout layout, const vk::AccessFlags2 access,
+    const vk::PipelineStageFlags2 stage) {
+    auto* surface = executor_physical_drs_depth_surface;
+    if (surface == nullptr) {
+        return;
+    }
+    ExecutorTouchPhysicalDrsDepthSurface(*surface);
+    if (surface->layout == layout && surface->access == access &&
+        surface->stage == stage) {
+        return;
+    }
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerBarrier);
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = surface->layout == vk::ImageLayout::eUndefined
+                            ? vk::PipelineStageFlagBits2::eTopOfPipe
+                            : surface->stage,
+        .srcAccessMask = surface->layout == vk::ImageLayout::eUndefined
+                             ? vk::AccessFlags2{}
+                             : surface->access,
+        .dstStageMask = stage,
+        .dstAccessMask = access,
+        .oldLayout = surface->layout,
+        .newLayout = layout,
+        .image = surface->image.image,
+        .subresourceRange{
+            .aspectMask = surface->aspects,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                           .pImageMemoryBarriers = &barrier});
+    surface->layout = layout;
+    surface->access = access;
+    surface->stage = stage;
+}
+
+bool Rasterizer::ExecutorBeginPhysicalDrs(const GraphicsPipeline* pipeline,
+                                          RenderState& state) {
+    std::scoped_lock drs_lock{executor_physical_drs_mutex};
+    executor_physical_drs_draw_active = false;
+    const bool requested = VideoCore::MobileGpuWantsPhysicalDrs();
+    u32 color_mask = 0;
+    bool valid_color_descriptors = true;
+    for (u32 index = 0; index < state.num_color_attachments; ++index) {
+        if (!state.color_attachments[index].image_view) {
+            continue;
+        }
+        color_mask |= 1u << index;
+        valid_color_descriptors &= static_cast<bool>(cb_descs[index].first);
+    }
+    const bool compatible =
+        requested && ExecutorPhysicalDrsPipelineCompatible(pipeline) &&
+        valid_color_descriptors && (color_mask & 1u) != 0 &&
+        state.num_layers == 1;
+    if (!compatible) {
+        if (executor_physical_drs_active) {
+            ExecutorResolvePhysicalDrs("incompatible_draw");
+        }
+        VideoCore::RecordMobileGpuPhysicalDrsDecision(false, requested, 0, 0);
+        return false;
+    }
+
+    auto& canonical = texture_cache.GetImage(cb_descs[0].first);
+    const auto& info = canonical.info;
+    if (info.size.depth != 1 || info.resources.levels != 1 ||
+        info.resources.layers != 1 || info.num_samples != 1 ||
+        canonical.backing == nullptr || canonical.backing->num_samples != 1 ||
+        info.props.is_depth || info.props.is_volume ||
+        info.size.width != state.width || info.size.height != state.height) {
+        if (executor_physical_drs_active) {
+            ExecutorResolvePhysicalDrs("unsupported_target");
+        }
+        VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+        return false;
+    }
+    std::array<VideoCore::Image*, AmdGpu::NUM_COLOR_BUFFERS>
+        canonical_colors{};
+    canonical_colors[0] = &canonical;
+    for (u32 index = 1; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+        if ((color_mask & (1u << index)) == 0) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(cb_descs[index].first);
+        const auto& color_info = image.info;
+        if (color_info.size.depth != 1 ||
+            color_info.resources.levels != 1 ||
+            color_info.resources.layers != 1 ||
+            color_info.num_samples != 1 || image.backing == nullptr ||
+            image.backing->num_samples != 1 ||
+            color_info.props.is_depth || color_info.props.is_volume ||
+            color_info.size.width != state.width ||
+            color_info.size.height != state.height) {
+            if (executor_physical_drs_active) {
+                ExecutorResolvePhysicalDrs("unsupported_mrt_target");
+            }
+            VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                false, true, 0, 0);
+            return false;
+        }
+        canonical_colors[index] = &image;
+    }
+
+    const bool has_depth =
+        state.depth_stencil_attachment.has_depth ||
+        state.depth_stencil_attachment.has_stencil;
+    VideoCore::Image* canonical_depth = nullptr;
+    vk::ImageAspectFlags depth_aspects{};
+    if (has_depth) {
+        if (!db_desc.first) {
+            if (executor_physical_drs_active) {
+                ExecutorResolvePhysicalDrs("missing_depth_target");
+            }
+            VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+            return false;
+        }
+        canonical_depth = &texture_cache.GetImage(db_desc.first);
+        const auto& depth_info = canonical_depth->info;
+        if (!depth_info.props.is_depth || depth_info.props.is_volume ||
+            depth_info.size.depth != 1 || depth_info.resources.levels != 1 ||
+            depth_info.resources.layers != 1 || depth_info.num_samples != 1 ||
+            canonical_depth->backing == nullptr ||
+            canonical_depth->backing->num_samples != 1 ||
+            depth_info.size.width != state.width ||
+            depth_info.size.height != state.height) {
+            if (executor_physical_drs_active) {
+                ExecutorResolvePhysicalDrs("unsupported_depth_target");
+            }
+            VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+            return false;
+        }
+        if (state.depth_stencil_attachment.has_depth) {
+            depth_aspects |= vk::ImageAspectFlagBits::eDepth;
+        }
+        if (state.depth_stencil_attachment.has_stencil) {
+            depth_aspects |= vk::ImageAspectFlagBits::eStencil;
+        }
+    }
+
+    const u32 scale = std::clamp(VideoCore::MobileGpuEffectiveScalePercent(),
+                                 50u, 100u);
+    const vk::Extent2D physical_extent{
+        .width = std::max(1u, (static_cast<u32>(state.width) * scale + 99u) / 100u),
+        .height = std::max(1u, (static_cast<u32>(state.height) * scale + 99u) / 100u),
+    };
+    const vk::FormatFeatureFlags2 required_features =
+        vk::FormatFeatureFlagBits2::eColorAttachment |
+        vk::FormatFeatureFlagBits2::eBlitSrc |
+        vk::FormatFeatureFlagBits2::eBlitDst |
+        vk::FormatFeatureFlagBits2::eSampledImage;
+    std::array<vk::Format, AmdGpu::NUM_COLOR_BUFFERS> physical_formats{};
+    const vk::Format physical_format =
+        instance.GetSupportedFormat(cb_descs[0].second.view_info.format,
+                                    required_features);
+    physical_formats[0] = physical_format;
+    if (physical_format == vk::Format::eUndefined) {
+        if (executor_physical_drs_active) {
+            ExecutorResolvePhysicalDrs("undefined_format");
+        }
+        VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+        return false;
+    }
+    const auto format_properties =
+        instance.GetPhysicalDevice().getFormatProperties(physical_format);
+    const vk::FormatFeatureFlags required_legacy =
+        vk::FormatFeatureFlagBits::eColorAttachment |
+        vk::FormatFeatureFlagBits::eBlitSrc |
+        vk::FormatFeatureFlagBits::eBlitDst |
+        vk::FormatFeatureFlagBits::eSampledImage;
+    if ((format_properties.optimalTilingFeatures & required_legacy) !=
+        required_legacy) {
+        if (executor_physical_drs_active) {
+            ExecutorResolvePhysicalDrs("unsupported_format");
+        }
+        VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+        return false;
+    }
+    for (u32 index = 1; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+        if ((color_mask & (1u << index)) == 0) {
+            continue;
+        }
+        const vk::Format format =
+            instance.GetSupportedFormat(
+                cb_descs[index].second.view_info.format, required_features);
+        if (format == vk::Format::eUndefined) {
+            if (executor_physical_drs_active) {
+                ExecutorResolvePhysicalDrs("undefined_mrt_format");
+            }
+            VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                false, true, 0, 0);
+            return false;
+        }
+        const auto properties =
+            instance.GetPhysicalDevice().getFormatProperties(format);
+        if ((properties.optimalTilingFeatures & required_legacy) !=
+            required_legacy) {
+            if (executor_physical_drs_active) {
+                ExecutorResolvePhysicalDrs("unsupported_mrt_format");
+            }
+            VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                false, true, 0, 0);
+            return false;
+        }
+        physical_formats[index] = format;
+    }
+
+    vk::Format depth_format = vk::Format::eUndefined;
+    if (has_depth) {
+        depth_format = db_desc.second.view_info.format;
+        const auto depth_properties =
+            instance.GetPhysicalDevice().getFormatProperties(depth_format);
+        const vk::FormatFeatureFlags depth_required =
+            vk::FormatFeatureFlagBits::eDepthStencilAttachment |
+            vk::FormatFeatureFlagBits::eBlitSrc |
+            vk::FormatFeatureFlagBits::eBlitDst;
+        if (depth_format == vk::Format::eUndefined ||
+            (depth_properties.optimalTilingFeatures & depth_required) !=
+                depth_required) {
+            if (executor_physical_drs_active) {
+                ExecutorResolvePhysicalDrs("unsupported_depth_format");
+            }
+            VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+            return false;
+        }
+    }
+
+    if (executor_physical_drs_present_image_id == cb_descs[0].first) {
+        executor_physical_drs_present_surface = nullptr;
+        executor_physical_drs_present_image_id = {};
+        executor_physical_drs_present_image_uid = 0;
+    }
+
+    bool continuing =
+        executor_physical_drs_active &&
+        executor_physical_drs_color_mask == color_mask &&
+        executor_physical_drs_image_id == cb_descs[0].first &&
+        executor_physical_drs_image_uid == canonical.image_uid &&
+        executor_physical_drs_depth_image_id ==
+            (has_depth ? db_desc.first : VideoCore::ImageId{}) &&
+        executor_physical_drs_depth_image_uid ==
+            (has_depth ? canonical_depth->image_uid : 0) &&
+        executor_physical_drs_scale_percent == scale &&
+        executor_physical_drs_surface != nullptr &&
+        executor_physical_drs_surface->format == physical_format &&
+        executor_physical_drs_surface->extent == physical_extent &&
+        (!has_depth ||
+         (executor_physical_drs_depth_surface != nullptr &&
+          executor_physical_drs_depth_surface->format == depth_format &&
+          executor_physical_drs_depth_surface->extent == physical_extent &&
+          executor_physical_drs_depth_surface->aspects == depth_aspects));
+    for (u32 index = 0;
+         continuing && index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+        if ((color_mask & (1u << index)) == 0) {
+            continue;
+        }
+        const auto* surface =
+            executor_physical_drs_color_surfaces[index];
+        continuing =
+            surface != nullptr &&
+            executor_physical_drs_color_image_ids[index] ==
+                cb_descs[index].first &&
+            executor_physical_drs_color_image_uids[index] ==
+                canonical_colors[index]->image_uid &&
+            surface->format == physical_formats[index] &&
+            surface->extent == physical_extent;
+    }
+    if (executor_physical_drs_active && !continuing) {
+        ExecutorResolvePhysicalDrs("target_change");
+    }
+
+    if (!continuing) {
+        executor_physical_drs_building = true;
+        auto surface_it = std::ranges::find_if(
+            executor_physical_drs_surfaces,
+            [&](const ExecutorPhysicalDrsSurface& surface) {
+                return surface.format == physical_format &&
+                       surface.extent == physical_extent &&
+                       surface.owner_image_id == cb_descs[0].first &&
+                       surface.owner_image_uid == canonical.image_uid;
+            });
+        if (surface_it == executor_physical_drs_surfaces.end()) {
+            ExecutorPhysicalDrsSurface surface{};
+            surface.image =
+                VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+            surface.format = physical_format;
+            surface.extent = physical_extent;
+            surface.owner_image_id = cb_descs[0].first;
+            surface.owner_image_uid = canonical.image_uid;
+            const vk::ImageCreateInfo image_ci{
+                .imageType = vk::ImageType::e2D,
+                .format = physical_format,
+                .extent = {physical_extent.width, physical_extent.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                         vk::ImageUsageFlagBits::eTransferSrc |
+                         vk::ImageUsageFlagBits::eTransferDst |
+                         vk::ImageUsageFlagBits::eSampled,
+                .initialLayout = vk::ImageLayout::eUndefined,
+            };
+            if (!ExecutorTryCreatePhysicalDrsImage(
+                    surface.image, image_ci, surface.allocation_bytes)) {
+                ExecutorResetPhysicalDrsTransientBindings();
+                VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                    false, true, 0, 0);
+                return false;
+            }
+            auto [view_result, view] =
+                instance.GetDevice().createImageViewUnique(vk::ImageViewCreateInfo{
+                    .image = surface.image.image,
+                    .viewType = vk::ImageViewType::e2D,
+                    .format = physical_format,
+                    .subresourceRange{
+                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                });
+            if (view_result != vk::Result::eSuccess) {
+                ExecutorResetPhysicalDrsTransientBindings();
+                VideoCore::RecordMobileGpuPhysicalDrsDecision(false, true, 0, 0);
+                return false;
+            }
+            surface.view = std::move(view);
+            executor_physical_drs_surfaces.emplace_back(std::move(surface));
+            surface_it = std::prev(executor_physical_drs_surfaces.end());
+            executor_physical_drs_resident_bytes +=
+                surface_it->allocation_bytes;
+            executor_physical_drs_peak_bytes =
+                std::max(executor_physical_drs_peak_bytes,
+                         executor_physical_drs_resident_bytes);
+        }
+        executor_physical_drs_surface = &*surface_it;
+        executor_physical_drs_color_surfaces.fill(nullptr);
+        executor_physical_drs_color_surfaces[0] =
+            executor_physical_drs_surface;
+
+        for (u32 index = 1; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+            if ((color_mask & (1u << index)) == 0) {
+                continue;
+            }
+            auto color_surface_it = std::ranges::find_if(
+                executor_physical_drs_surfaces,
+                [&](const ExecutorPhysicalDrsSurface& surface) {
+                    return surface.format == physical_formats[index] &&
+                           surface.extent == physical_extent &&
+                           surface.owner_image_id == cb_descs[index].first &&
+                           surface.owner_image_uid ==
+                               canonical_colors[index]->image_uid;
+                });
+            if (color_surface_it == executor_physical_drs_surfaces.end()) {
+                ExecutorPhysicalDrsSurface surface{};
+                surface.image = VideoCore::UniqueImage{
+                    instance.GetDevice(), instance.GetAllocator()};
+                surface.format = physical_formats[index];
+                surface.extent = physical_extent;
+                surface.owner_image_id = cb_descs[index].first;
+                surface.owner_image_uid =
+                    canonical_colors[index]->image_uid;
+                const vk::ImageCreateInfo image_ci{
+                    .imageType = vk::ImageType::e2D,
+                    .format = physical_formats[index],
+                    .extent = {physical_extent.width,
+                               physical_extent.height, 1},
+                    .mipLevels = 1,
+                    .arrayLayers = 1,
+                    .samples = vk::SampleCountFlagBits::e1,
+                    .tiling = vk::ImageTiling::eOptimal,
+                    .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                             vk::ImageUsageFlagBits::eTransferSrc |
+                             vk::ImageUsageFlagBits::eTransferDst |
+                             vk::ImageUsageFlagBits::eSampled,
+                    .initialLayout = vk::ImageLayout::eUndefined,
+                };
+                if (!ExecutorTryCreatePhysicalDrsImage(
+                        surface.image, image_ci,
+                        surface.allocation_bytes)) {
+                    ExecutorResetPhysicalDrsTransientBindings();
+                    VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                        false, true, 0, 0);
+                    return false;
+                }
+                auto [view_result, view] =
+                    instance.GetDevice().createImageViewUnique(
+                        vk::ImageViewCreateInfo{
+                            .image = surface.image.image,
+                            .viewType = vk::ImageViewType::e2D,
+                            .format = physical_formats[index],
+                            .subresourceRange{
+                                .aspectMask =
+                                    vk::ImageAspectFlagBits::eColor,
+                                .baseMipLevel = 0,
+                                .levelCount = 1,
+                                .baseArrayLayer = 0,
+                                .layerCount = 1,
+                            },
+                        });
+                if (view_result != vk::Result::eSuccess) {
+                    ExecutorResetPhysicalDrsTransientBindings();
+                    VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                        false, true, 0, 0);
+                    return false;
+                }
+                surface.view = std::move(view);
+                executor_physical_drs_surfaces.emplace_back(
+                    std::move(surface));
+                color_surface_it =
+                    std::prev(executor_physical_drs_surfaces.end());
+                executor_physical_drs_resident_bytes +=
+                    color_surface_it->allocation_bytes;
+                executor_physical_drs_peak_bytes =
+                    std::max(executor_physical_drs_peak_bytes,
+                             executor_physical_drs_resident_bytes);
+            }
+            executor_physical_drs_color_surfaces[index] =
+                &*color_surface_it;
+        }
+
+        if (has_depth) {
+            auto depth_surface_it = std::ranges::find_if(
+                executor_physical_drs_depth_surfaces,
+                [&](const ExecutorPhysicalDrsDepthSurface& surface) {
+                    return surface.format == depth_format &&
+                           surface.extent == physical_extent &&
+                           surface.aspects == depth_aspects &&
+                           surface.owner_image_id == db_desc.first &&
+                           surface.owner_image_uid == canonical_depth->image_uid;
+                });
+            if (depth_surface_it == executor_physical_drs_depth_surfaces.end()) {
+                ExecutorPhysicalDrsDepthSurface surface{};
+                surface.image = VideoCore::UniqueImage{
+                    instance.GetDevice(), instance.GetAllocator()};
+                surface.format = depth_format;
+                surface.extent = physical_extent;
+                surface.aspects = depth_aspects;
+                surface.owner_image_id = db_desc.first;
+                surface.owner_image_uid = canonical_depth->image_uid;
+                const vk::ImageCreateInfo image_ci{
+                    .imageType = vk::ImageType::e2D,
+                    .format = depth_format,
+                    .extent = {physical_extent.width, physical_extent.height, 1},
+                    .mipLevels = 1,
+                    .arrayLayers = 1,
+                    .samples = vk::SampleCountFlagBits::e1,
+                    .tiling = vk::ImageTiling::eOptimal,
+                    .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                             vk::ImageUsageFlagBits::eTransferSrc |
+                             vk::ImageUsageFlagBits::eTransferDst,
+                    .initialLayout = vk::ImageLayout::eUndefined,
+                };
+                if (!ExecutorTryCreatePhysicalDrsImage(
+                        surface.image, image_ci,
+                        surface.allocation_bytes)) {
+                    ExecutorResetPhysicalDrsTransientBindings();
+                    VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                        false, true, 0, 0);
+                    return false;
+                }
+                auto [view_result, view] =
+                    instance.GetDevice().createImageViewUnique(
+                        vk::ImageViewCreateInfo{
+                            .image = surface.image.image,
+                            .viewType = vk::ImageViewType::e2D,
+                            .format = depth_format,
+                            .subresourceRange{
+                                .aspectMask = depth_aspects,
+                                .baseMipLevel = 0,
+                                .levelCount = 1,
+                                .baseArrayLayer = 0,
+                                .layerCount = 1,
+                            },
+                        });
+                if (view_result != vk::Result::eSuccess) {
+                    ExecutorResetPhysicalDrsTransientBindings();
+                    VideoCore::RecordMobileGpuPhysicalDrsDecision(
+                        false, true, 0, 0);
+                    return false;
+                }
+                surface.view = std::move(view);
+                executor_physical_drs_depth_surfaces.emplace_back(
+                    std::move(surface));
+                depth_surface_it =
+                    std::prev(executor_physical_drs_depth_surfaces.end());
+                executor_physical_drs_resident_bytes +=
+                    depth_surface_it->allocation_bytes;
+                executor_physical_drs_peak_bytes =
+                    std::max(executor_physical_drs_peak_bytes,
+                             executor_physical_drs_resident_bytes);
+            }
+            executor_physical_drs_depth_surface = &*depth_surface_it;
+        } else {
+            executor_physical_drs_depth_surface = nullptr;
+        }
+
+        scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
+        canonical.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                          vk::AccessFlagBits2::eTransferRead, {});
+        ExecutorTransitionPhysicalDrsSurface(
+            vk::ImageLayout::eTransferDstOptimal,
+            vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eTransfer);
+        const vk::ImageBlit region{
+            .srcSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .srcOffsets = std::array{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{static_cast<s32>(state.width),
+                             static_cast<s32>(state.height), 1},
+            },
+            .dstSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .dstOffsets = std::array{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{static_cast<s32>(physical_extent.width),
+                             static_cast<s32>(physical_extent.height), 1},
+            },
+        };
+        scheduler.CommandBuffer().blitImage(
+            canonical.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+            executor_physical_drs_surface->image.image,
+            vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+        ExecutorTransitionPhysicalDrsSurface(
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::AccessFlagBits2::eColorAttachmentRead |
+                vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+
+        for (u32 index = 1; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+            if ((color_mask & (1u << index)) == 0) {
+                continue;
+            }
+            auto& mrt = *canonical_colors[index];
+            executor_physical_drs_surface =
+                executor_physical_drs_color_surfaces[index];
+            mrt.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                        vk::AccessFlagBits2::eTransferRead, {});
+            ExecutorTransitionPhysicalDrsSurface(
+                vk::ImageLayout::eTransferDstOptimal,
+                vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eTransfer);
+            const vk::ImageBlit mrt_region{
+                .srcSubresource{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .srcOffsets = std::array{
+                    vk::Offset3D{0, 0, 0},
+                    vk::Offset3D{static_cast<s32>(state.width),
+                                 static_cast<s32>(state.height), 1},
+                },
+                .dstSubresource{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .dstOffsets = std::array{
+                    vk::Offset3D{0, 0, 0},
+                    vk::Offset3D{
+                        static_cast<s32>(physical_extent.width),
+                        static_cast<s32>(physical_extent.height), 1},
+                },
+            };
+            scheduler.CommandBuffer().blitImage(
+                mrt.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                executor_physical_drs_surface->image.image,
+                vk::ImageLayout::eTransferDstOptimal, mrt_region,
+                vk::Filter::eNearest);
+            ExecutorTransitionPhysicalDrsSurface(
+                vk::ImageLayout::eColorAttachmentOptimal,
+                vk::AccessFlagBits2::eColorAttachmentRead |
+                    vk::AccessFlagBits2::eColorAttachmentWrite,
+                vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+        }
+        executor_physical_drs_surface =
+            executor_physical_drs_color_surfaces[0];
+
+        if (has_depth) {
+            canonical_depth->Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                     vk::AccessFlagBits2::eTransferRead, {});
+            ExecutorTransitionPhysicalDrsDepthSurface(
+                vk::ImageLayout::eTransferDstOptimal,
+                vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eTransfer);
+            const auto blit_depth_aspect =
+                [&](const vk::ImageAspectFlagBits aspect) {
+                    const vk::ImageBlit depth_region{
+                        .srcSubresource{
+                            .aspectMask = aspect,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .srcOffsets = std::array{
+                            vk::Offset3D{0, 0, 0},
+                            vk::Offset3D{static_cast<s32>(state.width),
+                                         static_cast<s32>(state.height), 1},
+                        },
+                        .dstSubresource{
+                            .aspectMask = aspect,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .dstOffsets = std::array{
+                            vk::Offset3D{0, 0, 0},
+                            vk::Offset3D{
+                                static_cast<s32>(physical_extent.width),
+                                static_cast<s32>(physical_extent.height), 1},
+                        },
+                    };
+                    scheduler.CommandBuffer().blitImage(
+                        canonical_depth->GetImage(),
+                        vk::ImageLayout::eTransferSrcOptimal,
+                        executor_physical_drs_depth_surface->image.image,
+                        vk::ImageLayout::eTransferDstOptimal, depth_region,
+                        vk::Filter::eNearest);
+                };
+            if (depth_aspects & vk::ImageAspectFlagBits::eDepth) {
+                blit_depth_aspect(vk::ImageAspectFlagBits::eDepth);
+            }
+            if (depth_aspects & vk::ImageAspectFlagBits::eStencil) {
+                blit_depth_aspect(vk::ImageAspectFlagBits::eStencil);
+            }
+            ExecutorTransitionPhysicalDrsDepthSurface(
+                vk::ImageLayout::eDepthStencilAttachmentOptimal,
+                vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+                vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                    vk::PipelineStageFlagBits2::eLateFragmentTests);
+        }
+
+        executor_physical_drs_image_id = cb_descs[0].first;
+        executor_physical_drs_image_uid = canonical.image_uid;
+        executor_physical_drs_depth_image_id =
+            has_depth ? db_desc.first : VideoCore::ImageId{};
+        executor_physical_drs_depth_image_uid =
+            has_depth ? canonical_depth->image_uid : 0;
+        executor_physical_drs_guest_address = info.guest_address;
+        executor_physical_drs_depth_guest_address =
+            has_depth ? canonical_depth->info.guest_address : 0;
+        executor_physical_drs_color_image_ids.fill({});
+        executor_physical_drs_color_image_uids.fill(0);
+        executor_physical_drs_color_guest_addresses.fill(0);
+        executor_physical_drs_color_mask = color_mask;
+        for (u32 index = 0; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+            if ((color_mask & (1u << index)) == 0) {
+                continue;
+            }
+            executor_physical_drs_color_image_ids[index] =
+                cb_descs[index].first;
+            executor_physical_drs_color_image_uids[index] =
+                canonical_colors[index]->image_uid;
+            executor_physical_drs_color_guest_addresses[index] =
+                canonical_colors[index]->info.guest_address;
+        }
+        executor_physical_drs_scale_percent = scale;
+        executor_physical_drs_active = true;
+        executor_physical_drs_building = false;
+    }
+
+    for (u32 index = 0; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+        if ((color_mask & (1u << index)) == 0) {
+            continue;
+        }
+        ExecutorTouchPhysicalDrsSurface(
+            *executor_physical_drs_color_surfaces[index]);
+        state.color_attachments[index].image_view =
+            *executor_physical_drs_color_surfaces[index]->view;
+        state.color_attachments[index].image_layout =
+            vk::ImageLayout::eColorAttachmentOptimal;
+    }
+    if (has_depth) {
+        ExecutorTouchPhysicalDrsDepthSurface(
+            *executor_physical_drs_depth_surface);
+        state.depth_stencil_attachment.image_view =
+            *executor_physical_drs_depth_surface->view;
+        state.depth_stencil_attachment.image_layout =
+            vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    }
+    state.width = static_cast<u16>(physical_extent.width);
+    state.height = static_cast<u16>(physical_extent.height);
+    executor_physical_drs_draw_active = true;
+
+    const u64 canonical_pixels =
+        static_cast<u64>(info.size.width) * info.size.height;
+    const u64 physical_pixels =
+        static_cast<u64>(physical_extent.width) * physical_extent.height;
+    VideoCore::RecordMobileGpuPhysicalDrsDecision(
+        true, false, canonical_pixels, physical_pixels);
+    return true;
+}
+
+void Rasterizer::ExecutorResolvePhysicalDrs(const char* reason) {
+    std::scoped_lock drs_lock{executor_physical_drs_mutex};
+    executor_physical_drs_draw_active = false;
+    if (!executor_physical_drs_active ||
+        executor_physical_drs_surface == nullptr ||
+        !executor_physical_drs_image_id) {
+        if (!VideoCore::IsManagedMobileGpuOptimization()) {
+            (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+            ExecutorSchedulePhysicalDrsOffCleanup();
+        }
+        return;
+    }
+
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
+    auto& canonical = texture_cache.GetImage(executor_physical_drs_image_id);
+    if (canonical.image_uid == executor_physical_drs_image_uid) {
+        ExecutorTransitionPhysicalDrsSurface(
+            vk::ImageLayout::eTransferSrcOptimal,
+            vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eTransfer);
+        canonical.Transit(vk::ImageLayout::eTransferDstOptimal,
+                          vk::AccessFlagBits2::eTransferWrite, {});
+        const vk::ImageBlit region{
+            .srcSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .srcOffsets = std::array{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{
+                    static_cast<s32>(executor_physical_drs_surface->extent.width),
+                    static_cast<s32>(executor_physical_drs_surface->extent.height), 1},
+            },
+            .dstSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .dstOffsets = std::array{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{static_cast<s32>(canonical.info.size.width),
+                             static_cast<s32>(canonical.info.size.height), 1},
+            },
+        };
+        scheduler.CommandBuffer().blitImage(
+            executor_physical_drs_surface->image.image,
+            vk::ImageLayout::eTransferSrcOptimal, canonical.GetImage(),
+            vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+        canonical.flags |= VideoCore::ImageFlagBits::GpuModified;
+        executor_physical_drs_present_surface =
+            executor_physical_drs_surface;
+        executor_physical_drs_present_image_id =
+            executor_physical_drs_image_id;
+        executor_physical_drs_present_image_uid =
+            executor_physical_drs_image_uid;
+        VideoCore::RecordMobileGpuPhysicalDrsResolve();
+    }
+
+    for (u32 index = 1; index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+        if ((executor_physical_drs_color_mask & (1u << index)) == 0 ||
+            executor_physical_drs_color_surfaces[index] == nullptr ||
+            !executor_physical_drs_color_image_ids[index]) {
+            continue;
+        }
+        auto& mrt =
+            texture_cache.GetImage(
+                executor_physical_drs_color_image_ids[index]);
+        if (mrt.image_uid !=
+            executor_physical_drs_color_image_uids[index]) {
+            continue;
+        }
+        executor_physical_drs_surface =
+            executor_physical_drs_color_surfaces[index];
+        ExecutorTransitionPhysicalDrsSurface(
+            vk::ImageLayout::eTransferSrcOptimal,
+            vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eTransfer);
+        mrt.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {});
+        const vk::ImageBlit region{
+            .srcSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .srcOffsets = std::array{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{
+                    static_cast<s32>(
+                        executor_physical_drs_surface->extent.width),
+                    static_cast<s32>(
+                        executor_physical_drs_surface->extent.height),
+                    1},
+            },
+            .dstSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .dstOffsets = std::array{
+                vk::Offset3D{0, 0, 0},
+                vk::Offset3D{
+                    static_cast<s32>(mrt.info.size.width),
+                    static_cast<s32>(mrt.info.size.height), 1},
+            },
+        };
+        scheduler.CommandBuffer().blitImage(
+            executor_physical_drs_surface->image.image,
+            vk::ImageLayout::eTransferSrcOptimal, mrt.GetImage(),
+            vk::ImageLayout::eTransferDstOptimal, region,
+            vk::Filter::eNearest);
+        mrt.flags |= VideoCore::ImageFlagBits::GpuModified;
+    }
+
+    if (executor_physical_drs_depth_surface != nullptr &&
+        executor_physical_drs_depth_image_id) {
+        auto& canonical_depth =
+            texture_cache.GetImage(executor_physical_drs_depth_image_id);
+        if (canonical_depth.image_uid ==
+            executor_physical_drs_depth_image_uid) {
+            ExecutorTransitionPhysicalDrsDepthSurface(
+                vk::ImageLayout::eTransferSrcOptimal,
+                vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eTransfer);
+            canonical_depth.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                    vk::AccessFlagBits2::eTransferWrite, {});
+            const auto blit_depth_aspect =
+                [&](const vk::ImageAspectFlagBits aspect) {
+                    const vk::ImageBlit region{
+                        .srcSubresource{
+                            .aspectMask = aspect,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .srcOffsets = std::array{
+                            vk::Offset3D{0, 0, 0},
+                            vk::Offset3D{
+                                static_cast<s32>(
+                                    executor_physical_drs_depth_surface
+                                        ->extent.width),
+                                static_cast<s32>(
+                                    executor_physical_drs_depth_surface
+                                        ->extent.height),
+                                1},
+                        },
+                        .dstSubresource{
+                            .aspectMask = aspect,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1,
+                        },
+                        .dstOffsets = std::array{
+                            vk::Offset3D{0, 0, 0},
+                            vk::Offset3D{
+                                static_cast<s32>(
+                                    canonical_depth.info.size.width),
+                                static_cast<s32>(
+                                    canonical_depth.info.size.height),
+                                1},
+                        },
+                    };
+                    scheduler.CommandBuffer().blitImage(
+                        executor_physical_drs_depth_surface->image.image,
+                        vk::ImageLayout::eTransferSrcOptimal,
+                        canonical_depth.GetImage(),
+                        vk::ImageLayout::eTransferDstOptimal, region,
+                        vk::Filter::eNearest);
+                };
+            if (executor_physical_drs_depth_surface->aspects &
+                vk::ImageAspectFlagBits::eDepth) {
+                blit_depth_aspect(vk::ImageAspectFlagBits::eDepth);
+            }
+            if (executor_physical_drs_depth_surface->aspects &
+                vk::ImageAspectFlagBits::eStencil) {
+                blit_depth_aspect(vk::ImageAspectFlagBits::eStencil);
+            }
+            canonical_depth.flags |=
+                VideoCore::ImageFlagBits::GpuModified;
+        }
+    }
+
+    static std::atomic<u32> resolve_logs{0};
+    const u32 log_index = resolve_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_index < 16) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_PHYSICAL_DRS] phase=resolve reason=%s scale=%u "
+            "guest=0x%llx",
+            reason != nullptr ? reason : "unknown",
+            executor_physical_drs_scale_percent,
+            static_cast<unsigned long long>(
+                executor_physical_drs_guest_address));
+    }
+    ExecutorResetPhysicalDrsTransientBindings();
+    if (!VideoCore::IsManagedMobileGpuOptimization()) {
+        (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+        ExecutorSchedulePhysicalDrsOffCleanup();
+    }
+}
+
+bool Rasterizer::ExecutorAcquirePhysicalDrsPresentationSource(
+    const VideoCore::ImageId image_id, vk::ImageView& image_view,
+    vk::Extent2D& extent) {
+    std::scoped_lock drs_lock{executor_physical_drs_mutex};
+    if (!VideoCore::IsManagedMobileGpuOptimization()) {
+        (void)ExecutorRunPhysicalDrsResidencyGc(0, true);
+        ExecutorSchedulePhysicalDrsOffCleanup();
+        return false;
+    }
+    if (executor_physical_drs_present_surface == nullptr ||
+        executor_physical_drs_present_image_id != image_id || !image_id) {
+        return false;
+    }
+    const auto& canonical = texture_cache.GetImage(image_id);
+    auto* surface = executor_physical_drs_present_surface;
+    if (canonical.image_uid != executor_physical_drs_present_image_uid ||
+        surface->owner_image_id != image_id ||
+        surface->owner_image_uid != canonical.image_uid ||
+        !surface->view || !surface->image) {
+        executor_physical_drs_present_surface = nullptr;
+        executor_physical_drs_present_image_id = {};
+        executor_physical_drs_present_image_uid = 0;
+        return false;
+    }
+    ExecutorTouchPhysicalDrsSurface(*surface);
+
+    if (surface->layout != vk::ImageLayout::eShaderReadOnlyOptimal ||
+        surface->access != vk::AccessFlagBits2::eShaderRead) {
+        scheduler.EndRendering(
+            Scheduler::EndRenderingReason::RasterizerBarrier);
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = surface->layout == vk::ImageLayout::eUndefined
+                                ? vk::PipelineStageFlagBits2::eTopOfPipe
+                                : surface->stage,
+            .srcAccessMask =
+                surface->layout == vk::ImageLayout::eUndefined
+                    ? vk::AccessFlags2{}
+                    : surface->access,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = surface->layout,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = surface->image.image,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        scheduler.CommandBuffer().pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                               .pImageMemoryBarriers = &barrier});
+        surface->layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        surface->access = vk::AccessFlagBits2::eShaderRead;
+        surface->stage = vk::PipelineStageFlagBits2::eComputeShader |
+                         vk::PipelineStageFlagBits2::eFragmentShader;
+    }
+    image_view = *surface->view;
+    extent = surface->extent;
+    return true;
+}
+
 void Rasterizer::ExecutorGpuLatePassTransition(u64 next_attachment_signature, u64 next_sequence,
                                                const char* reason) {
     if (!AmdGpu::RenderWaveTrace::LateFrameCaptureActive()) {
@@ -574,7 +2206,8 @@ void Rasterizer::CpSync() {
 #ifdef __ANDROID__
     ++executor_completion_work_serial;
 #endif
-    scheduler.EndRendering();
+    scheduler.FlushPendingBufferTransfers();
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerBarrier);
     auto cmdbuf = scheduler.CommandBuffer();
 
     const vk::MemoryBarrier ib_barrier{
@@ -587,15 +2220,54 @@ void Rasterizer::CpSync() {
 }
 
 void Rasterizer::CompletionWaitBarrier(const u64 dependency_tick) {
+    const bool completion_inside_rendering = scheduler.IsRendering();
+    const bool completion_after_pending_transfers =
+        scheduler.HasPendingBufferTransfers();
+    scheduler.FlushPendingBufferTransfers();
+#ifdef __ANDROID__
+    if (scheduler.IsDeviceLost() || !scheduler.HasRecordingCommandBuffer()) {
+        executor_completion_barrier_valid = false;
+        return;
+    }
+#endif
 #ifdef __ANDROID__
     ++executor_completion_barrier_calls;
     const u64 current_tick = scheduler.CurrentTick();
     const u64 current_epoch = scheduler.CommandRecordingEpoch();
+    // Managed EOP/EOS labels are CPU-side timeline sidecars, not resource
+    // accesses.  If the wait arrives inside one graphics scope, later
+    // attachment work remains ordered by that scope and buffer/image hazards
+    // still emit their normal resource-specific barriers.  If queued transfers
+    // were just flushed, their all-commands pre/post memory barriers already
+    // provide the same dependency.  Re-emitting an all-commands barrier here
+    // ended dynamic rendering thousands of times per second on Adreno without
+    // adding an uncovered resource hazard.
+    const bool sidecar_dependency_already_ordered =
+        Config::managedReadbackBatching() &&
+        VideoCore::IsManagedVulkanDriverOptimization() &&
+        (completion_inside_rendering || completion_after_pending_transfers);
+    if (sidecar_dependency_already_ordered) {
+        VideoCore::RecordVulkanBarrierElision();
+        ++executor_completion_barrier_elided;
+        executor_completion_barrier_tick = current_tick;
+        executor_completion_barrier_epoch = current_epoch;
+        executor_completion_barrier_dependency_tick =
+            std::max(executor_completion_barrier_dependency_tick,
+                     dependency_tick);
+        executor_completion_barrier_work_serial =
+            executor_completion_work_serial;
+        executor_completion_barrier_valid = true;
+        return;
+    }
     const bool barrier_is_redundant =
+        VideoCore::IsManagedVulkanDriverOptimization() &&
         executor_completion_barrier_valid &&
         executor_completion_barrier_tick == current_tick &&
+        executor_completion_barrier_epoch == current_epoch &&
+        executor_completion_barrier_work_serial == executor_completion_work_serial &&
         dependency_tick <= executor_completion_barrier_dependency_tick;
     if (barrier_is_redundant) {
+        VideoCore::RecordVulkanBarrierElision();
         ++executor_completion_barrier_elided;
         if ((executor_completion_barrier_calls & 4095u) == 0u) {
             __android_log_print(
@@ -615,7 +2287,18 @@ void Rasterizer::CompletionWaitBarrier(const u64 dependency_tick) {
         return;
     }
 #endif
-    scheduler.EndRendering();
+    if (scheduler.TryCompletionBarrierInsideRendering()) {
+#ifdef __ANDROID__
+        ++executor_completion_barrier_emitted;
+        executor_completion_barrier_tick = current_tick;
+        executor_completion_barrier_epoch = scheduler.CommandRecordingEpoch();
+        executor_completion_barrier_dependency_tick = dependency_tick;
+        executor_completion_barrier_work_serial = executor_completion_work_serial;
+        executor_completion_barrier_valid = true;
+#endif
+        return;
+    }
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerBarrier);
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -682,7 +2365,6 @@ bool Rasterizer::FilterDraw() {
         ScopedMarkerInsert("PrimitiveTypeNone");
         return false;
     }
-
     const bool cb_disabled =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
     const auto depth_copy =
@@ -840,6 +2522,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
 #ifdef __ANDROID__
+    u64 executor_transfer_epoch =
+        scheduler.PendingBufferTransferRequestEpoch();
+    const auto flush_draw_uploads = [&] {
+        const u64 current_epoch =
+            scheduler.PendingBufferTransferRequestEpoch();
+        if (current_epoch != executor_transfer_epoch) {
+            scheduler.FlushPendingBufferTransfers();
+            executor_transfer_epoch = current_epoch;
+        }
+    };
+#endif
+
+#ifdef __ANDROID__
     static const int kBisectDrawLevel = [] {
         const char* e = std::getenv("EXECUTOR_BISECT_DRAW");
         const int lvl = e ? std::atoi(e) : 0;
@@ -914,6 +2609,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     EXEC_DRAW_TRACE("pipeline_ok");
 #ifdef __ANDROID__
+    ExecutorPreparePhysicalDrsDraw(pipeline);
     if (kBisectDrawLevel == 2) {
         return;
     }
@@ -925,13 +2621,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         EXEC_DRAW_TRACE("bind_resources_return");
         return;
     }
+#ifdef __ANDROID__
+    flush_draw_uploads();
+#endif
     EXEC_DRAW_TRACE("bind_resources_ok");
 #ifdef __ANDROID__
     if (kBisectDrawLevel == 3) {
         return;
     }
 #endif
-    const auto state = BeginRendering(pipeline);
+    auto state = BeginRendering(pipeline);
+#ifdef __ANDROID__
+    flush_draw_uploads();
+#endif
+#ifdef __ANDROID__
+    const bool executor_physical_drs_selected =
+        ExecutorBeginPhysicalDrs(pipeline, state);
+#endif
+    UpdateFragmentShadingRate(pipeline, state);
     EXEC_DRAW_TRACE("begin_rendering_ok");
 #ifdef __ANDROID__
     if (Libraries::GnmDriver::ExecutorReplayActive()) {
@@ -1476,6 +3183,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             buffer_cache.PrepareIndexBuffer(index_offset, buffer_barriers,
                                             executor_gpu_probe_selected, executor_gpu_probe_draw);
     }
+#ifdef __ANDROID__
+    flush_draw_uploads();
+#endif
 
     buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).RetainCurrentAllocation();
 
@@ -1495,8 +3205,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                executor_gpu_probe_draw, executor_gpu_probe_fragment_hash);
     }
 #endif
-    scheduler.BeginRendering(state);
-
+    // All draw-owned uploads were published above. Disjoint HLE copies may
+    // remain queued until a real range dependency or submit boundary, but can
+    // no longer end this scope while the draw is being bound. Preserve the
+    // proven Qualcomm ordering for every ordinary draw.
+    const bool executor_late_render_scope =
+#ifdef __ANDROID__
+        executor_physical_drs_selected;
+#else
+        false;
+#endif
+    if (!executor_late_render_scope) {
+        scheduler.BeginRendering(state);
+    }
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
@@ -1524,6 +3245,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     ExecutorBindGuestGraphicsPipeline(pipeline, cmdbuf);
 #else
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eGraphics);
 #endif
     buffer_cache.BindPreparedVertexBuffers(prepared_vertex_buffers);
     if (is_indexed) {
@@ -1533,7 +3255,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (executor_post_bind_dynamic) {
         UpdateDynamicState(pipeline, is_indexed);
     }
+    ExecutorSealGuestGraphicsPipelineState(pipeline, cmdbuf);
+    if (executor_physical_drs_selected) {
+        std::scoped_lock drs_lock{executor_physical_drs_mutex};
+        if (!executor_physical_drs_draw_active) {
+            // Resource synchronization can resolve a scaled target while the
+            // draw is being prepared. Never submit the already-built scratch
+            // attachment state after that resolve; the following guest draw
+            // will rebuild against the canonical target.
+            ResetBindings();
+            return;
+        }
+    }
 #endif
+    if (executor_late_render_scope) {
+        // Record the render scope only after every operation that can flush
+        // transfers or resolve a physical DRS target.
+        scheduler.BeginRendering(state);
+    }
     EXEC_DRAW_TRACE("before_draw_cmd");
 #ifdef __ANDROID__
     const bool executor_depth_write_oracle_clear =
@@ -1754,16 +3493,40 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
+#ifdef __ANDROID__
+    u64 executor_transfer_epoch =
+        scheduler.PendingBufferTransferRequestEpoch();
+    const auto flush_draw_uploads = [&] {
+        const u64 current_epoch =
+            scheduler.PendingBufferTransferRequestEpoch();
+        if (current_epoch != executor_transfer_epoch) {
+            scheduler.FlushPendingBufferTransfers();
+            executor_transfer_epoch = current_epoch;
+        }
+    };
+#endif
+
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline || !pipeline->IsValid()) {
         return;
     }
 
+#ifdef __ANDROID__
+    ExecutorPreparePhysicalDrsDraw(pipeline);
+#endif
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+#ifdef __ANDROID__
+    flush_draw_uploads();
+#endif
+    auto state = BeginRendering(pipeline);
+#ifdef __ANDROID__
+    flush_draw_uploads();
+    ExecutorBeginPhysicalDrs(pipeline, state);
+#endif
+    UpdateFragmentShadingRate(pipeline, state);
     const auto& regs = liverpool->regs;
 
     const bool executor_gpu_probe_enabled = texture_cache.ExecutorGpuContentProbeEnabled();
@@ -1872,12 +3635,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     const auto& [buffer, base] =
-        buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
+        buffer_cache.ObtainReadOnlyBuffer(
+            arg_address + offset, stride * max_count,
+            VideoCore::BufferCache::ReadOnlyBufferUsage::Storage);
 
     VideoCore::Buffer* count_buffer{};
     u32 count_base{};
     if (count_address != 0) {
-        std::tie(count_buffer, count_base) = buffer_cache.ObtainBuffer(count_address, 4, false);
+        std::tie(count_buffer, count_base) =
+            buffer_cache.ObtainReadOnlyBuffer(
+                count_address, 4,
+                VideoCore::BufferCache::ReadOnlyBufferUsage::Storage);
     }
 
     const auto prepared_vertex_buffers =
@@ -1886,6 +3654,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (is_indexed) {
         prepared_index_buffer = buffer_cache.PrepareIndexBuffer(0, buffer_barriers);
     }
+#ifdef __ANDROID__
+    flush_draw_uploads();
+#endif
 
     if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
                                           vk::PipelineStageFlagBits2::eDrawIndirect)) {
@@ -1922,6 +3693,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ExecutorBindGuestGraphicsPipeline(pipeline, cmdbuf);
 #else
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eGraphics);
 #endif
     buffer_cache.BindPreparedVertexBuffers(prepared_vertex_buffers);
     if (is_indexed) {
@@ -1931,6 +3703,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (executor_post_bind_dynamic) {
         UpdateDynamicState(pipeline, is_indexed);
     }
+    ExecutorSealGuestGraphicsPipelineState(pipeline, cmdbuf);
 #endif
 
     if (is_indexed) {
@@ -2028,6 +3801,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("compute_direct");
+#endif
     scheduler.PopPendingOperations();
 #ifdef __ANDROID__
     ++executor_completion_work_serial;
@@ -2048,15 +3824,22 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    scheduler.FlushPendingBufferTransfers();
     if (!BindResources(pipeline)) {
         return;
     }
+    scheduler.FlushPendingBufferTransfers();
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerDispatch);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
+#ifdef __ANDROID__
+    ExecutorBindGuestComputePipeline(pipeline, cmdbuf);
+#else
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
+#endif
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
 
 #ifdef __ANDROID__
@@ -2089,6 +3872,10 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("compute_indirect");
+#endif
+    scheduler.FlushPendingBufferTransfers();
     scheduler.PopPendingOperations();
 #ifdef __ANDROID__
     ++executor_completion_work_serial;
@@ -2108,18 +3895,26 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+    const auto [buffer, base] = buffer_cache.ObtainReadOnlyBuffer(
+        address + offset, size,
+        VideoCore::BufferCache::ReadOnlyBufferUsage::Storage);
+    scheduler.FlushPendingBufferTransfers();
 
     if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
                                           vk::PipelineStageFlagBits2::eDrawIndirect)) {
         buffer_barriers.emplace_back(*barrier);
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerDispatch);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
+#ifdef __ANDROID__
+    ExecutorBindGuestComputePipeline(pipeline, cmdbuf);
+#else
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
+#endif
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
 
 #ifdef __ANDROID__
@@ -2149,16 +3944,30 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 }
 
 u64 Rasterizer::Flush() {
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("flush");
+#endif
     const u64 current_tick = scheduler.CurrentTick();
     scheduler.Flush();
     return current_tick;
 }
 
 void Rasterizer::Finish() {
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("finish");
+#endif
     scheduler.Finish(Scheduler::ExecutorFinishReason::Rasterizer);
 }
 
 void Rasterizer::OnSubmit() {
+#ifdef __ANDROID__
+    {
+        std::scoped_lock drs_lock{executor_physical_drs_mutex};
+        ++executor_physical_drs_generation;
+        ExecutorResolvePhysicalDrs("submit");
+    }
+#endif
+    scheduler.FlushPendingBufferTransfers();
 #ifdef __ANDROID__
     if (executor_unpublished_actual_draws != 0) {
         Libraries::GnmDriver::ExecutorGnmRecordActualDraw(executor_unpublished_actual_draws);
@@ -2190,9 +3999,21 @@ void Rasterizer::OnSubmit() {
             memory_budget_sample_valid = true;
         }
         sampled_device_memory = cached_device_memory_usage;
+        VideoCore::ObserveMobileGpuMemory(
+            static_cast<u64>(*sampled_device_memory),
+            static_cast<u64>(instance.GetTotalMemoryBudget()));
     }
     texture_cache.RunGarbageCollector(sampled_device_memory);
     buffer_cache.RunGarbageCollector(sampled_device_memory);
+#ifdef __ANDROID__
+    const bool force_physical_drs_cleanup =
+        !VideoCore::IsManagedMobileGpuOptimization();
+    (void)ExecutorRunPhysicalDrsResidencyGc(
+        0, force_physical_drs_cleanup);
+    if (force_physical_drs_cleanup) {
+        ExecutorSchedulePhysicalDrsOffCleanup();
+    }
+#endif
     pipeline_cache.AdvanceShaderIdentitySubmit();
 }
 
@@ -2429,7 +4250,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 #endif
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
+            const auto buffer_id =
+                desc.is_written || desc.is_formatted
+                    ? buffer_cache.FindBuffer(vsharp.base_address, static_cast<u32>(size))
+                    : VideoCore::BufferId{};
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
@@ -2442,7 +4266,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const bool is_storage = desc.IsStorage(vsharp);
         const u32 alignment =
             is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
-        if (!buffer_id) {
+        const bool has_guest_range =
+            !desc.IsSpecial() && vsharp.base_address != 0 && size != 0;
+        if (!has_guest_range) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
@@ -2497,8 +4323,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(null_buffer.Handle(), 0, VK_WHOLE_SIZE);
             }
         } else {
-            const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
+            const auto [vk_buffer, offset] = [&] {
+                if (!desc.is_written && !desc.is_formatted) {
+                    const auto usage =
+                        is_storage ? VideoCore::BufferCache::ReadOnlyBufferUsage::Storage
+                                   : VideoCore::BufferCache::ReadOnlyBufferUsage::Uniform;
+                    return buffer_cache.ObtainReadOnlyBuffer(
+                        vsharp.base_address, static_cast<u32>(size), usage, buffer_id);
+                }
+                return buffer_cache.ObtainBuffer(
+                    vsharp.base_address, static_cast<u32>(size), desc.is_written,
+                    desc.is_formatted, buffer_id);
+            }();
+            const bool renamed_read_only =
+                !desc.is_written && !desc.is_formatted &&
+                vk_buffer == &buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             ASSERT(adjust % 4 == 0);
@@ -2516,7 +4355,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto [scratch_data, scratch_offset] = scratch.Map(size, alignment);
                 if (scratch_data != nullptr) {
                     scratch.Commit();
-                    scheduler.EndRendering();
+                    scheduler.EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
                     const auto cmdbuf = scheduler.CommandBuffer();
 
                     boost::container::small_vector<vk::BufferMemoryBarrier2, 2> pre_barriers;
@@ -2580,11 +4419,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (!bound_aligned_scratch) {
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
-                if (auto barrier =
-                        vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
-                                                              : vk::AccessFlagBits2::eShaderRead,
-                                              vk::PipelineStageFlagBits2::eAllCommands)) {
-                    buffer_barriers.emplace_back(*barrier);
+                if (!renamed_read_only) {
+                    if (auto barrier =
+                            vk_buffer->GetBarrier(desc.is_written
+                                                      ? vk::AccessFlagBits2::eShaderWrite
+                                                      : vk::AccessFlagBits2::eShaderRead,
+                                                  vk::PipelineStageFlagBits2::eAllCommands)) {
+                        buffer_barriers.emplace_back(*barrier);
+                    }
                 }
             }
             if (desc.is_written && desc.is_formatted) {
@@ -2592,17 +4434,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
-        for (u32 alias = 0; alias < desc.NumBindings(); ++alias) {
-            set_writes.push_back({
-                .dstSet = VK_NULL_HANDLE,
-                .dstBinding = binding.unified++,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = is_storage ? vk::DescriptorType::eStorageBuffer
-                                             : vk::DescriptorType::eUniformBuffer,
-                .pBufferInfo = &buffer_infos.back(),
-            });
-        }
+        set_writes.push_back({
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = binding.unified++,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = is_storage ? vk::DescriptorType::eStorageBuffer
+                                         : vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &buffer_infos.back(),
+        });
         ++binding.buffer;
     }
 }
@@ -2617,6 +4457,42 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         !Libraries::GnmDriver::ExecutorReplayActive();
     static int exec_live_tsharp_log_budget = 96;
     static int exec_replay_tsharp_log_budget = 512;
+    const auto resolve_physical_drs_alias = [&](const VideoCore::ImageId image_id) {
+        if (!executor_physical_drs_active || !image_id) {
+            return;
+        }
+        const auto& sampled = texture_cache.GetImage(image_id);
+        bool aliases = false;
+        for (u32 index = 0;
+             !aliases && index < AmdGpu::NUM_COLOR_BUFFERS; ++index) {
+            if ((executor_physical_drs_color_mask & (1u << index)) == 0 ||
+                !executor_physical_drs_color_image_ids[index]) {
+                continue;
+            }
+            const auto& color =
+                texture_cache.GetImage(
+                    executor_physical_drs_color_image_ids[index]);
+            aliases =
+                image_id ==
+                    executor_physical_drs_color_image_ids[index] ||
+                (color.image_uid ==
+                     executor_physical_drs_color_image_uids[index] &&
+                 sampled.Overlaps(color.info.guest_address,
+                                  color.info.guest_size));
+        }
+        if (!aliases && executor_physical_drs_depth_image_id) {
+            const auto& depth =
+                texture_cache.GetImage(executor_physical_drs_depth_image_id);
+            aliases =
+                image_id == executor_physical_drs_depth_image_id ||
+                (depth.image_uid == executor_physical_drs_depth_image_uid &&
+                 sampled.Overlaps(depth.info.guest_address,
+                                  depth.info.guest_size));
+        }
+        if (aliases) {
+            ExecutorResolvePhysicalDrs("sampled_image_alias");
+        }
+    };
 #endif
 
     u32 image_slot = 0;
@@ -2763,6 +4639,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
             }
+#ifdef __ANDROID__
+            resolve_physical_drs_alias(image_id);
+#endif
             if (image->binding.is_bound) {
                 image->binding.force_general |= image_desc.is_written;
             }
@@ -3080,6 +4959,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::Resolve() {
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("gnm_resolve");
+#endif
+    scheduler.FlushPendingBufferTransfers();
     const auto& mrt0_hint = liverpool->last_cb_extent[0];
     const auto& mrt1_hint = liverpool->last_cb_extent[1];
     VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->regs.color_buffers[0], mrt0_hint};
@@ -3138,6 +5021,10 @@ void Rasterizer::Resolve() {
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("depth_stencil_copy");
+#endif
+    scheduler.FlushPendingBufferTransfers();
     auto& regs = liverpool->regs;
 
     auto read_desc = VideoCore::TextureCache::ImageDesc(
@@ -3205,11 +5092,16 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
 }
 
-void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds,
+                            bool defer_gnm_dma) {
 #ifdef __ANDROID__
     ++executor_completion_work_serial;
 #endif
-    buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
+    buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds, defer_gnm_dma);
+}
+
+void Rasterizer::FlushPendingGnmDmaTransfers() {
+    scheduler.FlushPendingGnmDmaTransfers();
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
@@ -3223,6 +5115,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     if (!IsMapped(addr, size)) {
         return false;
     }
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("invalidate_memory");
+#endif
     pipeline_cache.InvalidateShaderIdentityRange(addr, size);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
@@ -3234,7 +5129,31 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         return false;
     }
 #ifdef __ANDROID__
-    (void)liverpool->ResolvePendingCompletionReadForExecutor(addr, size);
+    ExecutorResolvePhysicalDrs("read_memory");
+    const bool completion_sidecar_resolved =
+        liverpool->ResolvePendingCompletionReadForExecutor(addr, size);
+    if (completion_sidecar_resolved) {
+        static std::atomic<u64> sidecar_resolved_reads{0};
+        static std::atomic<u64> sidecar_readbacks_elided{0};
+        const u64 resolved =
+            sidecar_resolved_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+        // Completion labels are written directly to CPU backing by the
+        // retirement sidecar.  If no independent GPU write remains for this
+        // range, issuing another copyBuffer + timeline wait only downloads the
+        // value that was just published and serializes the graphics queue.
+        if (!buffer_cache.IsRegionGpuModified(addr, size)) {
+            const u64 elided =
+                sidecar_readbacks_elided.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((resolved & 4095u) == 0) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4Native",
+                    "[EXECUTOR_READBACK_SIDECAR_FASTPATH] resolved=%llu elided=%llu",
+                    static_cast<unsigned long long>(resolved),
+                    static_cast<unsigned long long>(elided));
+            }
+            return true;
+        }
+    }
 #endif
     pipeline_cache.InvalidateShaderIdentityReadbackRange(addr, size);
     buffer_cache.ReadMemory(addr, size);
@@ -3272,8 +5191,10 @@ bool Rasterizer::IsMemoryGpuModified(VAddr addr, u64 size) {
 
 void Rasterizer::ProcessDownloadImages() {
 #ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("download_images");
     ++executor_completion_work_serial;
 #endif
+    scheduler.FlushPendingBufferTransfers();
     texture_cache.ProcessDownloadImages();
 }
 
@@ -3299,6 +5220,9 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+#ifdef __ANDROID__
+    ExecutorResolvePhysicalDrs("unmap_memory");
+#endif
     pipeline_cache.InvalidateShaderIdentityRange(addr, size);
     pipeline_cache.InvalidateSrtSnapshots();
     buffer_cache.InvalidateMemory(addr, size);
@@ -3318,7 +5242,87 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = scheduler.GetDynamicState();
+    // ExecutorBindGuestGraphicsPipeline invalidates this cache after each
+    // actual Qualcomm pipeline bind. When that bind was deduplicated, the
+    // pipeline and dynamic state are both still current and replaying every
+    // vkCmdSet* only creates redundant driver work.
+    const bool full_replay =
+        !VideoCore::IsManagedVulkanStateDeduplication();
+    if (full_replay) {
+        dynamic_state.Invalidate();
+    }
+    VideoCore::RecordVulkanDynamicState(full_replay);
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
+}
+
+void Rasterizer::UpdateFragmentShadingRate(const GraphicsPipeline* pipeline,
+                                           const RenderState& state) const {
+    vk::Extent2D rate{1, 1};
+#ifdef __ANDROID__
+    bool use_coarse_rate = false;
+    const bool explicit_coarse =
+        Config::managedCoarseFragmentShading();
+    const bool adaptive_mobile =
+        VideoCore::MobileGpuWantsCoarseShading();
+    if ((explicit_coarse || adaptive_mobile) &&
+        !executor_physical_drs_draw_active &&
+        instance.IsCoarseFragmentShadingSupported() &&
+        state.width >= 960 && state.height >= 540 &&
+        !attachment_feedback_loop) {
+        const auto& key = pipeline->GetGraphicsKey();
+        const auto* fragment = pipeline->TryGetStage(Shader::LogicalStage::Fragment);
+        bool has_color = false;
+        for (u32 index = 0; index < state.num_color_attachments; ++index) {
+            if (!state.color_attachments[index].image_view) {
+                continue;
+            }
+            has_color = true;
+        }
+        bool has_buffer_writes = false;
+        if (fragment != nullptr) {
+            for (const auto& buffer : fragment->buffers) {
+                has_buffer_writes |= buffer.is_written;
+            }
+        }
+        // Fragment shading rate is defined for blended and depthless color
+        // passes as well.  Those are the expensive lighting/post-processing
+        // passes that dominate mobile GPUs, so keep them eligible while
+        // excluding shaders whose per-fragment side effects or discard
+        // semantics cannot be coarsened safely.
+        use_coarse_rate =
+            has_color && key.num_samples == 1 &&
+            fragment != nullptr && !fragment->has_discard &&
+            !fragment->has_storage_images && !has_buffer_writes &&
+            !fragment->uses_buffer_atomic_float_min_max &&
+            !fragment->uses_image_atomic_float_min_max &&
+            !fragment->uses_buffer_int64_atomics;
+        if (use_coarse_rate) {
+            rate = explicit_coarse
+                       ? instance.GetCoarseFragmentSize()
+                       : instance.GetMobileFragmentSize();
+        }
+    }
+
+    static thread_local u64 total_draws = 0;
+    static thread_local u64 coarse_draws = 0;
+    ++total_draws;
+    coarse_draws += use_coarse_rate;
+    if ((total_draws & 16383u) == 0) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_ADAPTIVE_VRS] draws=%llu coarse=%llu coarsePct=%.1f rate=%ux%u",
+            static_cast<unsigned long long>(total_draws),
+            static_cast<unsigned long long>(coarse_draws),
+            static_cast<double>(coarse_draws) * 100.0 /
+                static_cast<double>(total_draws),
+            explicit_coarse ? instance.GetCoarseFragmentSize().width
+                            : instance.GetMobileFragmentSize().width,
+            explicit_coarse ? instance.GetCoarseFragmentSize().height
+                            : instance.GetMobileFragmentSize().height);
+    }
+#endif
+    VideoCore::RecordMobileGpuShadingDecision(rate.width > 1 || rate.height > 1);
+    scheduler.GetDynamicState().SetFragmentShadingRate(rate);
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
@@ -3402,6 +5406,16 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.height = yscale * 2.0f;
         }
 
+#ifdef __ANDROID__
+        if (executor_physical_drs_draw_active) {
+            const float physical_scale =
+                static_cast<float>(executor_physical_drs_scale_percent) / 100.0f;
+            viewport.x *= physical_scale;
+            viewport.y *= physical_scale;
+            viewport.width *= physical_scale;
+            viewport.height *= physical_scale;
+        }
+#endif
         viewports.push_back(viewport);
 
         auto vp_scsr = scsr;
@@ -3415,10 +5429,34 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
-        scissors.push_back({
+        vk::Rect2D scissor{
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
             .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
-        });
+        };
+#ifdef __ANDROID__
+        if (executor_physical_drs_draw_active) {
+            const double physical_scale =
+                static_cast<double>(executor_physical_drs_scale_percent) / 100.0;
+            const s32 right = scissor.offset.x +
+                              static_cast<s32>(scissor.extent.width);
+            const s32 bottom = scissor.offset.y +
+                               static_cast<s32>(scissor.extent.height);
+            const s32 scaled_left =
+                static_cast<s32>(std::floor(scissor.offset.x * physical_scale));
+            const s32 scaled_top =
+                static_cast<s32>(std::floor(scissor.offset.y * physical_scale));
+            const s32 scaled_right =
+                static_cast<s32>(std::ceil(right * physical_scale));
+            const s32 scaled_bottom =
+                static_cast<s32>(std::ceil(bottom * physical_scale));
+            scissor.offset = {scaled_left, scaled_top};
+            scissor.extent = {
+                static_cast<u32>(std::max(0, scaled_right - scaled_left)),
+                static_cast<u32>(std::max(0, scaled_bottom - scaled_top)),
+            };
+        }
+#endif
+        scissors.push_back(scissor);
     }
 
     if (viewports.empty()) {

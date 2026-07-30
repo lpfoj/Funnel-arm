@@ -40,6 +40,15 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    [[nodiscard]] vk::Result BuildResult() const noexcept {
+        return build_result;
+    }
+
+    [[nodiscard]] bool WasCompileRequired() const noexcept {
+        return build_result == vk::Result::ePipelineCompileRequired ||
+               build_result == vk::Result::ePipelineCompileRequiredEXT;
+    }
+
     vk::PipelineLayout GetLayout() const noexcept {
         return *pipeline_layout;
     }
@@ -65,6 +74,10 @@ public:
         return is_compute;
     }
 
+    [[nodiscard]] u64 Identity() const noexcept {
+        return identity;
+    }
+
     using DescriptorWrites = boost::container::small_vector<vk::WriteDescriptorSet, 16>;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
@@ -78,10 +91,12 @@ protected:
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
+    const u64 identity;
     vk::UniquePipeline pipeline;
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+    vk::Result build_result{vk::Result::eNotReady};
     bool uses_push_descriptors{};
     bool is_compute;
 };

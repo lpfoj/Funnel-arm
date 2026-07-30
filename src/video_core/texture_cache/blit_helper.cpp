@@ -115,6 +115,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     };
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
+    scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eGraphics);
 
     const MsPipelineKey key{num_samples, dst_pixel_format, false};
     auto it = std::ranges::find(color_to_ms_depth_pl, key, &MsPipeline::first);
@@ -123,6 +124,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         it = --color_to_ms_depth_pl.end();
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eGraphics);
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -142,7 +144,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
 
     cmdbuf.draw(3, 1, 0, 0);
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BlitHelper);
     scheduler.GetDynamicState().Invalidate();
 }
 
@@ -216,6 +218,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     };
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
+    scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eGraphics);
 
     const MsPipelineKey key{num_samples, pixel_format, src_msaa};
     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
@@ -224,6 +227,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         it = --ms_image_copy_pl.end();
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eGraphics);
 
     const vk::Viewport viewport = {
         .x = 0,
@@ -243,7 +247,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
 
     cmdbuf.draw(3, 1, 0, 0);
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BlitHelper);
     scheduler.GetDynamicState().Invalidate();
 }
 

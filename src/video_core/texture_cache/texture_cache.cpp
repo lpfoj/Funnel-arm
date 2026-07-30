@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/config.h"
+#include "common/content_fingerprint.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/scope_exit.h"
@@ -20,6 +21,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/amdgpu/render_wave_trace.h"
 #include "video_core/page_manager.h"
+#include "video_core/mobile_gpu_optimization.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -74,6 +76,28 @@ static void ExecutorDumpRtPpm(const char* path, const u8* pixels, u32 width, u32
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+static u64 ExactSurfaceIdentity(const ImageInfo& info) {
+    Common::ContentFingerprint64 fingerprint{
+        Common::FingerprintDomain::AttachmentSet};
+    const auto mix = [&](const auto value) {
+        fingerprint.UpdateLittleEndian(static_cast<u64>(value));
+    };
+    mix(info.guest_address);
+    mix(info.guest_size);
+    mix(info.size.width);
+    mix(info.size.height);
+    mix(info.size.depth);
+    mix(info.pitch);
+    mix(info.resources.levels);
+    mix(info.resources.layers);
+    mix(info.num_samples);
+    mix(info.num_bits);
+    mix(info.pixel_format);
+    mix(info.type);
+    mix(info.tile_mode);
+    return fingerprint.Finish();
+}
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& tracker_)
@@ -82,11 +106,30 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)} {
     const auto null_id = GetNullImage(vk::Format::eR8G8B8A8Unorm);
     ASSERT(null_id.index == NULL_IMAGE_ID.index);
+    RefreshManagedResidencyPolicy(true);
+}
 
+void TextureCache::RefreshManagedResidencyPolicy(const bool force) {
     const u32 max_samplers = instance.GetMaxSamplerAllocationCount();
-    trigger_gc_samplers = max_samplers * 3 / 4;
-    pressure_gc_samplers = max_samplers * 7 / 8;
-    critical_gc_samplers = max_samplers * 15 / 16;
+#ifdef __ANDROID__
+    const bool managed_mobile_gpu =
+        VideoCore::IsManagedMobileGpuOptimization();
+#else
+    constexpr bool managed_mobile_gpu = false;
+#endif
+    if (!force && residency_policy_initialized &&
+        residency_policy_mobile == managed_mobile_gpu) {
+        return;
+    }
+    residency_policy_initialized = true;
+    residency_policy_mobile = managed_mobile_gpu;
+
+    trigger_gc_samplers = managed_mobile_gpu ? max_samplers * 2 / 3
+                                             : max_samplers * 3 / 4;
+    pressure_gc_samplers = managed_mobile_gpu ? max_samplers * 4 / 5
+                                              : max_samplers * 7 / 8;
+    critical_gc_samplers = managed_mobile_gpu ? max_samplers * 9 / 10
+                                              : max_samplers * 15 / 16;
 
     if (!instance.CanReportMemoryUsage()) {
         trigger_gc_memory = 0;
@@ -106,17 +149,23 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         return static_cast<u64>(
             std::min(device_local_memory, std::clamp(proportional, floor, ceiling)));
     };
-    trigger_gc_memory = adaptive_threshold(9, 20, 768_MB, 1_GB + 512_MB);
+    trigger_gc_memory = managed_mobile_gpu
+                            ? adaptive_threshold(7, 20, 512_MB, 1_GB + 256_MB)
+                            : adaptive_threshold(9, 20, 768_MB, 1_GB + 512_MB);
     pressure_gc_memory = std::min<u64>(
         device_local_memory,
         std::max<u64>(
             trigger_gc_memory + 256_MB,
-            adaptive_threshold(3, 5, 1_GB, 2_GB + 256_MB)));
+            managed_mobile_gpu
+                ? adaptive_threshold(11, 20, 768_MB, 2_GB)
+                : adaptive_threshold(3, 5, 1_GB, 2_GB + 256_MB)));
     critical_gc_memory = std::min<u64>(
         device_local_memory,
         std::max<u64>(
             pressure_gc_memory + 256_MB,
-            adaptive_threshold(3, 4, 1_GB + 512_MB, 3_GB)));
+            managed_mobile_gpu
+                ? adaptive_threshold(7, 10, 1_GB + 256_MB, 2_GB + 512_MB)
+                : adaptive_threshold(3, 4, 1_GB + 512_MB, 3_GB)));
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4Native",
         "[EXECUTOR_TEXTURE_GC_POLICY] budgetMiB=%lld triggerMiB=%llu pressureMiB=%llu "
@@ -125,8 +174,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         static_cast<unsigned long long>(trigger_gc_memory / 1_MB),
         static_cast<unsigned long long>(pressure_gc_memory / 1_MB),
         static_cast<unsigned long long>(critical_gc_memory / 1_MB));
-    return;
-#endif
+#else
     const s64 min_spacing_expected = device_local_memory - 1_GB;
     const s64 min_spacing_critical = device_local_memory - 512_MB;
     const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
@@ -139,6 +187,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+#endif
 }
 
 TextureCache::~TextureCache() = default;
@@ -219,7 +268,7 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
         },
     }};
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::ImageDownload);
     tile_manager.TileImage(image, image_downloads, download_buffer.Handle(), offset,
                            linear_download_size);
 
@@ -605,7 +654,7 @@ void TextureCache::ExecutorGpuContentProbe(ImageId image_id, ExecutorGpuContentR
         .imageExtent = {width, height, depth},
     };
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::ImageDownload);
     const auto cmdbuf = scheduler.CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
                   cmdbuf);
@@ -825,7 +874,7 @@ void TextureCache::ExecutorTraceVideoOutSource(ImageId image_id, u64 sequence,
         .imageOffset = {0, 0, 0},
         .imageExtent = {image.info.size.width, image.info.size.height, 1},
     };
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::ImageDownload);
     const auto cmdbuf = scheduler.CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
@@ -949,7 +998,7 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
         }
     }
 
-    if (tile_aligned_height > height) {
+    if (!preferred_valid && tile_aligned_height > height) {
         for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
             if (!candidate_valid(*it) || *it == preferred) {
                 continue;
@@ -982,6 +1031,14 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
                 return *it;
             }
         }
+    }
+
+    // A VideoOut surface is authoritative for the normal PrepareFrame path.  Falling through to
+    // an arbitrary same-sized/aspect render target can select a transient or only partially drawn
+    // attachment from this flip, which presents as whole-frame or large-region flicker.  Keep the
+    // legacy heuristic only for replay/live-present callers that do not have a registered surface.
+    if (preferred_valid) {
+        return {};
     }
 
     ImageId exact_best{};
@@ -1079,7 +1136,7 @@ void TextureCache::ExecutorReplayReadbackColorTarget() {
                             "[EXECUTOR_RT_READBACK] skip reason=no_candidates");
         return;
     }
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::ImageDownload);
 
     struct RtStats {
         ImageId id{};
@@ -1631,12 +1688,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         return GetNullImage(info.pixel_format);
     }
 
+    scheduler.FlushPendingBufferTransfersForRange(info.guest_address,
+                                                  info.guest_size);
     std::scoped_lock lock{mutex};
+#ifdef __ANDROID__
+    if (VideoCore::IsManagedMobileGpuOptimization()) {
+        const auto indexed = exact_surface_index.find(
+            ExactSurfaceIdentity(info));
+        if (indexed != exact_surface_index.end()) {
+            for (const ImageId indexed_id : indexed->second) {
+                auto& indexed_image = slot_images[indexed_id];
+                const auto& indexed_info = indexed_image.info;
+                if (False(indexed_image.flags & ImageFlagBits::Registered) ||
+                    indexed_info.guest_address != info.guest_address ||
+                    indexed_info.guest_size != info.guest_size ||
+                    indexed_info.size != info.size ||
+                    indexed_info.pitch != info.pitch ||
+                    indexed_info.resources != info.resources ||
+                    indexed_info.num_samples != info.num_samples ||
+                    indexed_info.num_bits != info.num_bits ||
+                    indexed_info.pixel_format != info.pixel_format ||
+                    indexed_info.type != info.type ||
+                    indexed_info.tile_mode != info.tile_mode) {
+                    continue;
+                }
+                indexed_image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(indexed_image);
+                VideoCore::RecordMobileGpuSurfaceReuse(
+                    indexed_image.info.guest_size);
+                return indexed_id;
+            }
+        }
+    }
+#endif
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
 
     ImageId image_id{};
+    bool exact_surface_reuse = false;
 
     for (const auto& cache_id : image_ids) {
         auto& cache_image = slot_images[cache_id];
@@ -1657,6 +1747,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             continue;
         }
         image_id = cache_id;
+        exact_surface_reuse = true;
     }
 
     int view_mip{-1};
@@ -1693,6 +1784,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
+    if (exact_surface_reuse) {
+        VideoCore::RecordMobileGpuSurfaceReuse(image.info.guest_size);
+    }
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
@@ -1835,6 +1929,8 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    scheduler.FlushPendingBufferTransfersForRange(image.info.guest_address,
+                                                  image.info.guest_size);
 #ifdef __ANDROID__
     if (Libraries::GnmDriver::ExecutorReplayActive()) {
         const u32* src = reinterpret_cast<const u32*>(image.info.guest_address);
@@ -1939,7 +2035,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::TextureCacheRefresh);
 
     if (Libraries::GnmDriver::ExecutorGnmCaptureActive()) {
         Libraries::GnmDriver::ExecutorGnmCaptureRecordResource(4u, image.info.guest_address,
@@ -1973,17 +2069,18 @@ void TextureCache::RefreshImage(Image& image) {
         });
     }
 
-    const auto [buffer, offset] =
+    auto detile =
         tile_manager.DetileImage(in_buffer->Handle(), in_offset, image.info);
 #ifdef __ANDROID__
     if (exec_ri_trace)
         __android_log_print(ANDROID_LOG_INFO, "EXECUTOR", "[EXECUTOR_RI] after_detile");
 #endif
     for (auto& copy : image_copies) {
-        copy.bufferOffset += offset;
+        copy.bufferOffset += detile.offset;
     }
 
-    image.Upload(image_copies, buffer, offset);
+    image.Upload(image_copies, detile.buffer, detile.offset);
+    tile_manager.RetireDetileResult(std::move(detile));
 
 #ifdef __ANDROID__
     if (Libraries::GnmDriver::ExecutorReplayActive() && !image.info.props.is_depth &&
@@ -2001,7 +2098,7 @@ void TextureCache::RefreshImage(Image& image) {
                 .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                 .imageOffset = {0, 0, 0},
                 .imageExtent = {image.info.size.width, image.info.size.height, 1}};
-            scheduler.EndRendering();
+            scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::ImageDownload);
             const auto cb = scheduler.CommandBuffer();
             image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
             cb.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, dl.Handle(),
@@ -2044,6 +2141,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    exact_surface_index[ExactSurfaceIdentity(image.info)].push_back(image_id);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
 }
@@ -2053,6 +2151,18 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    const auto exact_key = ExactSurfaceIdentity(image.info);
+    auto exact_it = exact_surface_index.find(exact_key);
+    if (exact_it != exact_surface_index.end()) {
+        auto& exact_ids = exact_surface_index[exact_key];
+        auto id_it = std::ranges::find(exact_ids, image_id);
+        if (id_it != exact_ids.end()) {
+            exact_ids.erase(id_it);
+        }
+        if (exact_ids.empty()) {
+            exact_surface_index.erase(exact_key);
+        }
+    }
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -2258,6 +2368,7 @@ void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_devi
                 Vulkan::Scheduler::ExecutorFinishReason::TextureReadback);
         }
     }
+    VideoCore::RecordMobileGpuResidencyGc(deleted_images);
 }
 
 void TextureCache::GarbageCollectSamplers() {
@@ -2303,6 +2414,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector(const std::optional<size_t> sampled_device_memory) {
+    RefreshManagedResidencyPolicy();
     SCOPE_EXIT {
         ++gc_tick;
     };

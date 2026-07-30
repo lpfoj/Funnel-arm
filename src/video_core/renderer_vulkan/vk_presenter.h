@@ -84,16 +84,7 @@ public:
     }
 
     VideoCore::Image& RegisterVideoOutSurface(
-        const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
-        vo_buffers_addr.emplace_back(cpu_address);
-        auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
-        const auto image_id = texture_cache.FindImage(desc);
-        auto& image = texture_cache.GetImage(image_id);
-        image.usage.vo_surface = 1u;
-        executor_videoout_width.store(image.info.size.width, std::memory_order_release);
-        executor_videoout_height.store(image.info.size.height, std::memory_order_release);
-        return image;
-    }
+        const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address);
 
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
 
@@ -155,6 +146,7 @@ private:
     std::atomic<bool> executor_live_direct_present_active{false};
     std::atomic<u32> executor_videoout_width{0};
     std::atomic<u32> executor_videoout_height{0};
+    u64 mobile_gpu_last_frame_ns{};
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;
 };

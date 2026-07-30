@@ -72,6 +72,8 @@ bool ExecutorShouldLogReadbackOrdinal(const u64 ordinal) {
 }
 
 std::atomic<u64> executor_readback_protect_count{0};
+std::atomic<u64> executor_readback_protect_os_count{0};
+std::atomic<u64> executor_readback_protect_noop_count{0};
 std::atomic<u64> executor_readback_fault_count{0};
 std::atomic<u64> executor_readback_read_fault_count{0};
 std::atomic<u64> executor_readback_write_fault_count{0};
@@ -87,7 +89,6 @@ thread_local bool executor_handling_guest_fault = false;
 thread_local VAddr executor_bulk_write_begin = 0;
 thread_local VAddr executor_bulk_write_end = 0;
 thread_local bool executor_bulk_write_consumed = false;
-thread_local bool executor_defer_bulk_write_unprotect = false;
 #endif
 
 void BeginBulkGuestWrite(const VAddr address, const u64 size) noexcept {
@@ -112,9 +113,15 @@ void EndBulkGuestWrite() noexcept {
 
 struct PageManager::Impl {
     struct PageState {
-        u8 num_write_watchers : 5;
-        u8 num_read_watchers : 2;
-        u8 memory_wait_write_watcher : 1;
+        // Submit-wide readback ranges and completion-label sidecars can
+        // legitimately overlap the same guest page more than three times.
+        // The old two-bit read counter wrapped to zero, then a matching
+        // retirement looked like an underflow and also dropped protection too
+        // early. Keep exact watcher parity; this table is still compact enough
+        // for the 40-bit guest address space.
+        u16 num_write_watchers : 7;
+        u16 num_read_watchers : 8;
+        u16 memory_wait_write_watcher : 1;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 && memory_wait_write_watcher == 0
@@ -135,6 +142,7 @@ struct PageManager::Impl {
         u8 AddDelta() {
             if constexpr (is_read) {
                 if constexpr (delta == 1) {
+                    ASSERT_MSG(num_read_watchers < 255, "Too many read watchers");
                     return ++num_read_watchers;
                 } else if (delta == -1) {
                     ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
@@ -144,7 +152,7 @@ struct PageManager::Impl {
                 }
             } else {
                 if constexpr (delta == 1) {
-                    ASSERT_MSG(num_write_watchers < 31, "Too many write watchers");
+                    ASSERT_MSG(num_write_watchers < 127, "Too many write watchers");
                     return ++num_write_watchers;
                 } else if (delta == -1) {
                     ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
@@ -155,8 +163,8 @@ struct PageManager::Impl {
             }
         }
     };
-    static_assert(sizeof(PageState) == 1,
-                  "The 40-bit page-state table must remain byte-packed");
+    static_assert(sizeof(PageState) == 2,
+                  "The 40-bit page-state table must remain compact");
 
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PAGE_BITS);
@@ -405,7 +413,41 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         const auto apply = [&](const VAddr begin, const u64 bytes,
                                const Core::MemoryPermission actual_perms) {
+            // Watcher transitions and fault recovery can converge on the same
+            // permission state. Avoid repeating the expensive Android
+            // mprotect/TLB shootdown when the page table already has it.
+            bool permission_change = true;
+            if ((begin & (PAGE_SIZE - 1)) == 0 &&
+                (bytes & (PAGE_SIZE - 1)) == 0 &&
+                begin < (u64{1} << ADDRESS_BITS) &&
+                bytes <= (u64{1} << ADDRESS_BITS) - begin) {
+                const bool desired_read_protected =
+                    !True(actual_perms & Core::MemoryPermission::Read);
+                const bool desired_write_protected =
+                    !True(actual_perms & Core::MemoryPermission::Write);
+                const size_t first_page = begin >> PAGE_BITS;
+                const size_t page_end = first_page + (bytes >> PAGE_BITS);
+                permission_change = false;
+                for (size_t page = first_page; page < page_end; ++page) {
+                    if (ActualReadProtected(page) != desired_read_protected ||
+                        ActualWriteProtected(page) != desired_write_protected) {
+                        permission_change = true;
+                        break;
+                    }
+                }
+            }
+            if (!permission_change) {
+#ifdef __ANDROID__
+                executor_readback_protect_noop_count.fetch_add(
+                    1, std::memory_order_relaxed);
+#endif
+                return;
+            }
             impl.Protect(begin, bytes, actual_perms);
+#ifdef __ANDROID__
+            executor_readback_protect_os_count.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
             FillActualReadProtection(
                 begin, bytes, !True(actual_perms & Core::MemoryPermission::Read));
             FillActualWriteProtection(
@@ -439,13 +481,19 @@ struct PageManager::Impl {
                 __android_log_print(
                     ANDROID_LOG_INFO, "LSX4Native",
                     "[EXECUTOR_READBACK_PROTECT] n=%llu addr=0x%llx bytes=%zu read=%u write=%u "
-                    "execute=%u mode=%d",
+                    "execute=%u mode=%d osCalls=%llu noops=%llu",
                     static_cast<unsigned long long>(ordinal),
                     static_cast<unsigned long long>(address), size,
                     True(perms & Core::MemoryPermission::Read) ? 1u : 0u,
                     True(perms & Core::MemoryPermission::Write) ? 1u : 0u,
                     True(perms & Core::MemoryPermission::Execute) ? 1u : 0u,
-                    Config::getReadbacksMode());
+                    Config::getReadbacksMode(),
+                    static_cast<unsigned long long>(
+                        executor_readback_protect_os_count.load(
+                            std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(
+                        executor_readback_protect_noop_count.load(
+                            std::memory_order_relaxed)));
             }
         }
 #endif
@@ -454,17 +502,6 @@ struct PageManager::Impl {
     template <bool track, bool is_read>
     void ApplyWatcherProtection(const VAddr address, const u64 size,
                                 const Core::MemoryPermission perms) {
-#ifdef __ANDROID__
-        if constexpr (!track && !is_read) {
-            // A known bulk write can update the physical backing alias while
-            // the guest mapping remains protected. Keep the logical watcher
-            // state exact and defer the permission release until a direct
-            // guest write actually faults.
-            if (executor_defer_bulk_write_unprotect) {
-                return;
-            }
-        }
-#endif
         Protect(address, size, perms);
     }
 
@@ -558,33 +595,6 @@ struct PageManager::Impl {
         const VAddr page_limit = Common::AlignUp(address + bounded_size, PAGE_SIZE);
         rasterizer->InvalidateMemory(page_begin, page_limit - page_begin);
         ReleaseDeferredWriteProtectionRange(page_begin, page_limit - page_begin);
-    }
-
-    bool PrepareBulkGuestBackingWrite(const VAddr address, const u64 size) {
-        if (size == 0 || address >= (u64{1} << ADDRESS_BITS)) {
-            return false;
-        }
-        const u64 bounded_size = std::min(size, (u64{1} << ADDRESS_BITS) - address);
-        size_t page = address >> PAGE_BITS;
-        const size_t page_end = Common::DivCeil(address + bounded_size, PAGE_SIZE);
-        while (page < page_end && !ActualWriteProtected(page)) {
-            ++page;
-        }
-        if (page == page_end) {
-            return false;
-        }
-
-        const VAddr page_begin = Common::AlignDown(address, PAGE_SIZE);
-        const VAddr page_limit = Common::AlignUp(address + bounded_size, PAGE_SIZE);
-#ifdef __ANDROID__
-        const bool previous_defer = executor_defer_bulk_write_unprotect;
-        executor_defer_bulk_write_unprotect = true;
-#endif
-        const bool invalidated = rasterizer->InvalidateMemory(page_begin, page_limit - page_begin);
-#ifdef __ANDROID__
-        executor_defer_bulk_write_unprotect = previous_defer;
-#endif
-        return invalidated;
     }
 
     void PrepareBulkGuestRead(const VAddr address, const u64 size) {
@@ -689,12 +699,14 @@ struct PageManager::Impl {
                           : executor_readback_read_fault_count)
                     .fetch_add(1, std::memory_order_relaxed) +
                 1;
-            if (ExecutorShouldLogReadbackOrdinal(ordinal)) {
+            if (ExecutorShouldLogReadbackOrdinal(ordinal) ||
+                ExecutorShouldLogReadbackOrdinal(typed_ordinal)) {
                 const u64 guest_rip = executor_jit_current_fault_guest_rip();
                 __android_log_print(
                     ANDROID_LOG_INFO, "LSX4Native",
                     "[EXECUTOR_READBACK_FAULT] n=%llu typed=%llu addr=0x%llx isWrite=%u "
-                    "handled=%u guestRip=0x%llx hostPc=0x%llx reads=%llu writes=%llu",
+                    "handled=%u guestRip=0x%llx hostPc=0x%llx caller=0x%llx "
+                    "copySparseCaller=0x%llx reads=%llu writes=%llu",
                     static_cast<unsigned long long>(ordinal),
                     static_cast<unsigned long long>(typed_ordinal),
                     static_cast<unsigned long long>(addr), is_write ? 1u : 0u,
@@ -702,6 +714,9 @@ struct PageManager::Impl {
                     static_cast<unsigned long long>(guest_rip),
                     static_cast<unsigned long long>(
                         reinterpret_cast<uintptr_t>(Common::GetRip(context))),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(Common::GetLinkRegister(context))),
+                    static_cast<unsigned long long>(Core::ExecutorCopySparseCaller()),
                     static_cast<unsigned long long>(
                         executor_readback_read_fault_count.load(std::memory_order_relaxed)),
                     static_cast<unsigned long long>(
@@ -935,16 +950,6 @@ void PageManager::PrepareBulkGuestRead(const VAddr address, const u64 size) {
 void PageManager::PrepareBulkGuestWrite(const VAddr address, const u64 size) {
     if (Impl::owner != nullptr) {
         Impl::owner->PrepareBulkGuestWrite(address, size);
-    }
-}
-
-bool PageManager::PrepareBulkGuestBackingWrite(const VAddr address, const u64 size) {
-    return Impl::owner != nullptr && Impl::owner->PrepareBulkGuestBackingWrite(address, size);
-}
-
-void PageManager::ReleaseBulkGuestBackingWrite(const VAddr address, const u64 size) {
-    if (Impl::owner != nullptr) {
-        Impl::owner->ReleaseDeferredWriteProtectionRange(address, size);
     }
 }
 

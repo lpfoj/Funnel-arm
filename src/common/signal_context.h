@@ -11,6 +11,8 @@ void* GetXmmPointer(void* ctx, u8 index);
 
 void* GetRip(void* ctx);
 
+void* GetLinkRegister(void* ctx);
+
 void IncrementRip(void* ctx, u64 length);
 
 bool IsWriteError(void* ctx);

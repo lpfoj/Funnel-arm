@@ -3,9 +3,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <span>
+#include <tuple>
+#include <utility>
 #include <vector>
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -22,10 +26,13 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/page_manager.h"
+#include "video_core/mobile_gpu_optimization.h"
+#include "video_core/readback_optimization.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/vulkan_driver_optimization.h"
 
 namespace VideoCore {
 
@@ -40,6 +47,55 @@ bool ExecutorBufferReadbackContractTraceEnabled() {
     return enabled;
 }
 
+bool ExecutorReadOnlyRenameEnabled() {
+    static const bool enabled = [] {
+        constexpr const char* DisableMarker =
+            "/data/data/app.lsx4.android/files/lsx4-home/"
+            "run-bisect-disable-read-only-rename";
+        if (std::FILE* marker = std::fopen(DisableMarker, "rb")) {
+            std::fclose(marker);
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+bool ExecutorReadOnlyRenameUsageEnabled(const BufferCache::ReadOnlyBufferUsage usage) {
+    constexpr std::array<const char*, static_cast<std::size_t>(
+                                          BufferCache::ReadOnlyBufferUsage::Count)>
+        DisableMarkers{
+            "/data/data/app.lsx4.android/files/lsx4-home/"
+            "run-bisect-disable-read-only-rename-vertex",
+            "/data/data/app.lsx4.android/files/lsx4-home/"
+            "run-bisect-disable-read-only-rename-index",
+            "/data/data/app.lsx4.android/files/lsx4-home/"
+            "run-bisect-disable-read-only-rename-uniform",
+            "/data/data/app.lsx4.android/files/lsx4-home/"
+            "run-bisect-disable-read-only-rename-storage",
+        };
+    const auto read_mask = [&] {
+        u32 result = (1u << DisableMarkers.size()) - 1u;
+        for (std::size_t i = 0; i < DisableMarkers.size(); ++i) {
+            if (std::FILE* marker = std::fopen(DisableMarkers[i], "rb")) {
+                std::fclose(marker);
+                result &= ~(1u << i);
+            }
+        }
+        return result;
+    };
+    static std::atomic<u32> enabled_mask{read_mask()};
+    static std::atomic<u64> poll_count{0};
+    // Runtime polling is intentionally sparse: it makes type-by-type GPU
+    // corruption bisection possible without another multi-minute title load,
+    // while four marker probes per 65536 resources are immeasurable in play.
+    if ((poll_count.fetch_add(1, std::memory_order_relaxed) & 0xffffu) == 0xffffu) {
+        enabled_mask.store(read_mask(), std::memory_order_relaxed);
+    }
+    return (enabled_mask.load(std::memory_order_relaxed) &
+            (1u << static_cast<std::size_t>(usage))) != 0;
+}
+
 bool ExecutorShouldLogBufferReadbackOrdinal(const u64 ordinal) {
     return ordinal <= 64 || (ordinal & (ordinal - 1)) == 0;
 }
@@ -50,7 +106,57 @@ std::atomic<u64> executor_buffer_empty_download_count{0};
 std::atomic<u64> executor_buffer_download_bytes{0};
 
 constexpr u64 ExecutorPreciseReadbackWindow = TRACKER_BYTES_PER_PAGE;
-constexpr u64 ExecutorPreciseReadbackWaveMaxBytes = 4_MB;
+u64 ExecutorElapsedNs(const std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
+void ExecutorMaybeLogReadbackOptimizationStats() {
+    const auto stats = GetReadbackOptimizationStats();
+    static std::atomic<u64> next_log{1};
+    u64 expected = next_log.load(std::memory_order_relaxed);
+    if (stats.snapshots < expected) {
+        return;
+    }
+    const u64 following = expected == 1 ? 256 : expected + 256;
+    if (!next_log.compare_exchange_strong(expected, following, std::memory_order_relaxed)) {
+        return;
+    }
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_READBACK_BATCH_STATS] enabled=%u mode=%d snapshots=%llu "
+        "submit=%llu demand=%llu ranges=%llu pages=%llu copyCommands=%llu "
+        "copyRegions=%llu sourceBuffers=%llu mergedRegions=%llu timelineWaits=%llu "
+        "bytes=%llu cpuPlanMs=%.3f "
+        "cpuPublishMs=%.3f cpuWaitMs=%.3f gpuCompletionMs=%.3f fallbacks=%llu "
+        "publishFailures=%llu duplicateSubmitSkips=%llu overflowAllocations=%llu "
+        "demandFlushes=%llu baselineRequests=%llu sidecarLabels=%llu sidecarWaits=%llu",
+        Config::managedReadbackBatching() ? 1u : 0u, Config::getReadbacksMode(),
+        static_cast<unsigned long long>(stats.snapshots),
+        static_cast<unsigned long long>(stats.submit_snapshots),
+        static_cast<unsigned long long>(stats.demand_snapshots),
+        static_cast<unsigned long long>(stats.ranges),
+        static_cast<unsigned long long>(stats.pages),
+        static_cast<unsigned long long>(stats.copy_commands),
+        static_cast<unsigned long long>(stats.copy_regions),
+        static_cast<unsigned long long>(stats.source_buffers),
+        static_cast<unsigned long long>(stats.regions_merged),
+        static_cast<unsigned long long>(stats.timeline_waits),
+        static_cast<unsigned long long>(stats.bytes),
+        static_cast<double>(stats.cpu_plan_ns) / 1'000'000.0,
+        static_cast<double>(stats.cpu_publish_ns) / 1'000'000.0,
+        static_cast<double>(stats.cpu_wait_ns) / 1'000'000.0,
+        static_cast<double>(stats.gpu_completion_ns) / 1'000'000.0,
+        static_cast<unsigned long long>(stats.fallbacks),
+        static_cast<unsigned long long>(stats.publication_failures),
+        static_cast<unsigned long long>(stats.duplicate_submit_skips),
+        static_cast<unsigned long long>(stats.overflow_allocations),
+        static_cast<unsigned long long>(stats.demand_flushes),
+        static_cast<unsigned long long>(stats.baseline_requests),
+        static_cast<unsigned long long>(stats.sidecar_labels),
+        static_cast<unsigned long long>(stats.sidecar_waits));
+}
 
 }
 #endif
@@ -87,6 +193,14 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
 
+#ifdef __ANDROID__
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_READBACK_BATCH_CONFIG] enabled=%u effectiveMode=%d "
+        "configuredBy=managed_optimization_7",
+        Config::managedReadbackBatching() ? 1u : 0u, Config::getReadbacksMode());
+#endif
+
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
     const auto null_id =
@@ -114,12 +228,18 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         return static_cast<u64>(
             std::min(device_local_memory, std::clamp(proportional, floor, ceiling)));
     };
-    trigger_gc_memory = adaptive_threshold(9, 20, 768_MB, 1_GB + 512_MB);
+    const bool managed_mobile_gpu =
+        VideoCore::IsManagedMobileGpuOptimization();
+    trigger_gc_memory = managed_mobile_gpu
+                            ? adaptive_threshold(7, 20, 512_MB, 1_GB + 256_MB)
+                            : adaptive_threshold(9, 20, 768_MB, 1_GB + 512_MB);
     critical_gc_memory = std::min<u64>(
         device_local_memory,
         std::max<u64>(
             trigger_gc_memory + 256_MB,
-            adaptive_threshold(3, 4, 1_GB + 256_MB, 2_GB + 512_MB)));
+            managed_mobile_gpu
+                ? adaptive_threshold(7, 10, 1_GB, 2_GB + 256_MB)
+                : adaptive_threshold(3, 4, 1_GB + 256_MB, 2_GB + 512_MB)));
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4Native",
         "[EXECUTOR_BUFFER_GC_POLICY] budgetMiB=%lld triggerMiB=%llu criticalMiB=%llu",
@@ -144,6 +264,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 BufferCache::~BufferCache() = default;
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
+    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
 #ifdef __ANDROID__
     WaitForPendingReadback(device_addr, size);
 #endif
@@ -156,6 +277,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
 #ifdef __ANDROID__
     WaitForPendingReadback(device_addr, size);
 #endif
@@ -178,8 +300,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         VAddr download_addr = device_addr;
         u64 download_size = size;
 #ifdef __ANDROID__
-        if (!is_write && size <= TRACKER_BYTES_PER_PAGE &&
-            Config::getReadbacksMode() == Config::GpuReadbacksMode::Precise) {
+        const bool managed_submit_readback =
+            Config::managedReadbackBatching() &&
+            Config::getReadbacksMode() == Config::GpuReadbacksMode::Precise;
+        if (managed_submit_readback && size <= TRACKER_BYTES_PER_PAGE) {
             const VAddr buffer_begin = buffer.CpuAddr();
             const VAddr buffer_end = buffer_begin + buffer.SizeBytes();
             VAddr window_begin = Common::AlignDown(device_addr, ExecutorPreciseReadbackWindow);
@@ -199,12 +323,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         }
 #endif
 #ifdef __ANDROID__
-        if (!is_write && size <= TRACKER_BYTES_PER_PAGE &&
-            Config::getReadbacksMode() == Config::GpuReadbacksMode::Precise) {
-            DownloadBufferMemoryWave(buffer, download_addr, download_size);
+        if (managed_submit_readback) {
+            DownloadBufferMemoryWave(buffer, download_addr, download_size, is_write);
         } else
 #endif
         {
+#ifdef __ANDROID__
+            AccumulateReadbackOptimizationStats(
+                ReadbackOptimizationStats{.baseline_requests = 1});
+#endif
             DownloadBufferMemory<false>(buffer, download_addr, download_size, is_write);
         }
     });
@@ -233,16 +360,38 @@ void BufferCache::WaitForPendingReadback(VAddr device_addr, u64 size) {
         return;
     }
     liverpool->SendCommand<true>([this, dependency_tick] {
-        scheduler.Wait(dependency_tick);
+        const auto wait_start = std::chrono::steady_clock::now();
+        // A submit snapshot is normally carried by the surrounding guest
+        // submit. A CPU fault can arrive before that boundary is materialized;
+        // explicitly publish the current command buffer in that case so the
+        // retirement worker can own the single host timeline wait.
+        if (dependency_tick >= scheduler.CurrentTick()) {
+            scheduler.Flush();
+        }
+        // The retirement worker owns the sole Vulkan timeline wait for this
+        // tick. Waiting for retirement here avoids issuing a second host wait.
         scheduler.WaitRetirement(dependency_tick);
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .cpu_wait_ns = ExecutorElapsedNs(wait_start),
+        });
     });
 }
 
 void BufferCache::PrefetchReadbackWindows() {
-    if (recent_readback_window_count == 0 ||
+    const auto plan_start = std::chrono::steady_clock::now();
+    if (!Config::managedReadbackBatching() ||
+        recent_readback_window_count == 0 ||
         Config::getReadbacksMode() != Config::GpuReadbacksMode::Precise) {
         return;
     }
+    const u64 snapshot_tick = scheduler.CurrentTick();
+    if (snapshot_tick != 0 && snapshot_tick == last_submit_readback_snapshot_tick) {
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .duplicate_submit_skips = 1,
+        });
+        return;
+    }
+    scheduler.FlushPendingBufferTransfers();
 
     struct PrefetchCopy {
         vk::Buffer source{};
@@ -254,60 +403,88 @@ void BufferCache::PrefetchReadbackWindows() {
 
     boost::container::small_vector<PrefetchCopy, 32> copies;
     RangeSet scheduled_ranges;
+    RangeSet excluded_ranges;
     u64 total_size_bytes = 0;
     constexpr u64 CopyAlignment = 64;
-    constexpr u64 PrefetchBudget = 4_MB;
 
-    const auto range_is_pending = [&](const VAddr begin, const u64 size) {
+    // Start with ranges already owned by an earlier submit snapshot. New
+    // ranges are added below, so partially overlapping dirty spans still
+    // contribute their uncovered pages instead of being skipped wholesale.
+    {
         std::scoped_lock lock{pending_readback_mutex};
-        const VAddr end = begin + size;
-        return std::ranges::any_of(pending_readback_ranges, [&](const auto& pending) {
-            return pending.begin <= std::numeric_limits<VAddr>::max() - pending.size &&
-                   begin < pending.begin + pending.size && pending.begin < end;
-        });
-    };
+        for (const PendingReadbackRange& pending : pending_readback_ranges) {
+            if (pending.size != 0 &&
+                pending.begin <= std::numeric_limits<VAddr>::max() - pending.size) {
+                excluded_ranges.Add(pending.begin, pending.size);
+            }
+        }
+    }
 
     const auto queue_buffer_ranges = [&](Buffer& buffer, const VAddr range_addr,
                                          const u64 range_size) {
-        if (range_size == 0 || total_size_bytes >= PrefetchBudget) {
+        if (range_size == 0) {
             return;
         }
         memory_tracker->ForEachDownloadRange<false>(
             range_addr, range_size, [&](const u64 download_addr, const u64 download_size) {
                 gpu_modified_ranges.ForEachInRange(
                     download_addr, download_size, [&](const VAddr start, const VAddr end) {
-                        if (start >= end || scheduled_ranges.Intersects(start, end - start) ||
-                            !buffer.IsInBounds(start, end - start) ||
-                            total_size_bytes >= PrefetchBudget ||
-                            range_is_pending(start, end - start)) {
+                        if (start >= end || !buffer.IsInBounds(start, end - start)) {
                             return;
                         }
-                        const u64 copy_size =
-                            std::min<u64>(end - start, PrefetchBudget - total_size_bytes);
-                        if (copy_size == 0) {
-                            return;
+                        boost::container::small_vector<std::pair<VAddr, VAddr>, 4> gaps;
+                        excluded_ranges.ForEachNotInRange(
+                            start, end - start,
+                            [&](const VAddr gap_begin, const u64 gap_size) {
+                                gaps.emplace_back(gap_begin, gap_begin + gap_size);
+                            });
+                        for (const auto [gap_begin, gap_end] : gaps) {
+                            const u64 copy_size = gap_end - gap_begin;
+                            if (copy_size == 0) {
+                                continue;
+                            }
+                            const u64 source_offset = buffer.Offset(gap_begin);
+                            if (!copies.empty()) {
+                                PrefetchCopy& previous = copies.back();
+                                if (previous.source == buffer.Handle() &&
+                                    previous.guest_addr + previous.size == gap_begin &&
+                                    previous.source_offset + previous.size == source_offset &&
+                                    previous.download_offset + previous.size ==
+                                        total_size_bytes) {
+                                    previous.size += copy_size;
+                                } else {
+                                    copies.push_back(PrefetchCopy{
+                                        .source = buffer.Handle(),
+                                        .guest_addr = gap_begin,
+                                        .size = copy_size,
+                                        .source_offset = source_offset,
+                                        .download_offset = total_size_bytes,
+                                    });
+                                }
+                            } else {
+                                copies.push_back(PrefetchCopy{
+                                    .source = buffer.Handle(),
+                                    .guest_addr = gap_begin,
+                                    .size = copy_size,
+                                    .source_offset = source_offset,
+                                    .download_offset = total_size_bytes,
+                                });
+                            }
+                            scheduled_ranges.Add(gap_begin, copy_size);
+                            excluded_ranges.Add(gap_begin, copy_size);
+                            total_size_bytes =
+                                Common::AlignUp(total_size_bytes + copy_size, CopyAlignment);
                         }
-                        copies.push_back(PrefetchCopy{
-                            .source = buffer.Handle(),
-                            .guest_addr = start,
-                            .size = copy_size,
-                            .source_offset = buffer.Offset(start),
-                            .download_offset = total_size_bytes,
-                        });
-                        scheduled_ranges.Add(start, copy_size);
-                        total_size_bytes =
-                            Common::AlignUp(total_size_bytes + copy_size, CopyAlignment);
                     });
             });
     };
 
-    for (u32 index = 0;
-         index < recent_readback_window_count && total_size_bytes < PrefetchBudget; ++index) {
+    for (u32 index = 0; index < recent_readback_window_count; ++index) {
         const RecentReadbackWindow& window = recent_readback_windows[index];
         buffer_ranges.ForEachInRange(
             window.begin, window.size,
             [&](const VAddr range_begin, const VAddr range_end, const BufferId id) {
-                if (total_size_bytes >= PrefetchBudget || IsBufferInvalid(id)) {
+                if (IsBufferInvalid(id)) {
                     return;
                 }
                 Buffer& buffer = slot_buffers[id];
@@ -323,27 +500,167 @@ void BufferCache::PrefetchReadbackWindows() {
         return;
     }
 
-    const auto [download, base_offset] =
-        download_buffer.Map(total_size_bytes, CopyAlignment, false);
+    const u64 planned_regions = copies.size();
+    std::stable_sort(copies.begin(), copies.end(),
+                     [](const PrefetchCopy& lhs, const PrefetchCopy& rhs) {
+                         const VkBuffer lhs_handle = static_cast<VkBuffer>(lhs.source);
+                         const VkBuffer rhs_handle = static_cast<VkBuffer>(rhs.source);
+                         if (lhs_handle != rhs_handle) {
+                             return std::less<VkBuffer>{}(lhs_handle, rhs_handle);
+                         }
+                         if (lhs.source_offset != rhs.source_offset) {
+                             return lhs.source_offset < rhs.source_offset;
+                         }
+                         return lhs.guest_addr < rhs.guest_addr;
+                     });
+    boost::container::small_vector<PrefetchCopy, 32> coalesced_copies;
+    for (const PrefetchCopy& copy : copies) {
+        if (!coalesced_copies.empty()) {
+            PrefetchCopy& previous = coalesced_copies.back();
+            if (previous.source == copy.source &&
+                previous.guest_addr + previous.size == copy.guest_addr &&
+                previous.source_offset + previous.size == copy.source_offset) {
+                previous.size += copy.size;
+                continue;
+            }
+        }
+        coalesced_copies.push_back(copy);
+    }
+    copies = std::move(coalesced_copies);
+    total_size_bytes = 0;
+    for (PrefetchCopy& copy : copies) {
+        copy.download_offset = total_size_bytes;
+        total_size_bytes =
+            Common::AlignUp(total_size_bytes + copy.size, CopyAlignment);
+    }
+
+    std::unique_ptr<Buffer> overflow_download;
+    u8* download = nullptr;
+    u64 base_offset = 0;
+    if (total_size_bytes <= download_buffer.SizeBytes()) {
+        std::tie(download, base_offset) =
+            download_buffer.Map(total_size_bytes, CopyAlignment, false);
+    }
     if (download == nullptr) {
+        overflow_download = std::make_unique<Buffer>(
+            std::nothrow, instance, scheduler, MemoryUsage::Download, 0,
+            vk::BufferUsageFlagBits::eTransferDst, total_size_bytes);
+        if (overflow_download->IsValid() &&
+            overflow_download->mapped_data.size() >= total_size_bytes) {
+            download = overflow_download->mapped_data.data();
+            base_offset = 0;
+            AccumulateReadbackOptimizationStats(
+                ReadbackOptimizationStats{.overflow_allocations = 1});
+        }
+    }
+    if (download == nullptr &&
+        total_size_bytes <= download_buffer.SizeBytes()) {
+        // Dedicated allocation can fail under transient heap pressure. The
+        // existing ring remains a correctness fallback; waiting here only
+        // retires an older ring slice and does not create another submit.
+        overflow_download.reset();
+        std::tie(download, base_offset) =
+            download_buffer.Map(total_size_bytes, CopyAlignment, true);
+    }
+    if (download == nullptr) {
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .cpu_plan_ns = ExecutorElapsedNs(plan_start),
+            .fallbacks = 1,
+        });
         return;
     }
-    download_buffer.Commit();
-    scheduler.EndRendering();
+    Buffer* const download_target =
+        overflow_download ? overflow_download.get() : &download_buffer;
+    if (!overflow_download) {
+        download_buffer.Commit();
+    }
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferReadback);
     const auto cmdbuf = scheduler.CommandBuffer();
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 32> pre_barriers;
+    vk::Buffer previous_source{};
     for (const PrefetchCopy& copy : copies) {
-        cmdbuf.copyBuffer(copy.source, download_buffer.Handle(), vk::BufferCopy{
-            .srcOffset = copy.source_offset,
-            .dstOffset = base_offset + copy.download_offset,
-            .size = copy.size,
+        if (copy.source == previous_source) {
+            continue;
+        }
+        previous_source = copy.source;
+        pre_barriers.push_back(vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite |
+                             vk::AccessFlagBits2::eShaderWrite |
+                             vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = copy.source,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
         });
     }
+    pre_barriers.push_back(vk::BufferMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eHost,
+        .srcAccessMask = vk::AccessFlagBits2::eHostRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = download_target->Handle(),
+        .offset = base_offset,
+        .size = total_size_bytes,
+    });
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+        .pBufferMemoryBarriers = pre_barriers.data(),
+    });
+    std::vector<bool> copy_recorded(copies.size(), false);
+    u64 copy_commands = 0;
+    u64 copy_regions = 0;
+    for (size_t first = 0; first < copies.size(); ++first) {
+        if (copy_recorded[first]) {
+            continue;
+        }
+        const vk::Buffer source = copies[first].source;
+        boost::container::small_vector<vk::BufferCopy, 32> regions;
+        for (size_t index = first; index < copies.size(); ++index) {
+            if (!copy_recorded[index] && copies[index].source == source) {
+                const PrefetchCopy& copy = copies[index];
+                regions.push_back(vk::BufferCopy{
+                    .srcOffset = copy.source_offset,
+                    .dstOffset = base_offset + copy.download_offset,
+                    .size = copy.size,
+                });
+                copy_recorded[index] = true;
+            }
+        }
+        cmdbuf.copyBuffer(source, download_target->Handle(), regions);
+        ++copy_commands;
+        copy_regions += regions.size();
+    }
+    const vk::BufferMemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .buffer = download_target->Handle(),
+        .offset = base_offset,
+        .size = total_size_bytes,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &host_barrier,
+    });
 
     std::vector<PendingReadbackRange> tracked_ranges;
     tracked_ranges.reserve(copies.size());
-    const u64 completion_tick = scheduler.CurrentTick();
+    const u64 completion_tick = snapshot_tick;
+    u64 tracked_pages = 0;
+    u64 copied_bytes = 0;
+    for (const PrefetchCopy& copy : copies) {
+        copied_bytes += copy.size;
+    }
     scheduled_ranges.ForEach([&](const VAddr begin, const VAddr end) {
         const u64 size = end - begin;
+        tracked_pages +=
+            (size + static_cast<u64>(TRACKER_BYTES_PER_PAGE) - 1) /
+            static_cast<u64>(TRACKER_BYTES_PER_PAGE);
         page_manager->UpdatePageWatchers<true>(begin, size);
         page_manager->TrackPendingCompletionRead(begin, size);
         tracked_ranges.push_back(PendingReadbackRange{begin, size, completion_tick});
@@ -357,6 +674,7 @@ void BufferCache::PrefetchReadbackWindows() {
         memory_tracker->UnmarkRegionAsGpuModified(range.begin, range.size);
         gpu_modified_ranges.Subtract(range.begin, range.size);
     }
+    last_submit_readback_snapshot_tick = snapshot_tick;
 
     static u64 prefetch_batches = 0;
     static u64 prefetch_bytes = 0;
@@ -370,9 +688,37 @@ void BufferCache::PrefetchReadbackWindows() {
         prefetch_bytes = 0;
     }
 
-    scheduler.DeferOperation(
+    // Publish prefetched readbacks on the retirement runner for this exact
+    // timeline tick. This avoids leaving completed copies in the ordinary
+    // pending queue until another submit and lets faulting guest threads wait
+    // for one batched retirement point instead of repeatedly round-tripping
+    // through the GPU command queue.
+    const auto queued_at = std::chrono::steady_clock::now();
+    AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+        .snapshots = 1,
+        .submit_snapshots = 1,
+        .ranges = static_cast<u64>(tracked_ranges.size()),
+        .pages = tracked_pages,
+        .copy_commands = copy_commands,
+        .copy_regions = copy_regions,
+        .source_buffers = copy_commands,
+        .regions_merged = planned_regions - copies.size(),
+        .bytes = copied_bytes,
+        .cpu_plan_ns = ExecutorElapsedNs(plan_start),
+    });
+    ExecutorMaybeLogReadbackOptimizationStats();
+    scheduler.DeferPriorityOperationAt(
+        completion_tick,
         [this, copies = std::move(copies), tracked_ranges = std::move(tracked_ranges),
-         download, base_offset, completion_tick]() mutable {
+         download, base_offset, total_size_bytes, completion_tick, queued_at,
+         overflow_download = std::move(overflow_download)]() mutable {
+            const auto publish_start = std::chrono::steady_clock::now();
+            RecordReadbackTimelineRetirement(completion_tick);
+            if (overflow_download) {
+                overflow_download->InvalidateMappedRange(0, total_size_bytes);
+            } else {
+                download_buffer.InvalidateMappedRange(base_offset, total_size_bytes);
+            }
             auto* guest_memory = Core::Memory::Instance();
             bool wrote_all = true;
             for (const PrefetchCopy& copy : copies) {
@@ -383,6 +729,10 @@ void BufferCache::PrefetchReadbackWindows() {
                 }
             }
             if (!wrote_all) {
+                AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+                    .fallbacks = 1,
+                    .publication_failures = 1,
+                });
                 for (const PendingReadbackRange& range : tracked_ranges) {
                     gpu_modified_ranges.Add(range.begin, range.size);
                     memory_tracker->MarkRegionAsGpuModified(range.begin, range.size);
@@ -390,6 +740,10 @@ void BufferCache::PrefetchReadbackWindows() {
             } else {
                 NotifyGuestReadback();
             }
+            AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+                .cpu_publish_ns = ExecutorElapsedNs(publish_start),
+                .gpu_completion_ns = ExecutorElapsedNs(queued_at),
+            });
             {
                 std::scoped_lock lock{pending_readback_mutex};
                 std::erase_if(pending_readback_ranges, [&](const auto& pending) {
@@ -408,203 +762,394 @@ void BufferCache::PrefetchReadbackWindows() {
         });
 }
 
-void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_addr, u64 size) {
+void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, const VAddr device_addr,
+                                           const u64 size, const bool is_write) {
+    const auto plan_start = std::chrono::steady_clock::now();
+    // Demand publication is an explicit consumer boundary: all queued writes
+    // must be in the command stream before the one readback snapshot.
+    scheduler.FlushPendingBufferTransfers();
     struct WaveCopy {
-        Buffer* buffer = nullptr;
-        VAddr guest_addr = 0;
-        u64 size = 0;
-        u64 source_offset = 0;
-        u64 download_offset = 0;
+        Buffer* buffer{};
+        VAddr guest_addr{};
+        u64 size{};
+        u64 source_offset{};
+        u64 download_offset{};
+        bool primary{};
     };
 
     boost::container::small_vector<WaveCopy, 32> copies;
     RangeSet scheduled_ranges;
-    u64 total_size_bytes = 0;
     constexpr u64 CopyAlignment = 64;
-    constexpr u64 transfer_budget = ExecutorPreciseReadbackWaveMaxBytes;
 
     const auto queue_buffer_ranges = [&](Buffer& buffer, const VAddr range_addr,
-                                         const u64 range_size) {
-        if (range_size == 0 || total_size_bytes >= transfer_budget) {
+                                         const u64 range_size, const bool primary) {
+        if (range_size == 0) {
             return;
         }
         memory_tracker->ForEachDownloadRange<false>(
-            range_addr, range_size, [&](const u64 download_addr, const u64 download_size) {
+            range_addr, range_size,
+            [&](const u64 download_addr, const u64 download_size) {
                 gpu_modified_ranges.ForEachInRange(
-                    download_addr, download_size, [&](const VAddr start, const VAddr end) {
-                        if (start >= end || scheduled_ranges.Intersects(start, end - start) ||
-                            !buffer.IsInBounds(start, end - start) ||
-                            total_size_bytes >= transfer_budget) {
+                    download_addr, download_size,
+                    [&](const VAddr start, const VAddr end) {
+                        if (start >= end ||
+                            !buffer.IsInBounds(start, end - start)) {
                             return;
                         }
-                        const u64 available = transfer_budget - total_size_bytes;
-                        const u64 copy_size = std::min<u64>(end - start, available);
-                        if (copy_size == 0) {
-                            return;
+                        boost::container::small_vector<std::pair<VAddr, VAddr>, 4>
+                            gaps;
+                        scheduled_ranges.ForEachNotInRange(
+                            start, end - start,
+                            [&](const VAddr gap_begin, const u64 gap_size) {
+                                gaps.emplace_back(gap_begin,
+                                                  gap_begin + gap_size);
+                            });
+                        for (const auto [gap_begin, gap_end] : gaps) {
+                            const u64 copy_size = gap_end - gap_begin;
+                            if (copy_size == 0) {
+                                continue;
+                            }
+                            copies.push_back(WaveCopy{
+                                .buffer = &buffer,
+                                .guest_addr = gap_begin,
+                                .size = copy_size,
+                                .source_offset = buffer.Offset(gap_begin),
+                                .primary = primary,
+                            });
+                            scheduled_ranges.Add(gap_begin, copy_size);
                         }
-                        copies.push_back(WaveCopy{
-                            .buffer = &buffer,
-                            .guest_addr = start,
-                            .size = copy_size,
-                            .source_offset = buffer.Offset(start),
-                            .download_offset = total_size_bytes,
-                        });
-                        scheduled_ranges.Add(start, copy_size);
-                        total_size_bytes =
-                            Common::AlignUp(total_size_bytes + copy_size, CopyAlignment);
                     });
             });
     };
 
-    queue_buffer_ranges(primary_buffer, device_addr, size);
-    const u64 primary_size_bytes = total_size_bytes;
-
+    queue_buffer_ranges(primary_buffer, device_addr, size, true);
     const auto queue_window = [&](const RecentReadbackWindow& window) {
-        if (window.size == 0 || total_size_bytes >= transfer_budget) {
+        if (window.size == 0) {
             return;
         }
         buffer_ranges.ForEachInRange(
             window.begin, window.size,
-            [&](const VAddr range_begin, const VAddr range_end, const BufferId id) {
-                if (total_size_bytes >= transfer_budget || IsBufferInvalid(id)) {
+            [&](const VAddr range_begin, const VAddr range_end,
+                const BufferId id) {
+                if (IsBufferInvalid(id)) {
                     return;
                 }
                 Buffer& buffer = slot_buffers[id];
                 const VAddr begin = std::max(range_begin, buffer.CpuAddr());
-                const VAddr end =
-                    std::min<VAddr>(range_end, buffer.CpuAddr() + buffer.SizeBytes());
+                const VAddr end = std::min<VAddr>(
+                    range_end, buffer.CpuAddr() + buffer.SizeBytes());
                 if (begin < end) {
-                    queue_buffer_ranges(buffer, begin, end - begin);
+                    queue_buffer_ranges(buffer, begin, end - begin, false);
                 }
             });
     };
-
-    const RecentReadbackWindow current_window{device_addr, size};
-    u32 previous_index = recent_readback_window_count;
     for (u32 index = 0; index < recent_readback_window_count; ++index) {
-        const auto& recent = recent_readback_windows[index];
-        if (recent.begin == current_window.begin && recent.size == current_window.size) {
-            previous_index = index;
-            continue;
-        }
-        queue_window(recent);
+        queue_window(recent_readback_windows[index]);
     }
-    if (previous_index < recent_readback_window_count) {
-        for (u32 index = previous_index; index > 0; --index) {
-            recent_readback_windows[index] = recent_readback_windows[index - 1];
+
+    // Page-sized CPU writes are the dominant Bloodborne readback fault too:
+    // before a partial overwrite the current GPU contents must be published.
+    // Keep both read and write windows as submit-prefetch hints so the next
+    // ordinary submit retires recurring ranges in one wave instead of forcing
+    // one Vulkan submit/timeline wait for every guest fault.
+    if (size <= TRACKER_BYTES_PER_PAGE) {
+        const RecentReadbackWindow current_window{device_addr, size};
+        u32 previous_index = recent_readback_window_count;
+        for (u32 index = 0; index < recent_readback_window_count; ++index) {
+            const auto& recent = recent_readback_windows[index];
+            if (recent.begin == current_window.begin &&
+                recent.size == current_window.size) {
+                previous_index = index;
+                break;
+            }
         }
-    } else {
-        const u32 insert_index =
-            std::min<u32>(recent_readback_window_count,
-                          static_cast<u32>(recent_readback_windows.size() - 1));
-        for (u32 index = insert_index; index > 0; --index) {
-            recent_readback_windows[index] = recent_readback_windows[index - 1];
+        const u32 shift_from =
+            previous_index < recent_readback_window_count
+                ? previous_index
+                : std::min<u32>(recent_readback_window_count,
+                                recent_readback_windows.size() - 1);
+        for (u32 index = shift_from; index > 0; --index) {
+            recent_readback_windows[index] =
+                recent_readback_windows[index - 1];
         }
-        recent_readback_window_count =
-            std::min<u32>(recent_readback_window_count + 1,
-                          static_cast<u32>(recent_readback_windows.size()));
+        recent_readback_windows[0] = current_window;
+        if (previous_index == recent_readback_window_count) {
+            recent_readback_window_count =
+                std::min<u32>(recent_readback_window_count + 1,
+                              recent_readback_windows.size());
+        }
     }
-    recent_readback_windows[0] = current_window;
 
     if (copies.empty()) {
+        if (is_write) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
         return;
     }
 
-    static u64 wave_plan_samples{};
-    static u64 wave_plan_bytes{};
-    static u64 wave_plan_primary_bytes{};
-    static u64 wave_plan_budget_bytes{};
-    static u64 wave_plan_copies{};
-    static u64 wave_plan_max_bytes{};
-    static u64 wave_plan_max_copies{};
-    ++wave_plan_samples;
-    wave_plan_bytes += total_size_bytes;
-    wave_plan_primary_bytes += primary_size_bytes;
-    wave_plan_budget_bytes += transfer_budget;
-    wave_plan_copies += copies.size();
-    wave_plan_max_bytes = std::max(wave_plan_max_bytes, total_size_bytes);
-    wave_plan_max_copies = std::max<u64>(wave_plan_max_copies, copies.size());
-    if ((wave_plan_samples & 255u) == 0u) {
-        __android_log_print(
-            ANDROID_LOG_INFO, "LSX4Native",
-            "[EXECUTOR_READBACK_WAVE_PLAN] samples=256 totalMiB=%.3f avgKiB=%.3f "
-            "primaryMiB=%.3f avgPrimaryKiB=%.3f maxMiB=%.3f copies=%llu "
-            "avgCopies=%.3f maxCopies=%llu avgBudgetMiB=%.3f",
-            static_cast<double>(wave_plan_bytes) / static_cast<double>(1_MB),
-            static_cast<double>(wave_plan_bytes) / (256.0 * 1024.0),
-            static_cast<double>(wave_plan_primary_bytes) / static_cast<double>(1_MB),
-            static_cast<double>(wave_plan_primary_bytes) / (256.0 * 1024.0),
-            static_cast<double>(wave_plan_max_bytes) / static_cast<double>(1_MB),
-            static_cast<unsigned long long>(wave_plan_copies),
-            static_cast<double>(wave_plan_copies) / 256.0,
-            static_cast<unsigned long long>(wave_plan_max_copies),
-            static_cast<double>(wave_plan_budget_bytes) /
-                (256.0 * static_cast<double>(1_MB)));
-        wave_plan_bytes = 0;
-        wave_plan_primary_bytes = 0;
-        wave_plan_budget_bytes = 0;
-        wave_plan_copies = 0;
-        wave_plan_max_bytes = 0;
-        wave_plan_max_copies = 0;
+    const u64 planned_regions = copies.size();
+    std::stable_sort(
+        copies.begin(), copies.end(),
+        [](const WaveCopy& lhs, const WaveCopy& rhs) {
+            const VkBuffer lhs_handle =
+                static_cast<VkBuffer>(lhs.buffer->Handle());
+            const VkBuffer rhs_handle =
+                static_cast<VkBuffer>(rhs.buffer->Handle());
+            if (lhs_handle != rhs_handle) {
+                return std::less<VkBuffer>{}(lhs_handle, rhs_handle);
+            }
+            if (lhs.source_offset != rhs.source_offset) {
+                return lhs.source_offset < rhs.source_offset;
+            }
+            return lhs.guest_addr < rhs.guest_addr;
+        });
+    boost::container::small_vector<WaveCopy, 32> coalesced_copies;
+    for (const WaveCopy& copy : copies) {
+        if (!coalesced_copies.empty()) {
+            WaveCopy& previous = coalesced_copies.back();
+            if (previous.buffer == copy.buffer &&
+                previous.guest_addr + previous.size == copy.guest_addr &&
+                previous.source_offset + previous.size ==
+                    copy.source_offset) {
+                previous.size += copy.size;
+                previous.primary |= copy.primary;
+                continue;
+            }
+        }
+        coalesced_copies.push_back(copy);
+    }
+    copies = std::move(coalesced_copies);
+
+    u64 total_size_bytes = 0;
+    u64 copied_bytes = 0;
+    for (WaveCopy& copy : copies) {
+        copy.download_offset = total_size_bytes;
+        copied_bytes += copy.size;
+        total_size_bytes =
+            Common::AlignUp(total_size_bytes + copy.size, CopyAlignment);
     }
 
-    const auto [download, base_offset] = download_buffer.Map(total_size_bytes);
+    std::unique_ptr<Buffer> overflow_download;
+    u8* download = nullptr;
+    u64 base_offset = 0;
+    if (total_size_bytes <= download_buffer.SizeBytes()) {
+        std::tie(download, base_offset) =
+            download_buffer.Map(total_size_bytes, CopyAlignment, false);
+    }
     if (download == nullptr) {
-        DownloadBufferMemory<false>(primary_buffer, device_addr, size, false);
+        overflow_download = std::make_unique<Buffer>(
+            std::nothrow, instance, scheduler, MemoryUsage::Download, 0,
+            vk::BufferUsageFlagBits::eTransferDst, total_size_bytes);
+        if (overflow_download->IsValid() &&
+            overflow_download->mapped_data.size() >= total_size_bytes) {
+            download = overflow_download->mapped_data.data();
+            base_offset = 0;
+            AccumulateReadbackOptimizationStats(
+                ReadbackOptimizationStats{.overflow_allocations = 1});
+        }
+    }
+    if (download == nullptr &&
+        total_size_bytes <= download_buffer.SizeBytes()) {
+        overflow_download.reset();
+        std::tie(download, base_offset) =
+            download_buffer.Map(total_size_bytes, CopyAlignment, true);
+    }
+    if (download == nullptr) {
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .cpu_plan_ns = ExecutorElapsedNs(plan_start),
+            .fallbacks = 1,
+        });
+        // A full-size dedicated allocation can exceed a device allocation
+        // limit. Preserve correctness with the same managed retirement path
+        // in bounded chunks: no scheduler::Finish loop is reintroduced.
+        const u64 chunk_size =
+            std::max<u64>(TRACKER_BYTES_PER_PAGE,
+                          download_buffer.SizeBytes() / 2);
+        const auto saved_windows = recent_readback_windows;
+        const u32 saved_window_count = recent_readback_window_count;
+        recent_readback_window_count = 0;
+        for (u64 offset = 0; offset < size;) {
+            const u64 bytes = std::min(chunk_size, size - offset);
+            DownloadBufferMemoryWave(primary_buffer, device_addr + offset,
+                                     bytes, is_write);
+            offset += bytes;
+        }
+        recent_readback_windows = saved_windows;
+        recent_readback_window_count = saved_window_count;
         return;
     }
-    download_buffer.Commit();
-    scheduler.EndRendering();
+
+    Buffer* const download_target =
+        overflow_download ? overflow_download.get() : &download_buffer;
+    if (!overflow_download) {
+        download_buffer.Commit();
+    }
+    scheduler.EndRendering(
+        Vulkan::Scheduler::EndRenderingReason::BufferReadback);
     const auto cmdbuf = scheduler.CommandBuffer();
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 32> pre_barriers;
+    Buffer* previous_source{};
+    for (const WaveCopy& copy : copies) {
+        if (copy.buffer == previous_source) {
+            continue;
+        }
+        previous_source = copy.buffer;
+        pre_barriers.push_back(vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite |
+                             vk::AccessFlagBits2::eShaderWrite |
+                             vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = copy.buffer->Handle(),
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        });
+    }
+    pre_barriers.push_back(vk::BufferMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eHost,
+        .srcAccessMask = vk::AccessFlagBits2::eHostRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = download_target->Handle(),
+        .offset = base_offset,
+        .size = total_size_bytes,
+    });
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount =
+            static_cast<u32>(pre_barriers.size()),
+        .pBufferMemoryBarriers = pre_barriers.data(),
+    });
+
+    u64 copy_commands = 0;
+    u64 copy_regions = 0;
     for (size_t first = 0; first < copies.size();) {
         const vk::Buffer source = copies[first].buffer->Handle();
         boost::container::small_vector<vk::BufferCopy, 32> regions;
-        size_t last = first;
-        while (last < copies.size() && copies[last].buffer->Handle() == source) {
-            const WaveCopy& copy = copies[last++];
+        size_t end = first;
+        while (end < copies.size() &&
+               copies[end].buffer->Handle() == source) {
+            const WaveCopy& copy = copies[end++];
             regions.push_back(vk::BufferCopy{
                 .srcOffset = copy.source_offset,
                 .dstOffset = base_offset + copy.download_offset,
                 .size = copy.size,
             });
         }
-        cmdbuf.copyBuffer(source, download_buffer.Handle(), regions);
-        first = last;
+        cmdbuf.copyBuffer(source, download_target->Handle(), regions);
+        ++copy_commands;
+        copy_regions += regions.size();
+        first = end;
     }
-    scheduler.Finish(Vulkan::Scheduler::ExecutorFinishReason::BufferReadbackWave);
+    const vk::BufferMemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .buffer = download_target->Handle(),
+        .offset = base_offset,
+        .size = total_size_bytes,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &host_barrier,
+    });
 
-    auto* guest_memory = Core::Memory::Instance();
-    RangeSet published_ranges;
-    bool published_any = false;
-    for (const WaveCopy& copy : copies) {
-        if (!guest_memory->TryWriteBacking(std::bit_cast<u8*>(copy.guest_addr),
-                                           download + copy.download_offset, copy.size)) {
-            static std::atomic<u32> failure_count{0};
-            const u32 failure = failure_count.fetch_add(1, std::memory_order_relaxed);
-            if (failure < 16) {
-                LOG_ERROR(Render_Vulkan,
-                          "GPU wave readback could not write guest backing: addr={:#x}, "
-                          "size={:#x}, occurrence={}",
-                          copy.guest_addr, copy.size, failure + 1);
+    u64 tracked_ranges = 0;
+    u64 tracked_pages = 0;
+    scheduled_ranges.ForEach([&](const VAddr begin, const VAddr end) {
+        ++tracked_ranges;
+        const u64 range_size = end - begin;
+        tracked_pages +=
+            (range_size + static_cast<u64>(TRACKER_BYTES_PER_PAGE) - 1) /
+            static_cast<u64>(TRACKER_BYTES_PER_PAGE);
+    });
+    const u64 completion_tick = scheduler.CurrentTick();
+    const auto queued_at = std::chrono::steady_clock::now();
+    scheduler.DeferPriorityOperationAt(
+        completion_tick,
+        [this, copies = std::move(copies), download, base_offset,
+         total_size_bytes, completion_tick, queued_at, device_addr, size,
+         is_write,
+         overflow_download = std::move(overflow_download)]() mutable {
+            const auto publish_start = std::chrono::steady_clock::now();
+            RecordReadbackTimelineRetirement(completion_tick);
+            if (overflow_download) {
+                overflow_download->InvalidateMappedRange(0, total_size_bytes);
+            } else {
+                download_buffer.InvalidateMappedRange(base_offset,
+                                                      total_size_bytes);
             }
-            continue;
-        }
-        published_ranges.Add(copy.guest_addr, copy.size);
-        published_any = true;
-    }
-    if (published_any) {
-        published_ranges.ForEach([&](const VAddr begin, const VAddr end) {
-            gpu_modified_ranges.Subtract(begin, end - begin);
-            memory_tracker->UnmarkRegionAsGpuModified(begin, end - begin);
+            auto* guest_memory = Core::Memory::Instance();
+            RangeSet published_ranges;
+            bool published_any = false;
+            bool primary_failed = false;
+            for (const WaveCopy& copy : copies) {
+                if (!guest_memory->TryWriteBacking(
+                        std::bit_cast<u8*>(copy.guest_addr),
+                        download + copy.download_offset, copy.size)) {
+                    primary_failed |= copy.primary;
+                    AccumulateReadbackOptimizationStats(
+                        ReadbackOptimizationStats{
+                            .fallbacks = 1,
+                            .publication_failures = 1,
+                        });
+                    continue;
+                }
+                published_ranges.Add(copy.guest_addr, copy.size);
+                published_any = true;
+            }
+            published_ranges.ForEach(
+                [&](const VAddr begin, const VAddr end) {
+                    gpu_modified_ranges.Subtract(begin, end - begin);
+                    memory_tracker->UnmarkRegionAsGpuModified(begin,
+                                                              end - begin);
+                });
+            if (is_write && !primary_failed) {
+                memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            }
+            if (published_any) {
+                NotifyGuestReadback();
+                liverpool->NotifyMemoryPublicationForExecutor(device_addr,
+                                                              size);
+            }
+            AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+                .cpu_publish_ns = ExecutorElapsedNs(publish_start),
+                .gpu_completion_ns = ExecutorElapsedNs(queued_at),
+            });
         });
-        NotifyGuestReadback();
-        liverpool->NotifyMemoryPublicationForExecutor(device_addr, size);
-    }
+
+    AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+        .snapshots = 1,
+        .demand_snapshots = 1,
+        .ranges = tracked_ranges,
+        .pages = tracked_pages,
+        .copy_commands = copy_commands,
+        .copy_regions = copy_regions,
+        .source_buffers = copy_commands,
+        .regions_merged = planned_regions - copy_regions,
+        .bytes = copied_bytes,
+        .cpu_plan_ns = ExecutorElapsedNs(plan_start),
+        .demand_flushes = 1,
+    });
+    ExecutorMaybeLogReadbackOptimizationStats();
+
+    const auto wait_start = std::chrono::steady_clock::now();
+    scheduler.Flush();
+    scheduler.WaitRetirement(completion_tick);
+    AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+        .cpu_wait_ns = ExecutorElapsedNs(wait_start),
+    });
 }
 #endif
 
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
+#ifdef __ANDROID__
+    const auto plan_start = std::chrono::steady_clock::now();
+#endif
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
@@ -667,18 +1212,60 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
 #endif
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
+#ifdef __ANDROID__
+    if (download == nullptr) {
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .cpu_plan_ns = ExecutorElapsedNs(plan_start),
+            .fallbacks = 1,
+            .publication_failures = 1,
+        });
+        return;
+    }
+#endif
     for (auto& copy : copies) {
         copy.dstOffset += offset;
     }
     download_buffer.Commit();
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferReadback);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
-    const auto write_data = [&]() {
+#ifdef __ANDROID__
+    u64 copied_bytes = 0;
+    u64 copied_pages = 0;
+    for (const auto& copy : copies) {
+        copied_bytes += copy.size;
+        copied_pages +=
+            (copy.size + static_cast<u64>(TRACKER_BYTES_PER_PAGE) - 1) /
+            static_cast<u64>(TRACKER_BYTES_PER_PAGE);
+    }
+    const auto queued_at = std::chrono::steady_clock::now();
+    AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+        .snapshots = 1,
+        .demand_snapshots = 1,
+        .ranges = static_cast<u64>(copies.size()),
+        .pages = copied_pages,
+        .copy_commands = 1,
+        .copy_regions = static_cast<u64>(copies.size()),
+        .bytes = copied_bytes,
+        .cpu_plan_ns = ExecutorElapsedNs(plan_start),
+    });
+    ExecutorMaybeLogReadbackOptimizationStats();
+#endif
+    const auto write_data =
+        [this, buffer_cpu_addr = buffer.CpuAddr(), copies, download, offset, device_addr, size,
+         is_write
+#ifdef __ANDROID__
+         ,
+         queued_at
+#endif
+    ]() {
+#ifdef __ANDROID__
+        const auto publish_start = std::chrono::steady_clock::now();
+#endif
         auto* memory = Core::Memory::Instance();
         bool wrote_all = true;
         for (const auto& copy : copies) {
-            const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
+            const VAddr copy_device_addr = buffer_cpu_addr + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
             if (!memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
                                          download + dst_offset, copy.size)) {
@@ -694,22 +1281,47 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             }
         }
         if (!wrote_all) {
+#ifdef __ANDROID__
+            AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+                .cpu_publish_ns = ExecutorElapsedNs(publish_start),
+                .fallbacks = 1,
+                .publication_failures = 1,
+            });
+#endif
             return;
         }
         NotifyGuestReadback();
         for (const auto& copy : copies) {
-            gpu_modified_ranges.Subtract(buffer.CpuAddr() + copy.srcOffset, copy.size);
+            gpu_modified_ranges.Subtract(buffer_cpu_addr + copy.srcOffset, copy.size);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
         liverpool->NotifyMemoryPublicationForExecutor(device_addr, size);
+#ifdef __ANDROID__
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .timeline_waits = async ? 1u : 0u,
+            .cpu_publish_ns = ExecutorElapsedNs(publish_start),
+            .gpu_completion_ns = async ? ExecutorElapsedNs(queued_at) : 0u,
+        });
+#endif
     };
     if constexpr (async) {
         scheduler.DeferOperation(write_data);
     } else {
+#ifdef __ANDROID__
+        const auto wait_start = std::chrono::steady_clock::now();
+#endif
         scheduler.Finish(Vulkan::Scheduler::ExecutorFinishReason::BufferReadbackDirect);
+#ifdef __ANDROID__
+        const u64 wait_ns = ExecutorElapsedNs(wait_start);
+        AccumulateReadbackOptimizationStats(ReadbackOptimizationStats{
+            .timeline_waits = 1,
+            .cpu_wait_ns = wait_ns,
+            .gpu_completion_ns = wait_ns,
+        });
+#endif
         write_data();
     }
 }
@@ -785,7 +1397,9 @@ BufferCache::PreparedVertexBuffers BufferCache::PrepareVertexBuffers(
 
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+        const auto [buffer, offset] =
+            ObtainReadOnlyBuffer(range.base_address, static_cast<u32>(size),
+                                 ReadOnlyBufferUsage::Vertex);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
         if (IsRegionGpuModified(range.base_address, size)) {
@@ -843,22 +1457,141 @@ BufferCache::PreparedVertexBuffers BufferCache::PrepareVertexBuffers(
     return prepared;
 }
 
+#ifdef __ANDROID__
+void BufferCache::ExecutorMaybeLogBindDedup() {
+    const u64 total_attempts = executor_vertex_input_bind_attempts +
+                               executor_vertex_buffer_bind_attempts +
+                               executor_index_buffer_bind_attempts;
+    if (total_attempts < executor_bind_dedup_next_log) {
+        return;
+    }
+    executor_bind_dedup_next_log =
+        (total_attempts / 16384u + 1u) * 16384u;
+    const auto hit_percent = [](const u64 attempts, const u64 hits) {
+        return attempts != 0
+                   ? 100.0 * static_cast<double>(hits) /
+                         static_cast<double>(attempts)
+                   : 0.0;
+    };
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_VK_BIND_DEDUP] kind=vertexIndex total=%llu "
+        "input=%llu/%llu(%.1f%%) vertex=%llu/%llu(%.1f%%) "
+        "index=%llu/%llu(%.1f%%)",
+        static_cast<unsigned long long>(total_attempts),
+        static_cast<unsigned long long>(executor_vertex_input_bind_hits),
+        static_cast<unsigned long long>(executor_vertex_input_bind_attempts),
+        hit_percent(executor_vertex_input_bind_attempts,
+                    executor_vertex_input_bind_hits),
+        static_cast<unsigned long long>(executor_vertex_buffer_bind_hits),
+        static_cast<unsigned long long>(executor_vertex_buffer_bind_attempts),
+        hit_percent(executor_vertex_buffer_bind_attempts,
+                    executor_vertex_buffer_bind_hits),
+        static_cast<unsigned long long>(executor_index_buffer_bind_hits),
+        static_cast<unsigned long long>(executor_index_buffer_bind_attempts),
+        hit_percent(executor_index_buffer_bind_attempts,
+                    executor_index_buffer_bind_hits));
+}
+#endif
+
 void BufferCache::BindPreparedVertexBuffers(const PreparedVertexBuffers& prepared) {
     const auto cmdbuf = scheduler.CommandBuffer();
+#ifdef __ANDROID__
+    const bool dedup_enabled = IsManagedVulkanVertexBindDeduplication();
+    const u64 recording_tick = scheduler.CurrentTick();
+    const u64 graphics_pipeline_epoch =
+        scheduler.PipelineBindEpoch(vk::PipelineBindPoint::eGraphics);
+    if (executor_vertex_bind_cmdbuf != cmdbuf ||
+        executor_vertex_bind_recording_tick != recording_tick ||
+        executor_vertex_bind_graphics_pipeline_epoch != graphics_pipeline_epoch) {
+        executor_vertex_bind_cmdbuf = cmdbuf;
+        executor_vertex_bind_recording_tick = recording_tick;
+        executor_vertex_bind_graphics_pipeline_epoch = graphics_pipeline_epoch;
+        // Qualcomm's proprietary driver can consume stale vertex input/buffer
+        // state after a graphics-pipeline transition. Preserve deduplication
+        // within the pipeline epoch, but replay both binds at its boundary.
+        executor_vertex_input_bind_valid = false;
+        executor_vertex_buffer_bind_valid = false;
+    }
+
+    if (prepared.dynamic_vertex_input) {
+        ++executor_vertex_input_bind_attempts;
+        const u64 input_epoch = scheduler.VertexInputEpoch();
+        const bool input_hit =
+            dedup_enabled &&
+            executor_vertex_input_bind_valid &&
+            executor_vertex_input_bind_epoch == input_epoch &&
+            std::ranges::equal(executor_bound_vertex_state.bindings,
+                               prepared.bindings) &&
+            std::ranges::equal(executor_bound_vertex_state.attributes,
+                               prepared.attributes);
+        executor_vertex_input_bind_hits += static_cast<u64>(input_hit);
+        if (!input_hit) {
+            cmdbuf.setVertexInputEXT(prepared.bindings, prepared.attributes);
+            executor_vertex_input_bind_epoch = scheduler.MarkVertexInput();
+            executor_bound_vertex_state.bindings = prepared.bindings;
+            executor_bound_vertex_state.attributes = prepared.attributes;
+            executor_vertex_input_bind_valid = true;
+        }
+    }
+#else
     if (prepared.dynamic_vertex_input) {
         cmdbuf.setVertexInputEXT(prepared.bindings, prepared.attributes);
+        scheduler.MarkVertexInput();
     }
+#endif
     if (prepared.buffers.empty()) {
+#ifdef __ANDROID__
+        ExecutorMaybeLogBindDedup();
+#endif
         return;
     }
 
     const auto num_buffers = static_cast<u32>(prepared.buffers.size());
-    if (prepared.dynamic_vertex_input) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, prepared.buffers.data(), prepared.offsets.data());
-    } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, prepared.buffers.data(), prepared.offsets.data(),
-                                  prepared.sizes.data(), prepared.strides.data());
+#ifdef __ANDROID__
+    ++executor_vertex_buffer_bind_attempts;
+    const u64 vertex_buffer_epoch = scheduler.VertexBufferBindEpoch();
+    const bool buffer_hit =
+        dedup_enabled &&
+        executor_vertex_buffer_bind_valid &&
+        executor_vertex_buffer_bind_epoch == vertex_buffer_epoch &&
+        executor_bound_vertex_state.dynamic_vertex_input ==
+            prepared.dynamic_vertex_input &&
+        std::ranges::equal(executor_bound_vertex_state.buffers,
+                           prepared.buffers) &&
+        std::ranges::equal(executor_bound_vertex_state.offsets,
+                           prepared.offsets) &&
+        (prepared.dynamic_vertex_input ||
+         (std::ranges::equal(executor_bound_vertex_state.sizes,
+                             prepared.sizes) &&
+          std::ranges::equal(executor_bound_vertex_state.strides,
+                             prepared.strides)));
+    executor_vertex_buffer_bind_hits += static_cast<u64>(buffer_hit);
+    if (!buffer_hit) {
+#endif
+        [[maybe_unused]] u64 post_vertex_buffer_epoch{};
+        if (prepared.dynamic_vertex_input) {
+            cmdbuf.bindVertexBuffers(0, num_buffers, prepared.buffers.data(),
+                                     prepared.offsets.data());
+            post_vertex_buffer_epoch = scheduler.MarkVertexBufferBind();
+        } else {
+            cmdbuf.bindVertexBuffers2(0, num_buffers, prepared.buffers.data(),
+                                      prepared.offsets.data(), prepared.sizes.data(),
+                                      prepared.strides.data());
+            post_vertex_buffer_epoch = scheduler.MarkVertexBufferBind();
+        }
+#ifdef __ANDROID__
+        executor_vertex_buffer_bind_epoch = post_vertex_buffer_epoch;
+        executor_bound_vertex_state.buffers = prepared.buffers;
+        executor_bound_vertex_state.offsets = prepared.offsets;
+        executor_bound_vertex_state.sizes = prepared.sizes;
+        executor_bound_vertex_state.strides = prepared.strides;
+        executor_bound_vertex_state.dynamic_vertex_input =
+            prepared.dynamic_vertex_input;
+        executor_vertex_buffer_bind_valid = true;
     }
+    ExecutorMaybeLogBindDedup();
+#endif
 }
 
 BufferCache::PreparedIndexBuffer BufferCache::PrepareIndexBuffer(
@@ -873,7 +1606,8 @@ BufferCache::PreparedIndexBuffer BufferCache::PrepareIndexBuffer(
         regs.index_base_address.Address<VAddr>() + index_offset * index_size;
 
     const u32 index_buffer_size = regs.num_indices * index_size;
-    const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
+    const auto [vk_buffer, offset] =
+        ObtainReadOnlyBuffer(index_address, index_buffer_size, ReadOnlyBufferUsage::Index);
     if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
@@ -897,10 +1631,48 @@ BufferCache::PreparedIndexBuffer BufferCache::PrepareIndexBuffer(
 }
 
 void BufferCache::BindPreparedIndexBuffer(const PreparedIndexBuffer& prepared) {
-    scheduler.CommandBuffer().bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+    const auto cmdbuf = scheduler.CommandBuffer();
+#ifdef __ANDROID__
+    const bool dedup_enabled = IsManagedVulkanVertexBindDeduplication();
+    const u64 recording_tick = scheduler.CurrentTick();
+    const u64 graphics_pipeline_epoch =
+        scheduler.PipelineBindEpoch(vk::PipelineBindPoint::eGraphics);
+    if (executor_index_bind_cmdbuf != cmdbuf ||
+        executor_index_bind_recording_tick != recording_tick ||
+        executor_index_bind_graphics_pipeline_epoch != graphics_pipeline_epoch) {
+        executor_index_bind_cmdbuf = cmdbuf;
+        executor_index_bind_recording_tick = recording_tick;
+        executor_index_bind_graphics_pipeline_epoch = graphics_pipeline_epoch;
+        executor_index_buffer_bind_valid = false;
+    }
+    ++executor_index_buffer_bind_attempts;
+    const u64 index_buffer_epoch = scheduler.IndexBufferBindEpoch();
+    const bool index_hit =
+        dedup_enabled &&
+        executor_index_buffer_bind_valid &&
+        executor_index_buffer_bind_epoch == index_buffer_epoch &&
+        executor_bound_index_state.buffer == prepared.buffer &&
+        executor_bound_index_state.offset == prepared.offset &&
+        executor_bound_index_state.type == prepared.type;
+    executor_index_buffer_bind_hits += static_cast<u64>(index_hit);
+    if (!index_hit) {
+#endif
+        cmdbuf.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+#ifdef __ANDROID__
+        executor_index_buffer_bind_epoch = scheduler.MarkIndexBufferBind();
+        executor_bound_index_state = prepared;
+        executor_index_buffer_bind_valid = true;
+    }
+    ExecutorMaybeLogBindDedup();
+#else
+        scheduler.MarkIndexBufferBind();
+#endif
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (num_bytes == 0) {
+        return;
+    }
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
@@ -920,7 +1692,11 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     buffer->Fill(buffer->Offset(address), num_bytes, value);
 }
 
-void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds,
+                             bool defer_gnm_dma) {
+    if (num_bytes == 0) {
+        return;
+    }
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -953,6 +1729,18 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         .dstOffset = dst_buffer.Offset(dst),
         .size = num_bytes,
     };
+#ifdef __ANDROID__
+    if (defer_gnm_dma && IsManagedVulkanTransferCoalescing()) {
+        scheduler.QueueBufferCopies(
+            src_buffer.Handle(), dst_buffer.Handle(), std::span<const vk::BufferCopy>{&region, 1},
+            src_gds ? VAddr{0} : src, src_gds ? u64{0} : num_bytes,
+            dst_gds ? VAddr{0} : dst, dst_gds ? u64{0} : num_bytes,
+            Vulkan::Scheduler::BufferTransferOrigin::GnmDma);
+        return;
+    }
+#else
+    (void)defer_gnm_dma;
+#endif
     const vk::BufferMemoryBarrier2 buf_barriers_before[2] = {
         {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -973,7 +1761,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             .size = num_bytes,
         },
     };
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferCopy);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -1037,6 +1825,7 @@ static void ExecutorFlagSuspectGpuDescriptor(const char* site, VAddr addr, u64 s
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
+    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
 #ifdef __ANDROID__
     ExecutorFlagSuspectGpuDescriptor("ObtainBuffer", device_addr, size);
 #endif
@@ -1044,12 +1833,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         Libraries::GnmDriver::ExecutorGnmCaptureRecordResource(3u, device_addr, size);
     }
     Libraries::GnmDriver::ExecutorReplayCheckAddr(3u, device_addr, size);
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size) &&
-        (Libraries::GnmDriver::ExecutorReplayActive() ||
-         IsRegionCpuModified(device_addr, size))) {
-        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        return {&stream_buffer, offset};
-    }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
     }
@@ -1059,6 +1842,178 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         gpu_modified_ranges.Add(device_addr, size);
     }
     return {&buffer, buffer.Offset(device_addr)};
+}
+
+std::pair<Buffer*, u32> BufferCache::ObtainReadOnlyBuffer(
+    const VAddr device_addr, const u32 size, const ReadOnlyBufferUsage usage,
+    const BufferId fallback_buffer_id) {
+#ifndef __ANDROID__
+    (void)usage;
+    return ObtainBuffer(device_addr, size, false, false, fallback_buffer_id);
+#else
+    ASSERT(usage < ReadOnlyBufferUsage::Count);
+    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
+    if (!ExecutorReadOnlyRenameEnabled()) {
+        return ObtainBuffer(device_addr, size, false, false,
+                            fallback_buffer_id);
+    }
+
+    ++read_only_rename_attempts;
+    ++read_only_rename_usage_counts[static_cast<std::size_t>(usage)];
+    const auto maybe_log = [&] {
+        if (read_only_rename_attempts != 256 &&
+            (read_only_rename_attempts & 4095u) != 0u) {
+            return;
+        }
+        const auto fallback_count = [&](const ReadOnlyRenameFallback reason) {
+            return read_only_rename_fallback_counts[static_cast<std::size_t>(reason)];
+        };
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_READ_ONLY_RENAME] attempts=%llu renamed=%llu bytes=%llu "
+            "usage=vtx:%llu,idx:%llu,ubo:%llu,ssbo:%llu "
+            "renamedUsage=vtx:%llu,idx:%llu,ubo:%llu,ssbo:%llu "
+            "fallback=gpu:%llu,image:%llu,clean:%llu,read:%llu,large:%llu,"
+            "coherent:%llu,budget:%llu,ring:%llu,copy:%llu",
+            static_cast<unsigned long long>(read_only_rename_attempts),
+            static_cast<unsigned long long>(read_only_rename_ranges),
+            static_cast<unsigned long long>(read_only_rename_bytes),
+            static_cast<unsigned long long>(
+                read_only_rename_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Vertex)]),
+            static_cast<unsigned long long>(
+                read_only_rename_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Index)]),
+            static_cast<unsigned long long>(
+                read_only_rename_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Uniform)]),
+            static_cast<unsigned long long>(
+                read_only_rename_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Storage)]),
+            static_cast<unsigned long long>(
+                read_only_rename_success_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Vertex)]),
+            static_cast<unsigned long long>(
+                read_only_rename_success_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Index)]),
+            static_cast<unsigned long long>(
+                read_only_rename_success_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Uniform)]),
+            static_cast<unsigned long long>(
+                read_only_rename_success_usage_counts[static_cast<std::size_t>(
+                    ReadOnlyBufferUsage::Storage)]),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::GpuModified)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::ImageAlias)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::NotCpuDirty)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::NotReadable)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::TooLarge)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::StreamNotCoherent)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::TickBudget)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::RingBusy)),
+            static_cast<unsigned long long>(
+                fallback_count(ReadOnlyRenameFallback::CopyFailed)));
+    };
+    const auto fallback = [&](const ReadOnlyRenameFallback reason) {
+        ++read_only_rename_fallback_counts[static_cast<std::size_t>(reason)];
+        maybe_log();
+        return ObtainBuffer(device_addr, size, false, false, fallback_buffer_id);
+    };
+
+    if (!ExecutorReadOnlyRenameUsageEnabled(usage)) {
+        return ObtainBuffer(device_addr, size, false, false, fallback_buffer_id);
+    }
+
+    if (device_addr == 0 || size == 0) {
+        ++read_only_rename_fallback_counts[static_cast<std::size_t>(
+            ReadOnlyRenameFallback::NotReadable)];
+        maybe_log();
+        return {&GetBuffer(NULL_BUFFER_ID), 0};
+    }
+    if (IsRegionGpuModified(device_addr, size) ||
+        gpu_modified_ranges.Intersects(device_addr, size)) {
+        return fallback(ReadOnlyRenameFallback::GpuModified);
+    }
+    const bool replay_memory = Libraries::GnmDriver::ExecutorReplayActive();
+    if (IsRegionRegistered(device_addr, size) &&
+        !IsRegionCpuModified(device_addr, size) && !replay_memory) {
+        return fallback(ReadOnlyRenameFallback::NotCpuDirty);
+    }
+    if (texture_cache.FindImageFromRange(device_addr, size)) {
+        return fallback(ReadOnlyRenameFallback::ImageAlias);
+    }
+    if (!memory->IsReadableMapping(device_addr, size) &&
+        !replay_memory) {
+        return fallback(ReadOnlyRenameFallback::NotReadable);
+    }
+
+    // The stream ring is a win for small per-draw constants, but putting
+    // multi-megabyte vertex/index ranges in it causes frequent wraparound and
+    // lets Qualcomm observe a recycled range while an older draw is still in
+    // flight. Keep the original one-cache-page safety contract for every
+    // read-only usage; large geometry remains in the tracked buffer cache.
+    static constexpr u64 MaxRenameRangeBytes = CACHING_PAGESIZE;
+    static constexpr u64 MaxRenameBytesPerTick = 16_MB;
+    if (size > MaxRenameRangeBytes || size > stream_buffer.SizeBytes()) {
+        return fallback(ReadOnlyRenameFallback::TooLarge);
+    }
+    if (!stream_buffer.is_coherent || stream_buffer.mapped_data.empty()) {
+        return fallback(ReadOnlyRenameFallback::StreamNotCoherent);
+    }
+
+    const u64 current_tick = scheduler.CurrentTick();
+    if (read_only_rename_tick != current_tick) {
+        read_only_rename_tick = current_tick;
+        read_only_rename_tick_bytes = 0;
+    }
+    if (size > MaxRenameBytesPerTick -
+                   std::min(read_only_rename_tick_bytes, MaxRenameBytesPerTick)) {
+        return fallback(ReadOnlyRenameFallback::TickBudget);
+    }
+
+    const u64 alignment = [&] {
+        switch (usage) {
+        case ReadOnlyBufferUsage::Vertex:
+            return u64{16};
+        case ReadOnlyBufferUsage::Index:
+            return u64{4};
+        case ReadOnlyBufferUsage::Uniform:
+            return static_cast<u64>(instance.UniformMinAlignment());
+        case ReadOnlyBufferUsage::Storage:
+            return static_cast<u64>(instance.StorageMinAlignment());
+        case ReadOnlyBufferUsage::Count:
+            break;
+        }
+        UNREACHABLE();
+        return u64{16};
+    }();
+    const auto [stream_data, stream_offset] = stream_buffer.Map(size, alignment, false);
+    if (stream_data == nullptr) {
+        return fallback(ReadOnlyRenameFallback::RingBusy);
+    }
+    if (!memory->TryCopyReadableMemory(device_addr, stream_data, size, false)) {
+        std::memset(stream_data, 0, size);
+        stream_buffer.Commit();
+        stream_buffer.RetainCurrentAllocation();
+        return fallback(ReadOnlyRenameFallback::CopyFailed);
+    }
+    stream_buffer.Commit();
+    stream_buffer.RetainCurrentAllocation();
+    read_only_rename_tick_bytes += size;
+    ++read_only_rename_ranges;
+    ++read_only_rename_success_usage_counts[static_cast<std::size_t>(usage)];
+    read_only_rename_bytes += size;
+    maybe_log();
+    ASSERT(stream_offset <= std::numeric_limits<u32>::max());
+    return {&stream_buffer, static_cast<u32>(stream_offset)};
+#endif
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
@@ -1076,7 +2031,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 si
         return ObtainBuffer(gpu_addr, size, false, false);
     }
     const auto [data, offset] = staging_buffer.Map(size, 16);
-    memory->CopySparseMemory(gpu_addr, data, size);
+    if (!memory->TryCopyBackingMemory(gpu_addr, data, size)) {
+        memory->CopySparseMemory(gpu_addr, data, size);
+    }
     staging_buffer.Commit();
     return {&staging_buffer, offset};
 }
@@ -1123,7 +2080,7 @@ void BufferCache::ExecutorProbeGpuBuffer(VAddr device_addr, u32 size, const char
     }
     download_buffer.Commit();
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferProbe);
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1238,7 +2195,7 @@ void BufferCache::ExecutorProbeBoundGpuBuffer(VAddr guest_addr, u32 size, vk::Bu
     }
     download_buffer.Commit();
 
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferProbe);
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1339,6 +2296,7 @@ BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
     if (device_addr == 0) {
         return NULL_BUFFER_ID;
     }
+    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
     if (!buffer_id) {
@@ -1438,7 +2396,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .dstOffset = dst_base_offset,
         .size = overlap.SizeBytes(),
     };
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferCopy);
     const auto cmdbuf = scheduler.CommandBuffer();
 
     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> pre_barriers{};
@@ -1479,6 +2437,9 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 }
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+    // Creating a wider cache buffer can absorb and retire buffers outside the
+    // requested range. Materialize queued copies before changing that topology.
+    scheduler.FlushPendingBufferTransfers();
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -1570,39 +2531,52 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             upload_begin = std::min(upload_begin, copy.dstOffset);
             upload_end = std::max(upload_end, copy.dstOffset + copy.size);
         }
-        scheduler.EndRendering();
-        const auto cmdbuf = scheduler.CommandBuffer();
-        const vk::BufferMemoryBarrier2 pre_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
-                             vk::AccessFlagBits2::eTransferRead |
-                             vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .buffer = buffer.Handle(),
-            .offset = upload_begin,
-            .size = upload_end - upload_begin,
-        };
-        const vk::BufferMemoryBarrier2 post_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-            .buffer = buffer.Handle(),
-            .offset = upload_begin,
-            .size = upload_end - upload_begin,
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &pre_barrier,
-        });
-        cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &post_barrier,
-        });
+#ifdef __ANDROID__
+        if (IsManagedVulkanTransferCoalescing()) {
+            scheduler.QueueBufferUploadCopies(
+                src_buffer, buffer.buffer, copies,
+                buffer_start + upload_begin, upload_end - upload_begin);
+        } else
+#endif
+        {
+            scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferUpload);
+            const auto cmdbuf = scheduler.CommandBuffer();
+            const vk::BufferMemoryBarrier2 pre_barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead |
+                    vk::AccessFlagBits2::eMemoryWrite |
+                    vk::AccessFlagBits2::eTransferRead |
+                    vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .buffer = buffer.Handle(),
+                .offset = upload_begin,
+                .size = upload_end - upload_begin,
+            };
+            const vk::BufferMemoryBarrier2 post_barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead |
+                    vk::AccessFlagBits2::eMemoryWrite,
+                .buffer = buffer.Handle(),
+                .offset = upload_begin,
+                .size = upload_end - upload_begin,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &pre_barrier,
+            });
+            cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &post_barrier,
+            });
+        }
         TouchBuffer(buffer);
     }
     if (is_texel_buffer && !is_written) {
@@ -1621,7 +2595,14 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         for (auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            // These ranges were selected as CPU-modified by MemoryTracker, so
+            // the physical backing is authoritative. Read it through the
+            // unprotected alias: the guest VA page can remain read-protected
+            // solely because a disjoint range on the same 4-KiB page is still
+            // GPU-modified.
+            if (!memory->TryCopyBackingMemory(device_addr, src_pointer, copy.size)) {
+                memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            }
             copy.srcOffset += offset;
         }
         staging_buffer.Commit();
@@ -1635,7 +2616,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         for (const auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            if (!memory->TryCopyBackingMemory(device_addr, src_pointer, copy.size)) {
+                memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            }
         }
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;
@@ -1686,6 +2669,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
 }
 
 void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
+    scheduler.FlushPendingBufferTransfersForRange(device_addr, size);
     const VAddr device_addr_end = device_addr + size;
     ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
         RENDERER_TRACE;
@@ -1697,6 +2681,9 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    if (num_bytes == 0) {
+        return;
+    }
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),
@@ -1717,37 +2704,49 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         std::memcpy(staging, value, num_bytes);
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
     }
-    scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const vk::BufferMemoryBarrier2 pre_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .buffer = buffer.Handle(),
-        .offset = buffer.Offset(address),
-        .size = num_bytes,
-    };
-    const vk::BufferMemoryBarrier2 post_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .buffer = buffer.Handle(),
-        .offset = buffer.Offset(address),
-        .size = num_bytes,
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &pre_barrier,
-    });
-    cmdbuf.copyBuffer(src_buffer, buffer.Handle(), copy);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &post_barrier,
-    });
+#ifdef __ANDROID__
+    if (IsManagedVulkanTransferCoalescing()) {
+        const bool has_guest_range = buffer.CpuAddr() != 0;
+        scheduler.QueueBufferUploadCopies(
+            src_buffer, buffer.Handle(), std::span{&copy, 1},
+            has_guest_range ? address : 0, has_guest_range ? num_bytes : 0);
+    } else
+#endif
+    {
+        scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::BufferUpload);
+        const auto cmdbuf = scheduler.CommandBuffer();
+        const vk::BufferMemoryBarrier2 pre_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .buffer = buffer.Handle(),
+            .offset = buffer.Offset(address),
+            .size = num_bytes,
+        };
+        const vk::BufferMemoryBarrier2 post_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask =
+                vk::AccessFlagBits2::eMemoryRead |
+                vk::AccessFlagBits2::eMemoryWrite,
+            .buffer = buffer.Handle(),
+            .offset = buffer.Offset(address),
+            .size = num_bytes,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &pre_barrier,
+        });
+        cmdbuf.copyBuffer(src_buffer, buffer.Handle(), copy);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &post_barrier,
+        });
+    }
 }
 
 void BufferCache::RunGarbageCollector(const std::optional<size_t> sampled_device_memory) {
@@ -1762,6 +2761,7 @@ void BufferCache::RunGarbageCollector(const std::optional<size_t> sampled_device
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    scheduler.FlushPendingBufferTransfers();
     const bool aggressive = total_used_memory >= critical_gc_memory;
 #ifdef __ANDROID__
     const u64 ticks_to_destroy = std::min<u64>(aggressive ? 16 : 64, gc_tick);
@@ -1770,6 +2770,7 @@ void BufferCache::RunGarbageCollector(const std::optional<size_t> sampled_device
     const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
     int max_deletions = aggressive ? 64 : 32;
 #endif
+    const int initial_max_deletions = max_deletions;
     const auto clean_up = [&](BufferId buffer_id) {
         if (max_deletions == 0) {
             return true;
@@ -1781,6 +2782,8 @@ void BufferCache::RunGarbageCollector(const std::optional<size_t> sampled_device
         return false;
     };
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    VideoCore::RecordMobileGpuResidencyGc(
+        static_cast<u64>(initial_max_deletions - max_deletions));
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
@@ -1788,6 +2791,9 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
+    // Pending buffer-transfer batches retain raw Vulkan handles until their commands are
+    // materialized. Never let a cache slot enter deferred destruction first.
+    scheduler.FlushPendingBufferTransfers();
     Buffer& buffer = slot_buffers[buffer_id];
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });

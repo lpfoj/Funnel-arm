@@ -71,6 +71,16 @@ void* GetRip(void* ctx) {
 #endif
 }
 
+void* GetLinkRegister(void* ctx) {
+#if defined(__aarch64__)
+    return reinterpret_cast<void*>(
+        reinterpret_cast<ucontext_t*>(ctx)->uc_mcontext.regs[30]);
+#else
+    (void)ctx;
+    return nullptr;
+#endif
+}
+
 void IncrementRip(void* ctx, u64 length) {
 #if defined(_WIN32)
     ((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rip += length;

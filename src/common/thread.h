@@ -18,6 +18,21 @@ enum class ThreadPriority : u32 {
     Critical = 4,
 };
 
+enum class ThreadAffinityClass : u32 {
+    LatencyPerformance = 0,
+    GuestCompute = 1,
+    GraphicsDriver = 2,
+};
+
+// Captures the Android process' original allowed CPU mask before any emulator
+// thread narrows its own affinity. It is a no-op on other platforms.
+void InitializeAndroidThreadAffinity();
+
+// Applies a topology-derived subset of the captured Android CPU mask to the
+// calling thread. Returns false when topology discovery is unavailable or the
+// kernel rejects the request; both cases leave execution otherwise unchanged.
+bool ApplyCurrentThreadAffinity(ThreadAffinityClass affinity_class);
+
 void SetCurrentThreadRealtime(std::chrono::nanoseconds period_ns);
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);

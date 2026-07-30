@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/vulkan_driver_optimization.h"
+
+#include <cstring>
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -75,19 +79,91 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
     }
 
-    scheduler.EndRendering();
+    if (copies.empty()) {
+        return true;
+    }
 
-    static constexpr vk::MemoryBarrier READ_BARRIER{
+    const bool managed_batching =
+        VideoCore::IsManagedVulkanTransferCoalescing();
+#ifdef __ANDROID__
+    // The stock copy shader is frequently used to assemble small read-only
+    // draw buffers. If both sides still have authoritative CPU backing, doing
+    // the same ordered copies there avoids a transfer command, two barriers,
+    // and an end/reopen of the active dynamic-rendering scope. Once either
+    // side has an outstanding GPU write, retain the exact GPU path below.
+    // Only an unregistered, non-image destination is proven to have no
+    // device-local copy that could remain authoritative behind the tracker.
+    // Ambiguous destinations retain the Vulkan copy path.
+    static constexpr bool EnableCpuCopyBatch = false;
+    bool cpu_copy_batch = managed_batching && EnableCpuCopyBatch;
+    u64 cpu_copy_bytes = 0;
+    if (cpu_copy_batch) {
+        auto& texture_cache = rasterizer.GetTextureCache();
+        for (const auto& copy : copies) {
+            const VAddr source =
+                src_buf_sharp.base_address + copy.srcOffset;
+            const VAddr destination =
+                dst_buf_sharp.base_address + copy.dstOffset;
+            if (!rasterizer.IsMapped(source, copy.size) ||
+                !rasterizer.IsMapped(destination, copy.size) ||
+                rasterizer.IsMemoryGpuModified(source, copy.size) ||
+                rasterizer.IsMemoryGpuModified(destination, copy.size) ||
+                buffer_cache.IsRegionRegistered(destination, copy.size) ||
+                texture_cache.FindImageFromRange(source, copy.size) ||
+                texture_cache.FindImageFromRange(destination, copy.size)) {
+                cpu_copy_batch = false;
+                break;
+            }
+            cpu_copy_bytes += copy.size;
+        }
+    }
+    if (cpu_copy_batch) {
+        for (const auto& copy : copies) {
+            const VAddr source =
+                src_buf_sharp.base_address + copy.srcOffset;
+            const VAddr destination =
+                dst_buf_sharp.base_address + copy.dstOffset;
+            VideoCore::PageManager::PrepareBulkGuestWrite(destination, copy.size);
+            std::memmove(reinterpret_cast<void*>(destination),
+                         reinterpret_cast<const void*>(source), copy.size);
+        }
+        static u64 cpu_batches = 0;
+        static u64 cpu_regions = 0;
+        static u64 cpu_bytes = 0;
+        ++cpu_batches;
+        cpu_regions += copies.size();
+        cpu_bytes += cpu_copy_bytes;
+        if ((cpu_batches & (cpu_batches - 1)) == 0) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_SHADER_HLE_CPU_COPY] batches=%llu regions=%llu bytes=%llu",
+                static_cast<unsigned long long>(cpu_batches),
+                static_cast<unsigned long long>(cpu_regions),
+                static_cast<unsigned long long>(cpu_bytes));
+        }
+        return true;
+    }
+#endif
+    static constexpr vk::MemoryBarrier ReadBarrier{
         .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
-        .dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask =
+            vk::AccessFlagBits::eTransferRead |
+            vk::AccessFlagBits::eTransferWrite,
     };
-    static constexpr vk::MemoryBarrier WRITE_BARRIER{
+    static constexpr vk::MemoryBarrier WriteBarrier{
         .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-        .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+        .dstAccessMask =
+            vk::AccessFlagBits::eMemoryRead |
+            vk::AccessFlagBits::eMemoryWrite,
     };
-    scheduler.CommandBuffer().pipelineBarrier(
-        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
-        vk::DependencyFlagBits::eByRegion, READ_BARRIER, {}, {});
+    if (!managed_batching) {
+        // True A/B baseline: preserve the original immediate HLE copy stream.
+        scheduler.EndRendering(Scheduler::EndRenderingReason::ShaderHleCopy);
+        scheduler.CommandBuffer().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::DependencyFlagBits::eByRegion, ReadBarrier, {}, {});
+    }
 
     u32 batch_start = 0;
     u32 batch_end = 0;
@@ -119,8 +195,15 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             dst_offset_max = new_dst_offset_max;
         }
 
-        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
-            src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
+        const auto [src_buf, src_buf_offset] =
+            managed_batching
+                ? buffer_cache.ObtainReadOnlyBuffer(
+                      src_buf_sharp.base_address + src_offset_min,
+                      src_offset_max - src_offset_min,
+                      VideoCore::BufferCache::ReadOnlyBufferUsage::Storage)
+                : buffer_cache.ObtainBuffer(
+                      src_buf_sharp.base_address + src_offset_min,
+                      src_offset_max - src_offset_min, false);
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
             dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, true);
 
@@ -132,13 +215,27 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
-        scheduler.CommandBuffer().copyBuffer(src_buf->Handle(), dst_buf->Handle(), vk_copies);
+        if (managed_batching) {
+            scheduler.QueueBufferCopies(
+                src_buf->Handle(), dst_buf->Handle(), vk_copies,
+                src_buf_sharp.base_address + src_offset_min,
+                src_offset_max - src_offset_min,
+                dst_buf_sharp.base_address + dst_offset_min,
+                dst_offset_max - dst_offset_min,
+                Scheduler::BufferTransferOrigin::Hle);
+        } else {
+            scheduler.CommandBuffer().copyBuffer(
+                src_buf->Handle(), dst_buf->Handle(), vk_copies);
+        }
         batch_start = batch_end;
     }
 
-    scheduler.CommandBuffer().pipelineBarrier(
-        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
-        vk::DependencyFlagBits::eByRegion, WRITE_BARRIER, {}, {});
+    if (!managed_batching) {
+        scheduler.CommandBuffer().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::DependencyFlagBits::eByRegion, WriteBarrier, {}, {});
+    }
 
     return true;
 }

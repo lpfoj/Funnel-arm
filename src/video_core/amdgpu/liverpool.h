@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
@@ -109,14 +110,68 @@ public:
         return graphics_state_generation;
     }
 
-    void NotifyGraphicsStateChanged() noexcept {
+    [[nodiscard]] u64 GraphicsOtherGeneration() const noexcept {
+        return graphics_other_generation;
+    }
+
+    [[nodiscard]] u64 GraphicsShaderProgramGeneration() const noexcept {
+        return graphics_shader_program_generation;
+    }
+
+    [[nodiscard]] u64 GraphicsShaderUserDataGeneration() const noexcept {
+        return graphics_shader_user_data_generation;
+    }
+
+    enum GraphicsDirtySource : u32 {
+        GraphicsDirtyOther = 1u << 0,
+        GraphicsDirtyShaderProgram = 1u << 1,
+        GraphicsDirtyShaderUserData = 1u << 2,
+    };
+
+#ifdef __ANDROID__
+    struct GraphicsDirtyTelemetrySnapshot {
+        u64 other{};
+        u64 shader_program{};
+        u64 shader_user_data{};
+    };
+
+    [[nodiscard]] GraphicsDirtyTelemetrySnapshot GetGraphicsDirtyTelemetrySnapshot() const noexcept {
+        return {
+            .other = graphics_dirty_other.load(std::memory_order_relaxed),
+            .shader_program = graphics_dirty_shader_program.load(std::memory_order_relaxed),
+            .shader_user_data = graphics_dirty_shader_user_data.load(std::memory_order_relaxed),
+        };
+    }
+#endif
+
+    void NotifyGraphicsStateChanged(u32 dirty_sources = GraphicsDirtyOther) noexcept {
         ++graphics_state_generation;
+        graphics_other_generation += (dirty_sources & GraphicsDirtyOther) != 0;
+        graphics_shader_program_generation +=
+            (dirty_sources & GraphicsDirtyShaderProgram) != 0;
+        graphics_shader_user_data_generation +=
+            (dirty_sources & GraphicsDirtyShaderUserData) != 0;
+#ifdef __ANDROID__
+        if ((dirty_sources & GraphicsDirtyOther) != 0) {
+            graphics_dirty_other.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((dirty_sources & GraphicsDirtyShaderProgram) != 0) {
+            graphics_dirty_shader_program.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((dirty_sources & GraphicsDirtyShaderUserData) != 0) {
+            graphics_dirty_shader_user_data.fetch_add(1, std::memory_order_relaxed);
+        }
+#else
+        (void)dirty_sources;
+#endif
     }
 
     [[nodiscard]] bool IsRendererTerminal() const noexcept;
     void MarkRendererTerminal(const char* where) noexcept;
 
     void WaitRasterizerIdleForExecutor();
+
+    void FlushForPresentationForExecutor();
 
     [[nodiscard]] bool ResolvePendingCompletionReadForExecutor(VAddr address, u64 size);
 
@@ -197,6 +252,14 @@ public:
 
 private:
     u64 graphics_state_generation{1};
+    u64 graphics_other_generation{1};
+    u64 graphics_shader_program_generation{1};
+    u64 graphics_shader_user_data_generation{1};
+#ifdef __ANDROID__
+    std::atomic<u64> graphics_dirty_other{};
+    std::atomic<u64> graphics_dirty_shader_program{};
+    std::atomic<u64> graphics_dirty_shader_user_data{};
+#endif
 
     enum class Pm4Engine : u8 {
         Graphics,
@@ -204,13 +267,12 @@ private:
         Compute,
     };
 
-    struct Pm4StreamFingerprint {
-        u64 primary{};
-        u64 verifier{};
+    struct Pm4LayoutKey {
+        u64 coarse{};
         u32 words{};
         Pm4Engine engine{};
 
-        auto operator<=>(const Pm4StreamFingerprint&) const = default;
+        auto operator<=>(const Pm4LayoutKey&) const = default;
     };
 
     struct Pm4PacketDescriptor {
@@ -221,23 +283,23 @@ private:
     };
 
     struct Pm4DescriptorPlan {
-        Pm4StreamFingerprint fingerprint{};
+        Pm4LayoutKey key{};
         std::vector<Pm4PacketDescriptor> packets{};
     };
 
     struct Pm4DescriptorCacheLine {
-        Pm4StreamFingerprint fingerprint{};
+        Pm4LayoutKey key{};
         std::shared_ptr<const Pm4DescriptorPlan> plan{};
         u64 last_use{};
     };
 
     struct Pm4DescriptorAdmissionLine {
-        Pm4StreamFingerprint fingerprint{};
+        Pm4LayoutKey key{};
         bool occupied{};
     };
 
     static constexpr u32 Pm4DescriptorCacheSets = 256;
-    static constexpr u32 Pm4DescriptorCacheWays = 2;
+    static constexpr u32 Pm4DescriptorCacheWays = 4;
     static constexpr u32 Pm4DescriptorAdmissionLines = 1024;
 
     struct Pm4SnapshotKey {
@@ -307,6 +369,7 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
+    bool CopyGuestPm4Words(VAddr address, u32 num_words, std::vector<u32>& owned) const;
     bool CopyIndirectAtEncounter(Pm4Engine engine, VAddr address, u32 num_words,
                                  std::vector<u32>& owned,
                                  const Pm4SubmissionStatePtr& state) const;
@@ -332,14 +395,17 @@ private:
 #endif
     void SnapshotCpuIndirectGraph(Pm4Engine engine, std::span<const u32> stream,
                                   const Pm4SubmissionStatePtr& state, u32 depth = 0) const;
-    [[nodiscard]] static Pm4StreamFingerprint FingerprintPm4Stream(
+    [[nodiscard]] static Pm4LayoutKey MakePm4LayoutKey(
         Pm4Engine engine, std::span<const u32> stream) noexcept;
     [[nodiscard]] static std::shared_ptr<const Pm4DescriptorPlan> BuildPm4DescriptorPlan(
-        const Pm4StreamFingerprint& fingerprint, std::span<const u32> stream);
+        const Pm4LayoutKey& key, std::span<const u32> stream);
+    [[nodiscard]] static bool ValidatePm4PacketDescriptor(
+        const Pm4PacketDescriptor& descriptor, std::size_t offset_words,
+        std::span<const u32> remaining_stream) noexcept;
     [[nodiscard]] std::shared_ptr<const Pm4DescriptorPlan> FindPm4DescriptorPlan(
-        const Pm4StreamFingerprint& fingerprint);
+        const Pm4LayoutKey& key, std::span<const u32> stream);
     [[nodiscard]] bool AdmitPm4DescriptorPlanBuild(
-        const Pm4StreamFingerprint& fingerprint) noexcept;
+        const Pm4LayoutKey& key) noexcept;
     void RememberPm4DescriptorPlan(std::shared_ptr<const Pm4DescriptorPlan> plan);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                          std::vector<u32> owned_dcb = {}, std::vector<u32> owned_ccb = {},
@@ -440,6 +506,8 @@ private:
     u64 pm4_descriptor_cache_hits_{};
     u64 pm4_descriptor_cache_misses_{};
     u64 pm4_descriptor_cache_inserts_{};
+    u64 pm4_descriptor_cache_layout_mismatches_{};
+    u64 pm4_descriptor_cache_bytes_not_hashed_{};
     std::atomic<u32> num_mapped_queues{1u};
     std::atomic<u64> submit_ready_mask{};
 #ifdef __ANDROID__
@@ -511,6 +579,7 @@ private:
     std::vector<Common::UniqueFunction<void>> executor_completion_batch{};
     u64 executor_guest_submit_count{};
     u64 executor_completion_point_count{};
+    u32 executor_deferred_submit_boundaries{};
     u64 executor_submit_done_frame_count{};
     u64 executor_metrics_last_guest_submits{};
     u64 executor_metrics_last_completion_points{};

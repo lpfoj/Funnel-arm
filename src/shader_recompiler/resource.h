@@ -46,10 +46,8 @@ struct BufferResource {
         return true;
     }
 
-    u32 NumBindings() const noexcept {
-        constexpr auto BindingTypes =
-            IR::Type::U64 | IR::Type::U32 | IR::Type::F32 | IR::Type::U16 | IR::Type::U8;
-        return std::popcount(static_cast<u32>(used_types & BindingTypes));
+    constexpr u32 NumBindings() const noexcept {
+        return 1;
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {

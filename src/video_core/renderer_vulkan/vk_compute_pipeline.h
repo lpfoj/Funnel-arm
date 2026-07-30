@@ -38,7 +38,8 @@ struct ComputePipelineKey {
 class ComputePipeline : public Pipeline {
 public:
     struct SerializationSupport {
-        u32 dummy{};
+        std::vector<u8> storage_buffers{};
+        std::vector<u32> image_bindings{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
@@ -47,7 +48,8 @@ public:
     ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
                     const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
-                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
+                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading,
+                    vk::PipelineCreateFlags build_flags = {});
     ~ComputePipeline();
 
     u64 GetPipelineHash() const noexcept {

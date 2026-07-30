@@ -20,7 +20,9 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
                            BufferCache& buffer_cache_, u32 caching_pagebits, u64 caching_num_pages_)
     : scheduler{scheduler_}, buffer_cache{buffer_cache_},
       caching_pagesize{1ULL << caching_pagebits}, caching_num_pages{caching_num_pages_},
-      fault_buffer_size{caching_num_pages_ / 8},
+      fault_buffer_size{((caching_num_pages_ / 32) +
+                         Common::DivCeil(caching_num_pages_ / 32, 32ULL)) *
+                        sizeof(u32)},
       fault_buffer{instance, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, fault_buffer_size},
       download_buffer{instance, scheduler, MemoryUsage::Download,
                       0,        AllFlags,  MaxPendingFaults * PageFaultAreaSize} {
@@ -49,8 +51,15 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
     fault_process_desc_layout =
         Vulkan::Check(device.createDescriptorSetLayoutUnique(desc_layout_ci));
 
-    std::vector<std::string> defines{{fmt::format("CACHING_PAGEBITS={}", caching_pagebits),
-                                      fmt::format("MAX_PAGE_FAULTS={}", MaxPageFaults)}};
+    const u64 fault_words = caching_num_pages / 32;
+    const u64 summary_words = Common::DivCeil(fault_words, 32ULL);
+    std::vector<std::string> defines{{
+        fmt::format("CACHING_PAGEBITS={}", caching_pagebits),
+        fmt::format("MAX_PAGE_FAULTS={}", MaxPageFaults),
+        fmt::format("FAULT_WORDS={}", fault_words),
+        fmt::format("FAULT_SUMMARY_OFFSET={}", fault_words),
+        fmt::format("FAULT_SUMMARY_WORDS={}", summary_words),
+    }};
     const auto module = Vulkan::Compile(HostShaders::FAULT_BUFFER_PROCESS_COMP,
                                         vk::ShaderStageFlagBits::eCompute, device, defines);
     Vulkan::SetObjectName(device, module, "Fault Buffer Parser");
@@ -89,18 +98,26 @@ void FaultManager::ProcessFaultBuffer() {
 
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        // Guest shaders update the fault bitset with atomicOr and the parser
+        // consumes it with atomicExchange. Both are read-modify-write accesses,
+        // so advertising only one half leaves the atomic hazard unordered on
+        // tile-based mobile drivers.
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eShaderWrite,
         .buffer = fault_buffer.Handle(),
         .offset = 0,
         .size = fault_buffer_size,
     };
     const vk::BufferMemoryBarrier2 post_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eShaderWrite,
         .buffer = fault_buffer.Handle(),
         .offset = 0,
         .size = fault_buffer_size,
@@ -133,7 +150,7 @@ void FaultManager::ProcessFaultBuffer() {
             .pBufferInfo = &download_info,
         },
     }};
-    scheduler.EndRendering();
+    scheduler.EndRendering(Vulkan::Scheduler::EndRenderingReason::FaultCompute);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -141,8 +158,10 @@ void FaultManager::ProcessFaultBuffer() {
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
+    scheduler.MarkPipelineBind(vk::PipelineBindPoint::eCompute);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
+    scheduler.MarkDescriptorBind(vk::PipelineBindPoint::eCompute);
     const u32 num_threads = caching_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
     cmdbuf.dispatch(num_workgroups, 1, 1);
@@ -156,7 +175,8 @@ void FaultManager::ProcessFaultBuffer() {
     scheduler.DeferOperation([this, mapped, area = current_area] {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
-        const u32 fault_count = fault_buf[0];
+        const u32 fault_count =
+            std::min<u32>(fault_buf[0], static_cast<u32>(MaxPageFaults - 1));
         for (u32 i = 1; i <= fault_count; ++i) {
             fault_ranges.Add(fault_buf[i], caching_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);

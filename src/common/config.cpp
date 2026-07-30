@@ -169,8 +169,14 @@ static ConfigEntry<int> readbacksMode(GpuReadbacksMode::Disabled);
 static ConfigEntry<bool> readbackLinearImagesEnabled(false);
 static ConfigEntry<bool> directMemoryAccessEnabled(false);
 static std::atomic_bool managedGpuFastPathEnabled{false};
+static std::atomic_bool managedReadbackBatchingEnabled{false};
 static std::atomic_bool managedCoarseFragmentShadingEnabled{false};
 static std::atomic_bool managedDisableVkRobustnessEnabled{false};
+static std::atomic<u32> managedMaxAnisotropyValue{0};
+// Managed optimizations must be opt-in. The Android UI applies persisted
+// settings after loading the runtime library, so a true default can start
+// workers before an OFF preference reaches the native core.
+static std::atomic_bool managedAsyncPipelineCompilationEnabled{false};
 static ConfigEntry<bool> shouldDumpShaders(false);
 static ConfigEntry<bool> shouldPatchShaders(false);
 static ConfigEntry<u32> vblankFrequency(60);
@@ -424,6 +430,14 @@ bool copyGPUCmdBuffers() {
 }
 
 int getReadbacksMode() {
+#ifdef __ANDROID__
+    // Managed readback batching needs precise page tracking. Keep the stored
+    // desktop/game setting intact so disabling the managed option is a true
+    // A/B fallback to the user's original configuration.
+    if (managedReadbackBatching()) {
+        return GpuReadbacksMode::Precise;
+    }
+#endif
     return readbacksMode.get();
 }
 
@@ -439,12 +453,24 @@ bool managedGpuFastPath() {
     return managedGpuFastPathEnabled.load(std::memory_order_acquire);
 }
 
+bool managedReadbackBatching() {
+    return managedReadbackBatchingEnabled.load(std::memory_order_acquire);
+}
+
 bool managedCoarseFragmentShading() {
     return managedCoarseFragmentShadingEnabled.load(std::memory_order_acquire);
 }
 
 bool managedDisableVkRobustness() {
     return managedDisableVkRobustnessEnabled.load(std::memory_order_acquire);
+}
+
+u32 managedMaxAnisotropy() {
+    return managedMaxAnisotropyValue.load(std::memory_order_acquire);
+}
+
+bool managedAsyncPipelineCompilation() {
+    return managedAsyncPipelineCompilationEnabled.load(std::memory_order_acquire);
 }
 
 bool dumpShaders() {
@@ -612,12 +638,24 @@ void setManagedGpuFastPath(bool enable) {
     managedGpuFastPathEnabled.store(enable, std::memory_order_release);
 }
 
+void setManagedReadbackBatching(bool enable) {
+    managedReadbackBatchingEnabled.store(enable, std::memory_order_release);
+}
+
 void setManagedCoarseFragmentShading(bool enable) {
     managedCoarseFragmentShadingEnabled.store(enable, std::memory_order_release);
 }
 
 void setManagedDisableVkRobustness(bool enable) {
     managedDisableVkRobustnessEnabled.store(enable, std::memory_order_release);
+}
+
+void setManagedMaxAnisotropy(u32 value) {
+    managedMaxAnisotropyValue.store(value, std::memory_order_release);
+}
+
+void setManagedAsyncPipelineCompilation(bool enable) {
+    managedAsyncPipelineCompilationEnabled.store(enable, std::memory_order_release);
 }
 
 void setDumpShaders(bool enable, bool is_game_specific) {

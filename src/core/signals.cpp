@@ -77,10 +77,11 @@ static bool g_fault_signal_handlers_installed = false;
 static bool g_jit_signal_handlers_installed = false;
 
 extern "C" int executor_lsx4_android_runtime_jit_active() __attribute__((weak));
-extern "C" int executor_jit_has_synchronous_guest_fault_frame() __attribute__((weak));
+extern "C" int executor_jit_has_synchronous_guest_fault_frame(
+    const void* raw_context) __attribute__((weak));
 extern "C" int executor_jit_defer_synchronous_guest_fault(
     s32 native_sig, s32 si_code, s32 si_errno, s32 source_pid, u32 source_uid, u64 fault_addr,
-    s32 is_write) __attribute__((weak));
+    s32 is_write, const void* raw_context) __attribute__((weak));
 extern "C" u64 executor_jit_current_fault_guest_rip() __attribute__((weak));
 extern "C" u64 executor_jit_current_fault_active_block_rip() __attribute__((weak));
 extern "C" u64 executor_jit_current_fault_instruction() __attribute__((weak));
@@ -99,20 +100,22 @@ static bool AndroidJitActive() {
            executor_lsx4_android_runtime_jit_active() != 0;
 }
 
-static bool JitSynchronousGuestFaultCanResume() {
+static bool JitSynchronousGuestFaultCanResume(const void* raw_context) {
     return executor_jit_has_synchronous_guest_fault_frame != nullptr &&
-           executor_jit_has_synchronous_guest_fault_frame() != 0;
+           executor_jit_has_synchronous_guest_fault_frame(raw_context) != 0;
 }
 
 static bool DeferJitSynchronousGuestFault(int sig, const siginfo_t* info,
-                                               bool is_write) {
+                                         bool is_write,
+                                         const void* raw_context) {
     if (executor_jit_defer_synchronous_guest_fault == nullptr) {
         return false;
     }
     return executor_jit_defer_synchronous_guest_fault(
                sig, info ? info->si_code : 0, info ? info->si_errno : 0,
                info ? info->si_pid : 0, info ? info->si_uid : 0,
-               reinterpret_cast<u64>(info ? info->si_addr : nullptr), is_write ? 1 : 0) != 0;
+               reinterpret_cast<u64>(info ? info->si_addr : nullptr),
+               is_write ? 1 : 0, raw_context) != 0;
 }
 
 static struct sigaction& PreviousActionForSignal(int sig) {
@@ -448,9 +451,48 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     case SIGBUS: {
         const bool is_write = Common::IsWriteError(raw_context);
 #ifdef __ANDROID__
-        if (jit_parity && JitSynchronousGuestFaultCanResume()) {
+        if (jit_parity && JitSynchronousGuestFaultCanResume(raw_context)) {
             if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
-                (void)DeferJitSynchronousGuestFault(sig, info, is_write);
+#if defined(__aarch64__)
+                static std::atomic<u32> deferred_capture_count{0};
+                const u32 capture =
+                    deferred_capture_count.fetch_add(1, std::memory_order_relaxed);
+                if (capture < 32) {
+                    const auto* uc = static_cast<const ucontext_t*>(raw_context);
+                    const u64 host_pc =
+                        uc ? static_cast<u64>(uc->uc_mcontext.pc) : 0;
+                    const u64 host_lr =
+                        uc ? static_cast<u64>(uc->uc_mcontext.regs[30]) : 0;
+                    const u64 host_sp =
+                        uc ? static_cast<u64>(uc->uc_mcontext.sp) : 0;
+                    const u64 host_fp =
+                        uc ? static_cast<u64>(uc->uc_mcontext.regs[29]) : 0;
+                    const u64 guest_rip =
+                        executor_jit_current_fault_guest_rip != nullptr
+                            ? executor_jit_current_fault_guest_rip()
+                            : 0;
+                    const u64 active_rip =
+                        executor_jit_current_fault_active_block_rip != nullptr
+                            ? executor_jit_current_fault_active_block_rip()
+                            : 0;
+                    __android_log_print(
+                        ANDROID_LOG_ERROR, "LSX4Native",
+                        "[LSX4_DEFERRED_SIGNAL] phase=capture native=%d code=%d "
+                        "fault=%p write=%d hostPc=0x%llx hostLr=0x%llx "
+                        "hostSp=0x%llx hostFp=0x%llx guestRip=0x%llx "
+                        "activeRip=0x%llx",
+                        sig, info ? info->si_code : 0,
+                        info ? info->si_addr : nullptr, is_write ? 1 : 0,
+                        static_cast<unsigned long long>(host_pc),
+                        static_cast<unsigned long long>(host_lr),
+                        static_cast<unsigned long long>(host_sp),
+                        static_cast<unsigned long long>(host_fp),
+                        static_cast<unsigned long long>(guest_rip),
+                        static_cast<unsigned long long>(active_rip));
+                }
+#endif
+                (void)DeferJitSynchronousGuestFault(
+                    sig, info, is_write, raw_context);
                 UNREACHABLE_MSG(
                     "JIT synchronous guest access fault could not be deferred");
             }
@@ -574,12 +616,13 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
             if (jit_parity) {
                 const s32 guest_sig = Libraries::Kernel::NativeToOrbisSignal(sig);
                 if (Libraries::Kernel::HasSignalHandler(guest_sig) &&
-                    JitSynchronousGuestFaultCanResume()) {
-                    (void)DeferJitSynchronousGuestFault(sig, info, is_write);
+                    JitSynchronousGuestFaultCanResume(raw_context)) {
+                    (void)DeferJitSynchronousGuestFault(
+                        sig, info, is_write, raw_context);
                     UNREACHABLE_MSG(
                         "JIT synchronous guest access fault could not be deferred");
                 }
-                if (!JitSynchronousGuestFaultCanResume() &&
+                if (!JitSynchronousGuestFaultCanResume(raw_context) &&
                     ChainPreviousSignalHandler(sig, info, raw_context,
                                                "jit_host_access_no_resume")) {
                     return;
@@ -634,12 +677,13 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
             if (jit_parity) {
                 const s32 guest_sig = Libraries::Kernel::NativeToOrbisSignal(sig);
                 if (Libraries::Kernel::HasSignalHandler(guest_sig) &&
-                    JitSynchronousGuestFaultCanResume()) {
-                    (void)DeferJitSynchronousGuestFault(sig, info, false);
+                    JitSynchronousGuestFaultCanResume(raw_context)) {
+                    (void)DeferJitSynchronousGuestFault(
+                        sig, info, false, raw_context);
                     UNREACHABLE_MSG(
                         "JIT synchronous guest illegal instruction could not be deferred");
                 }
-                if (!JitSynchronousGuestFaultCanResume() &&
+                if (!JitSynchronousGuestFaultCanResume(raw_context) &&
                     ChainPreviousSignalHandler(sig, info, raw_context,
                                                "jit_host_ill_no_resume")) {
                     return;

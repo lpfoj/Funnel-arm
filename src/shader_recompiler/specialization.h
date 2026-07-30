@@ -88,7 +88,8 @@ struct StageSpecialization {
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_,
-                        const std::optional<Gcn::FetchShaderData>* parsed_fetch_shader = nullptr)
+                        const std::optional<Gcn::FetchShaderData>* parsed_fetch_shader = nullptr,
+                        const TessellationDataConstantBuffer* tess_constants_snapshot = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
         fetch_shader_data =
             parsed_fetch_shader ? *parsed_fetch_shader : Gcn::ParseFetchShader(info_);
@@ -156,7 +157,11 @@ struct StageSpecialization {
         if (info->l_stage == LogicalStage::TessellationControl ||
             info->l_stage == LogicalStage::TessellationEval) {
             TessellationDataConstantBuffer tess_constants{};
-            info->ReadTessConstantBuffer(tess_constants);
+            if (tess_constants_snapshot != nullptr) {
+                tess_constants = *tess_constants_snapshot;
+            } else {
+                info->ReadTessConstantBuffer(tess_constants);
+            }
             runtime_info.InitFromTessConstants(tess_constants);
         }
     }

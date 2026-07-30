@@ -10,6 +10,11 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <list>
+#include <memory>
+#include <mutex>
+#include <vector>
+
 namespace AmdGpu {
 struct Liverpool;
 }
@@ -59,7 +64,9 @@ public:
                                  bool from_guest = false);
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
-    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds,
+                    bool defer_gnm_dma = false);
+    void FlushPendingGnmDmaTransfers();
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
@@ -79,6 +86,16 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+
+#ifdef __ANDROID__
+    /// Returns the most recently resolved physically-scaled color target when
+    /// it is the image being scanned out.  The returned view is transitioned
+    /// for sampling so the presenter can feed it directly to FSR instead of
+    /// first expanding it with a nearest-neighbour blit.
+    bool ExecutorAcquirePhysicalDrsPresentationSource(VideoCore::ImageId image_id,
+                                                      vk::ImageView& image_view,
+                                                      vk::Extent2D& extent);
+#endif
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -106,6 +123,8 @@ private:
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
+    void UpdateFragmentShadingRate(const GraphicsPipeline* pipeline,
+                                   const RenderState& state) const;
 
     bool FilterDraw();
 
@@ -126,8 +145,43 @@ private:
     bool IsComputeImageClear(const Pipeline* pipeline);
 
 #ifdef __ANDROID__
+    struct ExecutorPhysicalDrsSurface;
+    struct ExecutorPhysicalDrsDepthSurface;
+    struct ExecutorPhysicalDrsCleanupControl;
+
     void ExecutorBindGuestGraphicsPipeline(const GraphicsPipeline* pipeline,
                                            vk::CommandBuffer cmdbuf);
+    void ExecutorSealGuestGraphicsPipelineState(const GraphicsPipeline* pipeline,
+                                                vk::CommandBuffer cmdbuf);
+    void ExecutorBindGuestComputePipeline(const ComputePipeline* pipeline,
+                                          vk::CommandBuffer cmdbuf);
+    void ExecutorPreparePhysicalDrsDraw(const GraphicsPipeline* pipeline);
+    bool ExecutorBeginPhysicalDrs(const GraphicsPipeline* pipeline, RenderState& state);
+    void ExecutorResolvePhysicalDrs(const char* reason);
+    void ExecutorTransitionPhysicalDrsSurface(vk::ImageLayout layout,
+                                              vk::AccessFlags2 access,
+                                              vk::PipelineStageFlags2 stage);
+    void ExecutorTransitionPhysicalDrsDepthSurface(vk::ImageLayout layout,
+                                                   vk::AccessFlags2 access,
+                                                   vk::PipelineStageFlags2 stage);
+    bool ExecutorPhysicalDrsPipelineCompatible(const GraphicsPipeline* pipeline) const;
+    void ExecutorTouchPhysicalDrsSurface(ExecutorPhysicalDrsSurface& surface) noexcept;
+    void ExecutorTouchPhysicalDrsDepthSurface(
+        ExecutorPhysicalDrsDepthSurface& surface) noexcept;
+    [[nodiscard]] u64 ExecutorPhysicalDrsImageAllocationBytes(
+        const vk::ImageCreateInfo& image_ci) const noexcept;
+    [[nodiscard]] bool ExecutorTryCreatePhysicalDrsImage(
+        VideoCore::UniqueImage& image, const vk::ImageCreateInfo& image_ci,
+        u64& allocation_bytes);
+    [[nodiscard]] u64 ExecutorPhysicalDrsResidencyBudgetBytes() const noexcept;
+    [[nodiscard]] bool ExecutorRunPhysicalDrsResidencyGc(
+        u64 reserve_bytes = 0, bool force_cleanup = false);
+    void ExecutorResetPhysicalDrsTransientBindings() noexcept;
+    static void ExecutorManagedMobileGpuTransition(
+        void* context, bool enabled) noexcept;
+    void ExecutorNotifyManagedMobileGpuTransition(bool enabled) noexcept;
+    void ExecutorSchedulePhysicalDrsOffCleanup();
+    void ExecutorCompletePhysicalDrsOffCleanup();
 
     struct ExecutorGpuLatePassProbeState {
         struct ImageIdentity {
@@ -219,9 +273,15 @@ private:
 #ifdef __ANDROID__
     ExecutorGpuLatePassProbeState executor_gpu_late_pass_probe{};
     vk::CommandBuffer executor_guest_graphics_cmdbuf{};
-    vk::Pipeline executor_guest_graphics_pipeline{};
-    u64 executor_guest_dynamic_epoch{};
-    u64 executor_guest_rendering_epoch{};
+    u64 executor_guest_graphics_pipeline_identity{};
+    u64 executor_guest_graphics_recording_tick{};
+    u64 executor_guest_graphics_pipeline_epoch{};
+    bool executor_guest_graphics_pipeline_valid{};
+    vk::CommandBuffer executor_guest_compute_cmdbuf{};
+    u64 executor_guest_compute_pipeline_identity{};
+    u64 executor_guest_compute_recording_tick{};
+    u64 executor_guest_compute_pipeline_epoch{};
+    bool executor_guest_compute_pipeline_valid{};
     u64 executor_unpublished_actual_draws{};
     u64 executor_completion_barrier_epoch{};
     u64 executor_completion_barrier_tick{};
@@ -232,6 +292,76 @@ private:
     u64 executor_completion_barrier_emitted{};
     u64 executor_completion_barrier_elided{};
     bool executor_completion_barrier_valid{};
+
+    struct ExecutorPhysicalDrsSurface {
+        VideoCore::UniqueImage image{};
+        vk::UniqueImageView view{};
+        vk::Format format{vk::Format::eUndefined};
+        vk::Extent2D extent{};
+        vk::ImageLayout layout{vk::ImageLayout::eUndefined};
+        vk::AccessFlags2 access{vk::AccessFlagBits2::eNone};
+        vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eTopOfPipe};
+        VideoCore::ImageId owner_image_id{};
+        u64 owner_image_uid{};
+        u64 allocation_bytes{};
+        u64 last_used_generation{};
+        u64 last_use_tick{};
+    };
+    struct ExecutorPhysicalDrsDepthSurface {
+        VideoCore::UniqueImage image{};
+        vk::UniqueImageView view{};
+        vk::Format format{vk::Format::eUndefined};
+        vk::Extent2D extent{};
+        vk::ImageAspectFlags aspects{};
+        vk::ImageLayout layout{vk::ImageLayout::eUndefined};
+        vk::AccessFlags2 access{vk::AccessFlagBits2::eNone};
+        vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eTopOfPipe};
+        VideoCore::ImageId owner_image_id{};
+        u64 owner_image_uid{};
+        u64 allocation_bytes{};
+        u64 last_used_generation{};
+        u64 last_use_tick{};
+    };
+    std::list<ExecutorPhysicalDrsSurface> executor_physical_drs_surfaces;
+    std::list<ExecutorPhysicalDrsDepthSurface> executor_physical_drs_depth_surfaces;
+    std::array<ExecutorPhysicalDrsSurface*, AmdGpu::NUM_COLOR_BUFFERS>
+        executor_physical_drs_color_surfaces{};
+    std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS>
+        executor_physical_drs_color_image_ids{};
+    std::array<u64, AmdGpu::NUM_COLOR_BUFFERS>
+        executor_physical_drs_color_image_uids{};
+    std::array<VAddr, AmdGpu::NUM_COLOR_BUFFERS>
+        executor_physical_drs_color_guest_addresses{};
+    u32 executor_physical_drs_color_mask{};
+    ExecutorPhysicalDrsSurface* executor_physical_drs_surface{};
+    ExecutorPhysicalDrsDepthSurface* executor_physical_drs_depth_surface{};
+    VideoCore::ImageId executor_physical_drs_image_id{};
+    u64 executor_physical_drs_image_uid{};
+    VideoCore::ImageId executor_physical_drs_depth_image_id{};
+    u64 executor_physical_drs_depth_image_uid{};
+    VAddr executor_physical_drs_guest_address{};
+    VAddr executor_physical_drs_depth_guest_address{};
+    u32 executor_physical_drs_scale_percent{100};
+    bool executor_physical_drs_active{};
+    bool executor_physical_drs_draw_active{};
+    ExecutorPhysicalDrsSurface* executor_physical_drs_present_surface{};
+    VideoCore::ImageId executor_physical_drs_present_image_id{};
+    u64 executor_physical_drs_present_image_uid{};
+    u64 executor_physical_drs_generation{};
+    u64 executor_physical_drs_resident_bytes{};
+    u64 executor_physical_drs_peak_bytes{};
+    u64 executor_physical_drs_budget_bytes{};
+    u64 executor_physical_drs_gc_passes{};
+    u64 executor_physical_drs_gc_evictions{};
+    u64 executor_physical_drs_gc_blocked{};
+    bool executor_physical_drs_building{};
+    bool executor_physical_drs_off_cleanup_scheduled{};
+    bool executor_physical_drs_shutting_down{};
+    // Resolve/admission/scheduling are one state transaction and deliberately
+    // nest their locked helpers.
+    std::recursive_mutex executor_physical_drs_mutex;
+    std::shared_ptr<ExecutorPhysicalDrsCleanupControl>
+        executor_physical_drs_cleanup_control;
 #endif
     bool fault_process_pending{};
     bool attachment_feedback_loop{};

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -58,6 +59,8 @@ struct UniqueBuffer {
 
     void Create(const vk::BufferCreateInfo& image_ci, MemoryUsage usage,
                 VmaAllocationInfo* out_alloc_info);
+    [[nodiscard]] bool TryCreate(const vk::BufferCreateInfo& image_ci, MemoryUsage usage,
+                                 VmaAllocationInfo* out_alloc_info) noexcept;
 
     operator vk::Buffer() const {
         return buffer;
@@ -75,6 +78,9 @@ public:
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                     MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
                     u64 size_bytes_);
+    Buffer(std::nothrow_t, const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+           MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
+           u64 size_bytes_) noexcept;
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
@@ -105,6 +111,12 @@ public:
     size_t SizeBytes() const {
         return size_bytes;
     }
+
+    [[nodiscard]] bool IsValid() const noexcept {
+        return static_cast<bool>(buffer.buffer);
+    }
+
+    void InvalidateMappedRange(u64 offset, u64 size) const noexcept;
 
     void SetLRUId(u64 id) noexcept {
         lru_id = id;

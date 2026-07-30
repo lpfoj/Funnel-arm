@@ -19,8 +19,11 @@ layout(std430, binding = 1) buffer output_buf32 {
 
 void main() {
     const uint id = gl_GlobalInvocationID.x;
-    uint word = fault_buffer[id];
-    fault_buffer[id] = 0u;
+    if (id >= FAULT_WORDS) {
+        return;
+    }
+
+    uint word = atomicExchange(fault_buffer[id], 0u);
     const uint base_bit = id * 32u;
     while (word != 0u) {
         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
@@ -28,7 +31,7 @@ void main() {
             return;
         }
         const uint bit = findLSB(word);
-        word &= word - 1;
+        word &= word - 1u;
         const uint page = base_bit + bit;
         download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
     }

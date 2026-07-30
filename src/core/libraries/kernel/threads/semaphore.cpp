@@ -1102,9 +1102,21 @@ static void TraceLiveUnityGfxSemContext(const char* op, PthreadSem** sem) {
 
 static void TraceLivePosixSem(const char* op, PthreadSem** sem, PthreadSem* native, s32 before,
                               s32 after, s32 ret) {
-    UpdateLivePosixSemRecord(op, sem, native, before, after, ret);
-    TraceLiveUnityGfxSemContext(op, sem);
+    const bool record_enabled = ShouldRecordPosixSemFrontier();
+    const bool trace_enabled = ShouldTraceLiveSync();
     const bool direct_sem = ShouldTraceLiveDirectPosixSem(sem);
+    if (!record_enabled && !trace_enabled && !direct_sem) {
+        return;
+    }
+    if (record_enabled) {
+        UpdateLivePosixSemRecord(op, sem, native, before, after, ret);
+    }
+    if (!trace_enabled && !direct_sem) {
+        return;
+    }
+    if (trace_enabled) {
+        TraceLiveUnityGfxSemContext(op, sem);
+    }
     const bool interesting = IsCurrentLiveInterestingThread();
     if (ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_RENDER_THREAD_ONLY") && g_curthread &&
         !interesting && !direct_sem && IsLiveKnownNoisyThreadName(g_curthread->name)) {
@@ -1130,6 +1142,9 @@ static void TraceLivePosixSem(const char* op, PthreadSem** sem, PthreadSem* nati
 
 static void TraceLivePosixSemDuration(const char* op, PthreadSem** sem, PthreadSem* native,
                                       s32 ret, long long elapsed_us) {
+    if (!ShouldTraceLiveSync() && !ShouldTraceLiveDirectPosixSem(sem)) {
+        return;
+    }
     if (elapsed_us >= 1000) {
         TraceLiveUnityGfxSemContext(op, sem);
     }
@@ -1233,7 +1248,17 @@ static std::shared_ptr<std::atomic_bool> BeginLivePosixSemWaitWatch(PthreadSem**
 static void TraceLiveKernelSem(const char* op, Common::SlotId sem, const OrbisSem* native,
                                s32 before, s32 after, s32 count, const u32* timeout, s32 ret,
                                const char* name = nullptr) {
-    UpdateLiveKernelSemRecord(op, sem, native, before, after, count, ret, name);
+    const bool record_enabled = ShouldRecordKernelSemFrontier();
+    const bool trace_enabled = ShouldTraceLiveSync();
+    if (!record_enabled && !trace_enabled) {
+        return;
+    }
+    if (record_enabled) {
+        UpdateLiveKernelSemRecord(op, sem, native, before, after, count, ret, name);
+    }
+    if (!trace_enabled) {
+        return;
+    }
     const bool interesting = IsCurrentLiveInterestingThread();
     if (ExecutorEnvFlag("EXECUTOR_LIGHT_ORACLE") && g_curthread &&
         IsLiveKnownNoisyThreadName(g_curthread->name)) {
@@ -1296,6 +1321,9 @@ static std::shared_ptr<std::atomic_bool> BeginLiveKernelSemWaitWatch(Common::Slo
 
 static void TraceLiveKernelSemDuration(Common::SlotId sem, const OrbisSem* native, s32 ret,
                                        long long elapsed_us, const u32* timeout) {
+    if (!ShouldTraceLiveSync()) {
+        return;
+    }
     if (ExecutorEnvFlag("EXECUTOR_LIGHT_ORACLE") && g_curthread &&
         IsLiveKnownNoisyThreadName(g_curthread->name)) {
         return;
@@ -1689,7 +1717,11 @@ s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTim
     }
     TraceLiveKernelSem("wait_enter", sem, native, before, before, needCount, pTimeout, ORBIS_OK);
     auto executor_wait_watch = BeginLiveKernelSemWaitWatch(sem, native, before, needCount, pTimeout);
-    const auto executor_wait_start = std::chrono::steady_clock::now();
+    const bool executor_trace_wait_duration = ShouldTraceLiveSync();
+    std::chrono::steady_clock::time_point executor_wait_start{};
+    if (executor_trace_wait_duration) {
+        executor_wait_start = std::chrono::steady_clock::now();
+    }
 #else
     PcOracleKernelSemaLog("wait_enter", sem, native, before, before, needCount, ORBIS_OK);
 #endif
@@ -1700,13 +1732,15 @@ s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTim
         executor_wait_watch->store(true, std::memory_order_release);
     }
     TraceLiveKernelSem("wait_return", sem, native, before, after, needCount, pTimeout, ret);
-    const auto executor_wait_end = std::chrono::steady_clock::now();
-    TraceLiveKernelSemDuration(
-        sem, native, ret,
-        std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
-                                                              executor_wait_start)
-            .count(),
-        pTimeout);
+    if (executor_trace_wait_duration) {
+        const auto executor_wait_end = std::chrono::steady_clock::now();
+        TraceLiveKernelSemDuration(
+            sem, native, ret,
+            std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
+                                                                  executor_wait_start)
+                .count(),
+            pTimeout);
+    }
 #else
     PcOracleKernelSemaLog("wait_return", sem, native, before, after, needCount, ret);
 #endif
@@ -1869,7 +1903,12 @@ s32 PS4_SYSV_ABI posix_sem_wait(PthreadSem** sem) {
 #ifdef __ANDROID__
     TraceLivePosixSem("wait_enter", sem, native, before, before, 0);
     auto executor_wait_watch = BeginLivePosixSemWaitWatch(sem, native, before);
-    const auto executor_wait_start = std::chrono::steady_clock::now();
+    const bool executor_trace_wait_duration =
+        ShouldTraceLiveSync() || ShouldTraceLiveDirectPosixSem(sem);
+    std::chrono::steady_clock::time_point executor_wait_start{};
+    if (executor_trace_wait_duration) {
+        executor_wait_start = std::chrono::steady_clock::now();
+    }
 #else
     const void* pc_oracle_return = __builtin_return_address(0);
     PcOraclePosixSemLog("wait_enter", sem, native, before, before, 0, pc_oracle_return);
@@ -1910,12 +1949,14 @@ s32 PS4_SYSV_ABI posix_sem_wait(PthreadSem** sem) {
     }
     TraceLivePosixSem("wait_return", sem, native, before,
                       native->value.load(std::memory_order_relaxed), 0);
-    const auto executor_wait_end = std::chrono::steady_clock::now();
-    TraceLivePosixSemDuration(
-        "wait", sem, native, 0,
-        std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
-                                                              executor_wait_start)
-            .count());
+    if (executor_trace_wait_duration) {
+        const auto executor_wait_end = std::chrono::steady_clock::now();
+        TraceLivePosixSemDuration(
+            "wait", sem, native, 0,
+            std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
+                                                                  executor_wait_start)
+                .count());
+    }
 #else
     PcOraclePosixSemLog("wait_return", sem, native, before,
                         native->value.load(std::memory_order_relaxed), 0, pc_oracle_return);
@@ -1989,7 +2030,12 @@ s32 PS4_SYSV_ABI posix_sem_timedwait(PthreadSem** sem, const OrbisKernelTimespec
 #ifdef __ANDROID__
     TraceLivePosixSem("timedwait_enter", sem, native, before, before, 0);
     auto executor_wait_watch = BeginLivePosixSemWaitWatch(sem, native, before);
-    const auto executor_wait_start = std::chrono::steady_clock::now();
+    const bool executor_trace_wait_duration =
+        ShouldTraceLiveSync() || ShouldTraceLiveDirectPosixSem(sem);
+    std::chrono::steady_clock::time_point executor_wait_start{};
+    if (executor_trace_wait_duration) {
+        executor_wait_start = std::chrono::steady_clock::now();
+    }
 #else
     const void* pc_oracle_return = __builtin_return_address(0);
     PcOraclePosixSemLog("timedwait_enter", sem, native, before, before, 0, pc_oracle_return);
@@ -2042,12 +2088,14 @@ s32 PS4_SYSV_ABI posix_sem_timedwait(PthreadSem** sem, const OrbisKernelTimespec
             }
             TraceLivePosixSem("timedwait_timeout", sem, native, before,
                               native->value.load(std::memory_order_relaxed), -1);
-            const auto executor_wait_end = std::chrono::steady_clock::now();
-            TraceLivePosixSemDuration(
-                "timedwait_timeout", sem, native, -1,
-                std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
-                                                                      executor_wait_start)
-                    .count());
+            if (executor_trace_wait_duration) {
+                const auto executor_wait_end = std::chrono::steady_clock::now();
+                TraceLivePosixSemDuration(
+                    "timedwait_timeout", sem, native, -1,
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        executor_wait_end - executor_wait_start)
+                        .count());
+            }
 #endif
             return -1;
         }
@@ -2061,12 +2109,14 @@ s32 PS4_SYSV_ABI posix_sem_timedwait(PthreadSem** sem, const OrbisKernelTimespec
     }
     TraceLivePosixSem("timedwait_return", sem, native, before,
                       native->value.load(std::memory_order_relaxed), 0);
-    const auto executor_wait_end = std::chrono::steady_clock::now();
-    TraceLivePosixSemDuration(
-        "timedwait", sem, native, 0,
-        std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
-                                                              executor_wait_start)
-            .count());
+    if (executor_trace_wait_duration) {
+        const auto executor_wait_end = std::chrono::steady_clock::now();
+        TraceLivePosixSemDuration(
+            "timedwait", sem, native, 0,
+            std::chrono::duration_cast<std::chrono::microseconds>(executor_wait_end -
+                                                                  executor_wait_start)
+                .count());
+    }
 #else
     PcOraclePosixSemLog("timedwait_return", sem, native, before,
                         native->value.load(std::memory_order_relaxed), 0, pc_oracle_return);

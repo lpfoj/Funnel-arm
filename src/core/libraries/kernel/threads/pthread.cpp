@@ -1321,6 +1321,8 @@ static void RunAndroidMappedGuestThread(void* arg) {
                                   reinterpret_cast<void*>(curthread->start_routine),
                                   curthread->arg);
     Common::SetCurrentThreadName(curthread->name.c_str());
+    (void)Common::ApplyCurrentThreadAffinity(
+        Common::ThreadAffinityClass::GuestCompute);
     if (trace_guest_thread) {
         __android_log_print(ANDROID_LOG_INFO, ExecutorAndroidLogTag,
                             "[EXECUTOR_GUEST_THREAD_NATIVE] begin thread=%p name=%s start=%p arg=%p",

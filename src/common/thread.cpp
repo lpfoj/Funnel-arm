@@ -3,7 +3,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <ctime>
+#include <fstream>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -13,6 +22,9 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "ntapi.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -37,6 +49,342 @@
 #endif
 
 namespace Common {
+
+#ifdef __ANDROID__
+namespace {
+
+constexpr const char* AndroidThreadAffinityLogTag = "LSX4Native";
+
+struct AndroidCpuTopology {
+    cpu_set_t baseline_allowed{};
+    cpu_set_t prime_cpus{};
+    cpu_set_t performance_cpus{};
+    cpu_set_t latency_cpus{};
+    cpu_set_t graphics_cpus{};
+    cpu_set_t compute_cpus{};
+    std::array<std::uint64_t, CPU_SETSIZE> scores{};
+    const char* score_source{"none"};
+    std::uint64_t minimum_score{};
+    std::uint64_t maximum_score{};
+    int baseline_count{};
+    int performance_count{};
+    int prime_count{};
+    int latency_count{};
+    int graphics_count{};
+    int compute_count{};
+    bool usable{};
+};
+
+AndroidCpuTopology& GetAndroidCpuTopology() {
+    static AndroidCpuTopology topology;
+    return topology;
+}
+
+std::once_flag& GetAndroidCpuTopologyOnceFlag() {
+    static std::once_flag once;
+    return once;
+}
+
+int CountCpus(const cpu_set_t& cpus) {
+    int count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        count += CPU_ISSET(cpu, &cpus) ? 1 : 0;
+    }
+    return count;
+}
+
+std::uint64_t ReadPositiveCpuValue(const int cpu, const char* relative_path) {
+    std::ifstream input{"/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" +
+                        relative_path};
+    std::uint64_t value = 0;
+    input >> value;
+    return input ? value : 0;
+}
+
+bool DiscoverScoreSource(const cpu_set_t& allowed, const char* relative_path,
+                         std::array<std::uint64_t, CPU_SETSIZE>& scores,
+                         std::uint64_t& minimum, std::uint64_t& maximum) {
+    minimum = std::numeric_limits<std::uint64_t>::max();
+    maximum = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        const std::uint64_t value = ReadPositiveCpuValue(cpu, relative_path);
+        if (value == 0) {
+            return false;
+        }
+        scores[static_cast<std::size_t>(cpu)] = value;
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    return minimum != std::numeric_limits<std::uint64_t>::max() && maximum > minimum;
+}
+
+void DiscoverAndroidCpuTopology() {
+    auto& topology = GetAndroidCpuTopology();
+    CPU_ZERO(&topology.baseline_allowed);
+    CPU_ZERO(&topology.prime_cpus);
+    CPU_ZERO(&topology.performance_cpus);
+    CPU_ZERO(&topology.latency_cpus);
+    CPU_ZERO(&topology.graphics_cpus);
+    CPU_ZERO(&topology.compute_cpus);
+
+    if (sched_getaffinity(0, sizeof(topology.baseline_allowed),
+                          &topology.baseline_allowed) != 0) {
+        __android_log_print(ANDROID_LOG_WARN, AndroidThreadAffinityLogTag,
+                            "[EXECUTOR_THREAD_AFFINITY_TOPOLOGY] enabled=0 "
+                            "reason=affinity_read_failed errno=%d",
+                            errno);
+        return;
+    }
+    topology.baseline_count = CountCpus(topology.baseline_allowed);
+    if (topology.baseline_count < 4) {
+        __android_log_print(ANDROID_LOG_INFO, AndroidThreadAffinityLogTag,
+                            "[EXECUTOR_THREAD_AFFINITY_TOPOLOGY] enabled=0 "
+                            "reason=small_allowed_mask allowed=%d",
+                            topology.baseline_count);
+        return;
+    }
+
+    std::array<std::uint64_t, CPU_SETSIZE> candidate_scores{};
+    if (DiscoverScoreSource(topology.baseline_allowed, "cpu_capacity", candidate_scores,
+                            topology.minimum_score, topology.maximum_score)) {
+        topology.score_source = "cpu_capacity";
+        topology.scores = candidate_scores;
+    } else {
+        candidate_scores.fill(0);
+        if (DiscoverScoreSource(topology.baseline_allowed, "cpufreq/cpuinfo_max_freq",
+                                candidate_scores, topology.minimum_score,
+                                topology.maximum_score)) {
+            topology.score_source = "cpuinfo_max_freq";
+            topology.scores = candidate_scores;
+        } else {
+            candidate_scores.fill(0);
+            if (DiscoverScoreSource(topology.baseline_allowed, "cpufreq/scaling_max_freq",
+                                    candidate_scores, topology.minimum_score,
+                                    topology.maximum_score)) {
+                topology.score_source = "scaling_max_freq";
+                topology.scores = candidate_scores;
+            } else {
+                __android_log_print(
+                    ANDROID_LOG_INFO, AndroidThreadAffinityLogTag,
+                    "[EXECUTOR_THREAD_AFFINITY_TOPOLOGY] enabled=0 "
+                    "reason=no_heterogeneous_capacity_data allowed=%d",
+                    topology.baseline_count);
+                return;
+            }
+        }
+    }
+
+    // Treat differences below ten percent as a homogeneous topology. Pinning
+    // such a device only removes scheduler freedom without selecting faster CPUs.
+    if (topology.maximum_score * 100u <= topology.minimum_score * 110u) {
+        __android_log_print(
+            ANDROID_LOG_INFO, AndroidThreadAffinityLogTag,
+            "[EXECUTOR_THREAD_AFFINITY_TOPOLOGY] enabled=0 "
+            "reason=effectively_homogeneous source=%s allowed=%d min=%llu max=%llu",
+            topology.score_source, topology.baseline_count,
+            static_cast<unsigned long long>(topology.minimum_score),
+            static_cast<unsigned long long>(topology.maximum_score));
+        return;
+    }
+
+    const std::uint64_t performance_floor = topology.maximum_score * 4u / 5u;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &topology.baseline_allowed)) {
+            continue;
+        }
+        const auto score = topology.scores[static_cast<std::size_t>(cpu)];
+        if (score >= performance_floor) {
+            CPU_SET(cpu, &topology.prime_cpus);
+            CPU_SET(cpu, &topology.performance_cpus);
+        }
+    }
+
+    topology.prime_count = CountCpus(topology.prime_cpus);
+    topology.performance_count = CountCpus(topology.performance_cpus);
+    // A two-core prime island is too small for the guest main and GPU command
+    // threads together on sustained workloads. Include the next cluster so the
+    // Android scheduler can balance latency-critical work without a hot-spot.
+    if (topology.performance_count <= 2) {
+        std::uint64_t next_cluster_score = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &topology.baseline_allowed)) {
+                continue;
+            }
+            const auto score = topology.scores[static_cast<std::size_t>(cpu)];
+            if (score < topology.maximum_score) {
+                next_cluster_score = std::max(next_cluster_score, score);
+            }
+        }
+        if (next_cluster_score != 0) {
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &topology.baseline_allowed) &&
+                    topology.scores[static_cast<std::size_t>(cpu)] >= next_cluster_score) {
+                    CPU_SET(cpu, &topology.performance_cpus);
+                }
+            }
+            topology.performance_count = CountCpus(topology.performance_cpus);
+        }
+    }
+
+    // Keep the frame-latency guest and GPU command threads off each other's
+    // CPU. Heavy Android emulators otherwise concentrate both, plus inherited
+    // guest workers, on the same small prime island. Pick the two strongest
+    // allowed CPUs deterministically and leave the remaining CPUs to audio,
+    // physics and other guest workers.
+    int latency_cpu = -1;
+    int graphics_cpu = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &topology.baseline_allowed)) {
+            continue;
+        }
+        if (latency_cpu < 0 ||
+            topology.scores[static_cast<std::size_t>(cpu)] >
+                topology.scores[static_cast<std::size_t>(latency_cpu)] ||
+            (topology.scores[static_cast<std::size_t>(cpu)] ==
+                 topology.scores[static_cast<std::size_t>(latency_cpu)] &&
+             cpu > latency_cpu)) {
+            latency_cpu = cpu;
+        }
+    }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (cpu == latency_cpu || !CPU_ISSET(cpu, &topology.baseline_allowed)) {
+            continue;
+        }
+        if (graphics_cpu < 0 ||
+            topology.scores[static_cast<std::size_t>(cpu)] >
+                topology.scores[static_cast<std::size_t>(graphics_cpu)] ||
+            (topology.scores[static_cast<std::size_t>(cpu)] ==
+                 topology.scores[static_cast<std::size_t>(graphics_cpu)] &&
+             cpu > graphics_cpu)) {
+            graphics_cpu = cpu;
+        }
+    }
+    if (latency_cpu >= 0) {
+        CPU_SET(latency_cpu, &topology.latency_cpus);
+    }
+    if (graphics_cpu >= 0) {
+        CPU_SET(graphics_cpu, &topology.graphics_cpus);
+    }
+    topology.latency_count = CountCpus(topology.latency_cpus);
+    topology.graphics_count = CountCpus(topology.graphics_cpus);
+
+    topology.compute_cpus = topology.baseline_allowed;
+    if (topology.baseline_count >= 6) {
+        if (latency_cpu >= 0) {
+            CPU_CLR(latency_cpu, &topology.compute_cpus);
+        }
+        if (graphics_cpu >= 0) {
+            CPU_CLR(graphics_cpu, &topology.compute_cpus);
+        }
+    }
+    topology.compute_count = topology.baseline_count;
+    topology.compute_count = CountCpus(topology.compute_cpus);
+    topology.usable = topology.latency_count == 1 &&
+                      topology.graphics_count == 1 &&
+                      topology.compute_count >= 2;
+    __android_log_print(
+        topology.usable ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+        AndroidThreadAffinityLogTag,
+        "[EXECUTOR_THREAD_AFFINITY_TOPOLOGY] enabled=%d source=%s allowed=%d "
+        "prime=%d performance=%d latency=%d graphics=%d compute=%d "
+        "latencyCpu=%d graphicsCpu=%d min=%llu max=%llu",
+        topology.usable ? 1 : 0, topology.score_source, topology.baseline_count,
+        topology.prime_count, topology.performance_count, topology.latency_count,
+        topology.graphics_count, topology.compute_count, latency_cpu, graphics_cpu,
+        static_cast<unsigned long long>(topology.minimum_score),
+        static_cast<unsigned long long>(topology.maximum_score));
+}
+
+const char* ThreadAffinityClassName(const ThreadAffinityClass affinity_class) {
+    switch (affinity_class) {
+    case ThreadAffinityClass::LatencyPerformance:
+        return "latency_performance";
+    case ThreadAffinityClass::GuestCompute:
+        return "guest_compute";
+    case ThreadAffinityClass::GraphicsDriver:
+        return "graphics_driver";
+    }
+    return "unknown";
+}
+
+} // namespace
+#endif
+
+void InitializeAndroidThreadAffinity() {
+#ifdef __ANDROID__
+    std::call_once(GetAndroidCpuTopologyOnceFlag(), DiscoverAndroidCpuTopology);
+#endif
+}
+
+bool ApplyCurrentThreadAffinity(const ThreadAffinityClass affinity_class) {
+#ifdef __ANDROID__
+    InitializeAndroidThreadAffinity();
+    const auto& topology = GetAndroidCpuTopology();
+    if (!topology.usable) {
+        return false;
+    }
+
+    cpu_set_t current_allowed;
+    CPU_ZERO(&current_allowed);
+    if (sched_getaffinity(0, sizeof(current_allowed), &current_allowed) != 0) {
+        return false;
+    }
+    const int current_count = CountCpus(current_allowed);
+
+    const cpu_set_t& role_cpus = [&]() -> const cpu_set_t& {
+        switch (affinity_class) {
+        case ThreadAffinityClass::LatencyPerformance:
+            return topology.latency_cpus;
+        case ThreadAffinityClass::GuestCompute:
+            return topology.compute_cpus;
+        case ThreadAffinityClass::GraphicsDriver:
+            return topology.graphics_cpus;
+        }
+        return topology.baseline_allowed;
+    }();
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &topology.baseline_allowed) &&
+            CPU_ISSET(cpu, &role_cpus)) {
+            CPU_SET(cpu, &requested);
+        }
+    }
+    const int requested_count = CountCpus(requested);
+    if (requested_count == 0) {
+        return false;
+    }
+
+    const int result = sched_setaffinity(0, sizeof(requested), &requested);
+    const int saved_errno = result == 0 ? 0 : errno;
+    cpu_set_t actual;
+    CPU_ZERO(&actual);
+    const int actual_count =
+        result == 0 && sched_getaffinity(0, sizeof(actual), &actual) == 0
+            ? CountCpus(actual)
+            : 0;
+
+    static std::array<std::atomic_uint32_t, 3> log_counts{};
+    const auto role_index = static_cast<std::size_t>(affinity_class);
+    if (role_index < log_counts.size() &&
+        log_counts[role_index].fetch_add(1, std::memory_order_relaxed) < 16) {
+        __android_log_print(
+            result == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+            AndroidThreadAffinityLogTag,
+            "[EXECUTOR_THREAD_AFFINITY] role=%s before=%d requested=%d actual=%d "
+            "result=%d errno=%d",
+            ThreadAffinityClassName(affinity_class), current_count, requested_count,
+            actual_count, result, saved_errno);
+    }
+    return result == 0 && actual_count != 0;
+#else
+    (void)affinity_class;
+    return false;
+#endif
+}
 
 #ifdef __APPLE__
 

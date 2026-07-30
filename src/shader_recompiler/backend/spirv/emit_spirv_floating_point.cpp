@@ -3,11 +3,14 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "video_core/mobile_gpu_optimization.h"
 
 namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
-    ctx.Decorate(op, spv::Decoration::NoContraction);
+    if (!VideoCore::IsManagedMobileGpuOptimization()) {
+        ctx.Decorate(op, spv::Decoration::NoContraction);
+    }
     return op;
 }
 

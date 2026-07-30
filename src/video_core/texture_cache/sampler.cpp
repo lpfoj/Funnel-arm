@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include "common/config.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -15,12 +16,29 @@ namespace VideoCore {
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
                  const AmdGpu::BorderColorBuffer border_color_base) {
     using namespace Vulkan;
-    const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
-                                   (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
-                                    AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
-    const float max_anisotropy =
+    const bool anisotropy_requested = instance.IsAnisotropicFilteringSupported() &&
+                                      (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
+                                       AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
+    const u32 managed_anisotropy = Config::managedMaxAnisotropy();
+    const bool anisotropy_enable =
+        anisotropy_requested && (managed_anisotropy == 0 || managed_anisotropy > 1);
+    float max_anisotropy =
         anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
                           : 1.0f;
+    if (managed_anisotropy > 1) {
+        max_anisotropy = std::min(max_anisotropy, static_cast<float>(managed_anisotropy));
+    }
+#ifdef __ANDROID__
+    if (managed_anisotropy != 0) {
+        static std::atomic_bool logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
+                                "[EXECUTOR_SAMPLER_ANISOTROPY] requested=%d cap=%u effective=%.1f",
+                                anisotropy_requested ? 1 : 0, managed_anisotropy,
+                                max_anisotropy);
+        }
+    }
+#endif
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {

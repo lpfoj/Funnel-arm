@@ -4,11 +4,16 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <map>
 #include <mutex>
 #include <queue>
+#include <span>
 #include <thread>
+#include <vector>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -207,6 +212,9 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+    // One renderer is active per runtime. Keep managed VRS state outside the
+    // DynamicState object so its ABI and all following Scheduler offsets remain stable.
+    inline static vk::Extent2D fragment_shading_rate{1, 1};
     u64 invalidation_epoch{};
 
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
@@ -393,6 +401,14 @@ struct DynamicState {
             dirty_state.feedback_loop_enabled = true;
         }
     }
+
+    void SetFragmentShadingRate(const vk::Extent2D rate) {
+        if (fragment_shading_rate.width != rate.width ||
+            fragment_shading_rate.height != rate.height) {
+            fragment_shading_rate = rate;
+            dirty_state.fragment_shading_rate = true;
+        }
+    }
 };
 
 class Scheduler {
@@ -406,6 +422,41 @@ public:
         TextureProbe,
         Rasterizer,
         PresenterShutdown,
+        Count,
+    };
+
+    enum class EndRenderingReason : u32 {
+        Unknown,
+        BeginStateChange,
+        PipelineResourceBarrier,
+        RasterizerBarrier,
+        RasterizerDraw,
+        RasterizerClear,
+        RasterizerCopy,
+        RasterizerDispatch,
+        ImageUpload,
+        ImageDownload,
+        ImageTransit,
+        TextureCacheRefresh,
+        BufferFill,
+        BufferReadback,
+        BufferCopy,
+        BufferProbe,
+        BufferUpload,
+        FaultCompute,
+        TileCompute,
+        BlitHelper,
+        ShaderHleCopy,
+        Presenter,
+        Flush,
+        Submit,
+        Count,
+    };
+
+    enum class BufferTransferOrigin : u32 {
+        Hle,
+        Upload,
+        GnmDma,
         Count,
     };
 
@@ -426,7 +477,37 @@ public:
 
     void BeginRendering(const RenderState& new_state);
 
-    void EndRendering();
+    void EndRendering(EndRenderingReason reason);
+
+    /// Preserve an active dynamic-rendering scope for a guest completion
+    /// dependency. This is legal only with dynamicRenderingLocalRead and uses
+    /// a graphics-shader-only memory dependency; attachment transitions and
+    /// transfer/compute work continue to use the conservative end-render path.
+    [[nodiscard]] bool TryCompletionBarrierInsideRendering();
+
+    void QueueBufferCopies(vk::Buffer source, vk::Buffer destination,
+                           std::span<const vk::BufferCopy> regions,
+                           VAddr source_guest_address, u64 source_size,
+                           VAddr destination_guest_address, u64 destination_size,
+                           BufferTransferOrigin origin);
+
+    void QueueBufferUploadCopies(vk::Buffer source, vk::Buffer destination,
+                                 std::span<const vk::BufferCopy> regions,
+                                 VAddr destination_guest_address, u64 destination_size);
+
+    void FlushPendingBufferTransfers();
+
+    void FlushPendingBufferTransfersForRange(VAddr guest_address, u64 size);
+
+    void FlushPendingGnmDmaTransfers();
+
+    [[nodiscard]] bool HasPendingBufferTransfers() const noexcept {
+        return !pending_buffer_transfers.empty();
+    }
+
+    [[nodiscard]] u64 PendingBufferTransferRequestEpoch() const noexcept {
+        return pending_buffer_transfer_request_epoch;
+    }
 
     const RenderState& GetRenderState() const {
         return render_state;
@@ -457,17 +538,87 @@ public:
         return command_recording_epoch.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] u64 PipelineBindEpoch(vk::PipelineBindPoint bind_point) const noexcept {
+        return pipeline_bind_epochs[BindPointIndex(bind_point)].load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u64 DescriptorBindEpoch(vk::PipelineBindPoint bind_point) const noexcept {
+        return descriptor_bind_epochs[BindPointIndex(bind_point)].load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u64 PushConstantEpoch(vk::PipelineBindPoint bind_point) const noexcept {
+        return push_constant_epochs[BindPointIndex(bind_point)].load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u64 VertexInputEpoch() const noexcept {
+        return vertex_input_epoch.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u64 VertexBufferBindEpoch() const noexcept {
+        return vertex_buffer_bind_epoch.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] u64 IndexBufferBindEpoch() const noexcept {
+        return index_buffer_bind_epoch.load(std::memory_order_relaxed);
+    }
+
+    u64 MarkPipelineBind(vk::PipelineBindPoint bind_point) noexcept {
+        return pipeline_bind_epochs[BindPointIndex(bind_point)].fetch_add(
+                   1, std::memory_order_relaxed) +
+               1;
+    }
+
+    u64 MarkDescriptorBind(vk::PipelineBindPoint bind_point) noexcept {
+        return descriptor_bind_epochs[BindPointIndex(bind_point)].fetch_add(
+                   1, std::memory_order_relaxed) +
+               1;
+    }
+
+    u64 MarkPushConstants(vk::PipelineBindPoint bind_point) noexcept {
+        return push_constant_epochs[BindPointIndex(bind_point)].fetch_add(
+                   1, std::memory_order_relaxed) +
+               1;
+    }
+
+    u64 MarkVertexInput() noexcept {
+        return vertex_input_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    u64 MarkVertexBufferBind() noexcept {
+        return vertex_buffer_bind_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    u64 MarkIndexBufferBind() noexcept {
+        return index_buffer_bind_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore.CurrentTick();
     }
 
+    [[nodiscard]] u64 KnownGpuTick() const noexcept {
+        return master_semaphore.KnownGpuTick();
+    }
+
     [[nodiscard]] bool HasPendingWork() const noexcept {
         return command_buffer_used ||
+               !pending_buffer_transfers.empty() ||
+#ifdef __ANDROID__
+               pending_submit_count.load(std::memory_order_acquire) != 0 ||
+#endif
                pending_ops_count.load(std::memory_order_acquire) != 0;
     }
 
     [[nodiscard]] bool IsDeviceLost() const noexcept {
         return master_semaphore.IsDeviceLost();
+    }
+
+    [[nodiscard]] bool HasRecordingCommandBuffer() const noexcept {
+        return command_buffer_recording;
+    }
+
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
     }
 
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
@@ -504,6 +655,10 @@ public:
     static std::mutex submit_mutex;
 
 private:
+    static constexpr std::size_t BindPointIndex(vk::PipelineBindPoint bind_point) noexcept {
+        return bind_point == vk::PipelineBindPoint::eCompute ? 1u : 0u;
+    }
+
     enum class ExecutorSubmitKind : u32 {
         FlushInfo,
         FlushPlain,
@@ -516,18 +671,69 @@ private:
 
     void SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
                          ExecutorFinishReason finish_reason = ExecutorFinishReason::Unknown);
+#ifdef __ANDROID__
+    void PendingSubmitThread(std::stop_token stoken);
+    void PublishPendingSubmitBatch();
+    bool SubmitPendingBatchLocked(const vk::SubmitInfo* trailing_submit = nullptr,
+                                  vk::Fence trailing_fence = {},
+                                  u64 trailing_tick = 0,
+                                  bool forced_boundary = false);
+    bool QueueSubmitLocked(vk::ArrayProxy<const vk::SubmitInfo> submits,
+                           vk::Fence fence, std::span<const u64> logical_ticks,
+                           u64 command_buffer_count, bool forced_boundary);
+#endif
 
     void PriorityPendingOpsThread(std::stop_token stoken);
     void RetirementPendingOpsThread(std::stop_token stoken);
 
 private:
+    struct PendingBufferTransfer {
+        vk::Buffer source;
+        vk::Buffer destination;
+        boost::container::small_vector<vk::BufferCopy, 8> regions;
+        VAddr source_begin{};
+        VAddr source_end{};
+        VAddr destination_begin{};
+        VAddr destination_end{};
+        vk::DeviceSize source_offset_begin{};
+        vk::DeviceSize source_offset_end{};
+        vk::DeviceSize destination_offset_begin{};
+        vk::DeviceSize destination_offset_end{};
+        bool dependency_barrier_before{};
+    };
+
     const Instance& instance;
     MasterSemaphore master_semaphore;
     mutable bool command_buffer_used{};
+    bool command_buffer_recording{};
     mutable std::atomic<u64> command_recording_epoch{};
+    // Command-state epochs belong to this command stream. Presenter owns
+    // separate draw/present/flip schedulers, so sharing these epochs across
+    // instances can incorrectly reuse state recorded into another buffer.
+    std::array<std::atomic<u64>, 2> pipeline_bind_epochs{};
+    std::array<std::atomic<u64>, 2> descriptor_bind_epochs{};
+    std::array<std::atomic<u64>, 2> push_constant_epochs{};
+    std::atomic<u64> vertex_input_epoch{};
+    std::atomic<u64> vertex_buffer_bind_epoch{};
+    std::atomic<u64> index_buffer_bind_epoch{};
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+#ifdef __ANDROID__
+    // Only internal, synchronization-free FlushPlain packets enter this batch.
+    // FlushInfo/fence/wait/Finish packets remain publication boundaries and are
+    // appended as a distinct VkSubmitInfo in the same vkQueueSubmit call.
+    // A batch must never cross Scheduler instances: each instance owns a
+    // different timeline semaphore and command pool.
+    boost::container::small_vector<vk::CommandBuffer, 8>
+        pending_submit_command_buffers;
+    boost::container::small_vector<u64, 8> pending_submit_ticks;
+    std::chrono::steady_clock::time_point pending_submit_deadline{};
+    std::atomic<u32> pending_submit_count{};
+    std::atomic<u64> pending_submit_last_tick{};
+    std::condition_variable_any pending_submit_cv;
+    std::jthread pending_submit_thread;
+#endif
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
@@ -543,10 +749,18 @@ private:
     std::jthread priority_pending_ops_thread;
     std::map<u64, std::queue<PendingOp>> retirement_pending_ops;
     std::map<u64, u64> retirement_outstanding_ops;
+    std::atomic<u64> retirement_outstanding_count{};
     std::mutex retirement_pending_ops_mutex;
     std::condition_variable_any retirement_pending_ops_cv;
     std::jthread retirement_pending_ops_thread;
     std::atomic<u64> retirement_completed_tick{};
+    std::vector<PendingBufferTransfer> pending_buffer_transfers;
+    u64 pending_buffer_transfer_requests{};
+    u64 pending_buffer_transfer_request_epoch{};
+    u64 pending_buffer_transfer_regions{};
+    u64 pending_gnm_dma_transfers{};
+    u32 pending_buffer_transfer_origins{};
+    bool flushing_buffer_transfers{};
 #ifdef __ANDROID__
     std::array<u64, static_cast<std::size_t>(ExecutorSubmitKind::Count)>
         executor_submit_kind_counts{};
@@ -560,6 +774,26 @@ private:
         executor_finish_wait_max_ns{};
     u64 executor_finish_wait_total{};
     u64 executor_submit_kind_total{};
+    inline static u64 executor_buffer_transfers_queued{};
+    inline static u64 executor_buffer_transfer_regions_queued{};
+    inline static u64 executor_buffer_transfer_flushes{};
+    inline static u64 executor_buffer_transfer_copy_calls{};
+    inline static u64 executor_buffer_transfer_copy_regions_emitted{};
+    inline static u64 executor_buffer_transfer_barriers_requested{};
+    inline static u64 executor_buffer_transfer_barriers_emitted{};
+    inline static u64 executor_buffer_transfer_max_queued{};
+    inline static u64 executor_buffer_transfer_dependency_barriers{};
+    inline static u64 executor_hle_buffer_transfers_queued{};
+    inline static u64 executor_buffer_uploads_queued{};
+    inline static u64 executor_gnm_dma_transfers_queued{};
+    inline static u64 executor_gnm_dma_regions_queued{};
+    inline static u64 executor_submit_batches{};
+    inline static u64 executor_submit_logical_packets{};
+    inline static u64 executor_submit_command_buffers{};
+    inline static u64 executor_submit_calls_saved{};
+    inline static u64 executor_submit_forced_boundaries{};
+    inline static u64 executor_submit_timer_flushes{};
+    inline static u64 executor_submit_max_batch{};
 #endif
     RenderState render_state;
     u64 rendering_epoch{};

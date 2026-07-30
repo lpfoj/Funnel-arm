@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include <array>
+#include <memory>
+
+#include "common/types.h"
+
 namespace Libraries::AudioOut {
 
 struct PortOut;
@@ -12,6 +17,7 @@ public:
     virtual ~PortBackend() = default;
 
     virtual void Output(void* ptr) = 0;
+    virtual void OutputFloat(const float* ptr, u32 frames, u32 channels) = 0;
 
     virtual void SetVolume(const std::array<int, 8>& ch_volumes) = 0;
 };
@@ -29,4 +35,4 @@ public:
     std::unique_ptr<PortBackend> Open(PortOut& port) override;
 };
 
-}
+} // namespace Libraries::AudioOut

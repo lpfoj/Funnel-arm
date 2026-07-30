@@ -82,8 +82,16 @@ UniqueImage::~UniqueImage() {
 }
 
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+    const vk::Result result = TryCreate(image_ci);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed allocating image with error {}",
+               vk::to_string(result));
+}
+
+vk::Result UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) noexcept {
     this->image_ci = image_ci;
-    ASSERT(!image);
+    if (image || allocator == VK_NULL_HANDLE) {
+        return vk::Result::eErrorInitializationFailed;
+    }
     const VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -95,11 +103,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
-                                     &allocation, nullptr);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
-               vk::to_string(vk::Result{result}));
+    VmaAllocation unsafe_allocation{};
+    const VkResult result =
+        vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
+                       &unsafe_allocation, nullptr);
+    if (result != VK_SUCCESS) {
+        return vk::Result{result};
+    }
     image = vk::Image{unsafe_image};
+    allocation = unsafe_allocation;
+    return vk::Result::eSuccess;
 }
 
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -306,6 +319,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 
 void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                     std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf) {
+    scheduler->FlushPendingBufferTransfersForRange(info.guest_address,
+                                                   info.guest_size);
     const vk::PipelineStageFlags2 dst_pl_stage =
         (dst_mask == vk::AccessFlagBits2::eTransferRead ||
          dst_mask == vk::AccessFlagBits2::eTransferWrite)
@@ -318,7 +333,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
     }
 
     if (!cmdbuf) {
-        scheduler->EndRendering();
+        scheduler->EndRendering(Scheduler::EndRenderingReason::ImageTransit);
         cmdbuf = scheduler->CommandBuffer();
     }
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -330,7 +345,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
 void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
                    u64 offset) {
     SetBackingSamples(info.num_samples, false);
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::ImageUpload);
 
     const vk::BufferMemoryBarrier2 pre_barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -376,7 +391,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
 void Image::Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                      u64 offset, u64 download_size) {
     SetBackingSamples(info.num_samples);
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::ImageDownload);
 
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -538,7 +553,7 @@ void Image::CopyImage(Image& src_image) {
         regions.push_back(region);
     }
 
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
 
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
 
@@ -604,7 +619,7 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
         .size = VK_WHOLE_SIZE,
     };
 
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
 
@@ -665,7 +680,7 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
     SetBackingSamples(info.num_samples);
     src_image.SetBackingSamples(src_info.num_samples);
 
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
 
@@ -679,7 +694,7 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
 void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
                     const VideoCore::SubresourceRange& mrt1_range) {
     SetBackingSamples(1, false);
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
 
     src_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
                       mrt0_range);
@@ -742,7 +757,7 @@ void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::Subresourc
         .baseArrayLayer = range.base.layer,
         .layerCount = range.extent.layers,
     };
-    scheduler->EndRendering();
+    scheduler->EndRendering(Scheduler::EndRenderingReason::RasterizerClear);
     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
     const auto cmdbuf = scheduler->CommandBuffer();
     cmdbuf.clearColorImage(GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
@@ -776,7 +791,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
     }
 
     if (copy_backing) {
-        scheduler->EndRendering();
+        scheduler->EndRendering(Scheduler::EndRenderingReason::RasterizerCopy);
         ASSERT(info.resources.levels == 1 && info.resources.layers == 1);
 
         auto barriers =
