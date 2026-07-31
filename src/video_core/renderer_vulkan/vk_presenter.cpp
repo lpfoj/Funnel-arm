@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image.h"
+#include "executor/android_performance_hint.h"
 
 #include <atomic>
 #include <chrono>
@@ -58,6 +59,7 @@ static void ExecutorLiveDirectPresentStats(bool present_ok, u32 src_width, u32 s
     if (present_ok) {
         ++ok;
         g_executor_live_present_count.fetch_add(1, std::memory_order_relaxed);
+        Executor::AndroidPerformanceHint::ReportFramePresented();
     } else {
         ++fail;
     }
@@ -1163,6 +1165,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         }
     } else {
         g_executor_live_present_count.fetch_add(1, std::memory_order_relaxed);
+        Executor::AndroidPerformanceHint::ReportFramePresented();
     }
 
     free_frame();

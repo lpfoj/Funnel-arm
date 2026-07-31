@@ -62,6 +62,11 @@ bool ExecutorReadOnlyRenameEnabled() {
 }
 
 bool ExecutorReadOnlyRenameUsageEnabled(const BufferCache::ReadOnlyBufferUsage usage) {
+    if (usage == BufferCache::ReadOnlyBufferUsage::Uniform ||
+        usage == BufferCache::ReadOnlyBufferUsage::Storage) {
+        return false;
+    }
+
     constexpr std::array<const char*, static_cast<std::size_t>(
                                           BufferCache::ReadOnlyBufferUsage::Count)>
         DisableMarkers{
@@ -338,6 +343,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
 }
 
 #ifdef __ANDROID__
+void BufferCache::ResolvePendingReadback(VAddr device_addr, u64 size) {
+    WaitForPendingReadback(device_addr, size);
+}
+
 void BufferCache::WaitForPendingReadback(VAddr device_addr, u64 size) {
     if (size == 0 || device_addr > std::numeric_limits<VAddr>::max() - size) {
         return;

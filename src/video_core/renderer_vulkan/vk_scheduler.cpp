@@ -19,6 +19,7 @@
 #ifdef __ANDROID__
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <android/log.h>
 #endif
@@ -124,7 +125,7 @@ struct ExecutorVkProbeTrace {
     u64 post_operations{};
 };
 
-constexpr u64 ExecutorVkJournalCapacity = 128;
+constexpr u64 ExecutorVkJournalCapacity = 1024;
 std::array<ExecutorVkJournalEntry, ExecutorVkJournalCapacity> executor_vk_journal{};
 std::atomic<u64> executor_vk_journal_sequence{0};
 std::atomic<bool> executor_vk_forced_session{false};
@@ -166,15 +167,15 @@ void ExecutorVkProbeRecord(const ExecutorVkJournalEntry& entry, u64 sequence) no
 void ExecutorVkFrameRecord(const ExecutorVkJournalEntry& entry, u64 sequence) noexcept;
 
 bool ExecutorVkJournalRecordEnabled(bool force_record) noexcept {
-    if (Config::managedGpuFastPath()) {
-        return false;
-    }
+    static const bool persistent_journal =
+        std::getenv("EXECUTOR_VK_JOURNAL") != nullptr;
     if (force_record) {
         executor_vk_forced_session.store(true, std::memory_order_release);
         return true;
     }
-    static const bool persistent_journal =
-        std::getenv("EXECUTOR_VK_JOURNAL") != nullptr;
+    if (Config::managedGpuFastPath() && !persistent_journal) {
+        return false;
+    }
     return persistent_journal ||
            executor_vk_forced_session.load(std::memory_order_acquire) ||
            executor_vk_frame_capture_active.load(std::memory_order_acquire);
@@ -499,6 +500,10 @@ void ExecutorVkProbeDumpAtSubmit(const void* stream, u64 tick, vk::Result result
 
 }
 
+bool ExecutorVkJournalRequested() noexcept {
+    return std::getenv("EXECUTOR_VK_JOURNAL") != nullptr;
+}
+
 u64 ExecutorVkJournalGraphicsDraw(const void* stream, u64 tick, u64 pipeline_key_hash,
                                   u64 pipeline_handle, u64 vs_hash, u64 ps_hash,
                                   ExecutorVkJournalDrawType draw_type, u32 primitive_type,
@@ -767,8 +772,21 @@ void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept {
     }
 
     const u64 newest = executor_vk_journal_sequence.load(std::memory_order_acquire);
-    constexpr u64 DumpEntries = 32;
+    constexpr u64 DumpEntries = ExecutorVkJournalCapacity;
     const u64 oldest = newest > DumpEntries ? newest - DumpEntries + 1 : 1;
+    std::FILE* journal_file{};
+    if (const char* path = std::getenv("EXECUTOR_VK_JOURNAL_FILE");
+        path != nullptr && path[0] != '\0') {
+        journal_file = std::fopen(path, "w");
+        if (journal_file != nullptr) {
+            std::fprintf(journal_file,
+                         "reason=%s failingTick=%llu oldest=%llu newest=%llu\n",
+                         reason ? reason : "unknown",
+                         static_cast<unsigned long long>(failing_tick),
+                         static_cast<unsigned long long>(oldest),
+                         static_cast<unsigned long long>(newest));
+        }
+    }
     __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
                         "[EXECUTOR_VK_JOURNAL_BEGIN] reason=%s failingTick=%llu oldest=%llu "
                         "newest=%llu",
@@ -780,6 +798,34 @@ void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept {
         const auto& entry = executor_vk_journal[(sequence - 1) % ExecutorVkJournalCapacity];
         if (entry.sequence.load(std::memory_order_acquire) != sequence) {
             continue;
+        }
+        if (journal_file != nullptr) {
+            std::fprintf(
+                journal_file,
+                "seq=%llu op=%u stream=0x%llx tick=%llu result=%d variant=%u prim=%u "
+                "key=0x%llx pipe=0x%llx vs=0x%llx ps=0x%llx cs=0x%llx "
+                "elements=%u instances=%u maxDraws=%u stride=%u "
+                "addr0=0x%llx addr1=0x%llx attach=0x%llx cb0=0x%llx db=0x%llx "
+                "colors=%u extent=%ux%u colorFmt=%u depthFmt=%u "
+                "writes=%u buffers=%u images=%u\n",
+                static_cast<unsigned long long>(sequence), static_cast<u32>(entry.op),
+                static_cast<unsigned long long>(entry.stream_id),
+                static_cast<unsigned long long>(entry.tick), entry.result, entry.op_variant,
+                entry.primitive_type,
+                static_cast<unsigned long long>(entry.pipeline_key_hash),
+                static_cast<unsigned long long>(entry.pipeline_handle),
+                static_cast<unsigned long long>(entry.vs_hash),
+                static_cast<unsigned long long>(entry.ps_hash),
+                static_cast<unsigned long long>(entry.cs_hash), entry.element_count,
+                entry.instance_count, entry.max_draw_count, entry.stride,
+                static_cast<unsigned long long>(entry.address0),
+                static_cast<unsigned long long>(entry.address1),
+                static_cast<unsigned long long>(entry.attachment_signature),
+                static_cast<unsigned long long>(entry.color_address),
+                static_cast<unsigned long long>(entry.depth_address),
+                entry.color_attachment_count, entry.color_width, entry.color_height,
+                entry.color_format, entry.depth_format, entry.descriptor_writes,
+                entry.buffer_descriptors, entry.image_descriptors);
         }
         if (entry.op == ExecutorVkJournalOp::GraphicsDraw) {
             __android_log_print(
@@ -836,6 +882,9 @@ void ExecutorVkJournalDump(const char* reason, u64 failing_tick) noexcept {
     __android_log_print(ANDROID_LOG_ERROR, "LSX4Native",
                         "[EXECUTOR_VK_JOURNAL_END] newest=%llu",
                         static_cast<unsigned long long>(newest));
+    if (journal_file != nullptr) {
+        std::fclose(journal_file);
+    }
 }
 #endif
 
@@ -1431,9 +1480,8 @@ void Scheduler::QueueBufferCopies(const vk::Buffer source, const vk::Buffer dest
         break;
     }
 #endif
-    if (!VideoCore::IsManagedVulkanTransferCoalescing()) {
-        // A/B baseline: materialize every request immediately with the
-        // conservative barrier path so no transfer calls are coalesced.
+    if (!VideoCore::IsManagedVulkanTransferCoalescing() ||
+        origin == BufferTransferOrigin::Upload) {
         FlushPendingBufferTransfers();
     }
 }
@@ -1873,7 +1921,8 @@ bool Scheduler::QueueSubmitLocked(
     const bool forced_boundary) {
     ASSERT(!logical_ticks.empty());
 
-    const bool executor_diagnostics_enabled = !Config::managedGpuFastPath();
+    const bool executor_diagnostics_enabled =
+        !Config::managedGpuFastPath() || ExecutorVkJournalRequested();
     if (executor_diagnostics_enabled) {
         for (const u64 tick : logical_ticks) {
             ExecutorVkJournalSubmit(this, tick, false, vk::Result::eSuccess);

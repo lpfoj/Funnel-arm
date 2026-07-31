@@ -680,7 +680,8 @@ struct PageManager::Impl {
         }
         const VAddr page_begin = Common::AlignDown(address, PAGE_SIZE);
         const VAddr page_limit = Common::AlignUp(address + bounded_size, PAGE_SIZE);
-        rasterizer->InvalidateMemory(page_begin, page_limit - page_begin);
+        rasterizer->InvalidateMemoryFromGuestThread(
+            page_begin, page_limit - page_begin);
         ReleaseDeferredWriteProtectionRange(page_begin, page_limit - page_begin);
     }
 
@@ -695,7 +696,7 @@ struct PageManager::Impl {
             ++page;
         }
         if (page != page_end) {
-            rasterizer->ReadMemory(address, bounded_size);
+            rasterizer->ReadMemoryFromGuestThread(address, bounded_size);
         }
     }
 

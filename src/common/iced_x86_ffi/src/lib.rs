@@ -125,6 +125,8 @@ pub struct X86DecodedInstruction {
     operand_width: u8,
     operand_count: u8,
     operand_count_visible: u8,
+    implicit_gpr_read_mask: u16,
+    implicit_gpr_write_mask: u16,
     bytes: [u8; 15],
 }
 
@@ -133,6 +135,28 @@ fn access_mask(access: OpAccess) -> u8 {
         OpAccess::Read | OpAccess::CondRead => ACTION_READ,
         OpAccess::Write | OpAccess::CondWrite => ACTION_WRITE,
         OpAccess::ReadWrite | OpAccess::ReadCondWrite => ACTION_READ | ACTION_WRITE,
+        _ => 0,
+    }
+}
+
+fn guest_gpr_mask(register: Register) -> u16 {
+    match register.full_register() {
+        Register::RAX => 1 << 0,
+        Register::RCX => 1 << 1,
+        Register::RDX => 1 << 2,
+        Register::RBX => 1 << 3,
+        Register::RSP => 1 << 4,
+        Register::RBP => 1 << 5,
+        Register::RSI => 1 << 6,
+        Register::RDI => 1 << 7,
+        Register::R8 => 1 << 8,
+        Register::R9 => 1 << 9,
+        Register::R10 => 1 << 10,
+        Register::R11 => 1 << 11,
+        Register::R12 => 1 << 12,
+        Register::R13 => 1 << 13,
+        Register::R14 => 1 << 14,
+        Register::R15 => 1 << 15,
         _ => 0,
     }
 }
@@ -431,6 +455,63 @@ pub unsafe extern "C" fn lsx_iced_decode(
     bytes_copy[..instruction.len()].copy_from_slice(&bytes[..instruction.len()]);
     let operand_start = public_operand_start(&instruction);
     let op_count = instruction.op_count().saturating_sub(operand_start).min(5);
+    let mut info_factory = InstructionInfoFactory::new();
+    let info = info_factory.info(&instruction);
+    let mut public_operands = [X86DecodedOperand::default(); 5];
+    let public_count = op_count as usize;
+    let mut explicit_gpr_read_mask = 0u16;
+    let mut explicit_gpr_write_mask = 0u16;
+    for (index, operand) in public_operands[..public_count].iter_mut().enumerate() {
+        let source_index = index as u32 + operand_start;
+        *operand = fill_operand(
+            &instruction,
+            source_index,
+            info.op_access(source_index),
+            constants.displacement_offset() as u8,
+            constants.displacement_size() as u8,
+            constants.immediate_offset() as u8,
+            constants.immediate_size() as u8,
+            constants.immediate_offset2() as u8,
+            constants.immediate_size2() as u8,
+        );
+        operand.id = index as u8;
+        match operand.operand_type {
+            OPERAND_REGISTER => {
+                let mask = guest_gpr_mask(
+                    Register::try_from(unsafe { operand.value.reg.value } as usize)
+                        .unwrap_or(Register::None),
+                );
+                if operand.actions & ACTION_READ != 0 {
+                    explicit_gpr_read_mask |= mask;
+                }
+                if operand.actions & ACTION_WRITE != 0 {
+                    explicit_gpr_write_mask |= mask;
+                }
+            }
+            OPERAND_MEMORY => {
+                let memory = unsafe { operand.value.mem };
+                explicit_gpr_read_mask |= guest_gpr_mask(
+                    Register::try_from(memory.base as usize).unwrap_or(Register::None),
+                );
+                explicit_gpr_read_mask |= guest_gpr_mask(
+                    Register::try_from(memory.index as usize).unwrap_or(Register::None),
+                );
+            }
+            _ => {}
+        }
+    }
+    let mut used_gpr_read_mask = 0u16;
+    let mut used_gpr_write_mask = 0u16;
+    for used in info.used_registers() {
+        let mask = guest_gpr_mask(used.register());
+        let actions = access_mask(used.access());
+        if actions & ACTION_READ != 0 {
+            used_gpr_read_mask |= mask;
+        }
+        if actions & ACTION_WRITE != 0 {
+            used_gpr_write_mask |= mask;
+        }
+    }
     ptr::write(
         instruction_out,
         X86DecodedInstruction {
@@ -450,6 +531,8 @@ pub unsafe extern "C" fn lsx_iced_decode(
             operand_width: operand_width(&instruction),
             operand_count: op_count as u8,
             operand_count_visible: op_count as u8,
+            implicit_gpr_read_mask: used_gpr_read_mask & !explicit_gpr_read_mask,
+            implicit_gpr_write_mask: used_gpr_write_mask & !explicit_gpr_write_mask,
             bytes: bytes_copy,
         },
     );
@@ -457,27 +540,9 @@ pub unsafe extern "C" fn lsx_iced_decode(
         for index in 0..operand_capacity {
             ptr::write(operands_out.add(index), X86DecodedOperand::default());
         }
-        let mut info_factory = InstructionInfoFactory::new();
-        let info = info_factory.info(&instruction);
         let count = (op_count as usize).min(operand_capacity);
         for index in 0..count {
-            let source_index = index as u32 + operand_start;
-            let mut operand = fill_operand(
-                &instruction,
-                source_index,
-                info.op_access(source_index),
-                constants.displacement_offset() as u8,
-                constants.displacement_size() as u8,
-                constants.immediate_offset() as u8,
-                constants.immediate_size() as u8,
-                constants.immediate_offset2() as u8,
-                constants.immediate_size2() as u8,
-            );
-            operand.id = index as u8;
-            ptr::write(
-                operands_out.add(index),
-                operand,
-            );
+            ptr::write(operands_out.add(index), public_operands[index]);
         }
     }
     STATUS_OK
@@ -521,7 +586,7 @@ pub unsafe extern "C" fn lsx_iced_format(
 
 #[no_mangle]
 pub extern "C" fn lsx_iced_decoder_contract_version() -> u32 {
-    0x0001_1501
+    0x0001_1601
 }
 
 #[no_mangle]
@@ -557,6 +622,21 @@ mod tests {
         assert_eq!(size_of::<X86ImmediateOperand>(), 24);
         assert_eq!(size_of::<X86DecodedOperand>(), 56);
         assert_eq!(size_of::<X86DecodedInstruction>(), 40);
+    }
+
+    #[test]
+    fn implicit_gpr_masks_distinguish_stack_and_dividend_state() {
+        let (push, _) = decode(&[0x50]);
+        assert_eq!(push.implicit_gpr_read_mask, 1 << 4);
+        assert_eq!(push.implicit_gpr_write_mask, 1 << 4);
+
+        let (div, _) = decode(&[0x48, 0xf7, 0xf1]);
+        assert_eq!(div.implicit_gpr_read_mask, (1 << 0) | (1 << 2));
+        assert_eq!(div.implicit_gpr_write_mask, (1 << 0) | (1 << 2));
+
+        let (plain_move, _) = decode(&[0x48, 0x8b, 0x45, 0x08]);
+        assert_eq!(plain_move.implicit_gpr_read_mask, 0);
+        assert_eq!(plain_move.implicit_gpr_write_mask, 0);
     }
 
     #[test]

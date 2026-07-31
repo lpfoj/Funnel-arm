@@ -206,9 +206,7 @@ bool IsManagedVulkanTransferCoalescing() noexcept {
 
 bool IsManagedVulkanSubmitCoalescing() noexcept {
 #ifdef __ANDROID__
-    static const bool allowed =
-        BisectionMarkerAbsent("run-bisect-disable-vk-submit-coalescing");
-    return IsManagedVulkanDriverOptimization() && allowed;
+    return false;
 #else
     return IsManagedVulkanDriverOptimization();
 #endif

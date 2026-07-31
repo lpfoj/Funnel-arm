@@ -41,6 +41,8 @@ enum class ExecutorVkJournalDrawType : u32 {
     IndexedIndirect = 4,
 };
 
+bool ExecutorVkJournalRequested() noexcept;
+
 u64 ExecutorVkJournalGraphicsDraw(const void* stream, u64 tick, u64 pipeline_key_hash,
                                   u64 pipeline_handle, u64 vs_hash, u64 ps_hash,
                                   ExecutorVkJournalDrawType draw_type, u32 primitive_type,

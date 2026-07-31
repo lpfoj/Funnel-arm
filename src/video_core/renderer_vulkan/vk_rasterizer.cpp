@@ -53,6 +53,32 @@ static u64 ExecutorVkPipelineHandle(vk::Pipeline pipeline) noexcept {
     return reinterpret_cast<u64>(static_cast<VkPipeline>(pipeline));
 }
 
+static bool ExecutorBisectSkipPipeline(u64 pipeline_hash) noexcept {
+    const char* cursor = std::getenv("EXECUTOR_BISECT_SKIP_PIPELINE_HASHES");
+    if (cursor == nullptr) {
+        return false;
+    }
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == ',' || *cursor == ';' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        char* end{};
+        const u64 candidate = std::strtoull(cursor, &end, 0);
+        if (end == cursor) {
+            ++cursor;
+            continue;
+        }
+        if (candidate == pipeline_hash) {
+            return true;
+        }
+        cursor = end;
+    }
+    return false;
+}
+
 static bool ExecutorNeedsQualcommPostBindDynamicState(const Instance& instance) noexcept {
     static const bool disabled_for_bisection =
         ::access("/data/data/app.lsx4.android/files/lsx4-home/"
@@ -2607,6 +2633,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         EXEC_DRAW_TRACE("no_pipeline_return");
         return;
     }
+#ifdef __ANDROID__
+    if (ExecutorBisectSkipPipeline(pipeline->GetPipelineHash())) {
+        return;
+    }
+#endif
     EXEC_DRAW_TRACE("pipeline_ok");
 #ifdef __ANDROID__
     ExecutorPreparePhysicalDrsDraw(pipeline);
@@ -3426,9 +3457,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 #ifdef __ANDROID__
-    if (!Config::managedGpuFastPath()) {
+    if (!Config::managedGpuFastPath() || ExecutorVkJournalRequested()) {
         const auto& key = pipeline->GetGraphicsKey();
         const auto& color = cb_descs[0].second.info;
+        const u64 image_view0 =
+            image_infos.empty()
+                ? 0
+                : reinterpret_cast<u64>(
+                      static_cast<VkImageView>(image_infos[0].imageView));
+        const u64 image_view1 =
+            image_infos.size() < 2
+                ? 0
+                : reinterpret_cast<u64>(
+                      static_cast<VkImageView>(image_infos[1].imageView));
         const u64 journal_sequence = ExecutorVkJournalGraphicsDraw(
             &scheduler, scheduler.CurrentTick(), pipeline->GetPipelineHash(),
             ExecutorVkPipelineHandle(pipeline->Handle()),
@@ -3437,7 +3478,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             is_indexed ? ExecutorVkJournalDrawType::IndexedDirect
                        : ExecutorVkJournalDrawType::Direct,
             static_cast<u32>(key.prim_type), regs.num_indices,
-            regs.num_instances.NumInstances(), 0, 0, 0, 0,
+            regs.num_instances.NumInstances(), 0, 0,
+            image_view0, image_view1,
             cb_descs[0].first ? color.guest_address : 0,
             executor_gpu_probe_attachments.depth_address,
             executor_gpu_probe_attachments.signature,
@@ -3461,7 +3503,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             key.stage_hashes[u32(Shader::LogicalStage::Fragment)], pipeline->GetPipelineHash(),
             is_indexed, false);
     }
-    if (!Config::managedGpuFastPath()) {
+    if (!Config::managedGpuFastPath() || ExecutorVkJournalRequested()) {
         ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
     }
     if (cb_descs[0].first) {
@@ -3512,6 +3554,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
 #ifdef __ANDROID__
+    if (ExecutorBisectSkipPipeline(pipeline->GetPipelineHash())) {
+        return;
+    }
     ExecutorPreparePhysicalDrsDraw(pipeline);
 #endif
     PrepareRenderState(pipeline);
@@ -3752,7 +3797,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
 #ifdef __ANDROID__
-    if (!Config::managedGpuFastPath()) {
+    if (!Config::managedGpuFastPath() || ExecutorVkJournalRequested()) {
         const auto& key = pipeline->GetGraphicsKey();
         const auto& color = cb_descs[0].second.info;
         const u64 journal_sequence = ExecutorVkJournalGraphicsDraw(
@@ -3787,7 +3832,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             key.stage_hashes[u32(Shader::LogicalStage::Fragment)], pipeline->GetPipelineHash(),
             is_indexed, true);
     }
-    if (!Config::managedGpuFastPath()) {
+    if (!Config::managedGpuFastPath() || ExecutorVkJournalRequested()) {
         ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
     }
     if (cb_descs[0].first) {
@@ -5124,6 +5169,98 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     return true;
 }
 
+bool Rasterizer::InvalidateMemoryFromGuestThread(VAddr addr, u64 size) {
+    GuestInvalidationRequest request{
+        .addr = addr,
+        .size = size,
+    };
+    bool queue_drain = false;
+    {
+        std::scoped_lock lock{guest_invalidation_mutex};
+        pending_guest_invalidations.push_back(&request);
+        if (!guest_invalidation_drain_queued) {
+            guest_invalidation_drain_queued = true;
+            queue_drain = true;
+        }
+    }
+    if (queue_drain) {
+        liverpool->SendCommand<false>([this] { DrainGuestInvalidations(); });
+    }
+    std::unique_lock lock{guest_invalidation_mutex};
+    request.completion_cv.wait(lock, [&request] { return request.complete; });
+    return request.result;
+}
+
+void Rasterizer::DrainGuestInvalidations() {
+    struct MergedRange {
+        VAddr begin;
+        VAddr end;
+        size_t first_request;
+        size_t request_count;
+    };
+
+    for (;;) {
+        std::vector<GuestInvalidationRequest*> batch;
+        {
+            std::scoped_lock lock{guest_invalidation_mutex};
+            batch.swap(pending_guest_invalidations);
+            if (batch.empty()) {
+                guest_invalidation_drain_queued = false;
+                return;
+            }
+        }
+
+        std::ranges::sort(batch, {}, [](const GuestInvalidationRequest* request) {
+            return request->addr;
+        });
+        std::vector<MergedRange> ranges;
+        ranges.reserve(batch.size());
+        for (size_t i = 0; i < batch.size();) {
+            const size_t first = i;
+            const VAddr begin = batch[i]->addr;
+            VAddr end =
+                batch[i]->size > std::numeric_limits<VAddr>::max() - begin
+                    ? std::numeric_limits<VAddr>::max()
+                    : begin + batch[i]->size;
+            ++i;
+            while (i < batch.size() && batch[i]->addr <= end) {
+                const VAddr next_end =
+                    batch[i]->size > std::numeric_limits<VAddr>::max() - batch[i]->addr
+                        ? std::numeric_limits<VAddr>::max()
+                        : batch[i]->addr + batch[i]->size;
+                end = std::max(end, next_end);
+                ++i;
+            }
+            ranges.push_back({
+                .begin = begin,
+                .end = end,
+                .first_request = first,
+                .request_count = i - first,
+            });
+        }
+
+        for (const MergedRange& range : ranges) {
+            const bool result = range.end > range.begin &&
+                                InvalidateMemory(range.begin, range.end - range.begin);
+            for (size_t i = 0; i < range.request_count; ++i) {
+                batch[range.first_request + i]->result = result;
+            }
+        }
+
+        {
+            std::scoped_lock lock{guest_invalidation_mutex};
+            for (GuestInvalidationRequest* request : batch) {
+                request->complete = true;
+                request->completion_cv.notify_one();
+            }
+            if (pending_guest_invalidations.empty()) {
+                guest_invalidation_drain_queued = false;
+                return;
+            }
+        }
+    }
+}
+
 bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     if (!IsMapped(addr, size)) {
         return false;
@@ -5141,6 +5278,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         // retirement sidecar.  If no independent GPU write remains for this
         // range, issuing another copyBuffer + timeline wait only downloads the
         // value that was just published and serializes the graphics queue.
+        buffer_cache.ResolvePendingReadback(addr, size);
         if (!buffer_cache.IsRegionGpuModified(addr, size)) {
             const u64 elided =
                 sidecar_readbacks_elided.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -5159,6 +5297,13 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     buffer_cache.ReadMemory(addr, size);
     pipeline_cache.InvalidateShaderIdentityReadbackRange(addr, size);
     return true;
+}
+
+bool Rasterizer::ReadMemoryFromGuestThread(VAddr addr, u64 size) {
+    bool read = false;
+    liverpool->SendCommand<true>(
+        [this, addr, size, &read] { read = ReadMemory(addr, size); });
+    return read;
 }
 
 void Rasterizer::TrackPendingCompletionRead(VAddr addr, u64 size) {

@@ -138,6 +138,10 @@ public:
 
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+#ifdef __ANDROID__
+    void ResolvePendingReadback(VAddr device_addr, u64 size);
+#endif
+
     [[nodiscard]] PreparedVertexBuffers PrepareVertexBuffers(
         const Vulkan::GraphicsPipeline& pipeline,
         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,

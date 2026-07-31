@@ -186,7 +186,7 @@ private:
         bool eop;
 
         operator bool() const noexcept {
-            return frame != nullptr;
+            return port != nullptr;
         }
     };
 

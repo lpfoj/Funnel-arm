@@ -18,7 +18,7 @@ inline constexpr X86DecodeStatus X86_STATUS_DECODE_FAILED = -2;
     return status == X86_STATUS_OK;
 }
 
-inline constexpr std::uint32_t X86_VERSION = 0x00011501u;
+inline constexpr std::uint32_t X86_VERSION = 0x00011601u;
 inline constexpr std::size_t X86_MAX_INSTRUCTION_LENGTH = 15;
 inline constexpr std::size_t X86_MAX_OPERAND_COUNT = 10;
 inline constexpr std::size_t X86_MAX_OPERAND_COUNT_VISIBLE = 5;
@@ -115,6 +115,8 @@ struct X86DecodedInstruction {
     std::uint8_t operand_width;
     std::uint8_t operand_count;
     std::uint8_t operand_count_visible;
+    std::uint16_t implicit_gpr_read_mask;
+    std::uint16_t implicit_gpr_write_mask;
     std::uint8_t bytes[X86_MAX_INSTRUCTION_LENGTH];
 };
 

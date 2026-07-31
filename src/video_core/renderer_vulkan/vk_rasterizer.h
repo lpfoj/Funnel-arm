@@ -13,6 +13,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 
 namespace AmdGpu {
@@ -70,6 +71,8 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
+    bool InvalidateMemoryFromGuestThread(VAddr addr, u64 size);
+    bool ReadMemoryFromGuestThread(VAddr addr, u64 size);
     void TrackPendingCompletionRead(VAddr addr, u64 size);
     void UntrackPendingCompletionRead(VAddr addr, u64 size);
     void TrackMemoryWaitWrite(VAddr addr, u64 size);
@@ -111,6 +114,16 @@ public:
     }
 
 private:
+    struct GuestInvalidationRequest {
+        VAddr addr{};
+        u64 size{};
+        bool complete{};
+        bool result{};
+        std::condition_variable completion_cv;
+    };
+
+    void DrainGuestInvalidations();
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -240,6 +253,9 @@ private:
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    std::mutex guest_invalidation_mutex;
+    std::vector<GuestInvalidationRequest*> pending_guest_invalidations;
+    bool guest_invalidation_drain_queued{};
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
